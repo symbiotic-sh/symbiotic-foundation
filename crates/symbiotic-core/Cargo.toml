@@ -1,0 +1,12 @@
+[package]
+name = "symbiotic-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tiny shared vocabulary for Symbiotic foundation crates"
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "symbiotic-queue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider-neutral durable queue contracts"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+symbiotic-core = { path = "../symbiotic-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"

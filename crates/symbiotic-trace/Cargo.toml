@@ -1,0 +1,22 @@
+[package]
+name = "symbiotic-trace"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Normalized invocation trace contracts and sinks"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+symbiotic-core = { path = "../symbiotic-core" }
+symbiotic-queue = { path = "../symbiotic-queue" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile = "3"

@@ -1,0 +1,26 @@
+[package]
+name = "symbiotic-model"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider-neutral model runtime contracts"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+symbiotic-core = { path = "../symbiotic-core" }
+symbiotic-queue = { path = "../symbiotic-queue" }
+symbiotic-trace = { path = "../symbiotic-trace" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
