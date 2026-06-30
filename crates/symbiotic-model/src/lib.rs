@@ -382,7 +382,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
         }),
         "embedding:openrouter:qwen/qwen3-embedding-8b"
         | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelQueueConfig {
-            max_in_flight: 1_000,
+            max_in_flight: 2_000,
             lease_seconds: 300,
             logical_retry_attempts: 6,
             retry_attempts: 6,
