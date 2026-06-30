@@ -396,7 +396,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
         // timeout at 60s (the free tier stalls rather than erroring) and let requests_per_minute fall
         // through to the host's default rate bucket (None here).
         "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelQueueConfig {
-            max_in_flight: 40,
+            max_in_flight: 200,
             lease_seconds: 600,
             logical_retry_attempts: 4,
             retry_attempts: 4,
