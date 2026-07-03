@@ -52,6 +52,13 @@ pub struct TimingTrace {
     pub queued_ms: Option<u64>,
     pub provider_ms: Option<u64>,
     pub total_ms: Option<u64>,
+    /// Split of `queued_ms` (whose semantics are unchanged): `throttle_wait_ms`
+    /// is time waiting on cooldowns/rate buckets, `queue_wait_ms` is the rest —
+    /// claim/lease wait plus any failed attempts on retries. Names match
+    /// `symbiotic_queue::QueueTelemetryAccumulator`. Absent on traces recorded
+    /// before the split existed.
+    pub queue_wait_ms: Option<u64>,
+    pub throttle_wait_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -416,6 +423,8 @@ mod tests {
                 queued_ms: Some(1),
                 provider_ms: Some(2),
                 total_ms: Some(3),
+                queue_wait_ms: None,
+                throttle_wait_ms: None,
             },
             outcome: InvocationOutcome::Succeeded,
             error_class: None,

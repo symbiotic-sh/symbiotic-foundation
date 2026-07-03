@@ -47,6 +47,46 @@ pub enum ModelCapability {
     AgentTask,
 }
 
+/// Relative price band for a model. Advisory: hosts use it for routing/budget
+/// decisions, not billing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    Free,
+    Budget,
+    #[default]
+    Standard,
+    Premium,
+}
+
+/// Reasoning capability of a model — distinct from `symbiotic_core::ModelTier`,
+/// which is selection routing, not what the model can do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningTier {
+    #[default]
+    None,
+    Standard,
+    Extended,
+}
+
+/// Capability flags for a model behind the engine seam: what the host can rely
+/// on when planning a call. Distinct from [`ModelCapability`], which names the
+/// operation kinds a provider serves (chat/embedding/rerank/...).
+///
+/// Additive-only: every field has a serde default so archived artifacts keep
+/// loading as fields are added.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelCapabilities {
+    /// Maximum context window in tokens, when known.
+    pub context_window: Option<u32>,
+    pub tool_use: bool,
+    pub structured_output: bool,
+    pub reasoning_tier: ReasoningTier,
+    pub cost_class: CostClass,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProviderAuthMode {
@@ -82,6 +122,14 @@ pub struct ProviderDescriptor {
 impl ProviderDescriptor {
     pub fn queue_id(&self) -> QueueId {
         self.identity.queue_id()
+    }
+
+    /// Capability flags for this model, resolved from the catalog by identity.
+    /// Unknown models get the conservative [`ModelCapabilities::default`] —
+    /// deliberately budget-pessimistic (`cost_class: Standard`, never `Free`,
+    /// even for uncatalogued `:free` models), so budget routing stays safe.
+    pub fn model_capabilities(&self) -> ModelCapabilities {
+        default_model_capabilities(&self.identity).unwrap_or_default()
     }
 }
 
@@ -440,6 +488,82 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
     }
 }
 
+/// Capability flags for known model identities, mirroring the
+/// [`default_model_queue_config`] catalog convention: unknown models return
+/// `None` so the host can apply its own defaults (or fall back to
+/// `ModelCapabilities::default()` via [`ProviderDescriptor::model_capabilities`]).
+///
+/// Values are advisory seam metadata (context budgets, routing hints), not
+/// provider-enforced limits.
+pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapabilities> {
+    match identity.queue_id().0.as_str() {
+        "chat:deepseek:deepseek-v4-flash" => Some(ModelCapabilities {
+            context_window: Some(128_000),
+            tool_use: true,
+            structured_output: true,
+            reasoning_tier: ReasoningTier::Standard,
+            cost_class: CostClass::Budget,
+        }),
+        "chat:deepseek:deepseek-v4-pro" => Some(ModelCapabilities {
+            context_window: Some(128_000),
+            tool_use: true,
+            structured_output: true,
+            reasoning_tier: ReasoningTier::Extended,
+            cost_class: CostClass::Standard,
+        }),
+        "chat:gemini:gemini-3.5-flash" => Some(ModelCapabilities {
+            context_window: Some(1_000_000),
+            tool_use: true,
+            structured_output: true,
+            reasoning_tier: ReasoningTier::Standard,
+            cost_class: CostClass::Budget,
+        }),
+        "chat:gemini:gemini-3.1-pro-preview" => Some(ModelCapabilities {
+            context_window: Some(1_000_000),
+            tool_use: true,
+            structured_output: true,
+            reasoning_tier: ReasoningTier::Extended,
+            cost_class: CostClass::Premium,
+        }),
+        "embedding:gemini:gemini-embedding-2" => Some(ModelCapabilities {
+            context_window: Some(2_048),
+            tool_use: false,
+            structured_output: false,
+            reasoning_tier: ReasoningTier::None,
+            cost_class: CostClass::Budget,
+        }),
+        "embedding:openrouter:qwen/qwen3-embedding-8b"
+        | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelCapabilities {
+            context_window: Some(32_768),
+            tool_use: false,
+            structured_output: false,
+            reasoning_tier: ReasoningTier::None,
+            cost_class: CostClass::Budget,
+        }),
+        "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelCapabilities {
+            context_window: None,
+            tool_use: false,
+            structured_output: false,
+            reasoning_tier: ReasoningTier::None,
+            cost_class: CostClass::Free,
+        }),
+        // Deliberately pessimistic floor for local models: local qwen-class chat
+        // models DO support tool use, but until per-model local entries exist we
+        // only guarantee cost (free). Catalogue a model explicitly if routing
+        // needs to rely on more.
+        _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
+            Some(ModelCapabilities {
+                context_window: None,
+                tool_use: false,
+                structured_output: false,
+                reasoning_tier: ReasoningTier::None,
+                cost_class: CostClass::Free,
+            })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct QueuedChatProvider<C> {
     inner: C,
@@ -566,6 +690,75 @@ where
     }
 }
 
+/// Queue-bound wrapper for a [`RerankProvider`], mirroring [`QueuedChatProvider`]
+/// and [`QueuedEmbeddingProvider`]. Reranking is a first-class model seam (the
+/// recall cascade's relevance stage), so it earns the same idempotency,
+/// response-cache, cooldown, and trace machinery as chat and embedding rather
+/// than a bespoke rate limiter. See the convergence plan's Stage 4 / backlog #9
+/// ("QueuedRerankProvider lands, the engine Reranker becomes a shim").
+#[derive(Clone)]
+pub struct QueuedRerankProvider<R> {
+    inner: R,
+    queue: Arc<dyn QueueBackend>,
+    trace_sink: Option<Arc<dyn TraceSink>>,
+    worker_id: String,
+    config: ModelQueueConfig,
+}
+
+impl<R> QueuedRerankProvider<R> {
+    pub fn new(
+        inner: R,
+        queue: Arc<dyn QueueBackend>,
+        worker_id: impl Into<String>,
+        config: ModelQueueConfig,
+    ) -> Self {
+        Self {
+            inner,
+            queue,
+            trace_sink: None,
+            worker_id: worker_id.into(),
+            config,
+        }
+    }
+
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace_sink = Some(sink);
+        self
+    }
+}
+
+#[async_trait]
+impl<R> ModelProvider for QueuedRerankProvider<R>
+where
+    R: RerankProvider + Clone + Send + Sync,
+{
+    fn descriptor(&self) -> &ProviderDescriptor {
+        self.inner.descriptor()
+    }
+}
+
+#[async_trait]
+impl<R> RerankProvider for QueuedRerankProvider<R>
+where
+    R: RerankProvider + Clone + Send + Sync + 'static,
+{
+    async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
+        run_queued(
+            self.inner.descriptor().clone(),
+            self.queue.clone(),
+            self.trace_sink.clone(),
+            self.worker_id.clone(),
+            self.config.clone(),
+            ModelCapability::Rerank,
+            "rerank",
+            &request,
+            |inner: R, request| async move { inner.rerank(request).await },
+            self.inner.clone(),
+        )
+        .await
+    }
+}
+
 async fn run_queued<P, Req, Res, Fut>(
     descriptor: ProviderDescriptor,
     queue: Arc<dyn QueueBackend>,
@@ -600,6 +793,10 @@ where
     }
 
     let queued_at = std::time::Instant::now();
+    // Cooldown + rate-bucket wait accumulated across loop iterations, so the
+    // trace can report the throttle-wait vs http-time split (the measured
+    // lesson) without changing `queued_ms` semantics.
+    let mut throttle_wait = Duration::ZERO;
     let logical_state = LogicalRetryState {
         attempts_used: 0,
         max_attempts: config
@@ -678,8 +875,10 @@ where
                 .await;
             }
         }
+        let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), &descriptor.queue_id()).await?;
         wait_for_model_budget(&descriptor.queue_id(), &config, request).await?;
+        throttle_wait += throttle_started.elapsed();
         let Some(item) = queue
             .claim_item(
                 &enqueue.item.item_id,
@@ -779,8 +978,11 @@ where
                 let mut trace = response.trace().clone();
                 trace.queue_item_id = Some(item.item_id.clone());
                 trace.request_hash = request_hash.clone();
-                trace.timing.queued_ms =
-                    Some(provider_started.duration_since(queued_at).as_millis() as u64);
+                let queued_ms = provider_started.duration_since(queued_at).as_millis() as u64;
+                let throttle_wait_ms = throttle_wait.as_millis() as u64;
+                trace.timing.queued_ms = Some(queued_ms);
+                trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
+                trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
                 trace.timing.provider_ms = Some(provider_started.elapsed().as_millis() as u64);
                 trace.timing.total_ms = Some(queued_at.elapsed().as_millis() as u64);
                 if let Some(trace_sink) = &trace_sink {
@@ -2046,12 +2248,52 @@ mod tests {
             "qwen/qwen3-embedding-8b",
         ))
         .unwrap();
-        assert_eq!(qwen_embedding.max_in_flight, 1_000);
+        assert_eq!(qwen_embedding.max_in_flight, 2_000);
         assert_eq!(qwen_embedding.requests_per_minute, None);
         assert_eq!(gemini_flash.max_in_flight, 100);
         assert_eq!(gemini_flash.requests_per_minute, Some(1_000));
         assert_eq!(gemini_pro.max_in_flight, 500);
         assert_eq!(gemini_pro.requests_per_minute, Some(100));
+    }
+
+    #[test]
+    fn known_model_capabilities_live_in_catalog() {
+        let flash = default_model_capabilities(&ModelIdentity::new(
+            "chat",
+            "deepseek",
+            "deepseek-v4-flash",
+        ))
+        .unwrap();
+        assert_eq!(flash.context_window, Some(128_000));
+        assert!(flash.tool_use);
+        assert!(flash.structured_output);
+        assert_eq!(flash.reasoning_tier, ReasoningTier::Standard);
+        assert_eq!(flash.cost_class, CostClass::Budget);
+
+        // Unknown models return None from the catalog; the descriptor method
+        // falls back to the conservative default profile.
+        let unknown = ModelIdentity::new("chat", "acme", "unknown-model");
+        assert!(default_model_capabilities(&unknown).is_none());
+        let descriptor = ProviderDescriptor {
+            identity: unknown,
+            provider_class: ProviderClass::Cloud,
+            capabilities: vec![ModelCapability::Chat],
+            auth_mode: ProviderAuthMode::None,
+            metadata: serde_json::json!({}),
+        };
+        assert_eq!(
+            descriptor.model_capabilities(),
+            ModelCapabilities::default()
+        );
+        assert_eq!(
+            ModelCapabilities::default().reasoning_tier,
+            ReasoningTier::None
+        );
+        assert_eq!(ModelCapabilities::default().cost_class, CostClass::Standard);
+
+        // Additive serde: a profile persisted before new fields existed still loads.
+        let sparse: ModelCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(sparse, ModelCapabilities::default());
     }
 
     #[test]
@@ -2440,6 +2682,18 @@ mod tests {
             records[1].timing.total_ms.unwrap_or_default()
                 >= records[1].timing.queued_ms.unwrap_or_default()
                     + records[1].timing.provider_ms.unwrap_or_default()
+        );
+        assert!(
+            records[1].timing.throttle_wait_ms.unwrap_or_default() >= 900,
+            "budget wait should be attributed to throttle_wait: {:?}",
+            records[1].timing
+        );
+        assert_eq!(
+            records[1].timing.queued_ms.unwrap_or_default(),
+            records[1].timing.queue_wait_ms.unwrap_or_default()
+                + records[1].timing.throttle_wait_ms.unwrap_or_default(),
+            "queue_wait + throttle_wait should partition queued time: {:?}",
+            records[1].timing
         );
     }
 
@@ -2832,5 +3086,124 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].operator.0, "ollama");
+    }
+
+    #[derive(Clone)]
+    struct CountingRerank {
+        descriptor: ProviderDescriptor,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingRerank {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                descriptor: ProviderDescriptor {
+                    identity: ModelIdentity::new("rerank", "nemotron", "nemotron-rerank-1b"),
+                    provider_class: ProviderClass::Cloud,
+                    capabilities: vec![ModelCapability::Rerank],
+                    auth_mode: ProviderAuthMode::None,
+                    metadata: serde_json::json!({}),
+                },
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingRerank {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for CountingRerank {
+        async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Rank documents by descending length as a deterministic stand-in
+            // for a real relevance model.
+            let mut hits: Vec<RerankHit> = request
+                .documents
+                .iter()
+                .enumerate()
+                .map(|(index, doc)| RerankHit {
+                    index,
+                    score: doc.len() as f32,
+                })
+                .collect();
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+            if let Some(top_k) = request.top_k {
+                hits.truncate(top_k);
+            }
+            Ok(RerankResponse {
+                hits,
+                trace: success_trace(
+                    &self.descriptor,
+                    request.sensitivity,
+                    request.role_binding.clone(),
+                    request.source.clone(),
+                    hash_json(&request)?,
+                    Some("ok"),
+                ),
+                raw_provider_response: None,
+            })
+        }
+    }
+
+    fn rerank_request(query: &str) -> RerankRequest {
+        RerankRequest {
+            query: query.to_string(),
+            documents: vec![
+                "short".to_string(),
+                "a much longer candidate document".to_string(),
+                "medium length".to_string(),
+            ],
+            top_k: Some(2),
+            sensitivity: Sensitivity::Shareable,
+            role_binding: Some("memory.rerank".to_string()),
+            source: Some("test".to_string()),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_rerank_provider_reuses_exact_response_cache_and_traces() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let trace_sink = Arc::new(InMemoryTraceSink::default());
+        let provider = QueuedRerankProvider::new(
+            CountingRerank::new(calls.clone()),
+            queue,
+            "worker",
+            ModelQueueConfig {
+                max_in_flight: 1,
+                lease_seconds: 60,
+                logical_retry_attempts: 2,
+                retry_attempts: 2,
+                retry_jitter_seconds: 0,
+                request_timeout_seconds: Some(10),
+                requests_per_minute: None,
+                input_units_per_minute: None,
+                response_cache_dir: Some(dir.path().join("cache")),
+            },
+        )
+        .with_trace_sink(trace_sink.clone());
+
+        let first = provider.rerank(rerank_request("query")).await.unwrap();
+        // Longest document ("a much longer candidate document") ranks first.
+        assert_eq!(first.hits.len(), 2);
+        assert_eq!(first.hits[0].index, 1);
+
+        let second = provider.rerank(rerank_request("query")).await.unwrap();
+        assert_eq!(second.hits[0].index, 1);
+
+        // Second identical call is served from the response cache — the
+        // underlying model runs exactly once.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let records = trace_sink.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].cache.response_cache, CacheStatus::Miss);
+        assert_eq!(records[1].cache.response_cache, CacheStatus::Hit);
     }
 }

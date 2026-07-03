@@ -8,7 +8,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.x: distinct from the runtime's same-named `symbiotic-core` / `symbiotic-queue`
+# (0.1.0) so both can path-coexist in the runtime lockfile until the Stage-4
+# crate rename lands. See convergence-and-interfaces-2026-07 §5 Stage 4/7.
+version = "0.2.0"
 edition = "2024"
 authors = ["Symbiotic Contributors"]
 license = "Apache-2.0 OR MIT"
@@ -19,7 +22,11 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
+# Aligned with the symbiotic runtime (0.37 / libsqlite3-sys 0.35) so a single
+# `links = "sqlite3"` native lib exists when the memory kit + foundation are
+# path-linked into the runtime. See docs/BAKE-IN-2026-07.md and the runtime
+# convergence plan (Stage 4: one sqlite across the memory plane).
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
