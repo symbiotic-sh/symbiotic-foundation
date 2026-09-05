@@ -23,3 +23,6 @@ foundation        -> no dependency on memory/runtime
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/MIGRATION.md](docs/MIGRATION.md).
+
+Build cache boundaries, source downloads, and their consumer contract are documented
+in [docs/architecture/build-artifacts.md](docs/architecture/build-artifacts.md).
