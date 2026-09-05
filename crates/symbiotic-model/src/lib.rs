@@ -2492,11 +2492,14 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    // Independent tests need distinct identities: cooldowns are process-wide by
+    // model, even when each test uses its own in-memory queue. Clones within a
+    // test deliberately retain one identity so duplicate waiters still contend.
     impl SlowUnavailableChat {
-        fn new(calls: Arc<AtomicUsize>) -> Self {
+        fn new(calls: Arc<AtomicUsize>, model: &str) -> Self {
             Self {
                 descriptor: ProviderDescriptor {
-                    identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-flash"),
+                    identity: ModelIdentity::new("chat", "test", model),
                     provider_class: ProviderClass::Cloud,
                     capabilities: vec![ModelCapability::Chat],
                     auth_mode: ProviderAuthMode::None,
@@ -2933,7 +2936,7 @@ mod tests {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
-            SlowUnavailableChat::new(calls.clone()),
+            SlowUnavailableChat::new(calls.clone(), "retry-exhaustion"),
             queue,
             "worker",
             ModelQueueConfig {
@@ -2960,7 +2963,7 @@ mod tests {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
-            SlowUnavailableChat::new(calls.clone()),
+            SlowUnavailableChat::new(calls.clone(), "retry-waiter"),
             queue,
             "worker",
             ModelQueueConfig {

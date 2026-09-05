@@ -57,3 +57,25 @@ Raw logs and session IDs are under .debug-session/validation-session.md.
 Local preflight completed: fmt, warnings-denied release clippy and all 40 tests
 passed (1 core, 20 model, 14 queue, 5 trace; none ignored), plus doc-tests. Session
 59941 exited 0; heavy local slot handed directly to Symbiotic lane per parent.
+
+## Retry fixture isolation
+
+Corrected hosted cold 33947361391 built 152 units in 79s and passed clippy, but
+`queued_chat_provider_waiter_shares_logical_retry_envelope` hit its 5s timeout.
+The failure reproduces locally using the already-built model test executable:
+`logical_retry --test-threads=1 --nocapture` => 2 pass, 1 timeout, 9.22s.
+Parallel and two-thread focused runs passed, revealing order-sensitive shared
+state. The preceding test leaves process-global model cooldown under the same
+identity even though test queues are independent. The fixture-only repair gives
+independent retry tests distinct model identities while duplicate clones retain
+the same key, and keeps all assertions and the original timeout.
+
+Parent approved one final corrected cold plus one warm after local validation;
+another unrelated hosted failure must stop retries. Waiting for Symbiotic's
+exclusive build slot before recompiling the test fixture repair. No hosted
+source archive or warm cache proof exists yet. Raw evidence is in .debug-session.
+
+Fixture isolation validated in local session 31786: exact serial reproduction
+now 3/3 pass (8.42s overall; original waiter timeout remains 5s). Full 40 tests,
+clippy -D warnings and fmt pass. Local slot released. Proceeding only with parent’s
+final approved cold/warm pair; any unrelated failure is a reported blocker.

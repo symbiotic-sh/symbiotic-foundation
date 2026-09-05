@@ -37,8 +37,8 @@ Each successful CI job uploads `foundation-source-<revision>-<attempt>` containi
 - `SHA256SUMS`: SHA-256 of the gzip archive;
 - `manifest.json`: exact revision, digest, filename and consumer contract.
 
-The archive uses `git archive` and gzip without a timestamp; the same revision
-produces identical bytes. Verify the digest against the artifact from the trusted
+The archive uses `git archive` and gzip without a timestamp; repeated packaging
+with the same revision and archive tools produces identical bytes. Verify the digest against the artifact from the trusted
 successful run, run `shasum -a 256 -c SHA256SUMS`, and extract. Use the full workspace
 layout if consuming crates by path; internal path dependencies remain relative.
 Normal Git consumers keep their full `rev` pins. The archive is an alternate
