@@ -1,7 +1,7 @@
 ---
 id: 001
 title: Compatible build cache and immutable source artifacts
-status: active
+status: review
 owner: foundation
 priority: P2
 depends_on:
@@ -9,7 +9,7 @@ lane: .github/workflows/ci.yml, scripts/, rust-toolchain.toml, docs/architecture
 design:
 pr: https://github.com/symbiotic-sh/symbiotic-foundation/pull/1
 created: 2026-09-05T05:19:45Z
-updated: 2026-09-05T05:19:46Z
+updated: 2026-09-05T05:50:20Z
 ---
 
 ## Scope
@@ -79,3 +79,13 @@ Fixture isolation validated in local session 31786: exact serial reproduction
 now 3/3 pass (8.42s overall; original waiter timeout remains 5s). Full 40 tests,
 clippy -D warnings and fmt pass. Local slot released. Proceeding only with parent’s
 final approved cold/warm pair; any unrelated failure is a reported blocker.
+
+## Final evidence
+
+Final run33947992655 cold and warm both pass. Cold152 compiled/0 Fresh/78s;
+warm8 compiled/144 Fresh/11s, exact cache hit and identical native digest/source
+revision. Both40-test gates green. Source artifact9963966062 and proof9963966279
+published; downloaded checksums and extracted workspace layout verified. Cold and
+warm source bytes identical. Full report: docs/reports/2026-09-05-build-cache-proof.md.
+No remaining implementation blocker; PR#1 remains unmerged for review. Final
+commit is evidence-only with CI skipped; executable candidate2132e85 is unchanged.

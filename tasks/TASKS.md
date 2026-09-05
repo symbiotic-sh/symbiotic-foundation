@@ -5,4 +5,4 @@
 
 | id | title | status | owner | prio | updated | latest handoff |
 |---|---|---|---|---|---|---|
-| 001 | Compatible build cache and immutable source artifacts | **active** | foundation | P2 | 2026-09-05 | - |
+| 001 | Compatible build cache and immutable source artifacts | **review** | foundation | P2 | 2026-09-05 | - |
