@@ -151,5 +151,10 @@ pub fn render_markdown(table: &Table, limits: Limits) -> Result<Presentation, Er
     if text.len() > limits.max_input_bytes {
         return Err(Error::LimitExceeded);
     }
-    Ok(Presentation{bytes:text.into_bytes(),losses:vec!["Markdown table presentation carries string cells only; newlines and markup are escaped.".into()]})
+    let loss =
+        "Markdown table presentation carries string cells only; newlines and markup are escaped.";
+    Ok(Presentation {
+        bytes: text.into_bytes(),
+        losses: vec![loss.into()],
+    })
 }

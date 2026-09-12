@@ -52,6 +52,12 @@ records. Those parsers and their product mappings are separately qualified in th
 consumer; this crate does not advertise document extraction or editable document
 round trips.
 
+External resource/version IDs accept ASCII letters, digits and `._:/-`, excluding
+URI `://` forms. Query strings, userinfo, whitespace and credential-bearing access
+URLs are rejected; the host supplies an opaque ID and resolves credentials at
+runtime. Navigation locators remain host-sanitized metadata. Collection limits are
+counted without allocating typed entries before decoding, under the input byte cap.
+
 Scope here is an explicit interchange restriction: empty audience means no
 recipients. Memory's empty-audience space-default semantics require an explicit
 host mapping; never copy empty arrays and assume equivalent access. Limits apply

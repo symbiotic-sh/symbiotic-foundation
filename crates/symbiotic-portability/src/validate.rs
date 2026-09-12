@@ -1,7 +1,7 @@
 use crate::*;
 use serde::{
     Deserialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,6 +11,60 @@ use std::{
 };
 
 struct UniqueJson;
+struct CollectionLimit(usize);
+impl<'de> DeserializeSeed<'de> for CollectionLimit {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        struct Count(usize);
+        impl<'de> Visitor<'de> for Count {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bounded collection")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                let mut count = 0usize;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                    if count > self.0 {
+                        return Err(de::Error::custom("collection limit"));
+                    }
+                }
+                Ok(())
+            }
+        }
+        d.deserialize_seq(Count(self.0))
+    }
+}
+struct RootLimits(Limits);
+impl<'de> DeserializeSeed<'de> for RootLimits {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        struct CheckRoot(Limits);
+        impl<'de> Visitor<'de> for CheckRoot {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("interchange envelope")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "records" | "changes" => {
+                            map.next_value_seed(CollectionLimit(self.0.max_records))?
+                        }
+                        "artifacts" => {
+                            map.next_value_seed(CollectionLimit(self.0.max_artifacts))?
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        d.deserialize_map(CheckRoot(self.0))
+    }
+}
 impl<'de> Deserialize<'de> for UniqueJson {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct Check;
@@ -59,6 +113,16 @@ fn decode<T: de::DeserializeOwned>(bytes: &[u8], limits: Limits) -> Result<T, Er
     if bytes.len() > limits.max_input_bytes {
         return Err(Error::LimitExceeded);
     }
+    // Count root collections without allocating their entries before typed decode.
+    RootLimits(limits)
+        .deserialize(&mut serde_json::Deserializer::from_slice(bytes))
+        .map_err(|e| {
+            if e.to_string().starts_with("collection limit") {
+                Error::LimitExceeded
+            } else {
+                Error::InvalidValue
+            }
+        })?;
     serde_json::from_slice::<UniqueJson>(bytes).map_err(|_| Error::InvalidValue)?;
     serde_json::from_slice(bytes).map_err(|_| Error::InvalidValue)
 }
@@ -87,9 +151,10 @@ fn scope(s: &Scope) -> Result<(), Error> {
 pub fn validate_scope(child: &Scope, parent: &Scope) -> Result<(), Error> {
     scope(child)?;
     scope(parent)?;
+    let audience: BTreeSet<_> = parent.audience.iter().collect();
     if child.space != parent.space
         || child.sensitivity < parent.sensitivity
-        || child.audience.iter().any(|v| !parent.audience.contains(v))
+        || child.audience.iter().any(|v| !audience.contains(v))
     {
         Err(Error::ScopeMismatch)
     } else {
@@ -331,15 +396,36 @@ fn validate_artifact(a: &Artifact, limits: Limits) -> Result<(), Error> {
             },
             Preservation::ExternalVerified,
         ) if exact => {
-            nonempty(resource_id)?;
-            nonempty(version)
+            external_id(resource_id)?;
+            external_id(version)
         }
-        (ArtifactTarget::External { resource_id, .. }, Preservation::ReferenceOnly) => {
-            nonempty(resource_id)
+        (
+            ArtifactTarget::External {
+                resource_id,
+                version_id,
+            },
+            Preservation::ReferenceOnly,
+        ) => {
+            external_id(resource_id)?;
+            if let Some(version) = version_id {
+                external_id(version)?;
+            }
+            Ok(())
         }
         (ArtifactTarget::Unavailable { reason }, Preservation::Unavailable) => nonempty(reason),
         _ => Err(Error::InvalidValue),
     }
+}
+fn external_id(value: &str) -> Result<(), Error> {
+    nonempty(value)?;
+    if value.contains("://")
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+    {
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
 }
 fn validate_path(path: &str) -> Result<(), Error> {
     nonempty(path)?;

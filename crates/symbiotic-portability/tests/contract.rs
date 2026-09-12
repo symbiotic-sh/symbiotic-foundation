@@ -181,3 +181,28 @@ fn oversize_json_is_rejected_before_deserializing() {
         Error::LimitExceeded
     );
 }
+
+#[test]
+fn collection_caps_precede_typed_allocation_and_external_ids_exclude_access_urls() {
+    assert_eq!(
+        decode_bundle(
+            br#"{"records":[{},{}]}"#,
+            Limits {
+                max_records: 1,
+                ..Limits::default()
+            }
+        )
+        .unwrap_err(),
+        Error::LimitExceeded
+    );
+    let mut b = bundle();
+    b["artifacts"] = json!([{"artifact_id":"external","sha256":null,"byte_length":null,"target":{"kind":"external","resource_id":"https://user:secret@example/file?token=secret","version_id":null},"preservation":"reference_only"}]);
+    assert_eq!(decode(b.clone()).unwrap_err(), Error::InvalidValue);
+    b["artifacts"][0]["target"]["resource_id"] = json!("provider:document-123");
+    assert!(decode(b).is_ok());
+    let parsed = decode(bundle()).unwrap();
+    assert_eq!(
+        validate_destination(&parsed, "other-app", &parsed.scope),
+        Err(Error::ScopeMismatch)
+    );
+}
