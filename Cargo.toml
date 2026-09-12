@@ -4,6 +4,7 @@ members = [
     "crates/symbiotic-queue",
     "crates/symbiotic-model",
     "crates/symbiotic-trace",
+    "crates/symbiotic-portability",
 ]
 resolver = "2"
 

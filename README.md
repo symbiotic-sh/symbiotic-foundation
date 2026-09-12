@@ -6,6 +6,8 @@ Reusable Rust contracts for durable AI work:
 - `symbiotic-queue` — durable execution queue traits and state vocabulary.
 - `symbiotic-model` — provider-neutral model/operator runtime traits.
 - `symbiotic-trace` — normalized invocation traces and pluggable sinks.
+- `symbiotic-portability` — external record interchange validation and explicit
+  CSV/Markdown presentations; no Memory or application mutation dependency.
 
 This repository is contract-first. It intentionally does not own Symbiotic memory, Archive,
 Gatekeeper, Vault, Matrix transport, or agent role evolution. Product runtimes compose these crates

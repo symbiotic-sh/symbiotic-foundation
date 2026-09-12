@@ -1,0 +1,19 @@
+[package]
+name = "symbiotic-portability"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.93"
+license.workspace = true
+description = "External typed record interchange and explicit presentation formats"
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+csv = "1.4"
+
+[dev-dependencies]
+tempfile = "3"
