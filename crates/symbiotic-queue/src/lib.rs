@@ -450,16 +450,15 @@ impl QueueBackend for SqliteQueue {
                     ts(item.updated_at),
                 ],
             ) {
-                if let Some(key) = &item.idempotency_key {
-                    if is_unique_constraint(&err) {
-                        if let Some(existing) = find_by_idempotency(&tx, &item.queue_id, key)? {
-                            tx.commit().map_err(storage_error)?;
-                            return Ok(EnqueueOutcome {
-                                item: existing,
-                                disposition: EnqueueDisposition::ActiveDuplicate,
-                            });
-                        }
-                    }
+                if let Some(key) = &item.idempotency_key
+                    && is_unique_constraint(&err)
+                    && let Some(existing) = find_by_idempotency(&tx, &item.queue_id, key)?
+                {
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(EnqueueOutcome {
+                        item: existing,
+                        disposition: EnqueueDisposition::ActiveDuplicate,
+                    });
                 }
                 return Err(storage_error(err));
             }

@@ -612,11 +612,13 @@ where
 {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         run_queued(
-            self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
+            QueueContext {
+                descriptor: self.inner.descriptor().clone(),
+                queue: self.queue.clone(),
+                trace_sink: self.trace_sink.clone(),
+                worker_id: self.worker_id.clone(),
+                config: self.config.clone(),
+            },
             ModelCapability::Chat,
             "chat",
             &request,
@@ -675,11 +677,13 @@ where
 {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         run_queued(
-            self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
+            QueueContext {
+                descriptor: self.inner.descriptor().clone(),
+                queue: self.queue.clone(),
+                trace_sink: self.trace_sink.clone(),
+                worker_id: self.worker_id.clone(),
+                config: self.config.clone(),
+            },
             ModelCapability::Embedding,
             "embedding",
             &request,
@@ -744,11 +748,13 @@ where
 {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
         run_queued(
-            self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
+            QueueContext {
+                descriptor: self.inner.descriptor().clone(),
+                queue: self.queue.clone(),
+                trace_sink: self.trace_sink.clone(),
+                worker_id: self.worker_id.clone(),
+                config: self.config.clone(),
+            },
             ModelCapability::Rerank,
             "rerank",
             &request,
@@ -759,12 +765,16 @@ where
     }
 }
 
-async fn run_queued<P, Req, Res, Fut>(
+struct QueueContext {
     descriptor: ProviderDescriptor,
     queue: Arc<dyn QueueBackend>,
     trace_sink: Option<Arc<dyn TraceSink>>,
     worker_id: String,
     config: ModelQueueConfig,
+}
+
+async fn run_queued<P, Req, Res, Fut>(
+    context: QueueContext,
     capability: ModelCapability,
     kind: &str,
     request: &Req,
@@ -778,18 +788,25 @@ where
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send,
 {
+    let QueueContext {
+        descriptor,
+        queue,
+        trace_sink,
+        worker_id,
+        config,
+    } = context;
     let request_hash = hash_json(request)?;
-    if let Some(cache_dir) = &config.response_cache_dir {
-        if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)? {
-            return return_cached_response(
-                cached,
-                &descriptor,
-                &trace_sink,
-                request_hash.clone(),
-                None,
-            )
-            .await;
-        }
+    if let Some(cache_dir) = &config.response_cache_dir
+        && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+    {
+        return return_cached_response(
+            cached,
+            &descriptor,
+            &trace_sink,
+            request_hash.clone(),
+            None,
+        )
+        .await;
     }
 
     let queued_at = std::time::Instant::now();
@@ -825,9 +842,11 @@ where
                 if let Some(next) = reenqueue_dead_item(
                     queue.as_ref(),
                     &descriptor,
-                    capability,
-                    kind,
-                    &request_hash,
+                    RetryRequest {
+                        capability,
+                        kind,
+                        request_hash: &request_hash,
+                    },
                     &idempotency_key,
                     &enqueue.item,
                     &config,
@@ -863,17 +882,17 @@ where
     }
 
     loop {
-        if let Some(cache_dir) = &config.response_cache_dir {
-            if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)? {
-                return return_cached_response(
-                    cached,
-                    &descriptor,
-                    &trace_sink,
-                    request_hash.clone(),
-                    Some(enqueue.item.item_id.clone()),
-                )
-                .await;
-            }
+        if let Some(cache_dir) = &config.response_cache_dir
+            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+        {
+            return return_cached_response(
+                cached,
+                &descriptor,
+                &trace_sink,
+                request_hash.clone(),
+                Some(enqueue.item.item_id.clone()),
+            )
+            .await;
         }
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), &descriptor.queue_id()).await?;
@@ -900,9 +919,11 @@ where
                         if let Some(next) = reenqueue_dead_item(
                             queue.as_ref(),
                             &descriptor,
-                            capability,
-                            kind,
-                            &request_hash,
+                            RetryRequest {
+                                capability,
+                                kind,
+                                request_hash: &request_hash,
+                            },
                             &idempotency_key,
                             &current,
                             &config,
@@ -916,18 +937,17 @@ where
                         }
                     }
                     QueueStatus::Succeeded => {
-                        if let Some(cache_dir) = &config.response_cache_dir {
-                            if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
-                            {
-                                return return_cached_response(
-                                    cached,
-                                    &descriptor,
-                                    &trace_sink,
-                                    request_hash.clone(),
-                                    Some(current.item_id),
-                                )
-                                .await;
-                            }
+                        if let Some(cache_dir) = &config.response_cache_dir
+                            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+                        {
+                            return return_cached_response(
+                                cached,
+                                &descriptor,
+                                &trace_sink,
+                                request_hash.clone(),
+                                Some(current.item_id),
+                            )
+                            .await;
                         }
                         enqueue = reenqueue_succeeded_without_cache(
                             queue.as_ref(),
@@ -1037,9 +1057,11 @@ where
                     if let Some(next) = reenqueue_dead_item(
                         queue.as_ref(),
                         &descriptor,
-                        capability,
-                        kind,
-                        &request_hash,
+                        RetryRequest {
+                            capability,
+                            kind,
+                            request_hash: &request_hash,
+                        },
                         &idempotency_key,
                         &dead_item,
                         &config,
@@ -1258,17 +1280,26 @@ fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRet
     }
 }
 
+struct RetryRequest<'a> {
+    capability: ModelCapability,
+    kind: &'a str,
+    request_hash: &'a str,
+}
+
 async fn reenqueue_dead_item(
     queue: &dyn QueueBackend,
     descriptor: &ProviderDescriptor,
-    capability: ModelCapability,
-    kind: &str,
-    request_hash: &str,
+    request: RetryRequest<'_>,
     idempotency_key: &Option<String>,
     item: &QueueItem,
     config: &ModelQueueConfig,
     err: &ModelError,
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
+    let RetryRequest {
+        capability,
+        kind,
+        request_hash,
+    } = request;
     let state = logical_retry_state(
         &item.payload,
         config
@@ -2461,11 +2492,14 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    // Independent tests need distinct identities: cooldowns are process-wide by
+    // model, even when each test uses its own in-memory queue. Clones within a
+    // test deliberately retain one identity so duplicate waiters still contend.
     impl SlowUnavailableChat {
-        fn new(calls: Arc<AtomicUsize>) -> Self {
+        fn new(calls: Arc<AtomicUsize>, model: &str) -> Self {
             Self {
                 descriptor: ProviderDescriptor {
-                    identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-flash"),
+                    identity: ModelIdentity::new("chat", "test", model),
                     provider_class: ProviderClass::Cloud,
                     capabilities: vec![ModelCapability::Chat],
                     auth_mode: ProviderAuthMode::None,
@@ -2902,7 +2936,7 @@ mod tests {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
-            SlowUnavailableChat::new(calls.clone()),
+            SlowUnavailableChat::new(calls.clone(), "retry-exhaustion"),
             queue,
             "worker",
             ModelQueueConfig {
@@ -2929,7 +2963,7 @@ mod tests {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
-            SlowUnavailableChat::new(calls.clone()),
+            SlowUnavailableChat::new(calls.clone(), "retry-waiter"),
             queue,
             "worker",
             ModelQueueConfig {

@@ -1,0 +1,95 @@
+name: Foundation CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: foundation-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+  CARGO_TERM_COLOR: never
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+          cargo -V
+
+      - name: Native compatibility boundary
+        id: native
+        run: |
+          mkdir -p .debug-session/ci
+          {
+            printf '%s\n' "$ImageOS" "$ImageVersion"
+            uname -m
+            cc --version
+            ld --version
+            ldd --version
+            dpkg-query -W
+          } > .debug-session/ci/native-environment.txt
+          echo "digest=$(sha256sum .debug-session/ci/native-environment.txt | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compatible compiled dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: foundation-v1
+          # Put compatibility in the explicit key, so fallback cannot cross it.
+          key: release-all-features-${{ env.CARGO_BUILD_TARGET }}-${{ steps.native.outputs.digest }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/ci.yml', 'scripts/ci-*') }}
+          env-vars: "CC CXX AR CFLAGS CXXFLAGS LDFLAGS RUST CARGO"
+          cache-bin: false
+
+      - name: Build and record actual Cargo reuse
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          NATIVE_DIGEST: ${{ steps.native.outputs.digest }}
+        run: ./scripts/ci-build-proof.sh
+
+      - name: Formatting, clippy, and tests
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --release --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --release --workspace --all-features --no-fail-fast
+
+      - name: Package revision-pinned source
+        run: ./scripts/source-artifact.sh .debug-session/source
+
+      - name: Publish source archive and checksums
+        id: source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: foundation-source-${{ github.sha }}-${{ github.run_attempt }}
+          path: .debug-session/source/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: foundation-build-proof-${{ github.sha }}-${{ github.run_attempt }}
+          path: .debug-session/ci/*
+          if-no-files-found: error
+          retention-days: 30
