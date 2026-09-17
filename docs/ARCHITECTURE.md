@@ -105,6 +105,14 @@ Gemini embedding, exact response cache, queue-bound chat/embedding wrappers, and
 retry classification. Codex CLI/session and optional `genai` adapters are still
 migration targets. The public contract remains ours.
 
+Known-model execution defaults live in `default_model_queue_config`. The current
+DeepSeek `deepseek-flash` name and retained `deepseek-v4-flash` name resolve the
+same existing 2,000-request queue policy. This is a configured limit, not a
+capacity measurement; consumers still apply their shared safety ceiling and
+explicit overrides. DeepSeek's [published account limit](https://api-docs.deepseek.com/quick_start/rate_limit/)
+was 2,500 for Flash when checked on September 17, 2026. Request scheduling and
+enforcement remain with the consuming execution adapter.
+
 ### `symbiotic-trace`
 
 Owns normalized invocation traces:

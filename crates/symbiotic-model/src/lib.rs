@@ -373,17 +373,19 @@ impl Default for ModelQueueConfig {
 /// one-at-a-time catalog entry.
 pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueueConfig> {
     match identity.queue_id().0.as_str() {
-        "chat:deepseek:deepseek-v4-flash" => Some(ModelQueueConfig {
-            max_in_flight: 2_000,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-        }),
+        "chat:deepseek:deepseek-flash" | "chat:deepseek:deepseek-v4-flash" => {
+            Some(ModelQueueConfig {
+                max_in_flight: 2_000,
+                lease_seconds: 600,
+                logical_retry_attempts: 4,
+                retry_attempts: 4,
+                retry_jitter_seconds: 20,
+                request_timeout_seconds: Some(600),
+                requests_per_minute: None,
+                input_units_per_minute: None,
+                response_cache_dir: None,
+            })
+        }
         "chat:deepseek:deepseek-v4-pro" => Some(ModelQueueConfig {
             max_in_flight: 400,
             lease_seconds: 600,
@@ -2350,6 +2352,24 @@ mod tests {
     use symbiotic_trace::InMemoryTraceSink;
 
     #[test]
+    fn current_deepseek_flash_name_preserves_shared_parallel_defaults() {
+        let current =
+            default_model_queue_config(&ModelIdentity::new("chat", "deepseek", "deepseek-flash"))
+                .expect("current Flash name must resolve shared queue settings");
+        let legacy = default_model_queue_config(&ModelIdentity::new(
+            "chat",
+            "deepseek",
+            "deepseek-v4-flash",
+        ))
+        .unwrap();
+        assert_eq!(current.max_in_flight, 2_000);
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(legacy).unwrap()
+        );
+    }
+
+    #[test]
     fn known_model_queue_defaults_live_in_catalog() {
         let flash = default_model_queue_config(&ModelIdentity::new(
             "chat",
@@ -2599,9 +2619,14 @@ mod tests {
 
     impl SlowUnavailableChat {
         fn new(calls: Arc<AtomicUsize>) -> Self {
+            // Independent fixtures must not inherit another test's model cooldown.
+            let model = format!(
+                "unavailable-fixture-{}",
+                TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
+            );
             Self {
                 descriptor: ProviderDescriptor {
-                    identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-flash"),
+                    identity: ModelIdentity::new("chat", "fixture", model),
                     provider_class: ProviderClass::Cloud,
                     capabilities: vec![ModelCapability::Chat],
                     auth_mode: ProviderAuthMode::None,
