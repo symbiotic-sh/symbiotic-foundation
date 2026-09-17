@@ -759,6 +759,8 @@ where
     }
 }
 
+// These arguments are the existing queue execution boundary; keep its behavior stable.
+#[allow(clippy::too_many_arguments)]
 async fn run_queued<P, Req, Res, Fut>(
     descriptor: ProviderDescriptor,
     queue: Arc<dyn QueueBackend>,
@@ -779,17 +781,17 @@ where
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send,
 {
     let request_hash = hash_json(request)?;
-    if let Some(cache_dir) = &config.response_cache_dir {
-        if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)? {
-            return return_cached_response(
-                cached,
-                &descriptor,
-                &trace_sink,
-                request_hash.clone(),
-                None,
-            )
-            .await;
-        }
+    if let Some(cache_dir) = &config.response_cache_dir
+        && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+    {
+        return return_cached_response(
+            cached,
+            &descriptor,
+            &trace_sink,
+            request_hash.clone(),
+            None,
+        )
+        .await;
     }
 
     let queued_at = std::time::Instant::now();
@@ -863,17 +865,17 @@ where
     }
 
     loop {
-        if let Some(cache_dir) = &config.response_cache_dir {
-            if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)? {
-                return return_cached_response(
-                    cached,
-                    &descriptor,
-                    &trace_sink,
-                    request_hash.clone(),
-                    Some(enqueue.item.item_id.clone()),
-                )
-                .await;
-            }
+        if let Some(cache_dir) = &config.response_cache_dir
+            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+        {
+            return return_cached_response(
+                cached,
+                &descriptor,
+                &trace_sink,
+                request_hash.clone(),
+                Some(enqueue.item.item_id.clone()),
+            )
+            .await;
         }
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), &descriptor.queue_id()).await?;
@@ -916,18 +918,17 @@ where
                         }
                     }
                     QueueStatus::Succeeded => {
-                        if let Some(cache_dir) = &config.response_cache_dir {
-                            if let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
-                            {
-                                return return_cached_response(
-                                    cached,
-                                    &descriptor,
-                                    &trace_sink,
-                                    request_hash.clone(),
-                                    Some(current.item_id),
-                                )
-                                .await;
-                            }
+                        if let Some(cache_dir) = &config.response_cache_dir
+                            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+                        {
+                            return return_cached_response(
+                                cached,
+                                &descriptor,
+                                &trace_sink,
+                                request_hash.clone(),
+                                Some(current.item_id),
+                            )
+                            .await;
                         }
                         enqueue = reenqueue_succeeded_without_cache(
                             queue.as_ref(),
@@ -1258,6 +1259,8 @@ fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRet
     }
 }
 
+// Retry bookkeeping follows the same execution boundary rather than another state type.
+#[allow(clippy::too_many_arguments)]
 async fn reenqueue_dead_item(
     queue: &dyn QueueBackend,
     descriptor: &ProviderDescriptor,
