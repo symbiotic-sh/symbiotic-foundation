@@ -1799,6 +1799,16 @@ pub struct OpenAiCompatibleChatProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    thinking: Option<ThinkingMode>,
+    reasoning_effort: Option<String>,
+}
+
+/// Provider extension supported by compatible APIs such as DeepSeek.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    Enabled,
+    Disabled,
 }
 
 impl OpenAiCompatibleChatProvider {
@@ -1827,7 +1837,28 @@ impl OpenAiCompatibleChatProvider {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key: api_key.into(),
+            thinking: None,
+            reasoning_effort: None,
         }
+    }
+
+    /// Reuse the consumer's connection pool and timeout policy.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Option<ThinkingMode>) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        let effort = effort.into();
+        if !effort.trim().is_empty() {
+            self.reasoning_effort = Some(effort);
+        }
+        self
     }
 }
 
@@ -1848,6 +1879,10 @@ struct OpenAiChatWireRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     stream: bool,
 }
 
@@ -1860,16 +1895,92 @@ struct OpenAiChatWireResponse {
 #[derive(Deserialize)]
 struct OpenAiChoice {
     #[serde(default)]
-    message: Option<ChatMessage>,
+    message: Option<OpenAiResponseMessage>,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
+struct OpenAiResponseMessage {
+    content: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
 struct OpenAiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     prompt_cache_hit_tokens: Option<u64>,
     prompt_cache_miss_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptDetails>,
+    completion_tokens_details: Option<OpenAiCompletionDetails>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiPromptDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiCompletionDetails {
+    reasoning_tokens: Option<u64>,
+}
+
+/// A cache label is meaningful only when numeric counters describe a consistent split.
+pub fn prompt_cache_status(total: Option<u64>, hit: Option<u64>, miss: Option<u64>) -> CacheStatus {
+    match (total, hit, miss) {
+        (Some(total), Some(hit), Some(miss)) if hit.checked_add(miss) == Some(total) => {
+            match (hit, miss) {
+                (0, _) => CacheStatus::Miss,
+                (_, 0) => CacheStatus::Hit,
+                _ => CacheStatus::PartialHit,
+            }
+        }
+        _ => CacheStatus::NotApplicable,
+    }
+}
+
+/// Normalize supported cache counters, rejecting contradictory observations.
+pub fn prompt_cache_counts(
+    total: Option<u64>,
+    hit: Option<u64>,
+    miss: Option<u64>,
+    nested_hit: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    if hit.zip(nested_hit).is_some_and(|(a, b)| a != b) {
+        return (None, None);
+    }
+    let hit = hit.or(nested_hit).or_else(|| {
+        total
+            .zip(miss)
+            .and_then(|(total, miss)| total.checked_sub(miss))
+    });
+    let miss = miss.or_else(|| {
+        total
+            .zip(hit)
+            .and_then(|(total, hit)| total.checked_sub(hit))
+    });
+    if total.zip(hit).is_some_and(|(total, hit)| hit > total)
+        || total.zip(miss).is_some_and(|(total, miss)| miss > total)
+        || total
+            .zip(hit.zip(miss))
+            .is_some_and(|(total, (hit, miss))| hit.checked_add(miss) != Some(total))
+    {
+        return (None, None);
+    }
+    (hit, miss)
+}
+
+fn reported_cost_usd(raw: &Value) -> Option<String> {
+    // Only explicit provider billing fields; never substitute token/rate estimates.
+    let value = raw
+        .pointer("/usage/cost")
+        .or_else(|| raw.pointer("/usage/cost_usd"))?;
+    let text = match value {
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        _ => return None,
+    };
+    let number = text.parse::<f64>().ok()?;
+    (number.is_finite() && number >= 0.0).then_some(text)
 }
 
 #[async_trait]
@@ -1884,6 +1995,14 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 .response_format
                 .as_deref()
                 .map(|format| serde_json::json!({ "type": format })),
+            thinking: self
+                .thinking
+                .map(|mode| serde_json::json!({ "type": mode })),
+            reasoning_effort: if self.thinking == Some(ThinkingMode::Disabled) {
+                None
+            } else {
+                self.reasoning_effort.as_deref()
+            },
             stream: false,
         };
         let resp = self
@@ -1911,16 +2030,11 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
             ModelError::Provider("OpenAI-compatible response had no choices".to_string())
         })?;
-        let usage = parsed.usage.unwrap_or(OpenAiUsage {
-            prompt_tokens: None,
-            completion_tokens: None,
-            prompt_cache_hit_tokens: None,
-            prompt_cache_miss_tokens: None,
-        });
+        let usage = parsed.usage.unwrap_or_default();
         let content = choice
             .message
             .as_ref()
-            .map(|message| message.content.as_str())
+            .and_then(|message| message.content.as_deref())
             .unwrap_or_default();
         let mut trace = success_trace(
             &self.descriptor,
@@ -1933,21 +2047,40 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         trace.usage = UsageTrace {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
-            reasoning_tokens: None,
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
             media_units: None,
             cost_micro_usd: None,
         };
+        let nested_hit = usage
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens);
+        let (hit, miss) = prompt_cache_counts(
+            usage.prompt_tokens,
+            usage.prompt_cache_hit_tokens,
+            usage.prompt_cache_miss_tokens,
+            nested_hit,
+        );
+        trace.metadata = serde_json::json!({
+            "provider": {
+                "response_id": raw.get("id").and_then(Value::as_str),
+                "served_model": raw.get("model").and_then(Value::as_str),
+                "created": raw.get("created").and_then(Value::as_i64),
+                "reasoning_tokens": trace.usage.reasoning_tokens,
+                "reported_cost_usd": reported_cost_usd(&raw),
+            },
+            "cache_miss_tokens": miss,
+            "observed_cache_tokens": {
+                "hit": usage.prompt_cache_hit_tokens,
+                "miss": usage.prompt_cache_miss_tokens,
+                "nested_hit": nested_hit,
+            },
+        });
         trace.cache = CacheTrace {
             response_cache: CacheStatus::Miss,
-            prompt_cache: match (
-                usage.prompt_cache_hit_tokens.unwrap_or(0),
-                usage.prompt_cache_miss_tokens.unwrap_or(0),
-            ) {
-                (0, _) => CacheStatus::Miss,
-                (_, 0) => CacheStatus::Hit,
-                _ => CacheStatus::PartialHit,
-            },
-            cached_input_tokens: usage.prompt_cache_hit_tokens,
+            prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
+            cached_input_tokens: hit,
         };
         Ok(ChatResponse {
             text: content.to_string(),
