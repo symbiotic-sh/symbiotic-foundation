@@ -23,4 +23,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 futures = "0.3"
+# Tests run with the `arbitrary_precision` serde_json feature that
+# symbiotic-portability enables in workspace builds, so numeric parsing is
+# checked the way consumers of the whole workspace see it.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 tempfile = "3"

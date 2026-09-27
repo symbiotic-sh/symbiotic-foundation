@@ -4,7 +4,9 @@ Reusable Rust contracts for durable AI work:
 
 - `symbiotic-core` — tiny shared vocabulary and identifiers.
 - `symbiotic-queue` — durable execution queue traits and state vocabulary.
-- `symbiotic-model` — provider-neutral model/operator runtime traits.
+- `symbiotic-model` — provider-neutral model/operator runtime traits: chat,
+  embedding, rerank and classification (typed questions answered with
+  probabilities, served by TypeSafe System One or any chat model).
 - `symbiotic-trace` — normalized invocation traces and pluggable sinks.
 - `symbiotic-portability` — external record interchange validation and explicit
   CSV/Markdown presentations; no Memory or application mutation dependency.
