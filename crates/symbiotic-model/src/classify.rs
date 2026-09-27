@@ -43,6 +43,16 @@ pub const JEV_MAX_REQUEST_TOKENS: u64 = 64_000;
 const JEV_TEMPLATE_RESERVE_TOKENS: u64 = 512;
 /// Tolerance for a probability that should lie in `[0, 1]`.
 const PROBABILITY_EPSILON: f64 = 1e-6;
+/// How far a provider-reported distribution may sum from 1 before it is
+/// rejected (it is then rescaled to sum exactly 1). Jev rounds to two
+/// decimals and renormalises; its sums were exact in 1,833 recorded calls.
+const REPORTED_SUM_TOLERANCE: f64 = 0.02;
+/// Two probabilities this close are a tie.
+const TIE_EPSILON: f64 = 1e-9;
+/// How far a reported Score may lie from its probability-weighted level.
+/// Two-decimal rounding moves the weighted level by at most 0.225 levels
+/// (ten levels); half a level means the answer is inconsistent.
+const SCORE_TOLERANCE_LEVELS: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Request and response types
@@ -413,15 +423,23 @@ impl ClassifyResponse {
     /// Evaluate a Choice question that may carry an abstain option such as
     /// `none`: the most probable other option is selected when its
     /// probability reaches `min_probability` and exceeds the abstain option's;
-    /// otherwise the decision is to abstain (a tie abstains). `None` when the
-    /// question has no Choice answer.
+    /// otherwise the decision is to abstain. Exact ties go to the answer's
+    /// `chosen` option (then to the first option in request order), so
+    /// without an abstain option this selects `chosen` whenever its
+    /// probability reaches the minimum. `None` when the question has no
+    /// Choice answer.
     pub fn decide_choice(
         &self,
         question_id: &str,
         abstain_option: Option<&str>,
         min_probability: f64,
     ) -> Option<ChoiceDecision> {
-        let AnswerValue::Choice { probabilities, .. } = self.answer(question_id)? else {
+        let AnswerValue::Choice {
+            chosen,
+            probabilities,
+            ..
+        } = self.answer(question_id)?
+        else {
             return None;
         };
         let abstain = abstain_option.map(|abstain| {
@@ -430,17 +448,22 @@ impl ClassifyResponse {
                 .find(|entry| entry.id == abstain)
                 .map_or(0.0, |entry| entry.probability)
         });
+        // More probable, or tied and the provider's chosen option.
+        let beats = |entry: &OptionProbability, other: f64| {
+            entry.probability > other + TIE_EPSILON
+                || ((entry.probability - other).abs() <= TIE_EPSILON && &entry.id == chosen)
+        };
         let best = probabilities
             .iter()
             .filter(|entry| Some(entry.id.as_str()) != abstain_option)
             .fold(None::<&OptionProbability>, |best, entry| match best {
-                Some(best) if best.probability >= entry.probability => Some(best),
+                Some(best) if !beats(entry, best.probability) => Some(best),
                 _ => Some(entry),
             });
         Some(match best {
             Some(best)
                 if best.probability >= min_probability
-                    && abstain.is_none_or(|abstain| best.probability > abstain) =>
+                    && abstain.is_none_or(|abstain| beats(best, abstain)) =>
             {
                 ChoiceDecision::Selected {
                     option: best.id.clone(),
@@ -494,6 +517,10 @@ where
 /// Queue-bound wrapper for a [`ClassifierProvider`], mirroring
 /// [`QueuedRerankProvider`]: idempotency, model cap, rate buckets, cooldowns,
 /// retry classification, exact response cache and traces.
+///
+/// Cached responses are scoped to the provider's descriptor (identity,
+/// class, auth mode and metadata such as the expected served model), so
+/// classifiers sharing a cache directory never read each other's answers.
 #[derive(Clone)]
 pub struct QueuedClassifierProvider<P> {
     inner: P,
@@ -541,14 +568,17 @@ where
     P: ClassifierProvider + Clone + Send + Sync + 'static,
 {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        let descriptor = self.inner.descriptor().clone();
+        let cache_scope = hash_json(&descriptor)?;
         run_queued(
-            self.inner.descriptor().clone(),
+            descriptor,
             self.queue.clone(),
             self.trace_sink.clone(),
             self.worker_id.clone(),
             self.config.clone(),
             ModelCapability::Classify,
             "classify",
+            Some(cache_scope),
             &request,
             |inner: P, request| async move { inner.classify(request).await },
             self.inner.clone(),
@@ -571,14 +601,15 @@ fn check_probability(question: &str, key: &str, value: f64) -> Result<f64, Model
     }
 }
 
-/// Exactly the requested options, each a probability, in request order.
-/// `normalise` rescales them to sum to 1 (a text model's stated numbers
-/// rarely do); otherwise they are kept as reported.
+/// Exactly the requested options, each a probability, in request order,
+/// rescaled to sum to 1. `max_sum_error` rejects a distribution whose sum is
+/// further from 1 (a provider that promises a distribution); `None` accepts
+/// any positive sum (a text model's stated numbers rarely add up).
 fn choice_probabilities(
     question: &str,
     options: &[ChoiceOption],
     mut reported: HashMap<String, f64>,
-    normalise: bool,
+    max_sum_error: Option<f64>,
 ) -> Result<Vec<OptionProbability>, ModelError> {
     let mut probabilities = Vec::with_capacity(options.len());
     for option in options {
@@ -598,27 +629,27 @@ fn choice_probabilities(
             "question `{question}`: `{extra}` is not one of the requested options"
         )));
     }
-    if normalise {
-        let values: Vec<f64> = probabilities
-            .iter()
-            .map(|entry| entry.probability)
-            .collect();
-        for (entry, value) in probabilities
+    let values: Vec<f64> = probabilities
+        .iter()
+        .map(|entry| entry.probability)
+        .collect();
+    for (entry, value) in
+        probabilities
             .iter_mut()
-            .zip(normalise_distribution(question, &values)?)
-        {
-            entry.probability = value;
-        }
+            .zip(normalise_distribution(question, &values, max_sum_error)?)
+    {
+        entry.probability = value;
     }
     Ok(probabilities)
 }
 
-/// Every level `"0"`, `"1"`, … exactly once, lowest first.
+/// Every level `"0"`, `"1"`, … exactly once, lowest first, rescaled to sum
+/// to 1; `max_sum_error` as in [`choice_probabilities`].
 fn score_probabilities(
     question: &str,
     level_count: usize,
     mut reported: HashMap<String, f64>,
-    normalise: bool,
+    max_sum_error: Option<f64>,
 ) -> Result<Vec<f64>, ModelError> {
     let mut probabilities = Vec::with_capacity(level_count);
     for level in 0..level_count {
@@ -635,20 +666,129 @@ fn score_probabilities(
             "question `{question}`: `{extra}` is not one of the {level_count} levels"
         )));
     }
-    if normalise {
-        probabilities = normalise_distribution(question, &probabilities)?;
-    }
-    Ok(probabilities)
+    normalise_distribution(question, &probabilities, max_sum_error)
 }
 
-fn normalise_distribution(question: &str, values: &[f64]) -> Result<Vec<f64>, ModelError> {
+fn normalise_distribution(
+    question: &str,
+    values: &[f64],
+    max_sum_error: Option<f64>,
+) -> Result<Vec<f64>, ModelError> {
     let total: f64 = values.iter().sum();
     if total <= PROBABILITY_EPSILON {
         return Err(ModelError::Provider(format!(
             "question `{question}`: the probabilities are all zero"
         )));
     }
+    if let Some(max_error) = max_sum_error
+        && (total - 1.0).abs() > max_error
+    {
+        return Err(ModelError::Provider(format!(
+            "question `{question}`: the probabilities sum to {total}, not 1"
+        )));
+    }
     Ok(values.iter().map(|value| value / total).collect())
+}
+
+/// Validate every answer against its question, in request order: the public
+/// contract of [`ClassifyResponse`] whatever the provider. Noul: a
+/// probability. Choice: exactly the requested option ids in order, each a
+/// probability, summing to 1, with `chosen` among the most probable options.
+/// Score: one probability per level, summing to 1, `value` their weighted
+/// level. Confidence, when present, is a probability.
+fn validate_answers(
+    request: &ClassifyRequest,
+    answers: &[ClassifierAnswer],
+) -> Result<(), ModelError> {
+    let invalid = |question: &str, detail: &str| {
+        ModelError::Provider(format!("answer to `{question}` is invalid: {detail}"))
+    };
+    if answers.len() != request.questions.len() {
+        return Err(ModelError::Provider(format!(
+            "{} answers for {} questions",
+            answers.len(),
+            request.questions.len()
+        )));
+    }
+    let sums_to_one = |values: &mut dyn Iterator<Item = f64>| {
+        (values.sum::<f64>() - 1.0).abs() <= PROBABILITY_EPSILON
+    };
+    for (question, answer) in request.questions.iter().zip(answers) {
+        let id = question.id.as_str();
+        if answer.question_id != question.id {
+            return Err(invalid(id, "answers are out of order"));
+        }
+        let in_range = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
+        match (&question.kind, &answer.value) {
+            (QuestionKind::Noul { .. }, AnswerValue::Noul { probability }) => {
+                if !in_range(*probability) {
+                    return Err(invalid(id, "probability outside [0, 1]"));
+                }
+            }
+            (
+                QuestionKind::Choice { options },
+                AnswerValue::Choice {
+                    chosen,
+                    probabilities,
+                    confidence,
+                },
+            ) => {
+                if probabilities.len() != options.len()
+                    || probabilities
+                        .iter()
+                        .zip(options)
+                        .any(|(entry, option)| entry.id != option.id)
+                {
+                    return Err(invalid(id, "options differ from the requested ones"));
+                }
+                if !probabilities
+                    .iter()
+                    .all(|entry| in_range(entry.probability))
+                    || !sums_to_one(&mut probabilities.iter().map(|entry| entry.probability))
+                {
+                    return Err(invalid(id, "not a probability distribution"));
+                }
+                let max = probabilities
+                    .iter()
+                    .map(|entry| entry.probability)
+                    .fold(0.0, f64::max);
+                if !probabilities
+                    .iter()
+                    .any(|entry| &entry.id == chosen && entry.probability >= max - TIE_EPSILON)
+                {
+                    return Err(invalid(id, "the chosen option is not the most probable"));
+                }
+                if confidence.is_some_and(|value| !in_range(value)) {
+                    return Err(invalid(id, "confidence outside [0, 1]"));
+                }
+            }
+            (
+                QuestionKind::Score { levels },
+                AnswerValue::Score {
+                    value,
+                    probabilities,
+                    confidence,
+                },
+            ) => {
+                if probabilities.len() != levels.len()
+                    || !probabilities.iter().all(|p| in_range(*p))
+                    || !sums_to_one(&mut probabilities.iter().copied())
+                {
+                    return Err(invalid(id, "not a distribution over the levels"));
+                }
+                if (value - expected_level(probabilities)).abs() > PROBABILITY_EPSILON {
+                    return Err(invalid(id, "value is not the weighted level"));
+                }
+                if confidence.is_some_and(|value| !in_range(value)) {
+                    return Err(invalid(id, "confidence outside [0, 1]"));
+                }
+            }
+            (kind, _) => {
+                return Err(invalid(id, &format!("expected a {} answer", kind.label())));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn most_probable(probabilities: &[OptionProbability]) -> String {
@@ -731,7 +871,7 @@ impl JevClassifierProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "systemone" }),
+                metadata: serde_json::json!({ "wire": "systemone", "served_model": model }),
             },
             client: reqwest::Client::new(),
             base_url: base_url.into(),
@@ -777,6 +917,7 @@ impl JevClassifierProvider {
     /// dated snapshot a gateway names for the requested version.
     pub fn with_served_model(mut self, served_model: impl Into<String>) -> Self {
         self.served_model = served_model.into();
+        self.descriptor.metadata["served_model"] = Value::String(self.served_model.clone());
         self
     }
 
@@ -826,68 +967,97 @@ impl JevClassifierProvider {
         Ok(())
     }
 
+    /// Map the typed answers onto the questions, in request order.
+    ///
+    /// Answers are read field by field from the parsed `Value`, never through
+    /// an internally tagged serde enum: that buffers numbers, and a buffered
+    /// number with a non-canonical spelling (`0.1200`) fails to deserialize
+    /// under serde_json's `arbitrary_precision`, which a workspace crate
+    /// enables.
     fn parse_answers(
         request: &ClassifyRequest,
-        mut answers: HashMap<String, JevWireAnswer>,
+        answers: &serde_json::Map<String, Value>,
     ) -> Result<Vec<ClassifierAnswer>, ModelError> {
         let mut parsed = Vec::with_capacity(request.questions.len());
         for question in &request.questions {
-            let answer = answers.remove(&question.id).ok_or_else(|| {
-                ModelError::Provider(format!("no answer for question `{}`", question.id))
-            })?;
-            let value = match (&question.kind, answer) {
-                (QuestionKind::Noul { .. }, JevWireAnswer::Noul { noul }) => AnswerValue::Noul {
-                    probability: check_probability(&question.id, "of yes", noul)?,
+            let id = question.id.as_str();
+            let malformed =
+                |detail: &str| ModelError::Provider(format!("answer to `{id}`: {detail}"));
+            let answer = answers
+                .get(id)
+                .and_then(Value::as_object)
+                .ok_or_else(|| malformed("missing or not an object"))?;
+            let kind = answer.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind != question.kind.label() {
+                return Err(malformed(&format!(
+                    "a {} question answered as `{kind}`",
+                    question.kind.label()
+                )));
+            }
+            let number = |field: &str| {
+                answer
+                    .get(field)
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| malformed(&format!("`{field}` is not a number")))
+            };
+            let confidence = match answer.get("confidence") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(check_probability(id, "confidence", number("confidence")?)?),
+            };
+            let distribution = || {
+                answer
+                    .get("probabilities")
+                    .cloned()
+                    .ok_or_else(|| malformed("no probabilities"))
+                    .and_then(|raw| number_map(id, raw).map_err(|detail| malformed(&detail)))
+            };
+            let value = match &question.kind {
+                QuestionKind::Noul { .. } => AnswerValue::Noul {
+                    probability: check_probability(id, "of yes", number("noul")?)?,
                 },
-                (
-                    QuestionKind::Choice { options },
-                    JevWireAnswer::Choice {
-                        choice,
-                        probabilities,
-                        confidence,
-                    },
-                ) => {
-                    if !options.iter().any(|option| option.id == choice) {
-                        return Err(ModelError::Provider(format!(
-                            "question `{}` chose `{choice}`, not a requested option",
-                            question.id
+                QuestionKind::Choice { options } => {
+                    let chosen = answer
+                        .get("choice")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| malformed("`choice` is not a string"))?;
+                    if !options.iter().any(|option| option.id == chosen) {
+                        return Err(malformed(&format!(
+                            "chose `{chosen}`, not a requested option"
                         )));
                     }
                     AnswerValue::Choice {
-                        chosen: choice,
+                        chosen: chosen.to_string(),
                         probabilities: choice_probabilities(
-                            &question.id,
+                            id,
                             options,
-                            probabilities,
-                            false,
+                            distribution()?,
+                            Some(REPORTED_SUM_TOLERANCE),
                         )?,
                         confidence,
                     }
                 }
-                (
-                    QuestionKind::Score { levels },
-                    JevWireAnswer::Score {
-                        score,
+                QuestionKind::Score { levels } => {
+                    let probabilities = score_probabilities(
+                        id,
+                        levels.len(),
+                        distribution()?,
+                        Some(REPORTED_SUM_TOLERANCE),
+                    )?;
+                    let value = expected_level(&probabilities);
+                    let reported = number("score")?;
+                    let top = (levels.len() - 1) as f64;
+                    if !(0.0..=top).contains(&reported)
+                        || (reported - value).abs() > SCORE_TOLERANCE_LEVELS
+                    {
+                        return Err(malformed(&format!(
+                            "score {reported} does not match its probabilities ({value:.3})"
+                        )));
+                    }
+                    AnswerValue::Score {
+                        value,
                         probabilities,
                         confidence,
-                    },
-                ) => AnswerValue::Score {
-                    value: score,
-                    probabilities: score_probabilities(
-                        &question.id,
-                        levels.len(),
-                        probabilities,
-                        false,
-                    )?,
-                    confidence,
-                },
-                (kind, answer) => {
-                    return Err(ModelError::Provider(format!(
-                        "question `{}` is a {} question but the answer is a {}",
-                        question.id,
-                        kind.label(),
-                        answer.label()
-                    )));
+                    }
                 }
             };
             parsed.push(ClassifierAnswer {
@@ -895,11 +1065,15 @@ impl JevClassifierProvider {
                 value,
             });
         }
-        if let Some(extra) = answers.keys().next() {
+        if let Some(extra) = answers
+            .keys()
+            .find(|key| !request.questions.iter().any(|q| &q.id == *key))
+        {
             return Err(ModelError::Provider(format!(
                 "answer for unrequested question `{extra}`"
             )));
         }
+        validate_answers(request, &parsed)?;
         Ok(parsed)
     }
 }
@@ -941,30 +1115,42 @@ impl ClassifierProvider for JevClassifierProvider {
             .map_err(|err| ModelError::Unavailable(err.to_string()))?;
         let raw: Value =
             serde_json::from_str(&text).map_err(|err| ModelError::Provider(err.to_string()))?;
-        let parsed: JevWireResponse = serde_json::from_value(raw.clone()).map_err(|err| {
-            ModelError::Provider(format!("unexpected System One response: {err}"))
-        })?;
-        if parsed.model != self.served_model {
+        let unexpected = |detail: &str| {
+            ModelError::Provider(format!("unexpected System One response: {detail}"))
+        };
+        let served_model = raw
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| unexpected("no model"))?
+            .to_string();
+        if served_model != self.served_model {
             return Err(ModelError::Provider(format!(
-                "served model `{}` is not the expected `{}`",
-                parsed.model, self.served_model
+                "served model `{served_model}` is not the expected `{}`",
+                self.served_model
             )));
         }
-        let answers = Self::parse_answers(&request, parsed.answers)?;
+        let answers = raw
+            .get("answers")
+            .and_then(Value::as_object)
+            .ok_or_else(|| unexpected("no answers"))?;
+        let answers = Self::parse_answers(&request, answers)?;
         let mut trace = classify_trace(&self.descriptor, &request, &text, started)?;
-        let usage = parsed.usage.unwrap_or_default();
-        trace.usage.input_tokens = usage.input_tokens;
-        trace.usage.output_tokens = usage.output_tokens;
+        let usage = |field: &str| {
+            raw.pointer(&format!("/usage/{field}"))
+                .and_then(Value::as_u64)
+        };
+        trace.usage.input_tokens = usage("input_tokens");
+        trace.usage.output_tokens = usage("output_tokens");
         trace.metadata = serde_json::json!({
             "provider": {
                 "response_id": raw.get("id").and_then(Value::as_str),
-                "served_model": parsed.model,
+                "served_model": served_model,
                 "reported_cost_usd": reported_cost_usd(&raw),
             },
         });
         Ok(ClassifyResponse {
             answers,
-            served_model: parsed.model,
+            served_model,
             trace,
             raw_provider_response: Some(raw),
         })
@@ -1066,50 +1252,6 @@ impl Serialize for ChoiceCriteria<'_> {
         }
         map.end()
     }
-}
-
-#[derive(Deserialize)]
-struct JevWireResponse {
-    model: String,
-    answers: HashMap<String, JevWireAnswer>,
-    #[serde(default)]
-    usage: Option<JevWireUsage>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum JevWireAnswer {
-    Noul {
-        noul: f64,
-    },
-    Choice {
-        choice: String,
-        probabilities: HashMap<String, f64>,
-        #[serde(default)]
-        confidence: Option<f64>,
-    },
-    Score {
-        score: f64,
-        probabilities: HashMap<String, f64>,
-        #[serde(default)]
-        confidence: Option<f64>,
-    },
-}
-
-impl JevWireAnswer {
-    fn label(&self) -> &'static str {
-        match self {
-            JevWireAnswer::Noul { .. } => "noul",
-            JevWireAnswer::Choice { .. } => "choice",
-            JevWireAnswer::Score { .. } => "score",
-        }
-    }
-}
-
-#[derive(Default, Deserialize)]
-struct JevWireUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,7 +1375,7 @@ impl ChatClassifierProvider {
                         &question.id,
                         options,
                         number_map(&question.id, raw).map_err(malformed)?,
-                        true,
+                        None,
                     )?;
                     AnswerValue::Choice {
                         chosen: most_probable(&probabilities),
@@ -1246,7 +1388,7 @@ impl ChatClassifierProvider {
                         &question.id,
                         levels.len(),
                         number_map(&question.id, raw).map_err(malformed)?,
-                        true,
+                        None,
                     )?;
                     AnswerValue::Score {
                         value: expected_level(&probabilities),
@@ -1263,6 +1405,7 @@ impl ChatClassifierProvider {
         if let Some(extra) = object.keys().next() {
             return Err(malformed(format!("unrequested key `{extra}`")));
         }
+        validate_answers(request, &answers)?;
         Ok(answers)
     }
 }
@@ -1467,26 +1610,9 @@ impl ClassifierProvider for StaticClassifierProvider {
                         question.id
                     ))
                 })?;
-            let matches = match (&question.kind, &answer.value) {
-                (QuestionKind::Noul { .. }, AnswerValue::Noul { .. }) => true,
-                (QuestionKind::Choice { options }, AnswerValue::Choice { probabilities, .. }) => {
-                    probabilities
-                        .iter()
-                        .all(|entry| options.iter().any(|option| option.id == entry.id))
-                }
-                (QuestionKind::Score { levels }, AnswerValue::Score { probabilities, .. }) => {
-                    probabilities.len() == levels.len()
-                }
-                _ => false,
-            };
-            if !matches {
-                return Err(ModelError::Provider(format!(
-                    "static answer for `{}` does not fit the question",
-                    question.id
-                )));
-            }
             answers.push(answer.clone());
         }
+        validate_answers(&request, &answers)?;
         let text =
             serde_json::to_string(&answers).map_err(|err| ModelError::Provider(err.to_string()))?;
         Ok(ClassifyResponse {
@@ -1750,8 +1876,11 @@ mod tests {
         );
         assert_eq!(
             response.decide_choice("tie", Some("none"), 0.1),
-            Some(ChoiceDecision::Abstained),
-            "a tie with the abstain option abstains"
+            Some(ChoiceDecision::Selected {
+                option: "a".into(),
+                probability: 0.4
+            }),
+            "at a tie with the abstain option the chosen option decides"
         );
         assert_eq!(
             response.decide_choice("tie", None, 0.1),
@@ -1958,6 +2087,300 @@ mod tests {
             response.trace.metadata.pointer("/provider/response_id"),
             Some(&serde_json::json!("gen-dec-1"))
         );
+    }
+
+    /// A literal HTTP body: numbers keep the provider's spelling (`0.1200`,
+    /// `5e-2`), which a float fixture would canonicalize.
+    fn literal(body: &str) -> Scripted {
+        (200, Vec::new(), body.to_string())
+    }
+
+    #[tokio::test]
+    async fn jev_parses_noncanonical_number_spellings() {
+        let server = mock_http(vec![literal(
+            r#"{"model":"jev-1.13.0","answers":{
+                "goal":{"type":"noul","noul":0.1200},
+                "route":{"type":"choice","choice":"quick",
+                         "probabilities":{"quick":0.70,"short_task":0.250,"goal":5e-2},
+                         "confidence":0.60},
+                "f":{"type":"score","score":1.050,
+                     "legend":{"0":"Calm","1":"Frustrated","2":"Very angry"},
+                     "probabilities":{"0":0.0,"1":0.950,"2":0.050},"confidence":0.920}},
+               "usage":{"input_tokens":612,"output_tokens":20}}"#,
+        )]);
+        let response = jev_at(&server)
+            .classify(request(vec![
+                route_question(),
+                goal_question(),
+                ClassifierQuestion::score(
+                    "f",
+                    "How frustrated?",
+                    ["Calm", "Frustrated", "Very angry"],
+                ),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(response.noul("goal"), Some(0.12));
+        assert_eq!(response.choice_probability("route", "goal"), Some(0.05));
+        assert_eq!(response.chosen("route"), Some("quick"));
+        let score = response.score("f").unwrap();
+        assert!((score - 1.05).abs() < 1e-9, "{score}");
+        assert_eq!(response.trace.usage.input_tokens, Some(612));
+    }
+
+    fn jev_route_answer(route: &str) -> Scripted {
+        literal(&format!(
+            r#"{{"model":"jev-1.13.0","answers":{{"goal":{{"type":"noul","noul":0.1}},"route":{route}}}}}"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn jev_answers_must_be_consistent_distributions() {
+        let bad_routes = [
+            // Chosen option is not the most probable one.
+            r#"{"type":"choice","choice":"quick","probabilities":{"quick":0.1,"short_task":0.9,"goal":0.0}}"#,
+            // Probabilities do not sum to 1.
+            r#"{"type":"choice","choice":"quick","probabilities":{"quick":0.1,"short_task":0.1,"goal":0.1}}"#,
+            // Confidence outside [0, 1] or not a number.
+            r#"{"type":"choice","choice":"quick","probabilities":{"quick":0.7,"short_task":0.2,"goal":0.1},"confidence":1.5}"#,
+            r#"{"type":"choice","choice":"quick","probabilities":{"quick":0.7,"short_task":0.2,"goal":0.1},"confidence":"high"}"#,
+            // Chosen option at a displayed tie must be one of the tied maxima.
+            r#"{"type":"choice","choice":"goal","probabilities":{"quick":0.4,"short_task":0.4,"goal":0.2}}"#,
+        ];
+        for route in bad_routes {
+            let server = mock_http(vec![jev_route_answer(route)]);
+            let err = jev_at(&server)
+                .classify(request(vec![route_question(), goal_question()]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Provider(_)),
+                "{route} gave {err:?}"
+            );
+        }
+        let score_question =
+            ClassifierQuestion::score("f", "How frustrated?", ["Calm", "Frustrated", "Very angry"]);
+        let bad_scores = [
+            r#"{"type":"score","score":999,"probabilities":{"0":0.0,"1":0.95,"2":0.05}}"#,
+            // Reported score far from the probability-weighted level.
+            r#"{"type":"score","score":2.0,"probabilities":{"0":1.0,"1":0.0,"2":0.0}}"#,
+            r#"{"type":"score","score":1.0,"probabilities":{"0":0.2,"1":0.2,"2":0.2}}"#,
+            r#"{"type":"score","score":1.05,"probabilities":{"0":0.0,"1":0.95,"2":0.05},"confidence":-0.1}"#,
+        ];
+        for score in bad_scores {
+            let server = mock_http(vec![literal(&format!(
+                r#"{{"model":"jev-1.13.0","answers":{{"f":{score}}}}}"#
+            ))]);
+            let err = jev_at(&server)
+                .classify(request(vec![score_question.clone()]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Provider(_)),
+                "{score} gave {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jev_tie_keeps_the_providers_choice_and_decisions_agree() {
+        // Jev rounds probabilities to two decimals; at a displayed tie its
+        // choice reflects the unrounded values and may be the later option.
+        let server = mock_http(vec![jev_route_answer(
+            r#"{"type":"choice","choice":"short_task","probabilities":{"quick":0.4,"short_task":0.4,"goal":0.2}}"#,
+        )]);
+        let response = jev_at(&server)
+            .classify(request(vec![route_question(), goal_question()]))
+            .await
+            .unwrap();
+        assert_eq!(response.chosen("route"), Some("short_task"));
+        assert_eq!(
+            response.decide_choice("route", None, 0.0),
+            Some(ChoiceDecision::Selected {
+                option: "short_task".into(),
+                probability: 0.4
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn chosen_and_decide_choice_agree_at_abstain_ties() {
+        let answer = |chosen: &str| ClassifyResponse {
+            answers: vec![ClassifierAnswer {
+                question_id: "category".into(),
+                value: AnswerValue::Choice {
+                    chosen: chosen.into(),
+                    probabilities: vec![
+                        OptionProbability {
+                            id: "invoice".into(),
+                            probability: 0.4,
+                        },
+                        OptionProbability {
+                            id: "none".into(),
+                            probability: 0.4,
+                        },
+                        OptionProbability {
+                            id: "receipt".into(),
+                            probability: 0.2,
+                        },
+                    ],
+                    confidence: None,
+                },
+            }],
+            served_model: "m".into(),
+            trace: success_trace(
+                StaticClassifierProvider::new([]).descriptor(),
+                Sensitivity::Shareable,
+                None,
+                None,
+                String::new(),
+                None,
+            ),
+            raw_provider_response: None,
+        };
+        assert_eq!(
+            answer("invoice").decide_choice("category", Some("none"), 0.1),
+            Some(ChoiceDecision::Selected {
+                option: "invoice".into(),
+                probability: 0.4
+            })
+        );
+        assert_eq!(
+            answer("none").decide_choice("category", Some("none"), 0.1),
+            Some(ChoiceDecision::Abstained)
+        );
+    }
+
+    #[tokio::test]
+    async fn static_answers_must_be_consistent() {
+        let inconsistent = ClassifierAnswer {
+            question_id: "route".into(),
+            value: AnswerValue::Choice {
+                chosen: "quick".into(),
+                probabilities: vec![
+                    OptionProbability {
+                        id: "quick".into(),
+                        probability: 0.1,
+                    },
+                    OptionProbability {
+                        id: "short_task".into(),
+                        probability: 0.9,
+                    },
+                    OptionProbability {
+                        id: "goal".into(),
+                        probability: 0.0,
+                    },
+                ],
+                confidence: None,
+            },
+        };
+        let err = StaticClassifierProvider::new([inconsistent])
+            .classify(request(vec![route_question()]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelError::Provider(_)), "{err:?}");
+    }
+
+    /// A classifier with a configurable identity and served model.
+    #[derive(Clone)]
+    struct NamedClassifier {
+        descriptor: ProviderDescriptor,
+        probability: f64,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NamedClassifier {
+        fn new(model: &str, served_model: &str, probability: f64) -> Self {
+            Self {
+                descriptor: ProviderDescriptor {
+                    identity: ModelIdentity::new("classify", "typesafe", model),
+                    provider_class: ProviderClass::Cloud,
+                    capabilities: vec![ModelCapability::Classify],
+                    auth_mode: ProviderAuthMode::None,
+                    metadata: serde_json::json!({ "served_model": served_model }),
+                },
+                probability,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NamedClassifier {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+    }
+
+    #[async_trait]
+    impl ClassifierProvider for NamedClassifier {
+        async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answers = vec![ClassifierAnswer::noul("goal", self.probability)];
+            Ok(ClassifyResponse {
+                served_model: self.descriptor.identity.model.0.clone(),
+                trace: classify_trace(&self.descriptor, &request, "x", Instant::now())?,
+                answers,
+                raw_provider_response: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_classifier_cache_is_scoped_to_the_provider_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Some(dir.path().join("cache"));
+        let queued = |provider: NamedClassifier| {
+            QueuedClassifierProvider::new(
+                provider,
+                Arc::new(SqliteQueue::in_memory().unwrap()),
+                "worker",
+                queue_config(cache.clone()),
+            )
+        };
+        let a = NamedClassifier::new("jev-1.13.0", "jev-1.13.0", 0.1);
+        let other_model = NamedClassifier::new("jev-1.14.0", "jev-1.14.0", 0.8);
+        let other_snapshot = NamedClassifier::new("jev-1.13.0", "jev-1.13.0-20260917", 0.6);
+        let request = || request(vec![goal_question()]);
+
+        assert_eq!(
+            queued(a.clone())
+                .classify(request())
+                .await
+                .unwrap()
+                .noul("goal"),
+            Some(0.1)
+        );
+        assert_eq!(
+            queued(other_model.clone())
+                .classify(request())
+                .await
+                .unwrap()
+                .noul("goal"),
+            Some(0.8),
+            "another model must not read the first model's cached answer"
+        );
+        assert_eq!(
+            queued(other_snapshot.clone())
+                .classify(request())
+                .await
+                .unwrap()
+                .noul("goal"),
+            Some(0.6),
+            "another expected snapshot must not read it either"
+        );
+        // The same configuration still hits its own entry.
+        assert_eq!(
+            queued(a.clone())
+                .classify(request())
+                .await
+                .unwrap()
+                .noul("goal"),
+            Some(0.1)
+        );
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_snapshot.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

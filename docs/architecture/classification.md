@@ -58,15 +58,30 @@ pub enum AnswerValue {
 question ids, a Choice without options or with repeated option ids, and a
 Score with fewer than two levels (`ModelError::InvalidRequest`).
 
+Every provider returns answers that satisfy one contract, checked by a shared
+validator before a response is returned: a Noul probability in `[0, 1]`; a
+Choice with exactly the requested option ids in order, probabilities in
+`[0, 1]` summing to 1, `chosen` among the most probable options, and
+confidence (when present) in `[0, 1]`; a Score with one probability per
+level summing to 1 and `value` equal to the probability-weighted level.
+
 Decision helpers evaluate caller thresholds only: `noul_at_least(id, t)`
 (inclusive) and `decide_choice(id, abstain_option, min_probability)`, which
 selects the most probable option other than an abstain option such as `none`
-when it reaches the minimum and beats the abstain option (a tie abstains).
+when it reaches the minimum and is more probable than the abstain option.
+Exact ties go to the answer's `chosen` option, so without an abstain option
+`decide_choice` always agrees with `chosen`.
 
 `QueuedClassifierProvider` runs classification through the same `run_queued`
 path as `QueuedChatProvider`, `QueuedEmbeddingProvider` and
 `QueuedRerankProvider`: idempotent enqueue, model cap, rate buckets, cooldowns,
-retry classification, exact response cache, and one trace per call.
+retry classification, exact response cache, and one trace per call. Its cache
+entries live under `{cache}/classify/{descriptor hash}/`, so classifiers with
+different identities or expected served models never share an entry. The
+other wrappers keep the historical `{cache}/{kind}/{request hash}` path, which
+does not include the model: two chat models sharing a cache directory can read
+each other's answers. That pre-existing defect is left for a separate change,
+because moving those paths would invalidate existing caches.
 
 ## Providers
 
@@ -91,7 +106,16 @@ response must name the expected served model (by default the requested one;
 tuned on one version. HTTP statuses use the crate's classification: 408/504
 time out, 429 is rate limited, 5xx (including TypeSafe's 529 Overloaded) is
 unavailable; all three are retryable. Answers that do not match the questions
-are `ModelError::Provider`.
+are `ModelError::Provider`: a missing or extra answer, a wrong kind, a choice
+outside the options or not among the most probable, a distribution that sums
+more than 0.02 from 1 (it is then rescaled), confidence outside `[0, 1]`, or a
+score outside the level range or more than half a level from its
+probability-weighted level (`value` is that weighted level). Jev rounds
+probabilities to two decimals, so a displayed tie can hide its real ranking;
+`chosen` keeps Jev's pick among the tied options. The response is read field
+by field from the parsed JSON rather than through a tagged serde enum, so
+numbers such as `0.1200` parse under serde_json's `arbitrary_precision`,
+which `symbiotic-portability` enables in workspace builds.
 
 **`ChatClassifierProvider`** wraps any `Arc<dyn ChatProvider>`. The system
 prompt opens with "You answer *n* independent questions about
@@ -144,8 +168,12 @@ OpenRouter snapshot answers exactly like `jev-1.13.0` has not been measured.
 ## Verification
 
 Tests use a loopback HTTP server and scripted chat providers; they need no
-provider account or paid call. They cover the System One body and question
-order, bearer auth, answer parsing for all three kinds, served-model checks,
-limit refusals before sending, status classification, the chat prompt and
-strict reply validation (including an out-of-vocabulary option), the queue
-wrapper's cache, traces and retry, and the catalogue entries.
+provider account or paid call. `symbiotic-model`'s tests enable serde_json's
+`arbitrary_precision` as the workspace does, and literal response bodies keep
+provider number spellings. They cover the System One body and question order,
+bearer auth, answer parsing for all three kinds, non-canonical numbers,
+inconsistent distributions, choices, scores and confidence, displayed ties,
+served-model checks, limit refusals before sending, status classification, the
+chat prompt and strict reply validation (including an out-of-vocabulary
+option), the queue wrapper's cache scoping, traces and retry, and the
+catalogue entries.

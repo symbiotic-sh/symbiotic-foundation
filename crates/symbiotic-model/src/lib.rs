@@ -705,6 +705,7 @@ where
             self.config.clone(),
             ModelCapability::Chat,
             "chat",
+            None,
             &request,
             |inner: C, request| async move { inner.chat(request).await },
             self.inner.clone(),
@@ -768,6 +769,7 @@ where
             self.config.clone(),
             ModelCapability::Embedding,
             "embedding",
+            None,
             &request,
             |inner: E, request| async move { inner.embed(request).await },
             self.inner.clone(),
@@ -837,6 +839,7 @@ where
             self.config.clone(),
             ModelCapability::Rerank,
             "rerank",
+            None,
             &request,
             |inner: R, request| async move { inner.rerank(request).await },
             self.inner.clone(),
@@ -855,6 +858,11 @@ async fn run_queued<P, Req, Res, Fut>(
     config: ModelQueueConfig,
     capability: ModelCapability,
     kind: &str,
+    // Response-cache subdirectory under `kind`. `None` keeps the historical
+    // `{cache}/{kind}/{request hash}` path, which is shared by every provider
+    // of that kind: two chat models sharing a cache directory can read each
+    // other's cached answers. Classification passes a descriptor hash.
+    cache_scope: Option<String>,
     request: &Req,
     call: impl Fn(P, Req) -> Fut + Send + Sync,
     provider: P,
@@ -867,8 +875,13 @@ where
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send,
 {
     let request_hash = hash_json(request)?;
+    let cache_kind = match &cache_scope {
+        Some(scope) => format!("{kind}/{scope}"),
+        None => kind.to_string(),
+    };
+    let cache_kind = cache_kind.as_str();
     if let Some(cache_dir) = &config.response_cache_dir
-        && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+        && let Some(cached) = load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
     {
         return return_cached_response(
             cached,
@@ -952,7 +965,7 @@ where
 
     loop {
         if let Some(cache_dir) = &config.response_cache_dir
-            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+            && let Some(cached) = load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
         {
             return return_cached_response(
                 cached,
@@ -1005,7 +1018,8 @@ where
                     }
                     QueueStatus::Succeeded => {
                         if let Some(cache_dir) = &config.response_cache_dir
-                            && let Some(cached) = load_cache::<Res>(cache_dir, kind, &request_hash)?
+                            && let Some(cached) =
+                                load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
                         {
                             return return_cached_response(
                                 cached,
@@ -1080,7 +1094,7 @@ where
                 }
                 response.set_trace(trace);
                 if let Some(cache_dir) = &config.response_cache_dir {
-                    store_cache(cache_dir, kind, &request_hash, &response)?;
+                    store_cache(cache_dir, cache_kind, &request_hash, &response)?;
                 }
                 queue
                     .complete(&item.item_id, &worker_id)
