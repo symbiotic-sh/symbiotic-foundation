@@ -62,6 +62,16 @@ Implemented now: hash/test embedding, static test chat, OpenAI-compatible chat,
 Gemini embedding, exact response cache, queue-bound wrappers, prompt-cache
 telemetry fields where adapters expose them, and retry classification.
 
+Classification (2026-09-28): `ClassifierProvider` with TypeSafe System One
+(`JevClassifierProvider`), chat-backed (`ChatClassifierProvider`) and static
+test providers, `QueuedClassifierProvider`, and catalogue defaults for
+`classify:typesafe:jev-1.13.0`. Consumers adopt it after bumping their
+foundation pin: Memory exposes it beside its foundation chat/embedding
+wrappers; the runtime and other products consume it through Memory or
+directly. `ModelCapability` gained `Classify` and `ModelCapabilities` gained
+`pricing` (serde default), so exhaustive matches and struct literals of those
+types need the new arm or field.
+
 Missing before product-wide use: Codex CLI/session adapter, optional `genai`
 adapter, stronger adapter-specific HTTP error classification, cost calculation,
 and host-owned credential resolution for concrete HTTP adapters.

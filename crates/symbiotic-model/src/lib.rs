@@ -26,6 +26,15 @@ use symbiotic_trace::{
 };
 use thiserror::Error;
 
+mod classify;
+pub use classify::{
+    AnswerValue, ChatClassifierProvider, ChoiceDecision, ChoiceOption, ClassifierAnswer,
+    ClassifierProvider, ClassifierQuestion, ClassifyRequest, ClassifyResponse, JEV_DEFAULT_MODEL,
+    JEV_MAX_CHOICE_OPTIONS, JEV_MAX_REQUEST_TOKENS, JEV_MAX_SCORE_LEVELS,
+    JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS, JevClassifierProvider, OptionProbability,
+    QuestionKind, QueuedClassifierProvider, StaticClassifierProvider, TYPESAFE_BASE_URL,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderClass {
@@ -41,6 +50,9 @@ pub enum ModelCapability {
     Chat,
     Embedding,
     Rerank,
+    /// Typed questions about a JSON state answered with probabilities
+    /// ([`ClassifierProvider`]).
+    Classify,
     Vision,
     ImageGeneration,
     VideoGeneration,
@@ -85,6 +97,27 @@ pub struct ModelCapabilities {
     pub structured_output: bool,
     pub reasoning_tier: ReasoningTier,
     pub cost_class: CostClass,
+    /// Published token tariff, when catalogued.
+    pub pricing: Option<ModelPricing>,
+}
+
+/// A model's published per-token tariff in micro-USD per million tokens
+/// (USD 1 per million tokens = 1_000_000). Advisory, like [`CostClass`]:
+/// hosts use it for estimates; the provider's bill is authoritative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPricing {
+    pub input_micro_usd_per_million_tokens: u64,
+    pub output_micro_usd_per_million_tokens: u64,
+}
+
+impl ModelPricing {
+    /// Estimated cost of one call in micro-USD, rounded up.
+    pub fn cost_micro_usd(&self, input_tokens: u64, output_tokens: u64) -> u64 {
+        let total = u128::from(input_tokens) * u128::from(self.input_micro_usd_per_million_tokens)
+            + u128::from(output_tokens) * u128::from(self.output_micro_usd_per_million_tokens);
+        u64::try_from(total.div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +263,15 @@ pub enum ModelError {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+}
+
+impl<T> ModelProvider for Arc<T>
+where
+    T: ModelProvider + ?Sized,
+{
+    fn descriptor(&self) -> &ProviderDescriptor {
+        (**self).descriptor()
+    }
 }
 
 #[async_trait]
@@ -456,6 +498,22 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             input_units_per_minute: None,
             response_cache_dir: None,
         }),
+        // TypeSafe System One (Jev 1.13). Account limits checked 2026-09-28:
+        // 1,200 requests/min and 250,000 tokens/s (15M/min), adjusted
+        // dynamically by TypeSafe. One call answers every question in about
+        // 0.4 s, so 32 in flight stays under the request limit; short
+        // timeout and jitter because callers usually wait on the answer.
+        "classify:typesafe:jev-1.13.0" => Some(ModelQueueConfig {
+            max_in_flight: 32,
+            lease_seconds: 60,
+            logical_retry_attempts: 3,
+            retry_attempts: 3,
+            retry_jitter_seconds: 2,
+            request_timeout_seconds: Some(30),
+            requests_per_minute: Some(1_200),
+            input_units_per_minute: Some(15_000_000),
+            response_cache_dir: None,
+        }),
         // (openrouter qwen chat: removed the conservative 200/600rpm entry — falls through to the
         // generic operator=openrouter fallback at 1000; throttle reactively only if it starts 429ing.)
         _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
@@ -505,6 +563,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: true,
             reasoning_tier: ReasoningTier::Standard,
             cost_class: CostClass::Budget,
+            pricing: None,
         }),
         "chat:deepseek:deepseek-v4-pro" => Some(ModelCapabilities {
             context_window: Some(128_000),
@@ -512,6 +571,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: true,
             reasoning_tier: ReasoningTier::Extended,
             cost_class: CostClass::Standard,
+            pricing: None,
         }),
         "chat:gemini:gemini-3.5-flash" => Some(ModelCapabilities {
             context_window: Some(1_000_000),
@@ -519,6 +579,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: true,
             reasoning_tier: ReasoningTier::Standard,
             cost_class: CostClass::Budget,
+            pricing: None,
         }),
         "chat:gemini:gemini-3.1-pro-preview" => Some(ModelCapabilities {
             context_window: Some(1_000_000),
@@ -526,6 +587,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: true,
             reasoning_tier: ReasoningTier::Extended,
             cost_class: CostClass::Premium,
+            pricing: None,
         }),
         "embedding:gemini:gemini-embedding-2" => Some(ModelCapabilities {
             context_window: Some(2_048),
@@ -533,6 +595,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: false,
             reasoning_tier: ReasoningTier::None,
             cost_class: CostClass::Budget,
+            pricing: None,
         }),
         "embedding:openrouter:qwen/qwen3-embedding-8b"
         | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelCapabilities {
@@ -541,13 +604,33 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
             structured_output: false,
             reasoning_tier: ReasoningTier::None,
             cost_class: CostClass::Budget,
+            pricing: None,
         }),
+        // TypeSafe System One: typed answers, 64k tokens per request (32k for
+        // the state plus the longest question), $0.042 per million input
+        // tokens, output free. OpenRouter serves the same version through
+        // its `/systemone` route at the same listed token price; its credit
+        // purchase fee makes the direct key cheaper when you have one.
+        "classify:typesafe:jev-1.13.0" | "classify:openrouter:typesafe/jev-1.13" => {
+            Some(ModelCapabilities {
+                context_window: Some(64_000),
+                tool_use: false,
+                structured_output: true,
+                reasoning_tier: ReasoningTier::None,
+                cost_class: CostClass::Budget,
+                pricing: Some(ModelPricing {
+                    input_micro_usd_per_million_tokens: 42_000,
+                    output_micro_usd_per_million_tokens: 0,
+                }),
+            })
+        }
         "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelCapabilities {
             context_window: None,
             tool_use: false,
             structured_output: false,
             reasoning_tier: ReasoningTier::None,
             cost_class: CostClass::Free,
+            pricing: None,
         }),
         // Deliberately pessimistic floor for local models: local qwen-class chat
         // models DO support tool use, but until per-model local entries exist we
@@ -560,6 +643,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
                 structured_output: false,
                 reasoning_tier: ReasoningTier::None,
                 cost_class: CostClass::Free,
+                pricing: None,
             })
         }
         _ => None,

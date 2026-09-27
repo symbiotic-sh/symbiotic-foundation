@@ -94,6 +94,8 @@ Owns provider-neutral model contracts:
 - chat;
 - embeddings;
 - rerank;
+- classification (typed Noul / Choice / Score questions answered with
+  probabilities; see [classification](architecture/classification.md));
 - future vision/media/agent-task capabilities;
 - provider identity and class;
 - auth mode descriptions;
@@ -101,8 +103,10 @@ Owns provider-neutral model contracts:
 - provider-neutral errors.
 
 Current implementations include hash/test providers, OpenAI-compatible chat,
-Gemini embedding, exact response cache, queue-bound chat/embedding wrappers, and
-retry classification. Codex CLI/session and optional `genai` adapters are still
+Gemini embedding, TypeSafe System One classification (`JevClassifierProvider`),
+chat-backed classification (`ChatClassifierProvider`), a static test
+classifier, exact response cache, queue-bound chat/embedding/rerank/classifier
+wrappers, and retry classification. Codex CLI/session and optional `genai` adapters are still
 migration targets. The public contract remains ours.
 
 Known-model execution defaults live in `default_model_queue_config`. The current
@@ -112,6 +116,12 @@ capacity measurement; consumers still apply their shared safety ceiling and
 explicit overrides. DeepSeek's [published account limit](https://api-docs.deepseek.com/quick_start/rate_limit/)
 was 2,500 for Flash when checked on September 17, 2026. Request scheduling and
 enforcement remain with the consuming execution adapter.
+
+`classify:typesafe:jev-1.13.0` is catalogued with TypeSafe's account limits
+(1,200 requests/min, 250,000 tokens/s) and, in `default_model_capabilities`,
+an advisory `ModelPricing` of $0.042 per million input tokens with free output.
+`ModelCapabilities::pricing` is additive (serde default `None`); hosts use it
+for estimates, and provider-reported cost stays in trace metadata.
 
 ### `symbiotic-trace`
 
