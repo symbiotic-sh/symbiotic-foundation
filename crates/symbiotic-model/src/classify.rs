@@ -276,8 +276,11 @@ pub enum AnswerValue {
     Noul { probability: f64 },
     /// Distribution over a Choice question's options, in request order.
     Choice {
-        /// The most probable option (the first one on a tie). Always one of
-        /// the requested option ids.
+        /// A most probable option; always one of the requested option ids.
+        /// On an exact tie it is the provider's pick among the tied options
+        /// (Jev rounds probabilities, so its pick reflects unrounded values;
+        /// chat-backed and builder answers take the first in request order).
+        /// [`ClassifyResponse::decide_choice`] breaks ties the same way.
         chosen: String,
         probabilities: Vec<OptionProbability>,
         /// Provider-reported certainty (0 to 1), when the provider has one.
@@ -776,7 +779,9 @@ fn validate_answers(
                 {
                     return Err(invalid(id, "not a distribution over the levels"));
                 }
-                if (value - expected_level(probabilities)).abs() > PROBABILITY_EPSILON {
+                if !value.is_finite()
+                    || (value - expected_level(probabilities)).abs() > PROBABILITY_EPSILON
+                {
                     return Err(invalid(id, "value is not the weighted level"));
                 }
                 if confidence.is_some_and(|value| !in_range(value)) {
@@ -2279,6 +2284,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ModelError::Provider(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn static_answers_with_non_finite_values_are_rejected() {
+        let score = ClassifierQuestion::score("f", "How frustrated?", ["Calm", "Angry"]);
+        let answers = [
+            AnswerValue::Score {
+                value: f64::NAN,
+                probabilities: vec![0.5, 0.5],
+                confidence: None,
+            },
+            AnswerValue::Score {
+                value: 0.5,
+                probabilities: vec![f64::NAN, 0.5],
+                confidence: None,
+            },
+            AnswerValue::Score {
+                value: 0.5,
+                probabilities: vec![0.5, 0.5],
+                confidence: Some(f64::NAN),
+            },
+        ];
+        for value in answers {
+            let err = StaticClassifierProvider::new([ClassifierAnswer {
+                question_id: "f".into(),
+                value: value.clone(),
+            }])
+            .classify(request(vec![score.clone()]))
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, ModelError::Provider(_)),
+                "{value:?} gave {err:?}"
+            );
+        }
     }
 
     /// A classifier with a configurable identity and served model.
