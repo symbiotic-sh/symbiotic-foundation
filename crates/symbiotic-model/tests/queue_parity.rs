@@ -555,3 +555,43 @@ async fn an_invalid_classify_request_takes_no_queue_slot() {
     assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
     assert!(queue.is_empty());
 }
+
+#[tokio::test]
+async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
+    let down = || {
+        Loopback::new(unique_identity()).failing_first(
+            (0..4)
+                .map(|_| ModelError::Unavailable("down".to_string()))
+                .collect(),
+        )
+    };
+    let once = ModelQueueConfig {
+        logical_retry_attempts: 1,
+        retry_attempts: 1,
+        ..config()
+    };
+
+    let kept = down();
+    let provider = queued(kept.clone(), Arc::new(MemoryQueue::new()), once.clone());
+    provider.chat(request("same")).await.unwrap_err();
+    let err = provider.chat(request("same")).await.unwrap_err();
+    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert_eq!(kept.calls.load(Ordering::SeqCst), 1, "no second paid call");
+
+    let renewed = down();
+    let provider = queued(
+        renewed.clone(),
+        Arc::new(MemoryQueue::new()),
+        ModelQueueConfig {
+            budget_renewal_seconds: Some(0),
+            ..once
+        },
+    );
+    provider.chat(request("same")).await.unwrap_err();
+    provider.chat(request("same")).await.unwrap_err();
+    assert_eq!(
+        renewed.calls.load(Ordering::SeqCst),
+        2,
+        "each call has its own budget"
+    );
+}

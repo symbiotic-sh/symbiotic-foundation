@@ -473,6 +473,13 @@ pub struct ModelQueueConfig {
     /// Debugging only: requests may contain sensitive text.
     #[serde(default)]
     pub request_debug_dir: Option<PathBuf>,
+    /// When a request's attempt budget ran out in an earlier call, a new call
+    /// for the same request gets a fresh budget once this many seconds have
+    /// passed. `None` (the default) keeps the exhausted budget while the queue
+    /// remembers the request, so a persistent runtime does not pay for it
+    /// again after a restart. `Some(0)` gives every call its own budget.
+    #[serde(default)]
+    pub budget_renewal_seconds: Option<u64>,
 }
 
 fn default_retry_base_delay_ms() -> u64 {
@@ -495,6 +502,7 @@ impl Default for ModelQueueConfig {
             retry_base_delay_ms: default_retry_base_delay_ms(),
             retry_provider_errors: false,
             request_debug_dir: None,
+            budget_renewal_seconds: None,
         }
     }
 }
@@ -1122,6 +1130,19 @@ where
         .await;
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
+            QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
+                enqueue = reenqueue_with_fresh_budget(
+                    queue.as_ref(),
+                    &queue_id,
+                    &descriptor,
+                    capability,
+                    kind,
+                    &request_hash,
+                    &idempotency_key,
+                    config,
+                )
+                .await?;
+            }
             QueueStatus::Dead => {
                 let dead_err = dead_item_retry_error(&enqueue.item);
                 if let Some(next) = reenqueue_dead_item(
@@ -1152,7 +1173,7 @@ where
             // no cache is configured) runs again: queue records coordinate
             // calls, they do not hold answers.
             QueueStatus::Succeeded => {
-                enqueue = reenqueue_succeeded_without_cache(
+                enqueue = reenqueue_with_fresh_budget(
                     queue.as_ref(),
                     &queue_id,
                     &descriptor,
@@ -1233,6 +1254,20 @@ where
                     continue;
                 }
                 Some(current) => match current.status {
+                    QueueStatus::Dead if budget_renewed(&current, config) => {
+                        enqueue = reenqueue_with_fresh_budget(
+                            queue.as_ref(),
+                            &queue_id,
+                            &descriptor,
+                            capability,
+                            kind,
+                            &request_hash,
+                            &idempotency_key,
+                            config,
+                        )
+                        .await?;
+                        continue;
+                    }
                     QueueStatus::Dead => {
                         let dead_err = dead_item_retry_error(&current);
                         if let Some(next) = reenqueue_dead_item(
@@ -1276,7 +1311,7 @@ where
                             )
                             .await;
                         }
-                        enqueue = reenqueue_succeeded_without_cache(
+                        enqueue = reenqueue_with_fresh_budget(
                             queue.as_ref(),
                             &queue_id,
                             &descriptor,
@@ -1630,6 +1665,16 @@ fn retry_jitter_seconds(
     u64::from_le_bytes(bytes) % (max_jitter_seconds + 1)
 }
 
+/// Whether a request another call exhausted (or that was exhausted before a
+/// restart) gets a fresh attempt budget: only when the policy renews budgets
+/// and the renewal time has passed since the request went dead.
+#[cfg(feature = "queue")]
+fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> bool {
+    config.budget_renewal_seconds.is_some_and(|seconds| {
+        Utc::now() - item.updated_at >= ChronoDuration::seconds(seconds as i64)
+    })
+}
+
 #[cfg(feature = "queue")]
 fn logical_max_attempts(config: &ModelQueueConfig) -> u32 {
     config
@@ -1744,7 +1789,7 @@ async fn reenqueue_dead_item(
 // Same execution boundary as `reenqueue_dead_item`.
 #[cfg(feature = "queue")]
 #[allow(clippy::too_many_arguments)]
-async fn reenqueue_succeeded_without_cache(
+async fn reenqueue_with_fresh_budget(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
     descriptor: &ProviderDescriptor,

@@ -110,6 +110,13 @@ per binding.
   runs out, the error keeps the class of the last failure (`RateLimited`,
   `Timeout`, `Unavailable`, else `Provider`) and says `exhausted after n/m`.
 
+- `budget_renewal_seconds` (default `None`): once a request has exhausted
+  its budget, later calls for the same request fail without a provider call
+  while the queue remembers it. On a persistent runtime that includes calls
+  after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
+  `Some(0)` gives every call its own budget, for hosts that schedule their own
+  retries.
+
 A classify request that fails validation returns `InvalidRequest` before it
 takes a queue slot.
 
