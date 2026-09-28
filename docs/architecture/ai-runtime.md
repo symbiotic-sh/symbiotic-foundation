@@ -70,6 +70,43 @@ Measured on one laptop with a 15 ms loopback provider, cap 64, 3,000 calls on
 one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
 1,750 calls/s.
 
+## Calls in flight
+
+Once an attempt claims its queue item, the runtime owns it, not the caller.
+The attempt runs as a task of its own, and the caller awaits its handle.
+Dropping the caller's future (a job timeout, `tokio::time::timeout` around
+`chat()`) therefore does not cancel the provider call. The attempt:
+
+- finishes the provider call, bounded by `request_timeout_seconds`;
+- records its receipts and trace, and stores the response in the cache when
+  one applies;
+- completes the item, or fails it with its error class and retry deadline;
+- keeps its model slot until then, so an abandoned call still counts against
+  `max_in_flight`.
+
+An identical caller waiting on the item, or a later identical request, gets
+the result through deduplication and the cache. Without a cache, it runs the
+request again once the item has finished, as for any finished request.
+
+The attempt renews its lease every third of `lease_seconds`, from its claim
+until the item is completed or failed. That covers the provider call and
+every receipt, trace, cache and cooldown write before the release, so a slow
+sink cannot let the lease expire and hand the item to another caller. The
+renewal is part of the attempt's own future, so it ends with the attempt and
+cannot outlive it. It also stops once a renewal fails because the lease was
+lost. Every exit of an attempt releases the lease, including a failed trace,
+cache or cooldown write.
+
+Renewal shares a task with the attempt, so nothing in the attempt may block
+its thread. A `ResponseCache` is synchronous and may do file I/O, so every
+cache read and write, the serialization of the stored response and the
+`request_debug_dir` capture run on tokio's blocking pool. A slow disk
+therefore delays only the call that is waiting for it.
+
+There is no cancellation API. A provider that panics propagates the panic to
+the waiting caller; its lease is not renewed and expires after
+`lease_seconds`, as after a crash.
+
 ## Shared limits
 
 Every provider handed out for one queue shares the limits below. By default a
