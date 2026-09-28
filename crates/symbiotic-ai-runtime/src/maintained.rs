@@ -2,10 +2,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use symbiotic_core::{QueueId, QueueItemId};
-use symbiotic_model::ModelError;
+use symbiotic_model::{DirResponseCache, ModelError};
 use symbiotic_queue::{
     ClaimRequest, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure, QueueBackend, QueueError,
     QueueItem,
@@ -17,41 +18,73 @@ const SWEEP_EVERY: u64 = 10_000;
 
 const ORPHANED: &str = "abandoned: no caller resumed this call within the runtime's retention";
 
+/// How long and how much of the response cache the sweep keeps.
+pub(crate) struct ResponseRetention {
+    pub(crate) cache: DirResponseCache,
+    pub(crate) max_age: Option<Duration>,
+    pub(crate) max_bytes: Option<u64>,
+}
+
 /// [`SqliteQueue`] that retires state older than the retention window at
 /// open and after every [`SWEEP_EVERY`] finished calls, so a long-running
-/// host's database stays bounded.
+/// host's database and response cache stay bounded.
 pub(crate) struct MaintainedQueue {
     queue: SqliteQueue,
-    retention: chrono::Duration,
+    sweep: Arc<Sweep>,
     finished: AtomicU64,
 }
 
-impl MaintainedQueue {
-    pub(crate) fn new(queue: SqliteQueue, retention: Duration) -> Self {
-        Self {
-            queue,
-            retention: chrono::Duration::from_std(retention)
-                .unwrap_or_else(|_| chrono::Duration::days(3650)),
-            finished: AtomicU64::new(0),
-        }
-    }
+struct Sweep {
+    queue: SqliteQueue,
+    retention: chrono::Duration,
+    responses: ResponseRetention,
+}
 
+impl Sweep {
     /// Mark calls orphaned by a crash dead, then drop finished calls, both
-    /// older than the retention window.
-    pub(crate) fn maintain(&self) -> Result<(), ModelError> {
+    /// older than the retention window; then prune the response cache.
+    fn run(&self) -> Result<(), ModelError> {
         let cutoff = Utc::now() - self.retention;
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
             .and_then(|_| self.queue.prune_terminal_before(cutoff))
-            .map(|_| ())
-            .map_err(|err| ModelError::Queue(err.to_string()))
+            .map_err(|err| ModelError::Queue(err.to_string()))?;
+        self.responses
+            .cache
+            .prune(self.responses.max_age, self.responses.max_bytes)?;
+        Ok(())
+    }
+}
+
+impl MaintainedQueue {
+    pub(crate) fn new(
+        queue: SqliteQueue,
+        retention: Duration,
+        responses: ResponseRetention,
+    ) -> Self {
+        Self {
+            sweep: Arc::new(Sweep {
+                queue: queue.clone(),
+                retention: chrono::Duration::from_std(retention)
+                    .unwrap_or_else(|_| chrono::Duration::days(3650)),
+                responses,
+            }),
+            queue,
+            finished: AtomicU64::new(0),
+        }
     }
 
-    fn finished_one(&self) {
+    pub(crate) fn maintain(&self) -> Result<(), ModelError> {
+        self.sweep.run()
+    }
+
+    async fn finished_one(&self) {
         if self.finished.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY == SWEEP_EVERY - 1 {
             // Retention is housekeeping: a failed sweep retries at the next
-            // interval and never fails the call that triggered it.
-            let _ = self.maintain();
+            // interval and never fails the call that triggered it. It does
+            // file and database I/O, so it runs on the blocking pool.
+            let sweep = self.sweep.clone();
+            let _ = tokio::task::spawn_blocking(move || sweep.run()).await;
         }
     }
 }
@@ -103,7 +136,7 @@ impl QueueBackend for MaintainedQueue {
 
     async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
         let result = self.queue.complete(item_id, worker_id).await;
-        self.finished_one();
+        self.finished_one().await;
         result
     }
 
@@ -118,7 +151,7 @@ impl QueueBackend for MaintainedQueue {
             .queue
             .fail(item_id, worker_id, error, retry_after_seconds)
             .await;
-        self.finished_one();
+        self.finished_one().await;
         result
     }
 
@@ -129,7 +162,7 @@ impl QueueBackend for MaintainedQueue {
         failure: Failure,
     ) -> Result<FailOutcome, QueueError> {
         let result = self.queue.fail_with(item_id, worker_id, failure).await;
-        self.finished_one();
+        self.finished_one().await;
         result
     }
 

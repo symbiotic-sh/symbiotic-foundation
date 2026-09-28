@@ -49,11 +49,13 @@ use symbiotic_queue::{
 use symbiotic_trace::TraceSink;
 
 #[cfg(feature = "queue")]
+pub mod private_fs;
+#[cfg(feature = "queue")]
 mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
-    CacheEntry, DirResponseCache, InMemoryReceiptSink, ModelAdmission, QueueReceipt,
-    QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
+    CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission,
+    QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
@@ -297,6 +299,16 @@ pub enum ModelError {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+
+    /// A stable, non-secret fingerprint of the credential this provider
+    /// calls with, or `None` when it has none. The queue runtime keys
+    /// attempt budgets by it, so a rotated credential starts with a fresh
+    /// budget instead of inheriting the exhausted budget of the old one. It
+    /// must never be the credential or a reversible form of it; see
+    /// [`api_key_fingerprint`]. The runtime does not store or trace it.
+    fn credential_fingerprint(&self) -> Option<String> {
+        None
+    }
 }
 
 impl<T> ModelProvider for Arc<T>
@@ -306,6 +318,24 @@ where
     fn descriptor(&self) -> &ProviderDescriptor {
         (**self).descriptor()
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        (**self).credential_fingerprint()
+    }
+}
+
+/// The fingerprint of an API key for
+/// [`ModelProvider::credential_fingerprint`]: SHA-256 over a fixed
+/// domain-separation prefix and the key, in hex; `None` for an empty key.
+/// One-way, so it identifies a key generation without revealing the key.
+pub fn api_key_fingerprint(api_key: &str) -> Option<String> {
+    if api_key.trim().is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"symbiotic-model/credential-fingerprint/v1\0");
+    hasher.update(api_key.as_bytes());
+    Some(hex::encode(hasher.finalize()))
 }
 
 #[async_trait]
@@ -801,6 +831,10 @@ where
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.inner.credential_fingerprint()
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -858,6 +892,10 @@ where
 {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
+    }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.inner.credential_fingerprint()
     }
 }
 
@@ -919,6 +957,10 @@ where
 {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
+    }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.inner.credential_fingerprint()
     }
 }
 
@@ -1096,7 +1138,7 @@ impl<Req> QueuedCall<Req> {
                 ),
                 idempotency_key: self.idempotency_key.clone(),
                 run_after: None,
-                max_attempts: Some(self.config.retry_attempts),
+                max_attempts: Some(item_max_attempts(&self.config)),
                 force: false,
             })
             .await
@@ -1340,7 +1382,7 @@ async fn run_queued<P, Req, Res, F, Fut>(
     provider: P,
 ) -> Result<Res, ModelError>
 where
-    P: Clone + Send + Sync + 'static,
+    P: ModelProvider + Clone + Send + Sync + 'static,
     Req: Clone + Serialize + Send + Sync + 'static,
     Req: BudgetedModelRequest,
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
@@ -1355,12 +1397,14 @@ where
     let request_value = serde_json::to_value(&request)
         .map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
     // The provider is part of the key: models pooled on one queue share its
-    // limits, never each other's attempt budgets or results.
-    let idempotency_key = Some(format!(
-        "{}:{}:{request_hash}",
-        queue_id.0,
-        hash_json(&descriptor)?
-    ));
+    // limits, never each other's attempt budgets or results. So is its
+    // credential's fingerprint, when it has one: a rotated credential gets
+    // a fresh budget. Only a hash of the fingerprint is stored.
+    let provider_identity = match provider.credential_fingerprint() {
+        Some(fingerprint) => hash_json(&(&descriptor, fingerprint))?,
+        None => hash_json(&descriptor)?,
+    };
+    let idempotency_key = Some(format!("{}:{provider_identity}:{request_hash}", queue_id.0));
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
         worker_id: runtime.worker_id.clone(),
@@ -2094,10 +2138,19 @@ fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> bool {
 }
 
 #[cfg(feature = "queue")]
+/// The request's total provider attempts, across every queue item of its
+/// retry chain.
 fn logical_max_attempts(config: &ModelQueueConfig) -> u32 {
+    config.logical_retry_attempts.max(1)
+}
+
+/// Provider attempts of one queue item: `retry_attempts`, never more than
+/// the request's total.
+#[cfg(feature = "queue")]
+fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
     config
-        .logical_retry_attempts
-        .max(config.retry_attempts)
+        .retry_attempts
+        .min(logical_max_attempts(config))
         .max(1)
 }
 
@@ -2273,10 +2326,7 @@ async fn reenqueue_with_fresh_budget(
         descriptor,
         LogicalRetryState {
             attempts_used: 0,
-            max_attempts: config
-                .logical_retry_attempts
-                .max(config.retry_attempts)
-                .max(1),
+            max_attempts: logical_max_attempts(config),
         },
     );
     // Conditional on `current` still being the newest item, so a delayed
@@ -2289,7 +2339,7 @@ async fn reenqueue_with_fresh_budget(
                 payload,
                 idempotency_key: idempotency_key.clone(),
                 run_after: None,
-                max_attempts: Some(config.retry_attempts.max(1)),
+                max_attempts: Some(item_max_attempts(config)),
                 force: true,
             },
             current,
@@ -2848,6 +2898,10 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        api_key_fingerprint(&self.api_key)
+    }
 }
 
 #[derive(Serialize)]
@@ -3104,6 +3158,10 @@ impl GeminiEmbeddingProvider {
 impl ModelProvider for GeminiEmbeddingProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
+    }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        api_key_fingerprint(&self.api_key)
     }
 }
 
@@ -4167,6 +4225,34 @@ mod tests {
         let response = provider.chat(chat_request("hello")).await.unwrap();
 
         assert_eq!(response.text, "hello");
+    }
+
+    #[test]
+    fn credential_fingerprints_identify_a_key_without_revealing_it() {
+        let key = "sk-live-0123456789abcdef";
+        let fingerprint = api_key_fingerprint(key).unwrap();
+        assert_eq!(api_key_fingerprint(key), Some(fingerprint.clone()));
+        assert_ne!(
+            api_key_fingerprint("sk-live-other"),
+            Some(fingerprint.clone())
+        );
+        assert!(!fingerprint.contains(key) && !fingerprint.contains("0123456789"));
+        assert_eq!(api_key_fingerprint(""), None);
+        assert_eq!(api_key_fingerprint("  "), None);
+
+        let provider = OpenAiCompatibleChatProvider::new("op", "m", "http://127.0.0.1:9", key);
+        assert_eq!(provider.credential_fingerprint(), Some(fingerprint.clone()));
+        let rotated = OpenAiCompatibleChatProvider::new("op", "m", "http://127.0.0.1:9", "sk-2");
+        assert_eq!(
+            provider.descriptor().identity,
+            rotated.descriptor().identity
+        );
+        assert_ne!(
+            provider.credential_fingerprint(),
+            rotated.credential_fingerprint()
+        );
+        let shared: Arc<dyn ChatProvider> = Arc::new(provider);
+        assert_eq!(shared.credential_fingerprint(), Some(fingerprint));
     }
 
     #[cfg(feature = "queue")]

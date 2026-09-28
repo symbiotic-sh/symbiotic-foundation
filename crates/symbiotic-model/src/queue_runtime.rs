@@ -207,28 +207,206 @@ pub trait ResponseCache: Send + Sync {
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError>;
 }
 
-/// The runtime's own cache: `{root}/{kind}[/{scope}]/{request_hash}.json`,
-/// written through a temporary file and a rename.
+/// The runtime's own cache: `{root}/{kind}[/{scope}]/{request_hash}.json`.
+///
+/// Private: the root and its subdirectories are `0700` and entries `0600`,
+/// written through a temporary file and a rename. A missing root is created
+/// `0700`. A component that is a symlink or belongs to another user is
+/// refused; one with wider permissions, as earlier versions wrote, is
+/// tightened on the next store.
+///
+/// With a maximum age, older entries miss. [`prune`](Self::prune) removes
+/// them, and the oldest entries beyond a size limit;
+/// [`purge`](Self::purge) removes entries by what their trace records.
 #[derive(Clone, Debug)]
 pub struct DirResponseCache {
     root: PathBuf,
+    max_age: Option<std::time::Duration>,
+}
+
+/// A cached response as [`DirResponseCache::purge`] sees it: whom it was
+/// for, as recorded on its trace.
+#[derive(Clone, Debug)]
+pub struct CachedResponse {
+    /// The request's `source`.
+    pub source: Option<String>,
+    /// The request's `role_binding`.
+    pub role_binding: Option<String>,
+    /// The model that answered.
+    pub model: Option<symbiotic_core::ModelIdentity>,
+    pub modified: std::time::SystemTime,
+    pub bytes: u64,
 }
 
 impl DirResponseCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            max_age: None,
+        }
+    }
+
+    /// Entries older than `max_age` miss, as if absent.
+    pub fn with_max_age(mut self, max_age: Option<std::time::Duration>) -> Self {
+        self.max_age = max_age;
+        self
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn path(&self, entry: &CacheEntry<'_>) -> Result<PathBuf, ModelError> {
-        let mut path = self.root.join(safe_component(entry.kind)?);
+    /// The entry's directories below the root, and its file.
+    fn path(&self, entry: &CacheEntry<'_>) -> Result<(Vec<PathBuf>, PathBuf), ModelError> {
+        let mut dirs = vec![self.root.join(safe_component(entry.kind)?)];
         if let Some(scope) = entry.scope {
-            path = path.join(safe_component(scope)?);
+            let scoped = dirs[0].join(safe_component(scope)?);
+            dirs.push(scoped);
         }
-        Ok(path.join(format!("{}.json", safe_component(entry.request_hash)?)))
+        let file =
+            dirs[dirs.len() - 1].join(format!("{}.json", safe_component(entry.request_hash)?));
+        Ok((dirs, file))
+    }
+
+    /// Remove entries older than `max_age`, then the oldest entries until
+    /// the rest fit in `max_bytes`. Returns how many were removed.
+    pub fn prune(
+        &self,
+        max_age: Option<std::time::Duration>,
+        max_bytes: Option<u64>,
+    ) -> Result<usize, ModelError> {
+        let now = std::time::SystemTime::now();
+        let mut entries = self.entries()?;
+        entries.sort_by_key(|(_, meta)| meta.modified().unwrap_or(now));
+        let mut total: u64 = entries.iter().map(|(_, meta)| meta.len()).sum();
+        let mut removed = 0;
+        for (path, meta) in entries {
+            let expired = max_age.is_some_and(|max_age| is_older(&meta, max_age, now));
+            let over = max_bytes.is_some_and(|max_bytes| total > max_bytes);
+            if !expired && !over {
+                continue;
+            }
+            remove_entry(&path)?;
+            total = total.saturating_sub(meta.len());
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Remove every entry whose recorded owner `matches`, for example all
+    /// responses to requests from one source. Returns how many were
+    /// removed. An entry that cannot be read is kept and reported.
+    pub fn purge(&self, matches: impl Fn(&CachedResponse) -> bool) -> Result<usize, ModelError> {
+        let mut removed = 0;
+        for (path, meta) in self.entries()? {
+            let raw = std::fs::read(&path).map_err(|err| cache_io(&path, err))?;
+            let value: Value = serde_json::from_slice(&raw)
+                .map_err(|err| ModelError::Cache(format!("{}: {err}", path.display())))?;
+            let trace = value.get("trace");
+            let text = |key: &str| {
+                trace
+                    .and_then(|trace| trace.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let response = CachedResponse {
+                source: text("source"),
+                role_binding: text("role_binding"),
+                model: trace
+                    .and_then(|trace| trace.get("model"))
+                    .and_then(|model| serde_json::from_value(model.clone()).ok()),
+                modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                bytes: meta.len(),
+            };
+            if matches(&response) {
+                remove_entry(&path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Every entry file under the root, without following symlinks.
+    fn entries(&self) -> Result<Vec<(PathBuf, std::fs::Metadata)>, ModelError> {
+        let mut found = Vec::new();
+        let mut pending = vec![self.root.clone()];
+        while let Some(dir) = pending.pop() {
+            let listing = match std::fs::read_dir(&dir) {
+                Ok(listing) => listing,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(cache_io(&dir, err)),
+            };
+            for entry in listing {
+                let path = entry.map_err(|err| cache_io(&dir, err))?.path();
+                let meta = std::fs::symlink_metadata(&path).map_err(|err| cache_io(&path, err))?;
+                if meta.is_dir() {
+                    pending.push(path);
+                } else if meta.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+                    found.push((path, meta));
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn is_older(
+    meta: &std::fs::Metadata,
+    max_age: std::time::Duration,
+    now: std::time::SystemTime,
+) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > max_age)
+}
+
+fn remove_entry(path: &Path) -> Result<(), ModelError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(cache_io(path, err)),
+    }
+}
+
+fn cache_io(path: &Path, err: std::io::Error) -> ModelError {
+    ModelError::Cache(format!("{}: {err}", path.display()))
+}
+
+/// Whether a path the cache reads exists, refusing one that is a symlink or
+/// belongs to another user.
+fn owned_or_missing(path: &Path) -> Result<Option<std::fs::Metadata>, ModelError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(ModelError::Cache(format!(
+                    "{} is a symlink; the response cache does not follow them",
+                    path.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: `geteuid` has no preconditions and cannot fail.
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    return Err(ModelError::Cache(format!(
+                        "{} is owned by another user",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(Some(meta))
+        }
+        // Below a regular file nothing can exist: a miss, like a missing file.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(cache_io(path, err)),
     }
 }
 
@@ -250,39 +428,40 @@ fn safe_component(value: &str) -> Result<&str, ModelError> {
 
 impl ResponseCache for DirResponseCache {
     fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError> {
-        let path = self.path(entry)?;
-        if !path.is_file() {
+        let (dirs, file) = self.path(entry)?;
+        for path in std::iter::once(&self.root).chain(&dirs) {
+            if owned_or_missing(path)?.is_none() {
+                return Ok(None);
+            }
+        }
+        let Some(meta) = owned_or_missing(&file)? else {
+            return Ok(None);
+        };
+        if self
+            .max_age
+            .is_some_and(|max_age| is_older(&meta, max_age, std::time::SystemTime::now()))
+        {
             return Ok(None);
         }
-        let raw = std::fs::read(&path).map_err(|err| ModelError::Cache(err.to_string()))?;
+        let raw = std::fs::read(&file).map_err(|err| cache_io(&file, err))?;
         serde_json::from_slice(&raw)
             .map(Some)
             .map_err(|err| ModelError::Cache(err.to_string()))
     }
 
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError> {
-        let path = self.path(entry)?;
-        write_json_atomically(&path, response)
+        let (dirs, file) = self.path(entry)?;
+        crate::private_fs::ensure_owned_dir(&self.root).map_err(|err| cache_io(&self.root, err))?;
+        for dir in &dirs {
+            crate::private_fs::ensure_owned_dir(dir).map_err(|err| cache_io(dir, err))?;
+        }
+        if owned_or_missing(&file)?.is_some() {
+            crate::private_fs::ensure_owned_file(&file).map_err(|err| cache_io(&file, err))?;
+        }
+        let bytes =
+            serde_json::to_vec(response).map_err(|err| ModelError::Cache(err.to_string()))?;
+        crate::private_fs::write_private_file(&file, &bytes).map_err(|err| cache_io(&file, err))
     }
-}
-
-pub(crate) fn write_json_atomically(path: &Path, value: &Value) -> Result<(), ModelError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| ModelError::Cache(err.to_string()))?;
-    }
-    let tmp = path.with_extension(format!("json.{}.tmp", uuid_like()));
-    let bytes = serde_json::to_vec(value).map_err(|err| ModelError::Cache(err.to_string()))?;
-    std::fs::write(&tmp, bytes).map_err(|err| ModelError::Cache(err.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        ModelError::Cache(err.to_string())
-    })
-}
-
-/// Unique enough for a temporary file name: concurrent writers of one entry
-/// must not share a temporary path.
-fn uuid_like() -> String {
-    QueueItemId::new().0
 }
 
 /// Everything a queued provider carries besides its inner provider.
@@ -438,6 +617,100 @@ mod tests {
             request: &request,
         };
         assert!(cache.load(&traversal).is_err());
+    }
+
+    fn chat_entry<'a>(hash: &'a str, request: &'a Value) -> CacheEntry<'a> {
+        CacheEntry {
+            kind: "chat",
+            scope: None,
+            request_hash: hash,
+            request,
+        }
+    }
+
+    #[test]
+    fn dir_cache_prunes_by_age_then_size_and_purges_by_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DirResponseCache::new(dir.path().join("cache"));
+        let request = serde_json::json!({});
+        for (hash, source) in [("a1", "a"), ("a2", "a"), ("b1", "b")] {
+            cache
+                .store(
+                    &chat_entry(hash, &request),
+                    &serde_json::json!({"trace": {"source": source}, "text": "x"}),
+                )
+                .unwrap();
+        }
+        let path = |hash: &str| dir.path().join(format!("cache/chat/{hash}.json"));
+        let set_age = |hash: &str, seconds: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path(hash))
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
+                )
+                .unwrap();
+        };
+        set_age("a1", 300);
+        set_age("a2", 200);
+        set_age("b1", 100);
+
+        // An expired entry misses before any prune.
+        let aging = cache
+            .clone()
+            .with_max_age(Some(std::time::Duration::from_secs(250)));
+        assert!(aging.load(&chat_entry("a1", &request)).unwrap().is_none());
+        assert!(aging.load(&chat_entry("a2", &request)).unwrap().is_some());
+
+        assert_eq!(
+            cache
+                .prune(Some(std::time::Duration::from_secs(250)), None)
+                .unwrap(),
+            1
+        );
+        assert!(!path("a1").exists());
+        let one_entry = std::fs::metadata(path("b1")).unwrap().len();
+        assert_eq!(cache.prune(None, Some(one_entry)).unwrap(), 1);
+        assert!(!path("a2").exists() && path("b1").exists());
+
+        cache
+            .store(
+                &chat_entry("a3", &request),
+                &serde_json::json!({"trace": {"source": "a"}}),
+            )
+            .unwrap();
+        let purged = cache
+            .purge(|cached| cached.source.as_deref() == Some("a"))
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(!path("a3").exists() && path("b1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_cache_is_owner_only_and_refuses_symlinked_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DirResponseCache::new(dir.path().join("cache"));
+        let request = serde_json::json!({});
+        cache
+            .store(&chat_entry("h", &request), &serde_json::json!({}))
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.path().join("cache")), 0o700);
+        assert_eq!(mode(&dir.path().join("cache/chat")), 0o700);
+        assert_eq!(mode(&dir.path().join("cache/chat/h.json")), 0o600);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::remove_dir_all(dir.path().join("cache/chat")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("cache/chat")).unwrap();
+        let load = cache.load(&chat_entry("h", &request)).unwrap_err();
+        assert!(load.to_string().contains("symlink"), "{load}");
+        let store = cache
+            .store(&chat_entry("h", &request), &serde_json::json!({}))
+            .unwrap_err();
+        assert!(store.to_string().contains("symlink"), "{store}");
     }
 
     #[test]
