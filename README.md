@@ -3,10 +3,14 @@
 Reusable Rust contracts for durable AI work:
 
 - `symbiotic-core` — tiny shared vocabulary and identifiers.
-- `symbiotic-queue` — durable execution queue traits and state vocabulary.
+- `symbiotic-queue` — durable execution queue traits and state vocabulary; the
+  local SQLite backend is its default `sqlite` feature.
 - `symbiotic-model` — provider-neutral model/operator runtime traits: chat,
   embedding, rerank and classification (typed questions answered with
-  probabilities, served by TypeSafe System One or any chat model).
+  probabilities, served by TypeSafe System One or any chat model). The
+  queue-bound `Queued*` wrappers are its default `queue` feature;
+  `default-features = false` gives the contracts and HTTP providers without a
+  queue or SQLite.
 - `symbiotic-trace` — normalized invocation traces and pluggable sinks.
 - `symbiotic-portability` — external record interchange validation and explicit
   CSV/Markdown presentations; no Memory or application mutation dependency.

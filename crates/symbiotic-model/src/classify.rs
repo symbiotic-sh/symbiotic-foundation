@@ -17,8 +17,8 @@
 //! - [`ChatClassifierProvider`]: any [`ChatProvider`] answering the same request
 //!   with one JSON-mode completion, strictly validated.
 //! - [`StaticClassifierProvider`]: scripted answers for tests.
-//! - [`QueuedClassifierProvider`]: the queue, retry, cache and trace wrapper
-//!   shared with the other `Queued*` providers.
+//! - [`QueuedClassifierProvider`] (default `queue` feature): the queue, retry,
+//!   cache and trace wrapper shared with the other `Queued*` providers.
 //!
 //! Callers keep the decision: thresholds are theirs, and the helpers on
 //! [`ClassifyResponse`] only evaluate caller-supplied thresholds.
@@ -488,6 +488,7 @@ impl TraceCarrier for ClassifyResponse {
     }
 }
 
+#[cfg(feature = "queue")]
 impl BudgetedModelRequest for ClassifyRequest {
     fn input_budget_units(&self) -> u64 {
         let state = Value::Object(self.state.clone()).to_string();
@@ -517,6 +518,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 /// Queue-bound wrapper for a [`ClassifierProvider`], mirroring
 /// [`QueuedRerankProvider`]: idempotency, model cap, rate buckets, cooldowns,
 /// retry classification, exact response cache and traces.
@@ -533,6 +535,7 @@ pub struct QueuedClassifierProvider<P> {
     config: ModelQueueConfig,
 }
 
+#[cfg(feature = "queue")]
 impl<P> QueuedClassifierProvider<P> {
     pub fn new(
         inner: P,
@@ -555,6 +558,7 @@ impl<P> QueuedClassifierProvider<P> {
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<P> ModelProvider for QueuedClassifierProvider<P>
 where
@@ -565,6 +569,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<P> ClassifierProvider for QueuedClassifierProvider<P>
 where
@@ -1633,8 +1638,12 @@ impl ClassifierProvider for StaticClassifierProvider {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::sync::Mutex;
+    #[cfg(feature = "queue")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "queue")]
     use symbiotic_queue::SqliteQueue;
+    #[cfg(feature = "queue")]
     use symbiotic_trace::InMemoryTraceSink;
 
     // -- Loopback HTTP server ------------------------------------------------
@@ -2044,6 +2053,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn jev_rejects_a_different_served_model_unless_configured() {
         // A gateway (OpenRouter's `/systemone`) reports a dated snapshot and
@@ -2321,6 +2331,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     /// A classifier with a configurable identity and served model.
     #[derive(Clone)]
     struct NamedClassifier {
@@ -2329,6 +2340,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "queue")]
     impl NamedClassifier {
         fn new(model: &str, served_model: &str, probability: f64) -> Self {
             Self {
@@ -2345,6 +2357,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for NamedClassifier {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2352,6 +2365,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ClassifierProvider for NamedClassifier {
         async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
@@ -2366,6 +2380,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_classifier_cache_is_scoped_to_the_provider_configuration() {
         let dir = tempfile::tempdir().unwrap();
@@ -2454,6 +2469,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn jev_http_statuses_use_the_shared_retry_classification() {
         let cases: [(u16, &str, bool); 10] = [
@@ -2836,6 +2852,7 @@ mod tests {
         assert!(matches!(wrong_kind, ModelError::Provider(_)));
     }
 
+    #[cfg(feature = "queue")]
     /// Counts calls; fails with `Unavailable` for the first `failures` calls.
     #[derive(Clone)]
     struct CountingClassifier {
@@ -2844,6 +2861,7 @@ mod tests {
         failures: usize,
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for CountingClassifier {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2851,6 +2869,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ClassifierProvider for CountingClassifier {
         async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
@@ -2861,6 +2880,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     fn queue_config(cache: Option<PathBuf>) -> ModelQueueConfig {
         ModelQueueConfig {
             max_in_flight: 1,
@@ -2875,6 +2895,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_classifier_reuses_exact_response_cache_and_traces() {
         let dir = tempfile::tempdir().unwrap();
@@ -2914,6 +2935,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_classifier_retries_retryable_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2937,6 +2959,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(feature = "queue")]
     #[test]
     fn classify_requests_carry_an_input_budget() {
         let small = request(vec![goal_question()]).input_budget_units();

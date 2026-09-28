@@ -7,12 +7,17 @@ license.workspace = true
 repository.workspace = true
 description = "Provider-neutral durable queue contracts"
 
+[features]
+default = ["sqlite"]
+# The local SQLite backend (`SqliteQueue`). The contracts alone need no storage.
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 symbiotic-core = { path = "../symbiotic-core" }
 thiserror.workspace = true
 tokio.workspace = true

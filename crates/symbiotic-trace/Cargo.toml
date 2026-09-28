@@ -13,7 +13,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
-symbiotic-queue = { path = "../symbiotic-queue" }
+# Queue event contracts only; no queue backend or SQLite.
+symbiotic-queue = { path = "../symbiotic-queue", default-features = false }
 thiserror.workspace = true
 tokio.workspace = true
 
