@@ -908,6 +908,8 @@ on_both_backends!(
     a_provider_panic_reaches_its_caller_and_ends_lease_renewal,
     a_slow_trace_write_keeps_the_lease_until_the_item_completes,
     a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded,
+    a_slow_cache_write_keeps_the_lease_until_the_item_completes,
+    a_waiters_slow_cache_read_does_not_stall_lease_renewal,
     a_failed_trace_write_still_completes_the_item,
     a_failed_cooldown_write_still_records_the_failure,
 );
@@ -1471,4 +1473,153 @@ async fn a_failed_cooldown_write_still_records_the_failure(
     );
     assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
     assert_no_more_renewals(&queue, backend).await;
+}
+
+/// The directory cache, whose first store blocks its thread for `delay`, as
+/// a slow disk would.
+struct SlowFirstStore {
+    inner: symbiotic_model::DirResponseCache,
+    delay: Duration,
+    slowed: std::sync::atomic::AtomicBool,
+}
+
+impl ResponseCache for SlowFirstStore {
+    fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError> {
+        self.inner.load(entry)
+    }
+
+    fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError> {
+        if !self.slowed.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.store(entry, response)
+    }
+}
+
+async fn a_slow_cache_write_keeps_the_lease_until_the_item_completes(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(100));
+    let queue_id = raw.descriptor.queue_id();
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            logical_retry_attempts: 2,
+            retry_attempts: 2,
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone())
+    .with_response_cache(Arc::new(SlowFirstStore {
+        inner: symbiotic_model::DirResponseCache::new(dir.path()),
+        delay: Duration::from_millis(4_000),
+        slowed: std::sync::atomic::AtomicBool::new(false),
+    }));
+
+    let call = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("stored")).await }
+    });
+    assert_eq!(
+        reclaimable_after_the_lease(&queue, &queue_id).await,
+        0,
+        "{backend}: the lease expired while the response was stored"
+    );
+    let answer = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.text, "stored", "{backend}");
+    let item = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, QueueStatus::Succeeded, "{backend}: {item:?}");
+    assert_eq!(item.attempt, 1, "{backend}: {item:?}");
+
+    let again = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("stored")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the identical request finishes"))
+        .unwrap();
+    assert_eq!(again.text, "stored", "{backend}");
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "{backend}: no second provider call"
+    );
+}
+
+/// The directory cache, whose next read after `slow_next_read` is set
+/// blocks its thread for `delay`.
+struct SlowNextRead {
+    inner: symbiotic_model::DirResponseCache,
+    delay: Duration,
+    slow_next_read: std::sync::atomic::AtomicBool,
+}
+
+impl ResponseCache for SlowNextRead {
+    fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError> {
+        if self.slow_next_read.swap(false, Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.load(entry)
+    }
+
+    fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError> {
+        self.inner.store(entry, response)
+    }
+}
+
+async fn a_waiters_slow_cache_read_does_not_stall_lease_renewal(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(5_000));
+    let queue_id = raw.descriptor.queue_id();
+    let cache = Arc::new(SlowNextRead {
+        inner: symbiotic_model::DirResponseCache::new(dir.path()),
+        delay: Duration::from_millis(4_000),
+        slow_next_read: std::sync::atomic::AtomicBool::new(false),
+    });
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_response_cache(cache.clone());
+
+    let first = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("read")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An identical caller arrives while the first call holds the lease; its
+    // first cache read takes 4 s.
+    cache.slow_next_read.store(true, Ordering::SeqCst);
+    let waiter = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("read")).await }
+    });
+    assert_eq!(
+        reclaimable_after_the_lease(&queue, &queue_id).await,
+        0,
+        "{backend}: the lease expired while a waiter read the cache"
+    );
+    // A waiter that reclaimed the expired lease would make the first call's
+    // completion fail.
+    for call in [first, waiter] {
+        let answer = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+            .unwrap()
+            .unwrap_or_else(|err| panic!("{backend}: {err}"));
+        assert_eq!(answer.text, "read", "{backend}");
+    }
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "{backend}: no second provider call"
+    );
 }

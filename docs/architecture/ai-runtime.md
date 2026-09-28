@@ -97,6 +97,12 @@ cannot outlive it. It also stops once a renewal fails because the lease was
 lost. Every exit of an attempt releases the lease, including a failed trace,
 cache or cooldown write.
 
+Renewal shares a task with the attempt, so nothing in the attempt may block
+its thread. A `ResponseCache` is synchronous and may do file I/O, so every
+cache read and write, the serialization of the stored response and the
+`request_debug_dir` capture run on tokio's blocking pool. A slow disk
+therefore delays only the call that is waiting for it.
+
 There is no cancellation API. A provider that panics propagates the panic to
 the waiting caller; its lease is not renewed and expires after
 `lease_seconds`, as after a crash.

@@ -1006,18 +1006,32 @@ impl CallReceipts {
 
 #[cfg(feature = "queue")]
 fn load_cached<Res: for<'de> Deserialize<'de>>(
-    cache: &Option<Arc<dyn ResponseCache>>,
+    cache: &dyn ResponseCache,
     entry: &CacheEntry<'_>,
 ) -> Result<Option<Res>, ModelError> {
-    let Some(cache) = cache else {
-        return Ok(None);
-    };
     cache
         .load(entry)?
         .map(|value| {
             serde_json::from_value(value).map_err(|err| ModelError::Cache(err.to_string()))
         })
         .transpose()
+}
+
+/// Run `work` on tokio's blocking pool and wait for it. A `ResponseCache`
+/// is synchronous and may do file I/O, and (de)serializing a whole response
+/// is CPU work. On an async worker thread either would stall every task
+/// there, including the renewal of an attempt's lease.
+#[cfg(feature = "queue")]
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ModelError> + Send + 'static,
+) -> Result<T, ModelError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(output) => output,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(ModelError::Cache(format!(
+            "response cache work did not finish: {err}"
+        ))),
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -1125,13 +1139,27 @@ impl<Req> QueuedCall<Req> {
         )
         .await
     }
+}
 
+/// Response-cache work, which runs on the blocking pool with a handle to
+/// the call.
+#[cfg(feature = "queue")]
+impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     /// The cached response, traced and receipted as a cache hit on `item`.
-    async fn cached<Res: TraceCarrier + for<'de> Deserialize<'de>>(
-        &self,
+    async fn cached<Res>(
+        self: &Arc<Self>,
         item: Option<&QueueItem>,
-    ) -> Result<Option<Res>, ModelError> {
-        let Some(cached) = load_cached::<Res>(&self.cache, &self.cache_entry())? else {
+    ) -> Result<Option<Res>, ModelError>
+    where
+        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let Some(cache) = self.cache.clone() else {
+            return Ok(None);
+        };
+        let call = self.clone();
+        let loaded =
+            run_blocking(move || load_cached::<Res>(cache.as_ref(), &call.cache_entry())).await?;
+        let Some(cached) = loaded else {
             return Ok(None);
         };
         self.receipts
@@ -1154,24 +1182,38 @@ impl<Req> QueuedCall<Req> {
         .map(Some)
     }
 
-    /// Trace a successful attempt and cache its response.
-    async fn record_success<Res: Serialize>(
-        &self,
+    /// Trace a successful attempt and cache its response; hands the
+    /// response back with the result of the writes.
+    async fn record_success<Res>(
+        self: &Arc<Self>,
         trace: &ModelInvocationTrace,
-        response: &Res,
-    ) -> Result<(), ModelError> {
-        if let Some(trace_sink) = &self.trace_sink {
-            trace_sink
-                .record_model_invocation(trace.clone())
-                .await
-                .map_err(|err| ModelError::Provider(err.to_string()))?;
+        response: Res,
+    ) -> (Res, Result<(), ModelError>)
+    where
+        Res: Serialize + Clone + Send + Sync + 'static,
+    {
+        if let Some(trace_sink) = &self.trace_sink
+            && let Err(err) = trace_sink.record_model_invocation(trace.clone()).await
+        {
+            return (response, Err(ModelError::Provider(err.to_string())));
         }
-        if let Some(cache) = &self.cache {
-            let value =
-                serde_json::to_value(response).map_err(|err| ModelError::Cache(err.to_string()))?;
-            cache.store(&self.cache_entry(), &value)?;
-        }
-        Ok(())
+        let Some(cache) = self.cache.clone() else {
+            return (response, Ok(()));
+        };
+        let call = self.clone();
+        let response = Arc::new(response);
+        let stored = run_blocking({
+            let response = response.clone();
+            move || {
+                let value = serde_json::to_value(&*response)
+                    .map_err(|err| ModelError::Cache(err.to_string()))?;
+                cache.store(&call.cache_entry(), &value)
+            }
+        })
+        .await;
+        // The blocking task has dropped its handle by the time it is joined.
+        let response = Arc::try_unwrap(response).unwrap_or_else(|shared| (*shared).clone());
+        (response, stored)
     }
 }
 
@@ -1242,10 +1284,14 @@ where
     let queue = &this.queue;
     let config = &this.config;
     let queue_id = &this.queue_id;
-    if let Some(dir) = &config.request_debug_dir {
-        DirResponseCache::new(dir.clone()).store(&this.cache_entry(), &this.request_value)?;
+    if let Some(dir) = config.request_debug_dir.clone() {
+        let call = call_state.clone();
+        run_blocking(move || {
+            DirResponseCache::new(dir).store(&call.cache_entry(), &call.request_value)
+        })
+        .await?;
     }
-    if let Some(cached) = this.cached::<Res>(None).await? {
+    if let Some(cached) = call_state.cached::<Res>(None).await? {
         return Ok(cached);
     }
 
@@ -1293,7 +1339,7 @@ where
     }
 
     loop {
-        if let Some(cached) = this.cached::<Res>(Some(&enqueue.item)).await? {
+        if let Some(cached) = call_state.cached::<Res>(Some(&enqueue.item)).await? {
             return Ok(cached);
         }
         let attempt_started = std::time::Instant::now();
@@ -1370,7 +1416,7 @@ where
                             }
                         }
                         QueueStatus::Succeeded => {
-                            if let Some(cached) = this.cached::<Res>(Some(&current)).await? {
+                            if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
                                 return Ok(cached);
                             }
                             enqueue = this.renew_budget(&current.item_id).await?;
@@ -1438,8 +1484,8 @@ async fn run_attempt<P, Req, Res, F, Fut>(
     clock: AttemptClock,
 ) -> Result<AttemptEnd<Res>, ModelError>
 where
-    Req: Clone,
-    Res: Serialize + TraceCarrier,
+    Req: Clone + Send + Sync + 'static,
+    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1467,7 +1513,7 @@ where
         &item.item_id,
         worker_id,
         config.lease_seconds,
-        settle(this, &item, provider, call, &clock),
+        settle(&call_state, &item, provider, call, &clock),
     )
     .await;
     drop(permit);
@@ -1573,18 +1619,19 @@ enum Settled<Res> {
 /// The leased part of an attempt: the running receipt, the provider call,
 /// and recording its outcome up to completing or failing the item. Every
 /// path ends with `complete` or `fail_with`, whatever the writes before it
-/// returned.
+/// returned. It shares its task with the lease renewal, so it never blocks
+/// the thread: response-cache work runs on the blocking pool.
 #[cfg(feature = "queue")]
 async fn settle<P, Req, Res, F, Fut>(
-    this: &QueuedCall<Req>,
+    this: &Arc<QueuedCall<Req>>,
     item: &QueueItem,
     provider: P,
     call: F,
     clock: &AttemptClock,
 ) -> Settled<Res>
 where
-    Req: Clone,
-    Res: Serialize + TraceCarrier,
+    Req: Clone + Send + Sync + 'static,
+    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1635,7 +1682,7 @@ where
             trace.timing.provider_ms = Some(provider_ms);
             trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
             response.set_trace(trace.clone());
-            let recorded = this.record_success(&trace, &response).await;
+            let (response, recorded) = this.record_success(&trace, response).await;
             let completed = queue.complete(&item.item_id, worker_id).await;
             Settled::Succeeded {
                 response,
