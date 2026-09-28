@@ -128,6 +128,9 @@ provider call. A caller whose item is not claimable spends nothing: one
 waiting on an identical call in flight, or one waiting out a retry backoff.
 Each attempt, including each retry, is charged once, and pacing stays exact
 because no two callers can be cleared for the same budget.
+A caller waiting for budget gives up its model slot and sleeps in slices of
+at most 250 ms. Between slices it looks at its item and the cache, so a
+duplicate whose answer has arrived returns at once and spends nothing.
 
 Pooling shares limits only. Deduplication, attempt budgets and results stay
 per provider: the idempotency key is the queue, the provider descriptor and

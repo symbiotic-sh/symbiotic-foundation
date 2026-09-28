@@ -1162,19 +1162,24 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         let Some(cached) = loaded else {
             return Ok(None);
         };
+        // Trace first, so the receipt carries any diagnostic the trace write
+        // added. The receipt repeats the original usage; its metadata is the
+        // returned response's.
+        let mut receipted = cached.trace().clone();
+        let response = self
+            .traced_cache_hit(cached, item.map(|item| item.item_id.clone()))
+            .await;
+        receipted.metadata = response.trace().metadata.clone();
         self.receipts
             .record(
                 ReceiptStatus::CacheHit,
                 item,
-                Some(cached.trace()),
+                Some(&receipted),
                 None,
                 AttemptTiming::NONE,
             )
             .await;
-        Ok(Some(
-            self.traced_cache_hit(cached, item.map(|item| item.item_id.clone()))
-                .await,
-        ))
+        Ok(Some(response))
     }
 
     /// Cache a successful attempt's response, then trace it. The provider
@@ -1453,7 +1458,24 @@ where
         };
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
-        let rate = wait_for_model_budget(queue_id, config, &this.request).await?;
+        let rate = match check_model_budget(queue_id, config, &this.request).await? {
+            RateCheck::Cleared(rate) => rate,
+            RateCheck::Wait(wait) => {
+                // Wait for budget in short slices without holding a model
+                // slot, and look at the item and the cache in between: a
+                // duplicate whose answer arrives returns without spending.
+                drop(permit);
+                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                throttle_wait += throttle_started.elapsed();
+                if let Followed::Answer(answer) = this
+                    .waiting_on_item(&call_state, &mut enqueue, config)
+                    .await?
+                {
+                    return Ok(answer);
+                }
+                continue;
+            }
+        };
         let attempt_throttle = throttle_started.elapsed();
         throttle_wait += attempt_throttle;
 
@@ -1491,42 +1513,82 @@ where
             // A retention-bounded backend evicted the item after it turned
             // terminal: queue the request again.
             AttemptEnd::Missing => enqueue = this.enqueue().await?,
-            AttemptEnd::NotClaimed => {
-                match queue
-                    .get_item(&enqueue.item.item_id)
-                    .await
-                    .map_err(queue_error)?
-                {
-                    None => {
-                        enqueue = this.enqueue().await?;
-                        continue;
+            AttemptEnd::NotClaimed => match this
+                .waiting_on_item(&call_state, &mut enqueue, config)
+                .await?
+            {
+                Followed::Answer(answer) => return Ok(answer),
+                Followed::Moved => {}
+                Followed::Waiting => tokio::time::sleep(Duration::from_millis(25)).await,
+            },
+        }
+    }
+}
+
+/// What a caller that cannot run its item found when it looked again.
+#[cfg(feature = "queue")]
+enum Followed<Res> {
+    /// A finished identical call's cached answer.
+    Answer(Res),
+    /// `enqueue` now points at a fresh or renewed item: try it at once.
+    Moved,
+    /// Nothing to do yet (the item may have moved to the next item of its
+    /// retry chain): look again shortly.
+    Waiting,
+}
+
+#[cfg(feature = "queue")]
+impl<Req: Send + Sync + 'static> QueuedCall<Req> {
+    /// Follow the request's item while this caller cannot run it, and fail
+    /// once the request's attempts are used up.
+    async fn waiting_on_item<Res>(
+        &self,
+        call_state: &Arc<Self>,
+        enqueue: &mut EnqueueOutcome,
+        config: &ModelQueueConfig,
+    ) -> Result<Followed<Res>, ModelError>
+    where
+        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let current = self
+            .queue
+            .get_item(&enqueue.item.item_id)
+            .await
+            .map_err(queue_error)?;
+        let Some(current) = current else {
+            *enqueue = self.enqueue().await?;
+            return Ok(Followed::Moved);
+        };
+        match current.status {
+            QueueStatus::Dead if budget_renewed(&current, config) => {
+                *enqueue = self.renew_budget(&current.item_id).await?;
+                Ok(Followed::Moved)
+            }
+            QueueStatus::Dead => {
+                let dead_err = dead_item_retry_error(&current);
+                match self.continue_chain(&current, &dead_err).await? {
+                    Some(next) => {
+                        *enqueue = next;
+                        Ok(Followed::Waiting)
                     }
-                    Some(current) => match current.status {
-                        QueueStatus::Dead if budget_renewed(&current, config) => {
-                            enqueue = this.renew_budget(&current.item_id).await?;
-                            continue;
-                        }
-                        QueueStatus::Dead => {
-                            let dead_err = dead_item_retry_error(&current);
-                            if let Some(next) = this.continue_chain(&current, &dead_err).await? {
-                                enqueue = next;
-                            } else {
-                                return Err(exhausted_request_error(
-                                    queue_id, &current, config, &dead_err,
-                                ));
-                            }
-                        }
-                        QueueStatus::Succeeded => {
-                            if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
-                                return Ok(cached);
-                            }
-                            enqueue = this.renew_budget(&current.item_id).await?;
-                            continue;
-                        }
-                        QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {}
-                    },
+                    None => Err(exhausted_request_error(
+                        &self.queue_id,
+                        &current,
+                        config,
+                        &dead_err,
+                    )),
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            QueueStatus::Succeeded => {
+                if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
+                    return Ok(Followed::Answer(cached));
+                }
+                *enqueue = self.renew_budget(&current.item_id).await?;
+                Ok(Followed::Moved)
+            }
+            // Still waiting: the top of the caller's loop checks the cache.
+            QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {
+                Ok(Followed::Waiting)
             }
         }
     }
@@ -2411,15 +2473,25 @@ impl RateGrant {
     }
 }
 
-/// Wait until the queue's rate limits allow one more attempt of `request`,
-/// without spending anything; the attempt spends it on a successful claim.
-/// `None` when the policy sets no rate limit.
+/// Whether the queue's rate limits allow one more attempt of `request` now.
 #[cfg(feature = "queue")]
-async fn wait_for_model_budget<R>(
+enum RateCheck {
+    /// Go ahead. The grant (`None` when the policy sets no rate limit) is
+    /// spent on a successful claim.
+    Cleared(Option<RateGrant>),
+    /// Not enough budget for this long. Nothing was spent.
+    Wait(Duration),
+}
+
+/// Check the queue's rate limits for one more attempt of `request`, without
+/// spending anything; a cleared attempt spends its grant on a successful
+/// claim.
+#[cfg(feature = "queue")]
+async fn check_model_budget<R>(
     queue_id: &QueueId,
     config: &ModelQueueConfig,
     request: &R,
-) -> Result<Option<RateGrant>, ModelError>
+) -> Result<RateCheck, ModelError>
 where
     R: BudgetedModelRequest,
 {
@@ -2445,44 +2517,46 @@ where
         });
     }
     if charges.is_empty() {
-        return Ok(None);
+        return Ok(RateCheck::Cleared(None));
     }
     let gate = {
         let gates = MODEL_RATE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
         let Ok(mut gates) = gates.lock() else {
-            return Ok(None);
+            return Ok(RateCheck::Cleared(None));
         };
         gates.entry(queue_id.0.clone()).or_default().clone()
     };
-    loop {
-        let held = gate.clone().lock_owned().await;
-        let wait = {
-            let buckets = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-            let Ok(mut buckets) = buckets.lock() else {
-                return Ok(None);
-            };
-            charges
-                .iter()
-                .filter_map(|charge| {
-                    buckets
-                        .entry(charge.key.clone())
-                        .or_insert_with(|| {
-                            RateBucket::with_burst(charge.per_minute, config.rate_burst_seconds)
-                        })
-                        .wait_for(charge.amount)
-                })
-                .max()
+    let held = gate.lock_owned().await;
+    let wait = {
+        let buckets = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut buckets) = buckets.lock() else {
+            return Ok(RateCheck::Cleared(None));
         };
-        let Some(wait) = wait else {
-            return Ok(Some(RateGrant {
-                _gate: held,
-                charges,
-            }));
-        };
-        drop(held);
-        tokio::time::sleep(wait).await;
-    }
+        charges
+            .iter()
+            .filter_map(|charge| {
+                buckets
+                    .entry(charge.key.clone())
+                    .or_insert_with(|| {
+                        RateBucket::with_burst(charge.per_minute, config.rate_burst_seconds)
+                    })
+                    .wait_for(charge.amount)
+            })
+            .max()
+    };
+    Ok(match wait {
+        None => RateCheck::Cleared(Some(RateGrant {
+            _gate: held,
+            charges,
+        })),
+        Some(wait) => RateCheck::Wait(wait),
+    })
 }
+
+/// Longest sleep of a caller waiting for rate budget before it looks again
+/// at its item and the cache: a duplicate's answer may have arrived.
+#[cfg(feature = "queue")]
+const RATE_WAIT_SLICE: Duration = Duration::from_millis(250);
 
 #[cfg(feature = "queue")]
 async fn wait_for_model_cooldown(
@@ -4241,36 +4315,31 @@ mod tests {
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
 
-        // Cleared without a claim: nothing is spent, and the next caller
-        // is cleared at once.
-        let unclaimed = wait_for_model_budget(&queue_id, &config, &chat_request("first"))
+        let cleared = |check: RateCheck| match check {
+            RateCheck::Cleared(grant) => grant.expect("a rate-limited policy returns a grant"),
+            RateCheck::Wait(wait) => panic!("budget is available, but asked to wait {wait:?}"),
+        };
+        // Cleared without a claim: nothing is spent, and the next caller is
+        // cleared at once.
+        drop(cleared(
+            check_model_budget(&queue_id, &config, &chat_request("first"))
+                .await
+                .unwrap(),
+        ));
+        cleared(
+            check_model_budget(&queue_id, &config, &chat_request("first"))
+                .await
+                .unwrap(),
+        )
+        .charge();
+        // Spent: the next caller waits about a second for the refill.
+        match check_model_budget(&queue_id, &config, &chat_request("second"))
             .await
             .unwrap()
-            .expect("a rate-limited policy returns a grant");
-        drop(unclaimed);
-        let claimed = tokio::time::timeout(
-            Duration::from_millis(100),
-            wait_for_model_budget(&queue_id, &config, &chat_request("first")),
-        )
-        .await
-        .expect("an unspent grant leaves the budget in place")
-        .unwrap()
-        .unwrap();
-        claimed.charge();
-
-        let started = std::time::Instant::now();
-        tokio::time::timeout(
-            Duration::from_millis(1500),
-            wait_for_model_budget(&queue_id, &config, &chat_request("second")),
-        )
-        .await
-        .expect("the next caller waits for the spent budget to refill, then proceeds")
-        .unwrap();
-        assert!(
-            started.elapsed() >= Duration::from_millis(900),
-            "{:?}",
-            started.elapsed()
-        );
+        {
+            RateCheck::Wait(wait) => assert!(wait >= Duration::from_millis(900), "{wait:?}"),
+            RateCheck::Cleared(_) => panic!("the budget was spent"),
+        }
     }
 
     #[tokio::test]

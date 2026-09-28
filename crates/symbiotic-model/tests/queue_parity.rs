@@ -920,6 +920,7 @@ on_both_backends!(
     an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage,
     a_retryable_errors_backoff_spends_no_rate_budget,
     identical_concurrent_requests_spend_rate_budget_once_per_attempt,
+    a_duplicate_waiting_for_rate_budget_takes_the_answer_at_once,
     a_request_limit_admits_its_burst_then_paces,
     an_input_unit_limit_paces_large_requests,
 );
@@ -1485,6 +1486,26 @@ async fn a_failed_trace_write_still_completes_the_item(backend: &str, queue: Arc
         "{backend}"
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+
+    // Each receipt's metadata matches the response it stands for.
+    let receipted = |status: ReceiptStatus| {
+        receipts
+            .receipts()
+            .into_iter()
+            .filter(|receipt| receipt.status == status)
+            .map(|receipt| diagnostics(&receipt.metadata))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        receipted(ReceiptStatus::Succeeded),
+        [["trace_write_failed"]],
+        "{backend}"
+    );
+    assert_eq!(
+        receipted(ReceiptStatus::CacheHit),
+        [["trace_write_failed"]],
+        "{backend}"
+    );
 }
 
 async fn a_failed_cooldown_write_still_records_the_failure(
@@ -1968,4 +1989,48 @@ async fn an_input_unit_limit_paces_large_requests(backend: &str, queue: Arc<Coun
         offsets[1] < Duration::from_millis(3_500),
         "{backend}: {offsets:?}"
     );
+}
+
+async fn a_duplicate_waiting_for_rate_budget_takes_the_answer_at_once(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let cache = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(300));
+    // One request of budget, refilled once a minute: the first call spends
+    // it, and the duplicates must not wait for the refill.
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            response_cache_dir: Some(cache.path().to_path_buf()),
+            ..slow_refill(1)
+        },
+    );
+
+    let started = Instant::now();
+    let identical: Vec<_> = (0..5)
+        .map(|_| {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.chat(request("same")).await })
+        })
+        .collect();
+    for call in identical {
+        let answer = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{backend}: a duplicate waited for rate budget"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.text, "same", "{backend}");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{backend}: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+
+    // The one request of budget went to the one provider call.
+    let other = tokio::time::timeout(Duration::from_secs(1), provider.chat(request("other"))).await;
+    assert!(other.is_err(), "{backend}: the budget is spent");
 }
