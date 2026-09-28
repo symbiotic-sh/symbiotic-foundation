@@ -23,6 +23,11 @@
 //!   cooldowns, attempt budgets and cached responses survive restarts.
 //! - Without one, state is in memory and ends with the process.
 //!
+//! Once a provider call starts, it belongs to the runtime. A caller that
+//! stops waiting (a dropped future, a timeout around the call) does not
+//! cancel it: the call finishes, records its outcome, fills the cache and
+//! releases its queue item, and identical requests get its result.
+//!
 //! Every provider handed out for one model (`queue_id`) shares one
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
 //! or caller uses it. Two bindings of one model must agree on those limits.

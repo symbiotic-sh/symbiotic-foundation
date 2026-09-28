@@ -449,6 +449,9 @@ pub struct ModelQueueConfig {
     pub logical_retry_attempts: u32,
     pub retry_attempts: u32,
     pub retry_jitter_seconds: u64,
+    /// Longest provider call; `None` never times out. A caller that stops
+    /// waiting does not cancel a call in flight (the runtime owns it), so
+    /// this is also what bounds a call nobody waits for.
     pub request_timeout_seconds: Option<u64>,
     pub requests_per_minute: Option<u32>,
     pub input_units_per_minute: Option<u64>,
@@ -813,7 +816,7 @@ where
             ModelCapability::Chat,
             "chat",
             None,
-            &request,
+            request,
             |inner: C, request| async move { inner.chat(request).await },
             self.inner.clone(),
         )
@@ -871,7 +874,7 @@ where
             ModelCapability::Embedding,
             "embedding",
             None,
-            &request,
+            request,
             |inner: E, request| async move { inner.embed(request).await },
             self.inner.clone(),
         )
@@ -932,7 +935,7 @@ where
             ModelCapability::Rerank,
             "rerank",
             None,
-            &request,
+            request,
             |inner: R, request| async move { inner.rerank(request).await },
             self.inner.clone(),
         )
@@ -1027,10 +1030,155 @@ fn elapsed_ms(since: std::time::Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What every attempt of one queued call shares: the backend and policy,
+/// the request with its identity and cache entry, and the call's sinks.
+#[cfg(feature = "queue")]
+struct QueuedCall<Req> {
+    queue: Arc<dyn QueueBackend>,
+    worker_id: String,
+    config: ModelQueueConfig,
+    queue_id: QueueId,
+    descriptor: ProviderDescriptor,
+    capability: ModelCapability,
+    kind: String,
+    // Response-cache subdirectory under `kind`; see `run_queued`.
+    cache_scope: Option<String>,
+    cache: Option<Arc<dyn ResponseCache>>,
+    trace_sink: Option<Arc<dyn TraceSink>>,
+    receipts: CallReceipts,
+    request: Req,
+    request_hash: String,
+    request_value: Value,
+    sensitivity: Sensitivity,
+    idempotency_key: Option<String>,
+}
+
+#[cfg(feature = "queue")]
+impl<Req> QueuedCall<Req> {
+    fn cache_entry(&self) -> CacheEntry<'_> {
+        CacheEntry {
+            kind: &self.kind,
+            scope: self.cache_scope.as_deref(),
+            request_hash: &self.request_hash,
+            request: &self.request_value,
+        }
+    }
+
+    /// Queue the request with a fresh attempt budget, or join the item an
+    /// identical request already has.
+    async fn enqueue(&self) -> Result<EnqueueOutcome, ModelError> {
+        self.queue
+            .enqueue(EnqueueRequest {
+                queue_id: self.queue_id.clone(),
+                kind: self.kind.clone(),
+                payload: model_queue_payload(
+                    &self.capability,
+                    &self.request_hash,
+                    &self.descriptor,
+                    LogicalRetryState {
+                        attempts_used: 0,
+                        max_attempts: logical_max_attempts(&self.config),
+                    },
+                ),
+                idempotency_key: self.idempotency_key.clone(),
+                run_after: None,
+                max_attempts: Some(self.config.retry_attempts),
+                force: false,
+            })
+            .await
+            .map_err(queue_error)
+    }
+
+    async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
+        reenqueue_with_fresh_budget(
+            self.queue.as_ref(),
+            &self.queue_id,
+            &self.descriptor,
+            self.capability,
+            &self.kind,
+            &self.request_hash,
+            &self.idempotency_key,
+            &self.config,
+            current,
+        )
+        .await
+    }
+
+    /// The next item of the request's retry chain after `dead`, or `None`
+    /// once the request's attempts are used up.
+    async fn continue_chain(
+        &self,
+        dead: &QueueItem,
+        err: &ModelError,
+    ) -> Result<Option<EnqueueOutcome>, ModelError> {
+        reenqueue_dead_item(
+            self.queue.as_ref(),
+            &self.queue_id,
+            &self.descriptor,
+            self.capability,
+            &self.kind,
+            &self.request_hash,
+            &self.idempotency_key,
+            dead,
+            &self.config,
+            err,
+        )
+        .await
+    }
+
+    /// The cached response, traced and receipted as a cache hit on `item`.
+    async fn cached<Res: TraceCarrier + for<'de> Deserialize<'de>>(
+        &self,
+        item: Option<&QueueItem>,
+    ) -> Result<Option<Res>, ModelError> {
+        let Some(cached) = load_cached::<Res>(&self.cache, &self.cache_entry())? else {
+            return Ok(None);
+        };
+        self.receipts
+            .record(
+                ReceiptStatus::CacheHit,
+                item,
+                Some(cached.trace()),
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
+        return_cached_response(
+            cached,
+            &self.descriptor,
+            &self.trace_sink,
+            self.request_hash.clone(),
+            item.map(|item| item.item_id.clone()),
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Trace a successful attempt and cache its response.
+    async fn record_success<Res: Serialize>(
+        &self,
+        trace: &ModelInvocationTrace,
+        response: &Res,
+    ) -> Result<(), ModelError> {
+        if let Some(trace_sink) = &self.trace_sink {
+            trace_sink
+                .record_model_invocation(trace.clone())
+                .await
+                .map_err(|err| ModelError::Provider(err.to_string()))?;
+        }
+        if let Some(cache) = &self.cache {
+            let value =
+                serde_json::to_value(response).map_err(|err| ModelError::Cache(err.to_string()))?;
+            cache.store(&self.cache_entry(), &value)?;
+        }
+        Ok(())
+    }
+}
+
 // The arguments are the queue execution boundary: one queued call.
 #[cfg(feature = "queue")]
 #[allow(clippy::too_many_arguments)]
-async fn run_queued<P, Req, Res, Fut>(
+async fn run_queued<P, Req, Res, F, Fut>(
     runtime: &QueueRuntime,
     descriptor: ProviderDescriptor,
     capability: ModelCapability,
@@ -1040,8 +1188,8 @@ async fn run_queued<P, Req, Res, Fut>(
     // of that kind: two chat models sharing a cache directory can read each
     // other's cached answers. Classification passes a descriptor hash.
     cache_scope: Option<String>,
-    request: &Req,
-    call: impl Fn(P, Req) -> Fut + Send + Sync,
+    request: Req,
+    call: F,
     provider: P,
 ) -> Result<Res, ModelError>
 where
@@ -1049,55 +1197,16 @@ where
     Req: Clone + Serialize + Send + Sync + 'static,
     Req: BudgetedModelRequest,
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Res, ModelError>> + Send,
+    F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
 {
-    let queue = &runtime.queue;
-    let trace_sink = &runtime.trace_sink;
-    let config = &runtime.config;
-    let worker_id = &runtime.worker_id;
     let queue_id = runtime
         .queue_id
         .clone()
         .unwrap_or_else(|| descriptor.queue_id());
-    let request_hash = hash_json(request)?;
-    let request_value =
-        serde_json::to_value(request).map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
-    let cache = runtime.cache();
-    let entry = CacheEntry {
-        kind,
-        scope: cache_scope.as_deref(),
-        request_hash: &request_hash,
-        request: &request_value,
-    };
-    let receipts = CallReceipts {
-        sink: runtime.receipt_sink.clone(),
-        queue_id: queue_id.clone(),
-        kind: kind.to_string(),
-        request_hash: request_hash.clone(),
-        input_units: request.input_budget_units(),
-    };
-    if let Some(dir) = &config.request_debug_dir {
-        DirResponseCache::new(dir.clone()).store(&entry, &request_value)?;
-    }
-    if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
-        receipts
-            .record(
-                ReceiptStatus::CacheHit,
-                None,
-                Some(cached.trace()),
-                None,
-                AttemptTiming::NONE,
-            )
-            .await;
-        return return_cached_response(cached, &descriptor, trace_sink, request_hash.clone(), None)
-            .await;
-    }
-
-    let queued_at = std::time::Instant::now();
-    // Cooldown + rate-bucket wait accumulated across loop iterations, so the
-    // trace can report the throttle-wait vs http-time split (the measured
-    // lesson) without changing `queued_ms` semantics.
-    let mut throttle_wait = Duration::ZERO;
+    let request_hash = hash_json(&request)?;
+    let request_value = serde_json::to_value(&request)
+        .map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
     // The provider is part of the key: models pooled on one queue share its
     // limits, never each other's attempt budgets or results.
     let idempotency_key = Some(format!(
@@ -1105,27 +1214,48 @@ where
         queue_id.0,
         hash_json(&descriptor)?
     ));
-    let fresh_enqueue = || {
-        queue.enqueue(EnqueueRequest {
+    let call_state = Arc::new(QueuedCall {
+        queue: runtime.queue.clone(),
+        worker_id: runtime.worker_id.clone(),
+        config: runtime.config.clone(),
+        receipts: CallReceipts {
+            sink: runtime.receipt_sink.clone(),
             queue_id: queue_id.clone(),
             kind: kind.to_string(),
-            payload: model_queue_payload(
-                &capability,
-                &request_hash,
-                &descriptor,
-                LogicalRetryState {
-                    attempts_used: 0,
-                    max_attempts: logical_max_attempts(config),
-                },
-            ),
-            idempotency_key: idempotency_key.clone(),
-            run_after: None,
-            max_attempts: Some(config.retry_attempts),
-            force: false,
-        })
-    };
-    let mut enqueue = fresh_enqueue().await.map_err(queue_error)?;
-    receipts
+            request_hash: request_hash.clone(),
+            input_units: request.input_budget_units(),
+        },
+        queue_id,
+        descriptor,
+        capability,
+        kind: kind.to_string(),
+        cache_scope,
+        cache: runtime.cache(),
+        trace_sink: runtime.trace_sink.clone(),
+        sensitivity: request_sensitivity(&request_value),
+        request,
+        request_hash,
+        request_value,
+        idempotency_key,
+    });
+    let this = call_state.as_ref();
+    let queue = &this.queue;
+    let config = &this.config;
+    let queue_id = &this.queue_id;
+    if let Some(dir) = &config.request_debug_dir {
+        DirResponseCache::new(dir.clone()).store(&this.cache_entry(), &this.request_value)?;
+    }
+    if let Some(cached) = this.cached::<Res>(None).await? {
+        return Ok(cached);
+    }
+
+    let queued_at = std::time::Instant::now();
+    // Cooldown + rate-bucket wait accumulated across loop iterations, so the
+    // trace can report the throttle-wait vs http-time split (the measured
+    // lesson) without changing `queued_ms` semantics.
+    let mut throttle_wait = Duration::ZERO;
+    let mut enqueue = this.enqueue().await?;
+    this.receipts
         .record(
             ReceiptStatus::Queued,
             Some(&enqueue.item),
@@ -1137,39 +1267,15 @@ where
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
             QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
-                enqueue = reenqueue_with_fresh_budget(
-                    queue.as_ref(),
-                    &queue_id,
-                    &descriptor,
-                    capability,
-                    kind,
-                    &request_hash,
-                    &idempotency_key,
-                    config,
-                    &enqueue.item.item_id,
-                )
-                .await?;
+                enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
             QueueStatus::Dead => {
                 let dead_err = dead_item_retry_error(&enqueue.item);
-                if let Some(next) = reenqueue_dead_item(
-                    queue.as_ref(),
-                    &queue_id,
-                    &descriptor,
-                    capability,
-                    kind,
-                    &request_hash,
-                    &idempotency_key,
-                    &enqueue.item,
-                    config,
-                    &dead_err,
-                )
-                .await?
-                {
+                if let Some(next) = this.continue_chain(&enqueue.item, &dead_err).await? {
                     enqueue = next;
                 } else {
                     return Err(exhausted_request_error(
-                        &queue_id,
+                        queue_id,
                         &enqueue.item,
                         config,
                         &dead_err,
@@ -1180,384 +1286,405 @@ where
             // no cache is configured) runs again: queue records coordinate
             // calls, they do not hold answers.
             QueueStatus::Succeeded => {
-                enqueue = reenqueue_with_fresh_budget(
-                    queue.as_ref(),
-                    &queue_id,
-                    &descriptor,
-                    capability,
-                    kind,
-                    &request_hash,
-                    &idempotency_key,
-                    config,
-                    &enqueue.item.item_id,
-                )
-                .await?;
+                enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
             QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {}
         }
     }
 
     loop {
-        if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
-            receipts
-                .record(
-                    ReceiptStatus::CacheHit,
-                    Some(&enqueue.item),
-                    Some(cached.trace()),
-                    None,
-                    AttemptTiming::NONE,
-                )
-                .await;
-            return return_cached_response(
-                cached,
-                &descriptor,
-                trace_sink,
-                request_hash.clone(),
-                Some(enqueue.item.item_id.clone()),
-            )
-            .await;
+        if let Some(cached) = this.cached::<Res>(Some(&enqueue.item)).await? {
+            return Ok(cached);
         }
         let attempt_started = std::time::Instant::now();
         let permit = match &runtime.admission {
             Some(admission) => Some(
                 admission
-                    .acquire(&queue_id, config.max_in_flight.max(1))
+                    .acquire(queue_id, config.max_in_flight.max(1))
                     .await?,
             ),
             None => None,
         };
         let throttle_started = std::time::Instant::now();
-        wait_for_model_cooldown(queue.as_ref(), &queue_id).await?;
-        wait_for_model_budget(&queue_id, config, request).await?;
+        wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
+        wait_for_model_budget(queue_id, config, &this.request).await?;
         let attempt_throttle = throttle_started.elapsed();
         throttle_wait += attempt_throttle;
-        let claimed = match queue
-            .claim_item(
-                &enqueue.item.item_id,
-                worker_id,
-                config.lease_seconds,
-                Some(config.max_in_flight.max(1)),
-            )
-            .await
-        {
-            Ok(claimed) => claimed,
+
+        // From its claim on, the attempt runs as a task of its own, holding
+        // the model slot. A caller that stops waiting for it does not cancel
+        // the provider call or strand the item's lease.
+        let attempt = tokio::spawn(run_attempt(
+            call_state.clone(),
+            enqueue.item.item_id.clone(),
+            permit,
+            provider.clone(),
+            call.clone(),
+            AttemptClock {
+                queued_at,
+                attempt_started,
+                attempt_throttle,
+                throttle_wait,
+            },
+        ));
+        let ended = match attempt.await {
+            Ok(ended) => ended?,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(err) => {
+                return Err(ModelError::Queue(format!(
+                    "{} attempt did not finish: {err}",
+                    queue_id.0
+                )));
+            }
+        };
+        match ended {
+            AttemptEnd::Succeeded(response) => return Ok(response),
+            AttemptEnd::Retry(Some(next)) => enqueue = *next,
+            AttemptEnd::Retry(None) => {}
             // A retention-bounded backend evicted the item after it turned
             // terminal: queue the request again.
-            Err(symbiotic_queue::QueueError::NotFound(_)) => {
-                drop(permit);
-                enqueue = fresh_enqueue().await.map_err(queue_error)?;
-                continue;
-            }
-            Err(err) => return Err(queue_error(err)),
-        };
-        let Some(item) = claimed else {
-            drop(permit);
-            match queue
-                .get_item(&enqueue.item.item_id)
-                .await
-                .map_err(queue_error)?
-            {
-                None => {
-                    enqueue = fresh_enqueue().await.map_err(queue_error)?;
-                    continue;
-                }
-                Some(current) => match current.status {
-                    QueueStatus::Dead if budget_renewed(&current, config) => {
-                        enqueue = reenqueue_with_fresh_budget(
-                            queue.as_ref(),
-                            &queue_id,
-                            &descriptor,
-                            capability,
-                            kind,
-                            &request_hash,
-                            &idempotency_key,
-                            config,
-                            &current.item_id,
-                        )
-                        .await?;
+            AttemptEnd::Missing => enqueue = this.enqueue().await?,
+            AttemptEnd::NotClaimed => {
+                match queue
+                    .get_item(&enqueue.item.item_id)
+                    .await
+                    .map_err(queue_error)?
+                {
+                    None => {
+                        enqueue = this.enqueue().await?;
                         continue;
                     }
-                    QueueStatus::Dead => {
-                        let dead_err = dead_item_retry_error(&current);
-                        if let Some(next) = reenqueue_dead_item(
-                            queue.as_ref(),
-                            &queue_id,
-                            &descriptor,
-                            capability,
-                            kind,
-                            &request_hash,
-                            &idempotency_key,
-                            &current,
-                            config,
-                            &dead_err,
-                        )
-                        .await?
-                        {
-                            enqueue = next;
-                        } else {
-                            return Err(exhausted_request_error(
-                                &queue_id, &current, config, &dead_err,
-                            ));
+                    Some(current) => match current.status {
+                        QueueStatus::Dead if budget_renewed(&current, config) => {
+                            enqueue = this.renew_budget(&current.item_id).await?;
+                            continue;
                         }
-                    }
-                    QueueStatus::Succeeded => {
-                        if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
-                            receipts
-                                .record(
-                                    ReceiptStatus::CacheHit,
-                                    Some(&current),
-                                    Some(cached.trace()),
-                                    None,
-                                    AttemptTiming::NONE,
-                                )
-                                .await;
-                            return return_cached_response(
-                                cached,
-                                &descriptor,
-                                trace_sink,
-                                request_hash.clone(),
-                                Some(current.item_id),
-                            )
-                            .await;
+                        QueueStatus::Dead => {
+                            let dead_err = dead_item_retry_error(&current);
+                            if let Some(next) = this.continue_chain(&current, &dead_err).await? {
+                                enqueue = next;
+                            } else {
+                                return Err(exhausted_request_error(
+                                    queue_id, &current, config, &dead_err,
+                                ));
+                            }
                         }
-                        enqueue = reenqueue_with_fresh_budget(
-                            queue.as_ref(),
-                            &queue_id,
-                            &descriptor,
-                            capability,
-                            kind,
-                            &request_hash,
-                            &idempotency_key,
-                            config,
-                            &current.item_id,
-                        )
-                        .await?;
-                        continue;
-                    }
-                    QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {}
-                },
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            continue;
-        };
-
-        // Queue wait of this attempt: admission plus claim, without throttle.
-        let attempt_throttle_ms = u64::try_from(attempt_throttle.as_millis()).unwrap_or(u64::MAX);
-        let attempt_queue_wait_ms = elapsed_ms(attempt_started).saturating_sub(attempt_throttle_ms);
-        receipts
-            .record(
-                ReceiptStatus::Running,
-                Some(&item),
-                None,
-                None,
-                AttemptTiming {
-                    queue_wait_ms: Some(attempt_queue_wait_ms),
-                    throttle_wait_ms: Some(attempt_throttle_ms),
-                    provider_ms: None,
-                },
-            )
-            .await;
-        let heartbeat = spawn_queue_heartbeat(
-            queue.clone(),
-            item.item_id.clone(),
-            worker_id.clone(),
-            config.lease_seconds,
-        );
-        let provider_started = std::time::Instant::now();
-        let result = if let Some(timeout) = config.request_timeout_seconds {
-            match tokio::time::timeout(
-                Duration::from_secs(timeout),
-                call(provider.clone(), request.clone()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(ModelError::Timeout(format!(
-                    "{} timed out after {}s",
-                    queue_id.0, timeout
-                ))),
-            }
-        } else {
-            call(provider.clone(), request.clone()).await
-        };
-        let provider_ms = elapsed_ms(provider_started);
-        let failed_timing = || AttemptTiming {
-            queue_wait_ms: None,
-            throttle_wait_ms: None,
-            provider_ms: Some(provider_ms),
-        };
-
-        match result {
-            Ok(mut response) => {
-                let mut trace = response.trace().clone();
-                trace.queue_item_id = Some(item.item_id.clone());
-                trace.request_hash = request_hash.clone();
-                let queued_ms = provider_started.duration_since(queued_at).as_millis() as u64;
-                let throttle_wait_ms = throttle_wait.as_millis() as u64;
-                trace.timing.queued_ms = Some(queued_ms);
-                trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
-                trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
-                trace.timing.provider_ms = Some(provider_ms);
-                trace.timing.total_ms = Some(queued_at.elapsed().as_millis() as u64);
-                if let Some(trace_sink) = trace_sink {
-                    trace_sink
-                        .record_model_invocation(trace.clone())
-                        .await
-                        .map_err(|err| ModelError::Provider(err.to_string()))?;
+                        QueueStatus::Succeeded => {
+                            if let Some(cached) = this.cached::<Res>(Some(&current)).await? {
+                                return Ok(cached);
+                            }
+                            enqueue = this.renew_budget(&current.item_id).await?;
+                            continue;
+                        }
+                        QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {}
+                    },
                 }
-                response.set_trace(trace.clone());
-                if let Some(cache) = &cache {
-                    let value = serde_json::to_value(&response)
-                        .map_err(|err| ModelError::Cache(err.to_string()))?;
-                    cache.store(&entry, &value)?;
-                }
-                let completed = queue.complete(&item.item_id, worker_id).await;
-                heartbeat.abort();
-                drop(permit);
-                completed.map_err(queue_error)?;
-                receipts
-                    .record(
-                        ReceiptStatus::Succeeded,
-                        Some(&item),
-                        Some(&trace),
-                        None,
-                        AttemptTiming {
-                            queue_wait_ms: None,
-                            throttle_wait_ms: None,
-                            provider_ms: Some(provider_ms),
-                        },
-                    )
-                    .await;
-                return Ok(response);
-            }
-            Err(err) if is_retryable(&err, config) => {
-                receipts
-                    .record(
-                        ReceiptStatus::Failed,
-                        Some(&item),
-                        None,
-                        Some(err.to_string()),
-                        failed_timing(),
-                    )
-                    .await;
-                let delay_ms =
-                    retry_delay_ms(item.attempt, config, &item.item_id, &request_hash, &err);
-                if is_transient(&err) {
-                    note_model_cooldown(queue.as_ref(), &queue_id, &err, delay_ms).await?;
-                }
-                // One exact deadline, kept by the backend: this caller and any
-                // duplicate waiting on the item retry no earlier than it.
-                let outcome = queue
-                    .fail_with(
-                        &item.item_id,
-                        worker_id,
-                        Failure {
-                            error: err.to_string(),
-                            error_class: Some(error_class(&err)),
-                            run_after: Some(
-                                Utc::now() + ChronoDuration::milliseconds(delay_ms as i64),
-                            ),
-                        },
-                    )
-                    .await;
-                heartbeat.abort();
-                drop(permit);
-                let outcome = outcome.map_err(queue_error)?;
-                if outcome == FailOutcome::MovedToDead {
-                    let dead_item = queue
-                        .get_item(&item.item_id)
-                        .await
-                        .map_err(queue_error)?
-                        .unwrap_or(item);
-                    if let Some(next) = reenqueue_dead_item(
-                        queue.as_ref(),
-                        &queue_id,
-                        &descriptor,
-                        capability,
-                        kind,
-                        &request_hash,
-                        &idempotency_key,
-                        &dead_item,
-                        config,
-                        &err,
-                    )
-                    .await?
-                    {
-                        enqueue = next;
-                        continue;
-                    }
-                    emit_failure_trace(
-                        &descriptor,
-                        trace_sink,
-                        Some(dead_item.item_id.clone()),
-                        request_hash.clone(),
-                        request_sensitivity(request),
-                        err.to_string(),
-                    )
-                    .await?;
-                    return Err(exhausted_request_error(&queue_id, &dead_item, config, &err));
-                }
-            }
-            Err(err) => {
-                receipts
-                    .record(
-                        ReceiptStatus::Failed,
-                        Some(&item),
-                        None,
-                        Some(err.to_string()),
-                        failed_timing(),
-                    )
-                    .await;
-                let failed = queue
-                    .fail_with(
-                        &item.item_id,
-                        worker_id,
-                        Failure {
-                            error: err.to_string(),
-                            error_class: Some(error_class(&err)),
-                            run_after: None,
-                        },
-                    )
-                    .await;
-                heartbeat.abort();
-                drop(permit);
-                failed.map_err(queue_error)?;
-                emit_failure_trace(
-                    &descriptor,
-                    trace_sink,
-                    Some(item.item_id),
-                    request_hash.clone(),
-                    request_sensitivity(request),
-                    err.to_string(),
-                )
-                .await?;
-                return Err(err);
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
 }
 
+/// When an attempt started and what it waited for, for its receipts and trace.
 #[cfg(feature = "queue")]
-fn spawn_queue_heartbeat(
-    queue: Arc<dyn QueueBackend>,
+struct AttemptClock {
+    /// When the call joined the queue.
+    queued_at: std::time::Instant,
+    /// When this attempt started waiting for a model slot.
+    attempt_started: std::time::Instant,
+    /// This attempt's cooldown and rate-bucket wait.
+    attempt_throttle: Duration,
+    /// The call's cooldown and rate-bucket wait over all its attempts.
+    throttle_wait: Duration,
+}
+
+/// How an attempt ended, as far as its caller's loop is concerned.
+#[cfg(feature = "queue")]
+enum AttemptEnd<Res> {
+    Succeeded(Res),
+    /// A retryable failure is recorded. The request's next attempt runs on
+    /// this item once its retry time comes (`None`), or on the next item of
+    /// its retry chain.
+    Retry(Option<Box<EnqueueOutcome>>),
+    /// Not claimable now: an identical call holds it, its retry time has not
+    /// come, or it has finished.
+    NotClaimed,
+    /// The backend no longer holds the item.
+    Missing,
+}
+
+/// One attempt of a queued call, from claiming its item to recording the
+/// outcome.
+///
+/// `run_queued` runs it as a task of its own and awaits it, so the runtime,
+/// not the caller, owns the attempt once it holds a lease. A caller that
+/// stops waiting (a dropped future, a timeout around the call) does not
+/// cancel the provider call: the attempt still records its result or error
+/// class, fills the response cache, completes or fails its item and frees
+/// the model slot, and identical requests find the outcome through
+/// deduplication and the cache. Every path after a successful claim
+/// releases the item's lease. The call is bounded by the policy's
+/// `request_timeout_seconds`, not by any caller.
+#[cfg(feature = "queue")]
+async fn run_attempt<P, Req, Res, F, Fut>(
+    call_state: Arc<QueuedCall<Req>>,
     item_id: QueueItemId,
-    worker_id: String,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    provider: P,
+    call: F,
+    clock: AttemptClock,
+) -> Result<AttemptEnd<Res>, ModelError>
+where
+    Req: Clone,
+    Res: Serialize + TraceCarrier,
+    F: FnOnce(P, Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Res, ModelError>>,
+{
+    let this = call_state.as_ref();
+    let queue = this.queue.as_ref();
+    let config = &this.config;
+    let worker_id = this.worker_id.as_str();
+    let item = match queue
+        .claim_item(
+            &item_id,
+            worker_id,
+            config.lease_seconds,
+            Some(config.max_in_flight.max(1)),
+        )
+        .await
+    {
+        Ok(Some(item)) => item,
+        Ok(None) => return Ok(AttemptEnd::NotClaimed),
+        Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
+        Err(err) => return Err(queue_error(err)),
+    };
+
+    // Queue wait of this attempt: admission plus claim, without throttle.
+    let attempt_throttle_ms = u64::try_from(clock.attempt_throttle.as_millis()).unwrap_or(u64::MAX);
+    let attempt_queue_wait_ms =
+        elapsed_ms(clock.attempt_started).saturating_sub(attempt_throttle_ms);
+    this.receipts
+        .record(
+            ReceiptStatus::Running,
+            Some(&item),
+            None,
+            None,
+            AttemptTiming {
+                queue_wait_ms: Some(attempt_queue_wait_ms),
+                throttle_wait_ms: Some(attempt_throttle_ms),
+                provider_ms: None,
+            },
+        )
+        .await;
+    let provider_started = std::time::Instant::now();
+    let result = holding_lease(
+        queue,
+        &item.item_id,
+        worker_id,
+        config.lease_seconds,
+        within_timeout(
+            &this.queue_id,
+            config.request_timeout_seconds,
+            call(provider, this.request.clone()),
+        ),
+    )
+    .await;
+    let provider_ms = elapsed_ms(provider_started);
+    let failed_timing = || AttemptTiming {
+        queue_wait_ms: None,
+        throttle_wait_ms: None,
+        provider_ms: Some(provider_ms),
+    };
+
+    match result {
+        Ok(mut response) => {
+            let mut trace = response.trace().clone();
+            trace.queue_item_id = Some(item.item_id.clone());
+            trace.request_hash = this.request_hash.clone();
+            let queued_ms = provider_started.duration_since(clock.queued_at).as_millis() as u64;
+            let throttle_wait_ms = clock.throttle_wait.as_millis() as u64;
+            trace.timing.queued_ms = Some(queued_ms);
+            trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
+            trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
+            trace.timing.provider_ms = Some(provider_ms);
+            trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
+            response.set_trace(trace.clone());
+            // Complete the item even when the trace or cache write failed,
+            // so the failure cannot leave it running.
+            let recorded = this.record_success(&trace, &response).await;
+            let completed = queue.complete(&item.item_id, worker_id).await;
+            drop(permit);
+            recorded?;
+            completed.map_err(queue_error)?;
+            this.receipts
+                .record(
+                    ReceiptStatus::Succeeded,
+                    Some(&item),
+                    Some(&trace),
+                    None,
+                    AttemptTiming {
+                        queue_wait_ms: None,
+                        throttle_wait_ms: None,
+                        provider_ms: Some(provider_ms),
+                    },
+                )
+                .await;
+            Ok(AttemptEnd::Succeeded(response))
+        }
+        Err(err) if is_retryable(&err, config) => {
+            this.receipts
+                .record(
+                    ReceiptStatus::Failed,
+                    Some(&item),
+                    None,
+                    Some(err.to_string()),
+                    failed_timing(),
+                )
+                .await;
+            let delay_ms = retry_delay_ms(
+                item.attempt,
+                config,
+                &item.item_id,
+                &this.request_hash,
+                &err,
+            );
+            let cooled = if is_transient(&err) {
+                note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
+            } else {
+                Ok(())
+            };
+            // One exact deadline, kept by the backend: this caller and any
+            // duplicate waiting on the item retry no earlier than it. The
+            // failure is recorded even when the cooldown could not be.
+            let failed = queue
+                .fail_with(
+                    &item.item_id,
+                    worker_id,
+                    Failure {
+                        error: err.to_string(),
+                        error_class: Some(error_class(&err)),
+                        run_after: Some(Utc::now() + ChronoDuration::milliseconds(delay_ms as i64)),
+                    },
+                )
+                .await;
+            drop(permit);
+            cooled?;
+            if failed.map_err(queue_error)? == FailOutcome::RetryScheduled {
+                return Ok(AttemptEnd::Retry(None));
+            }
+            let dead_item = queue
+                .get_item(&item.item_id)
+                .await
+                .map_err(queue_error)?
+                .unwrap_or(item);
+            if let Some(next) = this.continue_chain(&dead_item, &err).await? {
+                return Ok(AttemptEnd::Retry(Some(Box::new(next))));
+            }
+            emit_failure_trace(
+                &this.descriptor,
+                &this.trace_sink,
+                Some(dead_item.item_id.clone()),
+                this.request_hash.clone(),
+                this.sensitivity,
+                err.to_string(),
+            )
+            .await?;
+            Err(exhausted_request_error(
+                &this.queue_id,
+                &dead_item,
+                config,
+                &err,
+            ))
+        }
+        Err(err) => {
+            this.receipts
+                .record(
+                    ReceiptStatus::Failed,
+                    Some(&item),
+                    None,
+                    Some(err.to_string()),
+                    failed_timing(),
+                )
+                .await;
+            let failed = queue
+                .fail_with(
+                    &item.item_id,
+                    worker_id,
+                    Failure {
+                        error: err.to_string(),
+                        error_class: Some(error_class(&err)),
+                        run_after: None,
+                    },
+                )
+                .await;
+            drop(permit);
+            failed.map_err(queue_error)?;
+            emit_failure_trace(
+                &this.descriptor,
+                &this.trace_sink,
+                Some(item.item_id),
+                this.request_hash.clone(),
+                this.sensitivity,
+                err.to_string(),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
+/// `call`, failed as a timeout once `timeout_seconds` have passed.
+#[cfg(feature = "queue")]
+async fn within_timeout<T>(
+    queue_id: &QueueId,
+    timeout_seconds: Option<u64>,
+    call: impl std::future::Future<Output = Result<T, ModelError>>,
+) -> Result<T, ModelError> {
+    let Some(timeout) = timeout_seconds else {
+        return call.await;
+    };
+    tokio::time::timeout(Duration::from_secs(timeout), call)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ModelError::Timeout(format!(
+                "{} timed out after {}s",
+                queue_id.0, timeout
+            )))
+        })
+}
+
+/// Run `call` while renewing its item's lease every third of the lease.
+///
+/// The renewal is part of this future, not a task of its own, so it cannot
+/// outlive the call: it ends when the call does, or earlier once a renewal
+/// fails because the lease was lost.
+#[cfg(feature = "queue")]
+async fn holding_lease<T>(
+    queue: &dyn QueueBackend,
+    item_id: &QueueItemId,
+    worker_id: &str,
     lease_seconds: u64,
-) -> tokio::task::JoinHandle<()> {
-    let interval_seconds = (lease_seconds / 3).clamp(1, 60);
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(interval_seconds);
+    call: impl std::future::Future<Output = T>,
+) -> T {
+    let renew = async {
+        let interval = Duration::from_secs((lease_seconds / 3).clamp(1, 60));
         loop {
             tokio::time::sleep(interval).await;
             if queue
-                .heartbeat(&item_id, &worker_id, lease_seconds)
+                .heartbeat(item_id, worker_id, lease_seconds)
                 .await
                 .is_err()
             {
-                break;
+                return;
             }
         }
-    })
+    };
+    let mut call = std::pin::pin!(call);
+    tokio::select! {
+        biased;
+        output = &mut call => output,
+        () = renew => call.await,
+    }
 }
 
 #[async_trait]
@@ -2226,10 +2353,10 @@ async fn return_cached_response<Res: TraceCarrier>(
 }
 
 #[cfg(feature = "queue")]
-fn request_sensitivity<T: Serialize>(request: &T) -> Sensitivity {
-    serde_json::to_value(request)
-        .ok()
-        .and_then(|value| value.get("sensitivity").cloned())
+fn request_sensitivity(request: &Value) -> Sensitivity {
+    request
+        .get("sensitivity")
+        .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or(Sensitivity::Shareable)
 }

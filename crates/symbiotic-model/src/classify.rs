@@ -577,7 +577,7 @@ where
             ModelCapability::Classify,
             "classify",
             Some(cache_scope),
-            &request,
+            request,
             |inner: P, request| async move { inner.classify(request).await },
             self.inner.clone(),
         )

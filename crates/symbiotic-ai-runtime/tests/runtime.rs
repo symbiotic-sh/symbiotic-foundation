@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use symbiotic_ai_runtime::model::{ChatMessage, ModelCapability, ProviderAuthMode, ProviderClass};
 use symbiotic_ai_runtime::{
-    ChatProvider, ChatRequest, ChatResponse, InMemoryReceiptSink, ModelBinding, ModelError,
-    ModelProvider, ModelQueueConfig, ProviderDescriptor, ReceiptStatus, ResponseCacheMode, Runtime,
-    RuntimeConfig,
+    ChatProvider, ChatRequest, ChatResponse, DirResponseCache, InMemoryReceiptSink, ModelBinding,
+    ModelError, ModelProvider, ModelQueueConfig, ProviderDescriptor, ReceiptStatus,
+    ResponseCacheMode, Runtime, RuntimeConfig,
 };
 use symbiotic_core::{ModelIdentity, Sensitivity, TraceId};
 use symbiotic_trace::{InvocationOutcome, ModelInvocationTrace};
@@ -61,6 +61,7 @@ struct Loopback {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     fail: Option<Arc<ModelError>>,
+    delay: Duration,
 }
 
 impl Loopback {
@@ -77,7 +78,13 @@ impl Loopback {
             active: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
             fail: None,
+            delay: Duration::from_millis(15),
         }
+    }
+
+    fn slow(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     fn unavailable(self) -> Self {
@@ -102,7 +109,7 @@ impl ChatProvider for Loopback {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        tokio::time::sleep(self.delay).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         if let Some(err) = &self.fail {
             return Err(match err.as_ref() {
@@ -445,4 +452,122 @@ async fn an_exhausted_error_keeps_its_class_after_a_restart() {
     assert!(matches!(again, ModelError::Provider(_)), "{again:?}");
     assert!(again.to_string().contains("exhausted"), "{again}");
     assert_eq!(broken.calls.load(Ordering::SeqCst), 1);
+}
+
+/// A 3 s lease, renewed every second.
+fn leased() -> ModelQueueConfig {
+    ModelQueueConfig {
+        lease_seconds: 3,
+        ..policy()
+    }
+}
+
+/// The reported defect: a job timeout gives up on the first call while the
+/// provider works, and the identical call behind it must still finish.
+async fn an_abandoned_call_does_not_block_the_identical_request_behind_it(runtime: Runtime) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_500));
+    let chat = runtime
+        .chat(ModelBinding::new(raw.clone()).with_policy(leased()))
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_millis(500), chat.chat(request("same"))).await;
+    assert!(first.is_err(), "the first caller stops waiting");
+
+    let second = tokio::time::timeout(Duration::from_secs(20), chat.chat(request("same")))
+        .await
+        .expect("the identical request finishes")
+        .unwrap();
+    assert!(second.text.ends_with(":same"), "{}", second.text);
+}
+
+/// An identical caller already waiting, and one arriving later, both get the
+/// abandoned call's answer from one provider call.
+async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
+    runtime: Runtime,
+    cache: ResponseCacheMode,
+) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
+    let chat = runtime
+        .chat(
+            ModelBinding::new(raw.clone())
+                .with_policy(leased())
+                .with_response_cache(cache),
+        )
+        .unwrap();
+
+    let waiter = tokio::spawn({
+        let chat = chat.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            chat.chat(request("shared")).await
+        }
+    });
+    let first =
+        tokio::time::timeout(Duration::from_millis(300), chat.chat(request("shared"))).await;
+    assert!(first.is_err(), "the first caller stops waiting");
+
+    let waited = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the identical waiter finishes")
+        .unwrap()
+        .unwrap();
+    let later = tokio::time::timeout(Duration::from_secs(5), chat.chat(request("shared")))
+        .await
+        .expect("the later identical request finishes")
+        .unwrap();
+    assert_eq!(waited.text, later.text);
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "one provider call answered all three callers"
+    );
+}
+
+/// `MemoryQueue`.
+mod in_memory {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_abandoned_call_does_not_block_the_identical_request_behind_it() {
+        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(
+            Runtime::in_memory(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call() {
+        // An in-memory runtime caches nothing by default; a host cache
+        // answers the later callers.
+        let cache = tempfile::tempdir().unwrap();
+        super::a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
+            Runtime::in_memory(),
+            ResponseCacheMode::Custom(Arc::new(DirResponseCache::new(cache.path()))),
+        )
+        .await;
+    }
+}
+
+/// `SqliteQueue` in a state directory.
+mod persistent {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_abandoned_call_does_not_block_the_identical_request_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(persistent(
+            dir.path(),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call() {
+        let dir = tempfile::tempdir().unwrap();
+        super::a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
+            persistent(dir.path()),
+            ResponseCacheMode::Default,
+        )
+        .await;
+    }
 }

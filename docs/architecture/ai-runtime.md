@@ -70,6 +70,34 @@ Measured on one laptop with a 15 ms loopback provider, cap 64, 3,000 calls on
 one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
 1,750 calls/s.
 
+## Calls in flight
+
+Once an attempt claims its queue item, the runtime owns it, not the caller.
+The attempt runs as a task of its own, and the caller awaits its handle.
+Dropping the caller's future (a job timeout, `tokio::time::timeout` around
+`chat()`) therefore does not cancel the provider call. The attempt:
+
+- finishes the provider call, bounded by `request_timeout_seconds`;
+- records its receipts and trace, and stores the response in the cache when
+  one applies;
+- completes the item, or fails it with its error class and retry deadline;
+- keeps its model slot until then, so an abandoned call still counts against
+  `max_in_flight`.
+
+An identical caller waiting on the item, or a later identical request, gets
+the result through deduplication and the cache. Without a cache, it runs the
+request again once the item has finished, as for any finished request.
+
+The attempt renews its lease every third of `lease_seconds` while the
+provider works. The renewal is part of the attempt's own future, so it ends
+with the call and cannot outlive it. It also stops once a renewal fails
+because the lease was lost. Every exit of an attempt releases the lease,
+including a failed trace, cache or cooldown write.
+
+There is no cancellation API. A provider that panics propagates the panic to
+the waiting caller; its lease is not renewed and expires after
+`lease_seconds`, as after a crash.
+
 ## Shared limits
 
 Every provider handed out for one queue shares the limits below. By default a

@@ -1,6 +1,7 @@
 //! Queued-provider behaviour hosts depend on: shared admission, usage
 //! receipts, retry timing and classification, eviction recovery, request
-//! capture and the response-cache seam. Loopback providers only.
+//! capture, the response-cache seam, and attempts that outlive a caller who
+//! stopped waiting. Loopback providers only.
 #![cfg(feature = "queue")]
 
 use async_trait::async_trait;
@@ -16,9 +17,10 @@ use symbiotic_model::{
     ProviderClass, ProviderDescriptor, QueuedChatProvider, ReceiptStatus, ResponseCache,
 };
 use symbiotic_queue::{
-    ClaimRequest, EnqueueOutcome, EnqueueRequest, FailOutcome, MemoryQueue, QueueBackend,
-    QueueError, QueueItem,
+    ClaimRequest, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure, MemoryQueue, QueueBackend,
+    QueueError, QueueItem, QueueStatus,
 };
+use symbiotic_queue_sqlite::SqliteQueue;
 use symbiotic_trace::{
     CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
@@ -120,8 +122,10 @@ impl ChatProvider for Loopback {
         self.starts.lock().unwrap().push(Instant::now());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
+        // Count the call out even when it is cancelled mid-flight.
+        let _active = Leaves(&self.active);
         tokio::time::sleep(self.delay).await;
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        drop(_active);
         let failure = {
             let mut failures = self.failures.lock().unwrap();
             (!failures.is_empty()).then(|| failures.remove(0))
@@ -159,6 +163,15 @@ impl ChatProvider for Loopback {
             },
             raw_provider_response: None,
         })
+    }
+}
+
+/// Decrements a gauge when dropped.
+struct Leaves<'a>(&'a AtomicUsize);
+
+impl Drop for Leaves<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -823,4 +836,397 @@ async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
         2,
         "the fresh budget is still inside its renewal interval"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Once an attempt holds its lease, the runtime owns it, not the caller
+// ---------------------------------------------------------------------------
+
+/// A 3 s lease, renewed every second, and a single attempt per request.
+fn leased() -> ModelQueueConfig {
+    ModelQueueConfig {
+        lease_seconds: 3,
+        logical_retry_attempts: 1,
+        retry_attempts: 1,
+        ..config()
+    }
+}
+
+/// Forwards to a backend and counts lease renewals.
+struct CountsRenewals {
+    inner: Arc<dyn QueueBackend>,
+    renewals: AtomicUsize,
+}
+
+impl CountsRenewals {
+    fn renewals(&self) -> usize {
+        self.renewals.load(Ordering::SeqCst)
+    }
+}
+
+fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
+    Arc::new(CountsRenewals {
+        inner,
+        renewals: AtomicUsize::new(0),
+    })
+}
+
+/// One test per backend for each scenario below.
+macro_rules! on_both_backends {
+    ($($scenario:ident),* $(,)?) => {
+        mod memory {
+            use super::*;
+            $(
+                #[tokio::test]
+                async fn $scenario() {
+                    super::$scenario("memory", counted(Arc::new(MemoryQueue::new()))).await;
+                }
+            )*
+        }
+        mod sqlite {
+            use super::*;
+            $(
+                #[tokio::test]
+                async fn $scenario() {
+                    let queue = SqliteQueue::in_memory().unwrap();
+                    super::$scenario("sqlite", counted(Arc::new(queue))).await;
+                }
+            )*
+        }
+    };
+}
+
+on_both_backends!(
+    an_abandoned_call_completes_and_answers_the_next_identical_request,
+    an_abandoned_call_that_fails_records_its_class_and_releases_its_lease,
+    lease_renewal_ends_with_its_call_when_the_caller_left,
+    a_failed_cache_write_still_releases_the_lease,
+    an_abandoned_call_keeps_its_model_slot_until_it_finishes,
+    a_provider_panic_reaches_its_caller_and_ends_lease_renewal,
+);
+
+#[async_trait]
+impl QueueBackend for CountsRenewals {
+    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+        self.inner.enqueue(request).await
+    }
+    async fn enqueue_replacing(
+        &self,
+        request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        self.inner.enqueue_replacing(request, current).await
+    }
+    async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
+        self.inner.claim(request).await
+    }
+    async fn claim_item(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_in_flight: Option<usize>,
+    ) -> Result<Option<QueueItem>, QueueError> {
+        self.inner
+            .claim_item(item_id, worker_id, lease_seconds, max_in_flight)
+            .await
+    }
+    async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
+        self.inner.get_item(item_id).await
+    }
+    async fn heartbeat(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<(), QueueError> {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .heartbeat(item_id, worker_id, lease_seconds)
+            .await
+    }
+    async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
+        self.inner.complete(item_id, worker_id).await
+    }
+    async fn fail(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        error: &str,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner
+            .fail(item_id, worker_id, error, retry_after_seconds)
+            .await
+    }
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner.fail_with(item_id, worker_id, failure).await
+    }
+    async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
+        self.inner.reclaim_expired_leases(queue_id).await
+    }
+    async fn cooldown_until(
+        &self,
+        queue_id: &QueueId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, QueueError> {
+        self.inner.cooldown_until(queue_id).await
+    }
+    async fn note_cooldown(
+        &self,
+        queue_id: &QueueId,
+        until: chrono::DateTime<Utc>,
+    ) -> Result<(), QueueError> {
+        self.inner.note_cooldown(queue_id, until).await
+    }
+}
+
+/// Start `text` and stop waiting after `after`, as a job timeout would,
+/// while the provider is still working.
+async fn abandon(provider: &QueuedChatProvider<Loopback>, text: &str, after: Duration) {
+    let waited = tokio::time::timeout(after, provider.chat(request(text))).await;
+    assert!(
+        waited.is_err(),
+        "the caller must stop waiting while the provider works"
+    );
+}
+
+/// The item of the first call `receipts` saw queued.
+fn queued_item(receipts: &InMemoryReceiptSink) -> QueueItemId {
+    receipts
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.status == ReceiptStatus::Queued)
+        .and_then(|receipt| receipt.item_id.clone())
+        .expect("the call was queued")
+}
+
+/// `item_id` once it has left `Running`.
+async fn settled(queue: &CountsRenewals, item_id: &QueueItemId, within: Duration) -> QueueItem {
+    let deadline = Instant::now() + within;
+    loop {
+        let item = queue.get_item(item_id).await.unwrap().expect("item exists");
+        if item.status != QueueStatus::Running {
+            return item;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the item is still Running after {within:?}: its lease was renewed {} times, \
+             now until {:?}",
+            queue.renewals(),
+            item.lease_until
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// No lease is renewed from now on: waits over two renewal intervals.
+async fn assert_no_more_renewals(queue: &CountsRenewals, backend: &str) {
+    let before = queue.renewals();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        queue.renewals(),
+        before,
+        "{backend}: a lease was renewed after its call ended"
+    );
+}
+
+async fn an_abandoned_call_completes_and_answers_the_next_identical_request(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let cache = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_500));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            response_cache_dir: Some(cache.path().to_path_buf()),
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone());
+
+    abandon(&provider, "abandoned", Duration::from_millis(300)).await;
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(5)).await;
+    assert_eq!(item.status, QueueStatus::Succeeded, "{backend}");
+    assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
+
+    let answer = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("abandoned")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the identical request finishes"))
+        .unwrap();
+    assert_eq!(answer.text, "abandoned", "{backend}");
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "{backend}: answered from the cache without a second provider call"
+    );
+}
+
+async fn an_abandoned_call_that_fails_records_its_class_and_releases_its_lease(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity())
+        .slow(Duration::from_millis(1_500))
+        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+
+    abandon(&provider, "doomed", Duration::from_millis(300)).await;
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(5)).await;
+    assert_eq!(
+        item.status,
+        QueueStatus::Dead,
+        "{backend}: its only attempt failed"
+    );
+    assert_eq!(
+        item.last_error_class.as_deref(),
+        Some("unavailable"),
+        "{backend}"
+    );
+    assert!(
+        item.lease_owner.is_none() && item.lease_until.is_none(),
+        "{backend}: {item:?}"
+    );
+
+    // The next identical request reports the recorded failure and does
+    // not pay for another provider call.
+    let err = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("doomed")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the identical request finishes"))
+        .unwrap_err();
+    assert!(
+        matches!(err, ModelError::Unavailable(_)),
+        "{backend}: {err:?}"
+    );
+    assert!(err.to_string().contains("exhausted"), "{backend}: {err}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+async fn lease_renewal_ends_with_its_call_when_the_caller_left(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(2_200));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+
+    abandon(&provider, "renewed", Duration::from_millis(300)).await;
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(5)).await;
+    assert_eq!(item.status, QueueStatus::Succeeded, "{backend}");
+    assert!(
+        queue.renewals() >= 1,
+        "{backend}: the lease is renewed while the provider works"
+    );
+    assert_no_more_renewals(&queue, backend).await;
+}
+
+/// A response cache that cannot store.
+struct FullCache;
+
+impl ResponseCache for FullCache {
+    fn load(&self, _entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError> {
+        Ok(None)
+    }
+
+    fn store(&self, _entry: &CacheEntry<'_>, _response: &Value) -> Result<(), ModelError> {
+        Err(ModelError::Cache("disk full".to_string()))
+    }
+}
+
+async fn a_failed_cache_write_still_releases_the_lease(backend: &str, queue: Arc<CountsRenewals>) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_200));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased())
+        .with_receipt_sink(receipts.clone())
+        .with_response_cache(Arc::new(FullCache));
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        provider.chat(request("uncacheable")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+    .unwrap_err();
+    assert!(matches!(err, ModelError::Cache(_)), "{backend}: {err:?}");
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
+    assert_eq!(
+        item.status,
+        QueueStatus::Succeeded,
+        "{backend}: the provider answered"
+    );
+    assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
+    assert_no_more_renewals(&queue, backend).await;
+}
+
+async fn an_abandoned_call_keeps_its_model_slot_until_it_finishes(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
+    let provider =
+        queued(raw.clone(), queue.clone(), leased()).with_admission(ModelAdmission::new());
+
+    abandon(&provider, "first", Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(5), provider.chat(request("second")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the next call gets the model's slot"))
+        .unwrap();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2, "{backend}");
+    assert_eq!(
+        raw.peak.load(Ordering::SeqCst),
+        1,
+        "{backend}: the next call waited for the abandoned one"
+    );
+}
+
+/// A chat provider with a bug: it panics mid-call.
+#[derive(Clone)]
+struct PanicsMidCall {
+    descriptor: ProviderDescriptor,
+    delay: Duration,
+}
+
+impl ModelProvider for PanicsMidCall {
+    fn descriptor(&self) -> &ProviderDescriptor {
+        &self.descriptor
+    }
+}
+
+#[async_trait]
+impl ChatProvider for PanicsMidCall {
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        tokio::time::sleep(self.delay).await;
+        panic!("provider bug");
+    }
+}
+
+async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let provider = QueuedChatProvider::new(
+        PanicsMidCall {
+            descriptor: Loopback::new(unique_identity()).descriptor,
+            delay: Duration::from_millis(1_600),
+        },
+        queue.clone(),
+        "worker",
+        leased(),
+    );
+    let call = tokio::spawn(async move { provider.chat(request("boom")).await });
+    let err = call.await.expect_err("the call panics");
+    assert!(err.is_panic(), "{backend}: {err:?}");
+    assert!(
+        queue.renewals() >= 1,
+        "{backend}: the lease is renewed while the provider works"
+    );
+    assert_no_more_renewals(&queue, backend).await;
 }
