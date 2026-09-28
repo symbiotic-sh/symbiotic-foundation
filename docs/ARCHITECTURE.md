@@ -28,12 +28,17 @@ flowchart TB
     Queue["symbiotic-queue\ndurable work contracts"]
     Trace["symbiotic-trace\ninvocation traces and sinks"]
     Model["symbiotic-model\nprovider-neutral model contracts"]
+    AiRuntime["symbiotic-ai-runtime\nstateful provider runtime"]
+    Sqlite["symbiotic-queue-sqlite\npersistent backend"]
 
     Core --> Queue
     Core --> Trace
     Core --> Model
     Queue --> Trace
     Trace --> Model
+    Model --> AiRuntime
+    Queue --> Sqlite
+    Sqlite --> AiRuntime
 
     Runtime["Symbiotic runtime\npolicy, Gatekeeper, Vault, schedulers"] --> Queue
     Runtime --> Model
@@ -73,8 +78,11 @@ Owns durable execution vocabulary:
 
 It must not know about models, prompts, tokens, provider auth, usage, or cost.
 
-The first implementation is a local SQLite backend, the separate
-`symbiotic-queue-sqlite` crate. The contracts above need no storage, and a
+Two backends implement it. `MemoryQueue` lives in this crate: it is
+in-process, has no storage dependency and keeps a bounded terminal history.
+The local SQLite backend is the separate `symbiotic-queue-sqlite` crate. Both
+pass the shared conformance checks (`queue_backend_conformance!`, feature
+`conformance`). The contracts above need no storage, and a
 separate crate (not a feature) keeps it that way in any build: feature
 unification cannot add SQLite to a graph that names only the contracts
 (`symbiotic-trace`, `symbiotic-model`'s queue runtime, or a host with its own
@@ -121,6 +129,9 @@ and HTTP providers alone, so a host that schedules calls its own way can use
 them without the queue runtime. Neither configuration links SQLite.
 `crates/symbiotic-model/tests/feature_graph.rs` checks the dependency graphs.
 
+Hosts get queued providers from `symbiotic-ai-runtime` (below). Using the
+`Queued*` types directly is unsupported outside Foundation.
+
 Known-model execution defaults live in `default_model_queue_config`. The current
 DeepSeek `deepseek-flash` name and retained `deepseek-v4-flash` name resolve the
 same existing 2,000-request queue policy. This is a configured limit, not a
@@ -134,6 +145,15 @@ enforcement remain with the consuming execution adapter.
 an advisory `ModelPricing` of $0.042 per million input tokens with free output.
 `ModelCapabilities::pricing` is additive (serde default `None`); hosts use it
 for estimates, and provider-reported cost stays in trace metadata.
+
+### `symbiotic-ai-runtime`
+
+The one way hosts run model calls. `Runtime::open(RuntimeConfig { state_dir, .. })`
+returns a runtime that hands out ready `Arc<dyn …Provider>`s per binding. It
+owns queueing, retries, per-model shared limits, cooldowns, attempt budgets,
+the response cache, traces, receipts and persistence: SQLite under
+`state_dir`, or in memory. It is the only crate besides the SQLite backend that
+links SQLite. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
 
 ### `symbiotic-trace`
 

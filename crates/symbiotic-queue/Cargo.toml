@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "Provider-neutral durable queue contracts"
 
+[features]
+# The shared `QueueBackend` conformance checks (`conformance` module and the
+# `queue_backend_conformance!` macro), for backend crates' tests.
+conformance = []
+
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true

@@ -2,8 +2,14 @@
 
 Reusable Rust contracts for durable AI work:
 
+- `symbiotic-ai-runtime` — **the entry point for model calls.** Open one
+  `Runtime` (persistent with a state directory, in memory without) and get
+  ready chat, embedding, rerank and classifier providers. Queueing, retries,
+  limits, cooldowns, attempt budgets, caching, traces, usage receipts and
+  persistence are internal. See [docs/architecture/ai-runtime.md](docs/architecture/ai-runtime.md).
 - `symbiotic-core` — tiny shared vocabulary and identifiers.
-- `symbiotic-queue` — durable execution queue traits and state vocabulary; no
+- `symbiotic-queue` — durable execution queue traits and state vocabulary,
+  plus the in-process `MemoryQueue` backend and a backend conformance suite; no
   storage dependency.
 - `symbiotic-queue-sqlite` — the local SQLite backend (`SqliteQueue`) for those
   traits.
@@ -12,7 +18,9 @@ Reusable Rust contracts for durable AI work:
   probabilities, served by TypeSafe System One or any chat model). The
   queue-bound `Queued*` wrappers are its default `queue` feature;
   `default-features = false` gives the contracts and HTTP providers without the
-  queue runtime. Neither configuration links SQLite.
+  queue runtime. Neither configuration links SQLite. Hosts use the queued
+  providers through `symbiotic-ai-runtime`; building them directly is
+  unsupported.
 - `symbiotic-trace` — normalized invocation traces and pluggable sinks.
 - `symbiotic-portability` — external record interchange validation and explicit
   CSV/Markdown presentations; no Memory or application mutation dependency.

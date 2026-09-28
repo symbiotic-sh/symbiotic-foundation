@@ -121,7 +121,15 @@ Status: in progress.
 - add `capture_model_trace` or accept an Archive trace document from the host;
 - preserve benchmark reproducibility.
 
-Implemented now: memory CLI HTTP providers can use foundation model queues,
+Foundation side done (#8): `symbiotic-ai-runtime` is the stateful provider
+runtime consumers call instead of assembling queues. It has an in-memory
+backend and the parity Memory's local stack needed: shared per-model
+admission, rate burst, per-attempt receipts, retry base delay and
+provider-error retries, eviction recovery, request capture, and a
+response-cache seam for legacy cache layouts. Consumer adoption is tracked in
+each consumer repository.
+
+Implemented earlier: memory CLI HTTP providers can use foundation model queues,
 workflow LongMemEval row execution uses a foundation SQLite queue, provider and
 queue trace sinks can be attached from the benchmark runner, external score
 artifacts can be recorded into manifests, answer-only reruns can reuse complete

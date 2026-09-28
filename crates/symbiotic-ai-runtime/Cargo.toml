@@ -1,0 +1,27 @@
+[package]
+name = "symbiotic-ai-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stateful AI provider runtime: hands out ready queued providers and owns their persistence"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+symbiotic-core = { path = "../symbiotic-core" }
+symbiotic-model = { path = "../symbiotic-model" }
+symbiotic-queue = { path = "../symbiotic-queue" }
+# The persistent backend. This crate is the only Foundation crate that links
+# SQLite; `symbiotic-model` and `symbiotic-queue` stay storage-free.
+symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
+symbiotic-trace = { path = "../symbiotic-trace" }
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+tempfile = "3"

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/symbiotic-ai-runtime",
     "crates/symbiotic-core",
     "crates/symbiotic-queue",
     "crates/symbiotic-queue-sqlite",

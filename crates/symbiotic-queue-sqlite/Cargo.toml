@@ -16,6 +16,7 @@ symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-queue = { path = "../symbiotic-queue" }
 
 [dev-dependencies]
+symbiotic-queue = { path = "../symbiotic-queue", features = ["conformance"] }
 futures = "0.3"
 tempfile = "3"
 tokio.workspace = true

@@ -3,8 +3,9 @@
 //! The queue contracts and the model contracts never pull in SQLite: the SQLite
 //! queue backend is the separate `symbiotic-queue-sqlite` crate, so feature
 //! unification with other crates in the same build cannot bring it in. Without
-//! default features, `symbiotic-model` also leaves out its queue runtime. The
-//! checks read the resolved graphs of this workspace's lockfile
+//! default features, `symbiotic-model` also leaves out its queue runtime. Only
+//! the SQLite backend and `symbiotic-ai-runtime`, which persists through it,
+//! link SQLite. The checks read the resolved graphs of this workspace's lockfile
 //! (`cargo tree --locked --offline`).
 
 use std::process::Command;
@@ -99,4 +100,14 @@ fn sqlite_backend_is_its_own_crate() {
     let graph = normal_dependencies("symbiotic-queue-sqlite", &[]);
     assert!(has_package(&graph, "rusqlite"), "{graph}");
     assert!(has_package(&graph, "symbiotic-queue"), "{graph}");
+}
+
+#[test]
+fn only_the_ai_runtime_and_the_sqlite_backend_link_sqlite() {
+    let runtime = normal_dependencies("symbiotic-ai-runtime", &[]);
+    assert!(has_package(&runtime, "rusqlite"), "{runtime}");
+    assert!(has_package(&runtime, "symbiotic-queue-sqlite"), "{runtime}");
+    for crate_name in ["symbiotic-core", "symbiotic-portability"] {
+        assert_no_sqlite(&normal_dependencies(crate_name, &[]));
+    }
 }

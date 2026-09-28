@@ -1,0 +1,469 @@
+//! Stateful AI provider runtime.
+//!
+//! A host opens one [`Runtime`] and asks it for ready providers. It never
+//! builds queues, backends or queued wrappers itself:
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use symbiotic_ai_runtime::{ModelBinding, Runtime, RuntimeConfig};
+//! # fn demo(raw_chat: Arc<dyn symbiotic_ai_runtime::ChatProvider>) -> Result<(), symbiotic_ai_runtime::ModelError> {
+//! let runtime = Runtime::open(RuntimeConfig {
+//!     state_dir: Some("/var/lib/host/ai-runtime".into()),
+//!     ..RuntimeConfig::default()
+//! })?;
+//! let chat = runtime.chat(ModelBinding::new(raw_chat))?;
+//! # Ok(()) }
+//! ```
+//!
+//! The runtime owns retries and backoff, rate and concurrency limits,
+//! cooldowns, attempt budgets, the response cache, traces, usage receipts
+//! and persistence:
+//!
+//! - With a `state_dir`, state lives in a private SQLite database there, so
+//!   cooldowns, attempt budgets and cached responses survive restarts.
+//! - Without one, state is in memory and ends with the process.
+//!
+//! Every provider handed out for one model (`queue_id`) shares one
+//! concurrency cap, one pair of rate buckets and one cooldown, whichever role
+//! or caller uses it. Two bindings of one model must agree on those limits.
+//!
+//! This is the only Foundation crate that links SQLite.
+
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use symbiotic_core::{QueueId, QueueItemId};
+use symbiotic_model::{
+    ModelAdmission, QueuedChatProvider, QueuedClassifierProvider, QueuedEmbeddingProvider,
+    QueuedRerankProvider,
+};
+use symbiotic_queue::{MemoryQueue, QueueBackend};
+use symbiotic_queue_sqlite::SqliteQueue;
+use symbiotic_trace::TraceSink;
+
+mod maintained;
+
+use maintained::MaintainedQueue;
+
+/// The provider contracts and HTTP providers, for implementing or
+/// constructing the raw transports a [`ModelBinding`] wraps. Its `Queued*`
+/// types and queue wiring are the runtime's internals; consumer use of them is
+/// unsupported.
+pub use symbiotic_model as model;
+pub use symbiotic_model::{
+    CacheEntry, ChatProvider, ChatRequest, ChatResponse, ClassifierProvider, ClassifyRequest,
+    ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
+    InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig, ProviderDescriptor,
+    QueueReceipt, QueueReceiptSink, ReceiptStatus, RerankProvider, RerankRequest, RerankResponse,
+    ResponseCache, default_model_queue_config,
+};
+
+/// File name of the persistent queue database inside `state_dir`.
+pub const QUEUE_DATABASE: &str = "queue.sqlite";
+/// Directory of the runtime's response cache inside `state_dir`.
+pub const RESPONSES_DIR: &str = "responses";
+
+/// How the runtime is opened.
+#[derive(Clone)]
+pub struct RuntimeConfig {
+    /// Private directory for persistent state. `None` keeps all state in
+    /// memory. A missing directory is created owner-only.
+    pub state_dir: Option<PathBuf>,
+    /// Lease-owner prefix for this process. Defaults to the crate name and
+    /// process id; a random suffix keeps restarts distinct.
+    pub worker_id: Option<String>,
+    /// Receives a trace for every provider call and cache hit, unless a
+    /// binding supplies its own.
+    pub trace_sink: Option<Arc<dyn TraceSink>>,
+    /// Receives per-attempt usage receipts, unless a binding supplies its
+    /// own.
+    pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
+    /// Persistent state older than this is retired: queue records of
+    /// finished calls, and calls orphaned by a crash. Seven days by default.
+    /// Retiring a finished call only drops its deduplication record; cached
+    /// responses stay.
+    pub retention: Duration,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: None,
+            worker_id: None,
+            trace_sink: None,
+            receipt_sink: None,
+            retention: Duration::from_secs(7 * 24 * 60 * 60),
+        }
+    }
+}
+
+/// Where a bound provider's responses are cached.
+#[derive(Clone, Default)]
+pub enum ResponseCacheMode {
+    /// The runtime's own cache when it is persistent, scoped to the
+    /// provider's descriptor; no cache when it is in memory.
+    #[default]
+    Default,
+    /// No response cache: every call reaches the provider.
+    Off,
+    /// A host cache, for example one that reads a layout that predates the
+    /// runtime. See [`ResponseCache`].
+    Custom(Arc<dyn ResponseCache>),
+}
+
+/// A raw provider (the transport) plus how the runtime should run it.
+#[derive(Clone)]
+pub struct ModelBinding<P> {
+    pub provider: P,
+    /// Queue policy. `None` uses the catalog default for the provider's
+    /// model ([`default_model_queue_config`]), else [`ModelQueueConfig::default`].
+    /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
+    pub policy: Option<ModelQueueConfig>,
+    pub response_cache: ResponseCacheMode,
+    /// Overrides the runtime's receipt sink for this binding.
+    pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
+    /// Overrides the runtime's trace sink for this binding.
+    pub trace_sink: Option<Arc<dyn TraceSink>>,
+}
+
+impl<P> ModelBinding<P> {
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider,
+            policy: None,
+            response_cache: ResponseCacheMode::Default,
+            receipt_sink: None,
+            trace_sink: None,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: ModelQueueConfig) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    pub fn with_response_cache(mut self, mode: ResponseCacheMode) -> Self {
+        self.response_cache = mode;
+        self
+    }
+
+    pub fn with_receipt_sink(mut self, sink: Arc<dyn QueueReceiptSink>) -> Self {
+        self.receipt_sink = Some(sink);
+        self
+    }
+
+    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace_sink = Some(sink);
+        self
+    }
+}
+
+/// The limits every binding of one model shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SharedLimits {
+    max_in_flight: usize,
+    requests_per_minute: Option<u32>,
+    input_units_per_minute: Option<u64>,
+    rate_burst_seconds: u64,
+}
+
+impl SharedLimits {
+    fn of(policy: &ModelQueueConfig) -> Self {
+        Self {
+            max_in_flight: policy.max_in_flight.max(1),
+            requests_per_minute: policy.requests_per_minute,
+            input_units_per_minute: policy.input_units_per_minute,
+            rate_burst_seconds: policy.rate_burst_seconds,
+        }
+    }
+}
+
+struct Inner {
+    queue: Arc<dyn QueueBackend>,
+    admission: ModelAdmission,
+    limits: Mutex<HashMap<String, SharedLimits>>,
+    state_dir: Option<PathBuf>,
+    worker_id: String,
+    trace_sink: Option<Arc<dyn TraceSink>>,
+    receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
+}
+
+/// One stateful AI runtime. Clones share all state.
+#[derive(Clone)]
+pub struct Runtime {
+    inner: Arc<Inner>,
+}
+
+impl Runtime {
+    /// Open the runtime. With a `state_dir`, this creates the directory if
+    /// needed, opens (or creates) its queue database and retires state older
+    /// than the retention window.
+    pub fn open(config: RuntimeConfig) -> Result<Self, ModelError> {
+        let worker_id = config
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| format!("symbiotic-ai-runtime:{}", std::process::id()));
+        let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
+        let queue: Arc<dyn QueueBackend> = match &config.state_dir {
+            Some(dir) => Arc::new(open_persistent_queue(dir, config.retention)?),
+            None => Arc::new(MemoryQueue::new()),
+        };
+        Ok(Self {
+            inner: Arc::new(Inner {
+                queue,
+                admission: ModelAdmission::new(),
+                limits: Mutex::new(HashMap::new()),
+                state_dir: config.state_dir,
+                worker_id,
+                trace_sink: config.trace_sink,
+                receipt_sink: config.receipt_sink,
+            }),
+        })
+    }
+
+    /// An in-memory runtime with default settings.
+    pub fn in_memory() -> Self {
+        Self::open(RuntimeConfig::default()).expect("an in-memory runtime needs no I/O")
+    }
+
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.inner.state_dir.as_deref()
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.inner.state_dir.is_some()
+    }
+
+    /// A queued chat provider for `binding`.
+    pub fn chat<C>(&self, binding: ModelBinding<C>) -> Result<Arc<dyn ChatProvider>, ModelError>
+    where
+        C: ChatProvider + Clone + 'static,
+    {
+        let bound = self.bind(binding.provider.descriptor(), &binding)?;
+        let provider =
+            QueuedChatProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
+                .with_admission(self.inner.admission.clone());
+        Ok(Arc::new(bound.sinks.apply_chat(provider)))
+    }
+
+    /// A queued embedding provider for `binding`.
+    pub fn embedding<E>(
+        &self,
+        binding: ModelBinding<E>,
+    ) -> Result<Arc<dyn EmbeddingProvider>, ModelError>
+    where
+        E: EmbeddingProvider + Clone + 'static,
+    {
+        let bound = self.bind(binding.provider.descriptor(), &binding)?;
+        let provider = QueuedEmbeddingProvider::new(
+            binding.provider,
+            bound.queue,
+            bound.worker_id,
+            bound.policy,
+        )
+        .with_admission(self.inner.admission.clone());
+        Ok(Arc::new(bound.sinks.apply_embedding(provider)))
+    }
+
+    /// A queued rerank provider for `binding`.
+    pub fn rerank<R>(&self, binding: ModelBinding<R>) -> Result<Arc<dyn RerankProvider>, ModelError>
+    where
+        R: RerankProvider + Clone + 'static,
+    {
+        let bound = self.bind(binding.provider.descriptor(), &binding)?;
+        let provider =
+            QueuedRerankProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
+                .with_admission(self.inner.admission.clone());
+        Ok(Arc::new(bound.sinks.apply_rerank(provider)))
+    }
+
+    /// A queued classifier for `binding`.
+    pub fn classifier<P>(
+        &self,
+        binding: ModelBinding<P>,
+    ) -> Result<Arc<dyn ClassifierProvider>, ModelError>
+    where
+        P: ClassifierProvider + Clone + 'static,
+    {
+        let bound = self.bind(binding.provider.descriptor(), &binding)?;
+        let provider = QueuedClassifierProvider::new(
+            binding.provider,
+            bound.queue,
+            bound.worker_id,
+            bound.policy,
+        )
+        .with_admission(self.inner.admission.clone());
+        Ok(Arc::new(bound.sinks.apply_classifier(provider)))
+    }
+
+    /// Resolve a binding's policy, check it against the model's shared
+    /// limits, and pick its cache and sinks.
+    fn bind<P>(
+        &self,
+        descriptor: &ProviderDescriptor,
+        binding: &ModelBinding<P>,
+    ) -> Result<Bound, ModelError> {
+        let queue_id = descriptor.queue_id();
+        let mut policy = binding
+            .policy
+            .clone()
+            .or_else(|| default_model_queue_config(&descriptor.identity))
+            .unwrap_or_default();
+        policy.max_in_flight = policy.max_in_flight.max(1);
+        policy.response_cache_dir = None;
+        self.register_limits(&queue_id, &policy)?;
+        let cache = match &binding.response_cache {
+            ResponseCacheMode::Off => None,
+            ResponseCacheMode::Custom(cache) => Some(cache.clone()),
+            ResponseCacheMode::Default => self.inner.state_dir.as_ref().map(|dir| {
+                Arc::new(DirResponseCache::new(
+                    dir.join(RESPONSES_DIR).join(descriptor_scope(descriptor)),
+                )) as Arc<dyn ResponseCache>
+            }),
+        };
+        Ok(Bound {
+            queue: self.inner.queue.clone(),
+            worker_id: self.inner.worker_id.clone(),
+            policy,
+            sinks: Sinks {
+                trace: binding
+                    .trace_sink
+                    .clone()
+                    .or_else(|| self.inner.trace_sink.clone()),
+                receipt: binding
+                    .receipt_sink
+                    .clone()
+                    .or_else(|| self.inner.receipt_sink.clone()),
+                cache,
+            },
+        })
+    }
+
+    fn register_limits(
+        &self,
+        queue_id: &QueueId,
+        policy: &ModelQueueConfig,
+    ) -> Result<(), ModelError> {
+        let limits = SharedLimits::of(policy);
+        let mut registered = self
+            .inner
+            .limits
+            .lock()
+            .map_err(|_| ModelError::Queue("runtime policy lock poisoned".to_string()))?;
+        match registered.get(&queue_id.0) {
+            Some(existing) if *existing != limits => Err(ModelError::InvalidRequest(format!(
+                "{} is already bound with limits {existing:?}; a binding asked for {limits:?}",
+                queue_id.0
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                self.inner
+                    .admission
+                    .register(queue_id, limits.max_in_flight)?;
+                registered.insert(queue_id.0.clone(), limits);
+                Ok(())
+            }
+        }
+    }
+}
+
+struct Bound {
+    queue: Arc<dyn QueueBackend>,
+    worker_id: String,
+    policy: ModelQueueConfig,
+    sinks: Sinks,
+}
+
+struct Sinks {
+    trace: Option<Arc<dyn TraceSink>>,
+    receipt: Option<Arc<dyn QueueReceiptSink>>,
+    cache: Option<Arc<dyn ResponseCache>>,
+}
+
+macro_rules! apply_sinks {
+    ($name:ident, $ty:ident) => {
+        fn $name<P>(self, mut provider: $ty<P>) -> $ty<P> {
+            if let Some(sink) = self.trace {
+                provider = provider.with_trace_sink(sink);
+            }
+            if let Some(sink) = self.receipt {
+                provider = provider.with_receipt_sink(sink);
+            }
+            if let Some(cache) = self.cache {
+                provider = provider.with_response_cache(cache);
+            }
+            provider
+        }
+    };
+}
+
+impl Sinks {
+    apply_sinks!(apply_chat, QueuedChatProvider);
+    apply_sinks!(apply_embedding, QueuedEmbeddingProvider);
+    apply_sinks!(apply_rerank, QueuedRerankProvider);
+    apply_sinks!(apply_classifier, QueuedClassifierProvider);
+}
+
+/// Cache subdirectory of one provider: a hash of its descriptor (identity,
+/// class, auth mode, metadata), so two models never read each other's
+/// responses.
+fn descriptor_scope(descriptor: &ProviderDescriptor) -> String {
+    let bytes = serde_json::to_vec(descriptor).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn open_persistent_queue(dir: &Path, retention: Duration) -> Result<MaintainedQueue, ModelError> {
+    create_private_dir(dir)?;
+    let path = dir.join(QUEUE_DATABASE);
+    create_private_file(&path)?;
+    let queue = SqliteQueue::open(&path).map_err(|err| ModelError::Queue(err.to_string()))?;
+    let queue = MaintainedQueue::new(queue, retention);
+    queue.maintain()?;
+    Ok(queue)
+}
+
+fn io_error(path: &Path, err: std::io::Error) -> ModelError {
+    ModelError::Queue(format!("runtime state {}: {err}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<(), ModelError> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|err| io_error(dir, err))
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> Result<(), ModelError> {
+    std::fs::create_dir_all(dir).map_err(|err| io_error(dir, err))
+}
+
+/// Create the database file owner-only before SQLite opens it; SQLite gives
+/// its journal files the same mode.
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> Result<(), ModelError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(io_error(path, err)),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_file(_path: &Path) -> Result<(), ModelError> {
+    Ok(())
+}

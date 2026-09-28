@@ -199,6 +199,75 @@ impl SqliteQueue {
         Ok(updated)
     }
 
+    /// Mark active items of every queue that have not changed since
+    /// `stale_before` (and hold no live lease) dead with `reason`, without
+    /// notifying the event sink. For startup and maintenance sweeps outside
+    /// an async context. Returns the number of items marked.
+    pub fn retire_stale_active(
+        &self,
+        stale_before: DateTime<Utc>,
+        reason: &str,
+    ) -> Result<usize, QueueError> {
+        if reason.trim().is_empty() {
+            return Err(QueueError::InvalidRequest(
+                "stale queue cleanup reason must not be empty".to_string(),
+            ));
+        }
+        let now = Utc::now();
+        let mut conn = self.conn.lock().map_err(lock_error)?;
+        let tx = conn.transaction().map_err(storage_error)?;
+        let items = stale_active_items_in_tx(&tx, None, stale_before, now)?;
+        let updated = tx
+            .execute(
+                "update queue_items
+                 set status = 'dead',
+                     lease_owner = null,
+                     lease_until = null,
+                     last_error = ?2,
+                     updated_at = ?3
+                 where status in ('pending', 'failed', 'running')
+                   and updated_at < ?1
+                   and (status != 'running' or lease_until is null or lease_until < ?3)",
+                params![ts(stale_before), reason, ts(now)],
+            )
+            .map_err(storage_error)?;
+        for mut item in items {
+            item.status = QueueStatus::Dead;
+            item.lease_owner = None;
+            item.lease_until = None;
+            item.last_error = Some(reason.to_string());
+            item.updated_at = now;
+            insert_event(&tx, &item, Some(reason.to_string()))?;
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(updated)
+    }
+
+    /// Delete terminal items (succeeded or dead) last updated before
+    /// `before`, and queue events older than it. Active items are kept
+    /// whatever their age. Returns the number of items deleted.
+    ///
+    /// A deleted terminal item no longer deduplicates its idempotency key:
+    /// the next request with that key is inserted afresh.
+    pub fn prune_terminal_before(&self, before: DateTime<Utc>) -> Result<usize, QueueError> {
+        let mut conn = self.conn.lock().map_err(lock_error)?;
+        let tx = conn.transaction().map_err(storage_error)?;
+        let deleted = tx
+            .execute(
+                "delete from queue_items
+                 where status in ('succeeded', 'dead') and updated_at < ?1",
+                params![ts(before)],
+            )
+            .map_err(storage_error)?;
+        tx.execute(
+            "delete from queue_events where timestamp < ?1",
+            params![ts(before)],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(deleted)
+    }
+
     fn record_event_sync(&self, item: &QueueItem, error: Option<String>) -> Result<(), QueueError> {
         let conn = self.conn.lock().map_err(lock_error)?;
         insert_event(&conn, item, error)?;
@@ -1362,6 +1431,37 @@ mod tests {
         let item = queue.get(&retried[0].item_id).unwrap().unwrap();
         assert_eq!(item.status, QueueStatus::Succeeded);
         assert_eq!(item.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn prune_removes_old_terminal_items_and_events_only() {
+        let queue = SqliteQueue::in_memory().unwrap();
+        let done = queue.enqueue(request("done")).await.unwrap().item;
+        let active = queue.enqueue(request("active")).await.unwrap().item;
+        queue
+            .claim_item(&done.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        queue.complete(&done.item_id, "worker").await.unwrap();
+        {
+            let conn = queue.conn.lock().unwrap();
+            let old = ts(Utc::now() - ChronoDuration::days(30));
+            conn.execute("update queue_items set updated_at = ?1", params![old])
+                .unwrap();
+            conn.execute("update queue_events set timestamp = ?1", params![old])
+                .unwrap();
+        }
+
+        let deleted = queue
+            .prune_terminal_before(Utc::now() - ChronoDuration::days(7))
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(queue.get(&done.item_id).unwrap().is_none());
+        assert!(queue.get(&active.item_id).unwrap().is_some());
+        assert!(queue.events().unwrap().is_empty());
+        let again = queue.enqueue(request("done")).await.unwrap();
+        assert_eq!(again.disposition, EnqueueDisposition::Inserted);
     }
 
     struct CountingSink(AtomicUsize);

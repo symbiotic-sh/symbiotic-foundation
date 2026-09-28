@@ -4,8 +4,10 @@
 //! `queue_id`; a backend enforces durable work semantics for that id.
 //!
 //! The contracts (`QueueBackend`, `QueueEventSink`, items, events, telemetry)
-//! need no storage, so this crate has no storage dependency. The local SQLite
-//! backend is the separate `symbiotic-queue-sqlite` crate.
+//! need no storage, so this crate has no storage dependency. It ships the
+//! in-process [`MemoryQueue`] backend; the local SQLite backend is the separate
+//! `symbiotic-queue-sqlite` crate. The `conformance` feature exposes the checks
+//! every backend must pass.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,6 +16,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use symbiotic_core::{QueueId, QueueItemId};
 use thiserror::Error;
+
+#[cfg(feature = "conformance")]
+pub mod conformance;
+mod memory;
+
+pub use memory::{DEFAULT_RETAINED_TERMINAL_ITEMS, MemoryQueue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

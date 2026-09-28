@@ -33,3 +33,7 @@ jobs:
         run: cargo test --workspace --locked
       - name: Test (symbiotic-model without default features)
         run: cargo test -p symbiotic-model --no-default-features --locked
+      # The in-process backend runs the shared conformance checks; the SQLite
+      # backend runs them through its dev-dependency on the feature.
+      - name: Test (queue backend conformance)
+        run: cargo test -p symbiotic-queue --features conformance --locked
