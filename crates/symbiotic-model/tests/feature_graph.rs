@@ -1,13 +1,15 @@
-//! Dependency-graph contract of the `queue` feature.
+//! Dependency-graph contract of the provider crates.
 //!
-//! Without default features, `symbiotic-model` is the provider contracts and
-//! HTTP providers alone, so a host can use them without linking SQLite. The
-//! default build keeps the queue runtime. Both are checked on the resolved
-//! graph of this workspace's lockfile (`cargo tree --locked --offline`).
+//! The queue contracts and the model contracts never pull in SQLite: the SQLite
+//! queue backend is the separate `symbiotic-queue-sqlite` crate, so feature
+//! unification with other crates in the same build cannot bring it in. Without
+//! default features, `symbiotic-model` also leaves out its queue runtime. The
+//! checks read the resolved graphs of this workspace's lockfile
+//! (`cargo tree --locked --offline`).
 
 use std::process::Command;
 
-fn normal_dependencies(extra: &[&str]) -> String {
+fn normal_dependencies(package: &str, extra: &[&str]) -> String {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
     let output = Command::new(cargo)
@@ -16,13 +18,13 @@ fn normal_dependencies(extra: &[&str]) -> String {
             "--manifest-path",
             manifest,
             "--package",
-            "symbiotic-model",
+            package,
             "--edges",
             "normal",
             "--prefix",
             "none",
             "--format",
-            "{p} {f}",
+            "{p}|{f}",
             "--locked",
             "--offline",
         ])
@@ -43,31 +45,58 @@ fn has_package(graph: &str, name: &str) -> bool {
         .any(|line| line.split_whitespace().next() == Some(name))
 }
 
-#[test]
-fn without_default_features_the_model_contract_links_no_sqlite() {
-    let graph = normal_dependencies(&["--no-default-features"]);
+/// The features enabled on `name` (the `{f}` column after `|`).
+fn features(graph: &str, name: &str) -> Vec<String> {
+    graph
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some(name))
+        .flat_map(|line| {
+            line.rsplit_once('|')
+                .map(|(_, features)| features.to_string())
+        })
+        .flat_map(|features| {
+            features
+                .split(',')
+                .map(str::trim)
+                .filter(|feature| !feature.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
 
-    assert!(!has_package(&graph, "rusqlite"), "{graph}");
-    assert!(!has_package(&graph, "libsqlite3-sys"), "{graph}");
-    // Traces still name the queue event contracts, never the SQLite backend.
+fn assert_no_sqlite(graph: &str) {
+    for name in ["rusqlite", "libsqlite3-sys", "symbiotic-queue-sqlite"] {
+        assert!(!has_package(graph, name), "{name} in:\n{graph}");
+    }
+}
+
+#[test]
+fn queue_contracts_never_link_sqlite() {
+    assert_no_sqlite(&normal_dependencies("symbiotic-queue", &[]));
+    assert_no_sqlite(&normal_dependencies("symbiotic-trace", &[]));
+}
+
+#[test]
+fn model_contract_links_no_sqlite_with_or_without_the_queue_runtime() {
+    let lean = normal_dependencies("symbiotic-model", &["--no-default-features"]);
+    assert_no_sqlite(&lean);
     assert!(
-        graph
-            .lines()
-            .filter(|line| line.starts_with("symbiotic-queue "))
-            .all(|line| !line.contains("sqlite")),
-        "{graph}"
+        !features(&lean, "symbiotic-model").contains(&"queue".to_string()),
+        "{lean}"
+    );
+
+    let default = normal_dependencies("symbiotic-model", &[]);
+    assert_no_sqlite(&default);
+    assert!(
+        features(&default, "symbiotic-model").contains(&"queue".to_string()),
+        "{default}"
     );
 }
 
 #[test]
-fn default_features_keep_the_queue_runtime() {
-    let graph = normal_dependencies(&[]);
-
-    assert!(
-        graph
-            .lines()
-            .any(|line| line.starts_with("symbiotic-model ") && line.contains("queue")),
-        "{graph}"
-    );
+fn sqlite_backend_is_its_own_crate() {
+    let graph = normal_dependencies("symbiotic-queue-sqlite", &[]);
+    assert!(has_package(&graph, "rusqlite"), "{graph}");
     assert!(has_package(&graph, "symbiotic-queue"), "{graph}");
 }

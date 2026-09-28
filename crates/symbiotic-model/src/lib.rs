@@ -2511,7 +2511,7 @@ mod tests {
     #[cfg(feature = "queue")]
     use std::time::Duration;
     #[cfg(feature = "queue")]
-    use symbiotic_queue::SqliteQueue;
+    use symbiotic_queue_sqlite::SqliteQueue;
 
     #[cfg(feature = "queue")]
     static TEST_QUEUE_COUNTER: AtomicUsize = AtomicUsize::new(0);

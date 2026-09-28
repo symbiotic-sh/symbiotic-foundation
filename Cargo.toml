@@ -2,6 +2,7 @@
 members = [
     "crates/symbiotic-core",
     "crates/symbiotic-queue",
+    "crates/symbiotic-queue-sqlite",
     "crates/symbiotic-model",
     "crates/symbiotic-trace",
     "crates/symbiotic-portability",

@@ -1,32 +1,39 @@
-//! Local SQLite queue backend, enabled by the default `sqlite` feature.
+//! Local SQLite backend for the `symbiotic-queue` contracts.
+//!
+//! A separate crate, so a graph that names only the queue contracts (traces,
+//! queue-bound model providers, hosts with their own queue) never contains
+//! SQLite, whatever features other crates in the same build enable.
 
-use super::*;
-use chrono::Duration as ChronoDuration;
+use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use symbiotic_core::{QueueId, QueueItemId};
+use symbiotic_queue::{
+    ClaimRequest, EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend,
+    QueueError, QueueEvent, QueueEventSink, QueueItem, QueueStatus,
+};
 
 /// Status as stored in the SQLite `status` column.
-impl QueueStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Dead => "dead",
-        }
+fn status_str(status: QueueStatus) -> &'static str {
+    match status {
+        QueueStatus::Pending => "pending",
+        QueueStatus::Running => "running",
+        QueueStatus::Succeeded => "succeeded",
+        QueueStatus::Failed => "failed",
+        QueueStatus::Dead => "dead",
     }
+}
 
-    fn from_str(value: &str) -> Result<Self, QueueError> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "running" => Ok(Self::Running),
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "dead" => Ok(Self::Dead),
-            other => Err(QueueError::Storage(format!("unknown queue status {other}"))),
-        }
+fn parse_status(value: &str) -> Result<QueueStatus, QueueError> {
+    match value {
+        "pending" => Ok(QueueStatus::Pending),
+        "running" => Ok(QueueStatus::Running),
+        "succeeded" => Ok(QueueStatus::Succeeded),
+        "failed" => Ok(QueueStatus::Failed),
+        "dead" => Ok(QueueStatus::Dead),
+        other => Err(QueueError::Storage(format!("unknown queue status {other}"))),
     }
 }
 
@@ -281,7 +288,7 @@ impl QueueBackend for SqliteQueue {
                     item.queue_id.0,
                     item.kind,
                     payload,
-                    item.status.as_str(),
+                    status_str(item.status),
                     item.attempt,
                     item.max_attempts,
                     ts(item.run_after),
@@ -523,7 +530,7 @@ impl QueueBackend for SqliteQueue {
                      last_error = ?4,
                      updated_at = ?5
                  where item_id = ?1",
-                params![item_id.0, status.as_str(), ts(run_after), error, ts(now)],
+                params![item_id.0, status_str(status), ts(run_after), error, ts(now)],
             )
             .map_err(storage_error)?;
             let updated = get_required(conn, item_id)?;
@@ -852,7 +859,7 @@ fn insert_event(
             item.item_id.0,
             item.queue_id.0,
             item.kind,
-            item.status.as_str(),
+            status_str(item.status),
             item.attempt,
             ts(Utc::now()),
             error
@@ -870,7 +877,7 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueItem> {
         queue_id: QueueId(row.get(1)?),
         kind: row.get(2)?,
         payload: serde_json::from_str(&payload_json).map_err(json_to_sql)?,
-        status: QueueStatus::from_str(&status).map_err(queue_to_sql)?,
+        status: parse_status(&status).map_err(queue_to_sql)?,
         attempt: row.get(5)?,
         max_attempts: row.get(6)?,
         run_after: parse_ts(row.get::<_, String>(7)?).map_err(queue_to_sql)?,
@@ -893,7 +900,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEvent> {
         item_id: QueueItemId(row.get(0)?),
         queue_id: QueueId(row.get(1)?),
         kind: row.get(2)?,
-        status: QueueStatus::from_str(&status).map_err(queue_to_sql)?,
+        status: parse_status(&status).map_err(queue_to_sql)?,
         attempt: row.get(4)?,
         timestamp: parse_ts(row.get::<_, String>(5)?).map_err(queue_to_sql)?,
         error: row.get(6)?,

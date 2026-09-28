@@ -1408,6 +1408,7 @@ dependencies = [
  "sha2",
  "symbiotic-core",
  "symbiotic-queue",
+ "symbiotic-queue-sqlite",
  "symbiotic-trace",
  "tempfile",
  "thiserror",
@@ -1435,12 +1436,26 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "rusqlite",
  "serde",
  "serde_json",
  "symbiotic-core",
  "tempfile",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "symbiotic-queue-sqlite"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "rusqlite",
+ "serde_json",
+ "symbiotic-core",
+ "symbiotic-queue",
+ "tempfile",
  "tokio",
 ]
 

@@ -29,11 +29,7 @@ jobs:
       # invocation, which would re-enable a default under test.
       - name: Clippy (symbiotic-model without default features)
         run: cargo clippy -p symbiotic-model --no-default-features --all-targets --locked -- -D warnings
-      - name: Clippy (symbiotic-queue without default features)
-        run: cargo clippy -p symbiotic-queue --no-default-features --all-targets --locked -- -D warnings
       - name: Test (default features)
         run: cargo test --workspace --locked
       - name: Test (symbiotic-model without default features)
         run: cargo test -p symbiotic-model --no-default-features --locked
-      - name: Test (symbiotic-queue without default features)
-        run: cargo test -p symbiotic-queue --no-default-features --locked

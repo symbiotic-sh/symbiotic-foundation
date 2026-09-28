@@ -1,22 +1,21 @@
 [package]
-name = "symbiotic-trace"
+name = "symbiotic-queue-sqlite"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Normalized invocation trace contracts and sinks"
+description = "Local SQLite backend for the symbiotic-queue contracts"
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
-serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-queue = { path = "../symbiotic-queue" }
-thiserror.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+futures = "0.3"
 tempfile = "3"
+tokio.workspace = true

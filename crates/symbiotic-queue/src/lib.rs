@@ -1,12 +1,11 @@
-//! Provider-neutral durable queue contracts and a local SQLite backend.
+//! Provider-neutral durable queue contracts.
 //!
 //! The queue is intentionally model-agnostic. Model/provider code chooses the
-//! `queue_id`; this crate enforces durable work semantics for that id.
+//! `queue_id`; a backend enforces durable work semantics for that id.
 //!
 //! The contracts (`QueueBackend`, `QueueEventSink`, items, events, telemetry)
-//! need no storage. The SQLite backend, [`SqliteQueue`], is behind the default
-//! `sqlite` feature; crates that only name the contracts depend on this crate
-//! with `default-features = false` and do not link SQLite.
+//! need no storage, so this crate has no storage dependency. The local SQLite
+//! backend is the separate `symbiotic-queue-sqlite` crate.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -168,11 +167,6 @@ pub trait QueueBackend: Send + Sync {
 pub trait QueueEventSink: Send + Sync {
     async fn record_queue_event(&self, event: QueueEvent);
 }
-
-#[cfg(feature = "sqlite")]
-mod sqlite;
-#[cfg(feature = "sqlite")]
-pub use sqlite::SqliteQueue;
 
 /// Latency distribution over millisecond samples (nearest-rank percentiles).
 ///

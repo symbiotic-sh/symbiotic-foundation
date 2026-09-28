@@ -73,10 +73,12 @@ Owns durable execution vocabulary:
 
 It must not know about models, prompts, tokens, provider auth, usage, or cost.
 
-The first implementation is a local SQLite backend in this crate, behind the
-default `sqlite` feature. The contracts above need no storage: crates that only
-name them (`symbiotic-trace`, and `symbiotic-model`'s queue runtime) depend on
-`symbiotic-queue` with `default-features = false`. The backend supports
+The first implementation is a local SQLite backend, the separate
+`symbiotic-queue-sqlite` crate. The contracts above need no storage, and a
+separate crate (not a feature) keeps it that way in any build: feature
+unification cannot add SQLite to a graph that names only the contracts
+(`symbiotic-trace`, `symbiotic-model`'s queue runtime, or a host with its own
+queue). The backend supports
 idempotent enqueue, active-key uniqueness across SQLite handles, claim leases,
 lease-owner checks, heartbeat, complete, fail/retry/dead-letter, cooldowns,
 expired-lease reclaim, queue events, reopen/resume tests, and multi-connection
@@ -116,8 +118,8 @@ The queue-bound wrappers (`QueuedChatProvider`, `QueuedEmbeddingProvider`,
 `QueuedRerankProvider`, `QueuedClassifierProvider`) are the default `queue`
 feature. With `default-features = false` the crate is the provider contracts
 and HTTP providers alone, so a host that schedules calls its own way can use
-them without the queue runtime and without linking SQLite.
-`crates/symbiotic-model/tests/feature_graph.rs` checks both dependency graphs.
+them without the queue runtime. Neither configuration links SQLite.
+`crates/symbiotic-model/tests/feature_graph.rs` checks the dependency graphs.
 
 Known-model execution defaults live in `default_model_queue_config`. The current
 DeepSeek `deepseek-flash` name and retained `deepseek-v4-flash` name resolve the

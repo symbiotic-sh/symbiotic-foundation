@@ -1642,7 +1642,7 @@ mod tests {
     #[cfg(feature = "queue")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "queue")]
-    use symbiotic_queue::SqliteQueue;
+    use symbiotic_queue_sqlite::SqliteQueue;
     #[cfg(feature = "queue")]
     use symbiotic_trace::InMemoryTraceSink;
 
