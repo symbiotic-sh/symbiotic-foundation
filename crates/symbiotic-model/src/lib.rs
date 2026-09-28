@@ -6,6 +6,12 @@
 //! The default `queue` feature adds the `Queued*` providers, which run calls
 //! through a `symbiotic-queue` backend. Without it, the crate is the provider
 //! contracts and HTTP providers alone: no queue runtime and no SQLite.
+//!
+//! Hosts do not assemble the queued providers themselves: `symbiotic-ai-runtime`
+//! opens one stateful runtime and hands out ready providers. The `Queued*`
+//! types, [`ModelQueueConfig`] wiring and the queue backends are public because
+//! that crate composes them; using them directly from a consumer is
+//! unsupported.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,8 +35,6 @@ use thiserror::Error;
 #[cfg(feature = "queue")]
 use chrono::Duration as ChronoDuration;
 #[cfg(feature = "queue")]
-use std::path::Path;
-#[cfg(feature = "queue")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "queue")]
 use std::time::Duration;
@@ -38,11 +42,21 @@ use std::time::Duration;
 use symbiotic_core::QueueItemId;
 #[cfg(feature = "queue")]
 use symbiotic_queue::{
-    EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend, QueueItem,
-    QueueStatus,
+    EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure, QueueBackend,
+    QueueItem, QueueStatus,
 };
 #[cfg(feature = "queue")]
 use symbiotic_trace::TraceSink;
+
+#[cfg(feature = "queue")]
+mod queue_runtime;
+#[cfg(feature = "queue")]
+pub use queue_runtime::{
+    CacheEntry, DirResponseCache, InMemoryReceiptSink, ModelAdmission, QueueReceipt,
+    QueueReceiptSink, ReceiptStatus, ResponseCache,
+};
+#[cfg(feature = "queue")]
+use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
 mod classify;
 #[cfg(feature = "queue")]
@@ -310,6 +324,36 @@ pub trait RerankProvider: ModelProvider {
 }
 
 #[async_trait]
+impl<T> ChatProvider for Arc<T>
+where
+    T: ChatProvider + ?Sized,
+{
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        (**self).chat(request).await
+    }
+}
+
+#[async_trait]
+impl<T> EmbeddingProvider for Arc<T>
+where
+    T: EmbeddingProvider + ?Sized,
+{
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
+        (**self).embed(request).await
+    }
+}
+
+#[async_trait]
+impl<T> RerankProvider for Arc<T>
+where
+    T: RerankProvider + ?Sized,
+{
+    async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
+        (**self).rerank(request).await
+    }
+}
+
+#[async_trait]
 pub trait CredentialResolver: Send + Sync {
     async fn resolve_auth(&self, mode: &ProviderAuthMode) -> Result<ResolvedAuth, ModelError>;
 }
@@ -409,6 +453,37 @@ pub struct ModelQueueConfig {
     pub requests_per_minute: Option<u32>,
     pub input_units_per_minute: Option<u64>,
     pub response_cache_dir: Option<PathBuf>,
+    /// Seconds of rate budget available as an initial burst. `0` (the
+    /// default) paces from the first request; `60` lets one minute's budget
+    /// through at once, as providers that meter per minute allow.
+    #[serde(default)]
+    pub rate_burst_seconds: u64,
+    /// First retry delay; it doubles per attempt up to 32x, capped at 30 s,
+    /// before jitter. The default is one second.
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub retry_base_delay_ms: u64,
+    /// Also retry `ModelError::Provider` failures (non-transient provider
+    /// answers such as a 4xx or an unparsable body). Off by default: only
+    /// unavailable, rate-limited and timed-out calls retry. Provider errors
+    /// never start a cooldown.
+    #[serde(default)]
+    pub retry_provider_errors: bool,
+    /// Write each request, serialized, to
+    /// `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued.
+    /// Debugging only: requests may contain sensitive text.
+    #[serde(default)]
+    pub request_debug_dir: Option<PathBuf>,
+    /// When a request's attempt budget ran out in an earlier call, a new call
+    /// for the same request gets a fresh budget once this many seconds have
+    /// passed. `None` (the default) keeps the exhausted budget while the queue
+    /// remembers the request, so a persistent runtime does not pay for it
+    /// again after a restart. `Some(0)` gives every call its own budget.
+    #[serde(default)]
+    pub budget_renewal_seconds: Option<u64>,
+}
+
+fn default_retry_base_delay_ms() -> u64 {
+    1_000
 }
 
 impl Default for ModelQueueConfig {
@@ -423,6 +498,11 @@ impl Default for ModelQueueConfig {
             requests_per_minute: None,
             input_units_per_minute: None,
             response_cache_dir: None,
+            rate_burst_seconds: 0,
+            retry_base_delay_ms: default_retry_base_delay_ms(),
+            retry_provider_errors: false,
+            request_debug_dir: None,
+            budget_renewal_seconds: None,
         }
     }
 }
@@ -446,6 +526,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             })
         }
         "chat:deepseek:deepseek-v4-pro" => Some(ModelQueueConfig {
@@ -458,6 +539,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: Some(600),
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         "chat:gemini:gemini-3.5-flash" => Some(ModelQueueConfig {
             max_in_flight: 100,
@@ -469,6 +551,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: Some(1_000),
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         "chat:gemini:gemini-3.1-pro-preview" => Some(ModelQueueConfig {
             max_in_flight: 500,
@@ -480,6 +563,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: Some(100),
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         "embedding:gemini:gemini-embedding-2" => Some(ModelQueueConfig {
             max_in_flight: 1_000,
@@ -491,6 +575,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: Some(4_500),
             input_units_per_minute: Some(5_000_000),
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         "embedding:openrouter:qwen/qwen3-embedding-8b"
         | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelQueueConfig {
@@ -503,6 +588,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: None,
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         // Nemotron free reranker: keep the elevated openrouter concurrency but cap the per-request
         // timeout at 60s (the free tier stalls rather than erroring) and let requests_per_minute fall
@@ -517,6 +603,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: None,
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         // TypeSafe System One (Jev 1.13). Account limits checked 2026-09-28:
         // 1,200 requests/min and 250,000 tokens/s (15M/min), adjusted
@@ -533,6 +620,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: Some(1_200),
             input_units_per_minute: Some(15_000_000),
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         // (openrouter qwen chat: removed the conservative 200/600rpm entry — falls through to the
         // generic operator=openrouter fallback at 1000; throttle reactively only if it starts 429ing.)
@@ -547,6 +635,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             })
         }
         // Sane default for any not-individually-catalogued OpenRouter model (chat or embedding):
@@ -563,6 +652,7 @@ pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueue
             requests_per_minute: None,
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         }),
         _ => None,
     }
@@ -671,13 +761,15 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
 }
 
 #[cfg(feature = "queue")]
+/// Queue-bound wrapper for a [`ChatProvider`].
+///
+/// Hosts get queued providers from `symbiotic-ai-runtime`'s `Runtime`, which
+/// owns the backend, admission, caches and sinks. Constructing this type
+/// directly is supported only inside Foundation.
 #[derive(Clone)]
 pub struct QueuedChatProvider<C> {
     inner: C,
-    queue: Arc<dyn QueueBackend>,
-    trace_sink: Option<Arc<dyn TraceSink>>,
-    worker_id: String,
-    config: ModelQueueConfig,
+    runtime: QueueRuntime,
 }
 
 #[cfg(feature = "queue")]
@@ -690,17 +782,11 @@ impl<C> QueuedChatProvider<C> {
     ) -> Self {
         Self {
             inner,
-            queue,
-            trace_sink: None,
-            worker_id: worker_id.into(),
-            config,
+            runtime: QueueRuntime::new(queue, worker_id.into(), config),
         }
     }
 
-    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
-        self.trace_sink = Some(sink);
-        self
-    }
+    queue_runtime_builders!();
 }
 
 #[cfg(feature = "queue")]
@@ -722,11 +808,8 @@ where
 {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         run_queued(
+            &self.runtime,
             self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
             ModelCapability::Chat,
             "chat",
             None,
@@ -739,13 +822,12 @@ where
 }
 
 #[cfg(feature = "queue")]
+/// Queue-bound wrapper for an [`EmbeddingProvider`]; see
+/// [`QueuedChatProvider`] for who constructs it.
 #[derive(Clone)]
 pub struct QueuedEmbeddingProvider<E> {
     inner: E,
-    queue: Arc<dyn QueueBackend>,
-    trace_sink: Option<Arc<dyn TraceSink>>,
-    worker_id: String,
-    config: ModelQueueConfig,
+    runtime: QueueRuntime,
 }
 
 #[cfg(feature = "queue")]
@@ -758,17 +840,11 @@ impl<E> QueuedEmbeddingProvider<E> {
     ) -> Self {
         Self {
             inner,
-            queue,
-            trace_sink: None,
-            worker_id: worker_id.into(),
-            config,
+            runtime: QueueRuntime::new(queue, worker_id.into(), config),
         }
     }
 
-    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
-        self.trace_sink = Some(sink);
-        self
-    }
+    queue_runtime_builders!();
 }
 
 #[cfg(feature = "queue")]
@@ -790,11 +866,8 @@ where
 {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         run_queued(
+            &self.runtime,
             self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
             ModelCapability::Embedding,
             "embedding",
             None,
@@ -811,15 +884,11 @@ where
 /// and [`QueuedEmbeddingProvider`]. Reranking is a first-class model seam (the
 /// recall cascade's relevance stage), so it earns the same idempotency,
 /// response-cache, cooldown, and trace machinery as chat and embedding rather
-/// than a bespoke rate limiter. See the convergence plan's Stage 4 / backlog #9
-/// ("QueuedRerankProvider lands, the engine Reranker becomes a shim").
+/// than a bespoke rate limiter.
 #[derive(Clone)]
 pub struct QueuedRerankProvider<R> {
     inner: R,
-    queue: Arc<dyn QueueBackend>,
-    trace_sink: Option<Arc<dyn TraceSink>>,
-    worker_id: String,
-    config: ModelQueueConfig,
+    runtime: QueueRuntime,
 }
 
 #[cfg(feature = "queue")]
@@ -832,17 +901,11 @@ impl<R> QueuedRerankProvider<R> {
     ) -> Self {
         Self {
             inner,
-            queue,
-            trace_sink: None,
-            worker_id: worker_id.into(),
-            config,
+            runtime: QueueRuntime::new(queue, worker_id.into(), config),
         }
     }
 
-    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
-        self.trace_sink = Some(sink);
-        self
-    }
+    queue_runtime_builders!();
 }
 
 #[cfg(feature = "queue")]
@@ -864,11 +927,8 @@ where
 {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
         run_queued(
+            &self.runtime,
             self.inner.descriptor().clone(),
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
             ModelCapability::Rerank,
             "rerank",
             None,
@@ -880,15 +940,99 @@ where
     }
 }
 
-// These arguments are the existing queue execution boundary; keep its behavior stable.
+/// Usage receipts of one queued call.
+#[cfg(feature = "queue")]
+struct CallReceipts {
+    sink: Option<Arc<dyn QueueReceiptSink>>,
+    queue_id: QueueId,
+    kind: String,
+    request_hash: String,
+    input_units: u64,
+}
+
+#[cfg(feature = "queue")]
+struct AttemptTiming {
+    queue_wait_ms: Option<u64>,
+    throttle_wait_ms: Option<u64>,
+    provider_ms: Option<u64>,
+}
+
+#[cfg(feature = "queue")]
+impl AttemptTiming {
+    const NONE: Self = Self {
+        queue_wait_ms: None,
+        throttle_wait_ms: None,
+        provider_ms: None,
+    };
+}
+
+#[cfg(feature = "queue")]
+impl CallReceipts {
+    async fn record(
+        &self,
+        status: ReceiptStatus,
+        item: Option<&QueueItem>,
+        trace: Option<&ModelInvocationTrace>,
+        error: Option<String>,
+        timing: AttemptTiming,
+    ) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        sink.record_receipt(QueueReceipt {
+            queue_id: self.queue_id.clone(),
+            kind: self.kind.clone(),
+            item_id: item.map(|item| item.item_id.clone()),
+            request_hash: self.request_hash.clone(),
+            status,
+            attempt: item.map_or(0, |item| item.attempt),
+            request_units: 1,
+            input_units: self.input_units,
+            usage: trace.map(|trace| trace.usage.clone()),
+            cache: trace.map(|trace| trace.cache.clone()),
+            metadata: trace.map_or(Value::Null, |trace| trace.metadata.clone()),
+            error,
+            queue_wait_ms: timing.queue_wait_ms,
+            throttle_wait_ms: timing.throttle_wait_ms,
+            provider_ms: timing.provider_ms,
+            timestamp: Utc::now(),
+        })
+        .await;
+    }
+}
+
+#[cfg(feature = "queue")]
+fn load_cached<Res: for<'de> Deserialize<'de>>(
+    cache: &Option<Arc<dyn ResponseCache>>,
+    entry: &CacheEntry<'_>,
+) -> Result<Option<Res>, ModelError> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    cache
+        .load(entry)?
+        .map(|value| {
+            serde_json::from_value(value).map_err(|err| ModelError::Cache(err.to_string()))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "queue")]
+fn queue_error(err: symbiotic_queue::QueueError) -> ModelError {
+    ModelError::Queue(err.to_string())
+}
+
+#[cfg(feature = "queue")]
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+// The arguments are the queue execution boundary: one queued call.
 #[cfg(feature = "queue")]
 #[allow(clippy::too_many_arguments)]
 async fn run_queued<P, Req, Res, Fut>(
+    runtime: &QueueRuntime,
     descriptor: ProviderDescriptor,
-    queue: Arc<dyn QueueBackend>,
-    trace_sink: Option<Arc<dyn TraceSink>>,
-    worker_id: String,
-    config: ModelQueueConfig,
     capability: ModelCapability,
     kind: &str,
     // Response-cache subdirectory under `kind`. `None` keeps the historical
@@ -907,23 +1051,46 @@ where
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send,
 {
+    let queue = &runtime.queue;
+    let trace_sink = &runtime.trace_sink;
+    let config = &runtime.config;
+    let worker_id = &runtime.worker_id;
+    let queue_id = runtime
+        .queue_id
+        .clone()
+        .unwrap_or_else(|| descriptor.queue_id());
     let request_hash = hash_json(request)?;
-    let cache_kind = match &cache_scope {
-        Some(scope) => format!("{kind}/{scope}"),
-        None => kind.to_string(),
+    let request_value =
+        serde_json::to_value(request).map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
+    let cache = runtime.cache();
+    let entry = CacheEntry {
+        kind,
+        scope: cache_scope.as_deref(),
+        request_hash: &request_hash,
+        request: &request_value,
     };
-    let cache_kind = cache_kind.as_str();
-    if let Some(cache_dir) = &config.response_cache_dir
-        && let Some(cached) = load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
-    {
-        return return_cached_response(
-            cached,
-            &descriptor,
-            &trace_sink,
-            request_hash.clone(),
-            None,
-        )
-        .await;
+    let receipts = CallReceipts {
+        sink: runtime.receipt_sink.clone(),
+        queue_id: queue_id.clone(),
+        kind: kind.to_string(),
+        request_hash: request_hash.clone(),
+        input_units: request.input_budget_units(),
+    };
+    if let Some(dir) = &config.request_debug_dir {
+        DirResponseCache::new(dir.clone()).store(&entry, &request_value)?;
+    }
+    if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
+        receipts
+            .record(
+                ReceiptStatus::CacheHit,
+                None,
+                Some(cached.trace()),
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
+        return return_cached_response(cached, &descriptor, trace_sink, request_hash.clone(), None)
+            .await;
     }
 
     let queued_at = std::time::Instant::now();
@@ -931,64 +1098,98 @@ where
     // trace can report the throttle-wait vs http-time split (the measured
     // lesson) without changing `queued_ms` semantics.
     let mut throttle_wait = Duration::ZERO;
-    let logical_state = LogicalRetryState {
-        attempts_used: 0,
-        max_attempts: config
-            .logical_retry_attempts
-            .max(config.retry_attempts)
-            .max(1),
-    };
-    let payload = model_queue_payload(&capability, &request_hash, &descriptor, logical_state);
-    let idempotency_key = Some(format!("{}:{request_hash}", descriptor.queue_id().0));
-    let mut enqueue = queue
-        .enqueue(EnqueueRequest {
-            queue_id: descriptor.queue_id(),
+    // The provider is part of the key: models pooled on one queue share its
+    // limits, never each other's attempt budgets or results.
+    let idempotency_key = Some(format!(
+        "{}:{}:{request_hash}",
+        queue_id.0,
+        hash_json(&descriptor)?
+    ));
+    let fresh_enqueue = || {
+        queue.enqueue(EnqueueRequest {
+            queue_id: queue_id.clone(),
             kind: kind.to_string(),
-            payload: payload.clone(),
+            payload: model_queue_payload(
+                &capability,
+                &request_hash,
+                &descriptor,
+                LogicalRetryState {
+                    attempts_used: 0,
+                    max_attempts: logical_max_attempts(config),
+                },
+            ),
             idempotency_key: idempotency_key.clone(),
             run_after: None,
             max_attempts: Some(config.retry_attempts),
             force: false,
         })
-        .await
-        .map_err(|err| ModelError::Queue(err.to_string()))?;
+    };
+    let mut enqueue = fresh_enqueue().await.map_err(queue_error)?;
+    receipts
+        .record(
+            ReceiptStatus::Queued,
+            Some(&enqueue.item),
+            None,
+            None,
+            AttemptTiming::NONE,
+        )
+        .await;
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
+            QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
+                enqueue = reenqueue_with_fresh_budget(
+                    queue.as_ref(),
+                    &queue_id,
+                    &descriptor,
+                    capability,
+                    kind,
+                    &request_hash,
+                    &idempotency_key,
+                    config,
+                    &enqueue.item.item_id,
+                )
+                .await?;
+            }
             QueueStatus::Dead => {
                 let dead_err = dead_item_retry_error(&enqueue.item);
                 if let Some(next) = reenqueue_dead_item(
                     queue.as_ref(),
+                    &queue_id,
                     &descriptor,
                     capability,
                     kind,
                     &request_hash,
                     &idempotency_key,
                     &enqueue.item,
-                    &config,
+                    config,
                     &dead_err,
                 )
                 .await?
                 {
                     enqueue = next;
                 } else {
-                    return Err(exhausted_request_error(&descriptor, &enqueue.item, &config));
+                    return Err(exhausted_request_error(
+                        &queue_id,
+                        &enqueue.item,
+                        config,
+                        &dead_err,
+                    ));
                 }
             }
-            QueueStatus::Succeeded if config.response_cache_dir.is_none() => {
-                return Err(ModelError::Cache(format!(
-                    "{} request already completed but no cached response was available",
-                    descriptor.queue_id().0
-                )));
-            }
+            // A finished identical request whose response is not cached (or
+            // no cache is configured) runs again: queue records coordinate
+            // calls, they do not hold answers.
             QueueStatus::Succeeded => {
-                enqueue = reenqueue_succeeded_without_cache(
+                enqueue = reenqueue_with_fresh_budget(
                     queue.as_ref(),
+                    &queue_id,
                     &descriptor,
                     capability,
                     kind,
                     &request_hash,
                     &idempotency_key,
-                    &config,
+                    config,
+                    &enqueue.item.item_id,
                 )
                 .await?;
             }
@@ -997,91 +1198,165 @@ where
     }
 
     loop {
-        if let Some(cache_dir) = &config.response_cache_dir
-            && let Some(cached) = load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
-        {
+        if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
+            receipts
+                .record(
+                    ReceiptStatus::CacheHit,
+                    Some(&enqueue.item),
+                    Some(cached.trace()),
+                    None,
+                    AttemptTiming::NONE,
+                )
+                .await;
             return return_cached_response(
                 cached,
                 &descriptor,
-                &trace_sink,
+                trace_sink,
                 request_hash.clone(),
                 Some(enqueue.item.item_id.clone()),
             )
             .await;
         }
+        let attempt_started = std::time::Instant::now();
+        let permit = match &runtime.admission {
+            Some(admission) => Some(
+                admission
+                    .acquire(&queue_id, config.max_in_flight.max(1))
+                    .await?,
+            ),
+            None => None,
+        };
         let throttle_started = std::time::Instant::now();
-        wait_for_model_cooldown(queue.as_ref(), &descriptor.queue_id()).await?;
-        wait_for_model_budget(&descriptor.queue_id(), &config, request).await?;
-        throttle_wait += throttle_started.elapsed();
-        let Some(item) = queue
+        wait_for_model_cooldown(queue.as_ref(), &queue_id).await?;
+        wait_for_model_budget(&queue_id, config, request).await?;
+        let attempt_throttle = throttle_started.elapsed();
+        throttle_wait += attempt_throttle;
+        let claimed = match queue
             .claim_item(
                 &enqueue.item.item_id,
-                &worker_id,
+                worker_id,
                 config.lease_seconds,
                 Some(config.max_in_flight.max(1)),
             )
             .await
-            .map_err(|err| ModelError::Queue(err.to_string()))?
-        else {
-            if let Some(current) = queue
+        {
+            Ok(claimed) => claimed,
+            // A retention-bounded backend evicted the item after it turned
+            // terminal: queue the request again.
+            Err(symbiotic_queue::QueueError::NotFound(_)) => {
+                drop(permit);
+                enqueue = fresh_enqueue().await.map_err(queue_error)?;
+                continue;
+            }
+            Err(err) => return Err(queue_error(err)),
+        };
+        let Some(item) = claimed else {
+            drop(permit);
+            match queue
                 .get_item(&enqueue.item.item_id)
                 .await
-                .map_err(|err| ModelError::Queue(err.to_string()))?
+                .map_err(queue_error)?
             {
-                match current.status {
+                None => {
+                    enqueue = fresh_enqueue().await.map_err(queue_error)?;
+                    continue;
+                }
+                Some(current) => match current.status {
+                    QueueStatus::Dead if budget_renewed(&current, config) => {
+                        enqueue = reenqueue_with_fresh_budget(
+                            queue.as_ref(),
+                            &queue_id,
+                            &descriptor,
+                            capability,
+                            kind,
+                            &request_hash,
+                            &idempotency_key,
+                            config,
+                            &current.item_id,
+                        )
+                        .await?;
+                        continue;
+                    }
                     QueueStatus::Dead => {
                         let dead_err = dead_item_retry_error(&current);
                         if let Some(next) = reenqueue_dead_item(
                             queue.as_ref(),
+                            &queue_id,
                             &descriptor,
                             capability,
                             kind,
                             &request_hash,
                             &idempotency_key,
                             &current,
-                            &config,
+                            config,
                             &dead_err,
                         )
                         .await?
                         {
                             enqueue = next;
                         } else {
-                            return Err(exhausted_request_error(&descriptor, &current, &config));
+                            return Err(exhausted_request_error(
+                                &queue_id, &current, config, &dead_err,
+                            ));
                         }
                     }
                     QueueStatus::Succeeded => {
-                        if let Some(cache_dir) = &config.response_cache_dir
-                            && let Some(cached) =
-                                load_cache::<Res>(cache_dir, cache_kind, &request_hash)?
-                        {
+                        if let Some(cached) = load_cached::<Res>(&cache, &entry)? {
+                            receipts
+                                .record(
+                                    ReceiptStatus::CacheHit,
+                                    Some(&current),
+                                    Some(cached.trace()),
+                                    None,
+                                    AttemptTiming::NONE,
+                                )
+                                .await;
                             return return_cached_response(
                                 cached,
                                 &descriptor,
-                                &trace_sink,
+                                trace_sink,
                                 request_hash.clone(),
                                 Some(current.item_id),
                             )
                             .await;
                         }
-                        enqueue = reenqueue_succeeded_without_cache(
+                        enqueue = reenqueue_with_fresh_budget(
                             queue.as_ref(),
+                            &queue_id,
                             &descriptor,
                             capability,
                             kind,
                             &request_hash,
                             &idempotency_key,
-                            &config,
+                            config,
+                            &current.item_id,
                         )
                         .await?;
                         continue;
                     }
                     QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {}
-                }
+                },
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         };
 
+        // Queue wait of this attempt: admission plus claim, without throttle.
+        let attempt_throttle_ms = u64::try_from(attempt_throttle.as_millis()).unwrap_or(u64::MAX);
+        let attempt_queue_wait_ms = elapsed_ms(attempt_started).saturating_sub(attempt_throttle_ms);
+        receipts
+            .record(
+                ReceiptStatus::Running,
+                Some(&item),
+                None,
+                None,
+                AttemptTiming {
+                    queue_wait_ms: Some(attempt_queue_wait_ms),
+                    throttle_wait_ms: Some(attempt_throttle_ms),
+                    provider_ms: None,
+                },
+            )
+            .await;
         let heartbeat = spawn_queue_heartbeat(
             queue.clone(),
             item.item_id.clone(),
@@ -1099,12 +1374,17 @@ where
                 Ok(result) => result,
                 Err(_) => Err(ModelError::Timeout(format!(
                     "{} timed out after {}s",
-                    descriptor.queue_id().0,
-                    timeout
+                    queue_id.0, timeout
                 ))),
             }
         } else {
             call(provider.clone(), request.clone()).await
+        };
+        let provider_ms = elapsed_ms(provider_started);
+        let failed_timing = || AttemptTiming {
+            queue_wait_ms: None,
+            throttle_wait_ms: None,
+            provider_ms: Some(provider_ms),
         };
 
         match result {
@@ -1117,66 +1397,88 @@ where
                 trace.timing.queued_ms = Some(queued_ms);
                 trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
                 trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
-                trace.timing.provider_ms = Some(provider_started.elapsed().as_millis() as u64);
+                trace.timing.provider_ms = Some(provider_ms);
                 trace.timing.total_ms = Some(queued_at.elapsed().as_millis() as u64);
-                if let Some(trace_sink) = &trace_sink {
+                if let Some(trace_sink) = trace_sink {
                     trace_sink
                         .record_model_invocation(trace.clone())
                         .await
                         .map_err(|err| ModelError::Provider(err.to_string()))?;
                 }
-                response.set_trace(trace);
-                if let Some(cache_dir) = &config.response_cache_dir {
-                    store_cache(cache_dir, cache_kind, &request_hash, &response)?;
+                response.set_trace(trace.clone());
+                if let Some(cache) = &cache {
+                    let value = serde_json::to_value(&response)
+                        .map_err(|err| ModelError::Cache(err.to_string()))?;
+                    cache.store(&entry, &value)?;
                 }
-                queue
-                    .complete(&item.item_id, &worker_id)
-                    .await
-                    .map_err(|err| {
-                        heartbeat.abort();
-                        ModelError::Queue(err.to_string())
-                    })?;
+                let completed = queue.complete(&item.item_id, worker_id).await;
                 heartbeat.abort();
+                drop(permit);
+                completed.map_err(queue_error)?;
+                receipts
+                    .record(
+                        ReceiptStatus::Succeeded,
+                        Some(&item),
+                        Some(&trace),
+                        None,
+                        AttemptTiming {
+                            queue_wait_ms: None,
+                            throttle_wait_ms: None,
+                            provider_ms: Some(provider_ms),
+                        },
+                    )
+                    .await;
                 return Ok(response);
             }
-            Err(err) if is_retryable(&err) => {
-                let retry_after = retry_after_seconds(
-                    item.attempt,
-                    config.retry_jitter_seconds,
-                    &item.item_id,
-                    &request_hash,
-                    &err,
-                );
-                note_model_cooldown(queue.as_ref(), &descriptor.queue_id(), &err, retry_after)
-                    .await?;
-                let outcome = queue
-                    .fail(
-                        &item.item_id,
-                        &worker_id,
-                        &err.to_string(),
-                        Some(retry_after),
+            Err(err) if is_retryable(&err, config) => {
+                receipts
+                    .record(
+                        ReceiptStatus::Failed,
+                        Some(&item),
+                        None,
+                        Some(err.to_string()),
+                        failed_timing(),
                     )
-                    .await
-                    .map_err(|err| {
-                        heartbeat.abort();
-                        ModelError::Queue(err.to_string())
-                    })?;
+                    .await;
+                let delay_ms =
+                    retry_delay_ms(item.attempt, config, &item.item_id, &request_hash, &err);
+                if is_transient(&err) {
+                    note_model_cooldown(queue.as_ref(), &queue_id, &err, delay_ms).await?;
+                }
+                // One exact deadline, kept by the backend: this caller and any
+                // duplicate waiting on the item retry no earlier than it.
+                let outcome = queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: err.to_string(),
+                            error_class: Some(error_class(&err)),
+                            run_after: Some(
+                                Utc::now() + ChronoDuration::milliseconds(delay_ms as i64),
+                            ),
+                        },
+                    )
+                    .await;
                 heartbeat.abort();
+                drop(permit);
+                let outcome = outcome.map_err(queue_error)?;
                 if outcome == FailOutcome::MovedToDead {
                     let dead_item = queue
                         .get_item(&item.item_id)
                         .await
-                        .map_err(|err| ModelError::Queue(err.to_string()))?
+                        .map_err(queue_error)?
                         .unwrap_or(item);
                     if let Some(next) = reenqueue_dead_item(
                         queue.as_ref(),
+                        &queue_id,
                         &descriptor,
                         capability,
                         kind,
                         &request_hash,
                         &idempotency_key,
                         &dead_item,
-                        &config,
+                        config,
                         &err,
                     )
                     .await?
@@ -1186,28 +1488,43 @@ where
                     }
                     emit_failure_trace(
                         &descriptor,
-                        &trace_sink,
+                        trace_sink,
                         Some(dead_item.item_id.clone()),
                         request_hash.clone(),
                         request_sensitivity(request),
                         err.to_string(),
                     )
                     .await?;
-                    return Err(exhausted_request_error(&descriptor, &dead_item, &config));
+                    return Err(exhausted_request_error(&queue_id, &dead_item, config, &err));
                 }
             }
             Err(err) => {
-                queue
-                    .fail(&item.item_id, &worker_id, &err.to_string(), None)
-                    .await
-                    .map_err(|err| {
-                        heartbeat.abort();
-                        ModelError::Queue(err.to_string())
-                    })?;
+                receipts
+                    .record(
+                        ReceiptStatus::Failed,
+                        Some(&item),
+                        None,
+                        Some(err.to_string()),
+                        failed_timing(),
+                    )
+                    .await;
+                let failed = queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: err.to_string(),
+                            error_class: Some(error_class(&err)),
+                            run_after: None,
+                        },
+                    )
+                    .await;
                 heartbeat.abort();
+                drop(permit);
+                failed.map_err(queue_error)?;
                 emit_failure_trace(
                     &descriptor,
-                    &trace_sink,
+                    trace_sink,
                     Some(item.item_id),
                     request_hash.clone(),
                     request_sensitivity(request),
@@ -1280,7 +1597,7 @@ impl TraceCarrier for RerankResponse {
 }
 
 #[cfg(feature = "queue")]
-fn is_retryable(err: &ModelError) -> bool {
+fn is_transient(err: &ModelError) -> bool {
     matches!(
         err,
         ModelError::Unavailable(_) | ModelError::RateLimited(_) | ModelError::Timeout(_)
@@ -1288,11 +1605,45 @@ fn is_retryable(err: &ModelError) -> bool {
 }
 
 #[cfg(feature = "queue")]
-fn retry_backoff_seconds(attempt: u32) -> u64 {
-    2u64.saturating_pow(attempt.saturating_sub(1).min(5))
-        .min(30)
+fn is_retryable(err: &ModelError, config: &ModelQueueConfig) -> bool {
+    is_transient(err) || (config.retry_provider_errors && matches!(err, ModelError::Provider(_)))
 }
 
+/// Backoff before jitter: the base delay doubling per attempt up to 32x,
+/// capped at 30 s (or at the base, if that is longer).
+#[cfg(feature = "queue")]
+fn retry_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
+    let base_ms = base_ms.max(1);
+    base_ms
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(5)))
+        .min(30_000.max(base_ms))
+}
+
+/// Delay before the next attempt: backoff plus deterministic jitter, at most
+/// two minutes.
+#[cfg(feature = "queue")]
+fn retry_delay_ms(
+    attempt: u32,
+    config: &ModelQueueConfig,
+    item_id: &QueueItemId,
+    request_hash: &str,
+    err: &ModelError,
+) -> u64 {
+    retry_backoff_ms(attempt, config.retry_base_delay_ms)
+        .saturating_add(
+            retry_jitter_seconds(
+                config.retry_jitter_seconds,
+                item_id,
+                request_hash,
+                attempt,
+                err,
+            )
+            .saturating_mul(1_000),
+        )
+        .clamp(1, 120_000)
+}
+
+#[cfg(test)]
 #[cfg(feature = "queue")]
 fn retry_after_seconds(
     attempt: u32,
@@ -1301,15 +1652,11 @@ fn retry_after_seconds(
     request_hash: &str,
     err: &ModelError,
 ) -> u64 {
-    retry_backoff_seconds(attempt)
-        .saturating_add(retry_jitter_seconds(
-            max_jitter_seconds,
-            item_id,
-            request_hash,
-            attempt,
-            err,
-        ))
-        .clamp(1, 120)
+    let config = ModelQueueConfig {
+        retry_jitter_seconds: max_jitter_seconds,
+        ..ModelQueueConfig::default()
+    };
+    retry_delay_ms(attempt, &config, item_id, request_hash, err).div_ceil(1_000)
 }
 
 #[cfg(feature = "queue")]
@@ -1340,19 +1687,81 @@ fn retry_jitter_seconds(
     u64::from_le_bytes(bytes) % (max_jitter_seconds + 1)
 }
 
+/// Whether a request another call exhausted (or that was exhausted before a
+/// restart) gets a fresh attempt budget: only when the policy renews budgets
+/// and the renewal time has passed since the request went dead.
+#[cfg(feature = "queue")]
+fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> bool {
+    config.budget_renewal_seconds.is_some_and(|seconds| {
+        Utc::now() - item.updated_at >= ChronoDuration::seconds(seconds as i64)
+    })
+}
+
+#[cfg(feature = "queue")]
+fn logical_max_attempts(config: &ModelQueueConfig) -> u32 {
+    config
+        .logical_retry_attempts
+        .max(config.retry_attempts)
+        .max(1)
+}
+
+/// Stable class name of an error, kept on failed queue items so a later
+/// call reports the same class.
+#[cfg(feature = "queue")]
+fn error_class(err: &ModelError) -> String {
+    match err {
+        ModelError::Unavailable(_) => "unavailable".to_string(),
+        ModelError::Auth(_) => "auth".to_string(),
+        ModelError::RateLimited(_) => "rate_limited".to_string(),
+        ModelError::BudgetExhausted(_) => "budget_exhausted".to_string(),
+        ModelError::Timeout(_) => "timeout".to_string(),
+        ModelError::Unsupported(capability) => format!(
+            "unsupported:{}",
+            serde_json::to_value(capability)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default()
+        ),
+        ModelError::InvalidRequest(_) => "invalid_request".to_string(),
+        ModelError::Provider(_) => "provider".to_string(),
+        ModelError::Queue(_) => "queue".to_string(),
+        ModelError::Cache(_) => "cache".to_string(),
+    }
+}
+
+/// The error a dead item stands for, from its recorded class. Items failed
+/// before classes were recorded fall back to reading the message.
 #[cfg(feature = "queue")]
 fn dead_item_retry_error(item: &QueueItem) -> ModelError {
     let error = item
         .last_error
         .clone()
         .unwrap_or_else(|| "dead queue item".to_string());
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("rate") || lower.contains("429") {
-        ModelError::RateLimited(error)
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        ModelError::Timeout(error)
-    } else {
-        ModelError::Unavailable(error)
+    match item.last_error_class.as_deref() {
+        Some("unavailable") => ModelError::Unavailable(error),
+        Some("auth") => ModelError::Auth(error),
+        Some("rate_limited") => ModelError::RateLimited(error),
+        Some("budget_exhausted") => ModelError::BudgetExhausted(error),
+        Some("timeout") => ModelError::Timeout(error),
+        Some("invalid_request") => ModelError::InvalidRequest(error),
+        Some("queue") => ModelError::Queue(error),
+        Some("cache") => ModelError::Cache(error),
+        Some(class) => class
+            .strip_prefix("unsupported:")
+            .and_then(|capability| {
+                serde_json::from_value(Value::String(capability.to_string())).ok()
+            })
+            .map_or(ModelError::Provider(error), ModelError::Unsupported),
+        None => {
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("rate") || lower.contains("429") {
+                ModelError::RateLimited(error)
+            } else if lower.contains("timeout") || lower.contains("timed out") {
+                ModelError::Timeout(error)
+            } else {
+                ModelError::Unavailable(error)
+            }
+        }
     }
 }
 
@@ -1406,6 +1815,7 @@ fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRet
 #[allow(clippy::too_many_arguments)]
 async fn reenqueue_dead_item(
     queue: &dyn QueueBackend,
+    queue_id: &QueueId,
     descriptor: &ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
@@ -1415,13 +1825,7 @@ async fn reenqueue_dead_item(
     config: &ModelQueueConfig,
     err: &ModelError,
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
-    let state = logical_retry_state(
-        &item.payload,
-        config
-            .logical_retry_attempts
-            .max(config.retry_attempts)
-            .max(1),
-    );
+    let state = logical_retry_state(&item.payload, logical_max_attempts(config));
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
     if attempts_used >= state.max_attempts {
         return Ok(None);
@@ -1432,37 +1836,40 @@ async fn reenqueue_dead_item(
         max_attempts: state.max_attempts,
     };
     let payload = model_queue_payload(&capability, request_hash, descriptor, next_state);
-    let retry_after = retry_after_seconds(
-        item.attempt,
-        config.retry_jitter_seconds,
-        &item.item_id,
-        request_hash,
-        err,
-    );
+    let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err);
+    // Replace the dead item only while it is still the newest for the
+    // request: a caller holding a stale item must not start a second chain.
     let outcome = queue
-        .enqueue(EnqueueRequest {
-            queue_id: descriptor.queue_id(),
-            kind: kind.to_string(),
-            payload,
-            idempotency_key: idempotency_key.clone(),
-            run_after: Some(Utc::now() + ChronoDuration::seconds(retry_after as i64)),
-            max_attempts: Some(remaining_attempts.min(config.retry_attempts.max(1)).max(1)),
-            force: true,
-        })
+        .enqueue_replacing(
+            EnqueueRequest {
+                queue_id: queue_id.clone(),
+                kind: kind.to_string(),
+                payload,
+                idempotency_key: idempotency_key.clone(),
+                run_after: Some(Utc::now() + ChronoDuration::milliseconds(retry_after_ms as i64)),
+                max_attempts: Some(remaining_attempts.min(config.retry_attempts.max(1)).max(1)),
+                force: true,
+            },
+            &item.item_id,
+        )
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))?;
     Ok(Some(outcome))
 }
 
+// Same execution boundary as `reenqueue_dead_item`.
 #[cfg(feature = "queue")]
-async fn reenqueue_succeeded_without_cache(
+#[allow(clippy::too_many_arguments)]
+async fn reenqueue_with_fresh_budget(
     queue: &dyn QueueBackend,
+    queue_id: &QueueId,
     descriptor: &ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
     request_hash: &str,
     idempotency_key: &Option<String>,
     config: &ModelQueueConfig,
+    current: &QueueItemId,
 ) -> Result<EnqueueOutcome, ModelError> {
     let payload = model_queue_payload(
         &capability,
@@ -1476,43 +1883,57 @@ async fn reenqueue_succeeded_without_cache(
                 .max(1),
         },
     );
+    // Conditional on `current` still being the newest item, so a delayed
+    // caller cannot renew over a budget another caller renewed meanwhile.
     queue
-        .enqueue(EnqueueRequest {
-            queue_id: descriptor.queue_id(),
-            kind: kind.to_string(),
-            payload,
-            idempotency_key: idempotency_key.clone(),
-            run_after: None,
-            max_attempts: Some(config.retry_attempts.max(1)),
-            force: true,
-        })
+        .enqueue_replacing(
+            EnqueueRequest {
+                queue_id: queue_id.clone(),
+                kind: kind.to_string(),
+                payload,
+                idempotency_key: idempotency_key.clone(),
+                run_after: None,
+                max_attempts: Some(config.retry_attempts.max(1)),
+                force: true,
+            },
+            current,
+        )
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))
 }
 
 #[cfg(feature = "queue")]
 fn exhausted_request_error(
-    descriptor: &ProviderDescriptor,
+    queue_id: &QueueId,
     item: &QueueItem,
     config: &ModelQueueConfig,
+    last_error: &ModelError,
 ) -> ModelError {
-    let state = logical_retry_state(
-        &item.payload,
-        config
-            .logical_retry_attempts
-            .max(config.retry_attempts)
-            .max(1),
-    );
+    let state = logical_retry_state(&item.payload, logical_max_attempts(config));
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
-    ModelError::Provider(format!(
+    let message = format!(
         "{} request exhausted after {}/{} logical attempt(s): {}",
-        descriptor.queue_id().0,
+        queue_id.0,
         attempts_used,
         state.max_attempts,
         item.last_error
             .clone()
             .unwrap_or_else(|| "unknown provider error".to_string())
-    ))
+    );
+    // Keep the class of the last failure, so callers can still tell a rate
+    // limit or timeout from a provider fault once retries run out.
+    match last_error {
+        ModelError::RateLimited(_) => ModelError::RateLimited(message),
+        ModelError::Timeout(_) => ModelError::Timeout(message),
+        ModelError::Unavailable(_) => ModelError::Unavailable(message),
+        ModelError::Auth(_) => ModelError::Auth(message),
+        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(message),
+        ModelError::InvalidRequest(_) => ModelError::InvalidRequest(message),
+        ModelError::Queue(_) => ModelError::Queue(message),
+        ModelError::Cache(_) => ModelError::Cache(message),
+        ModelError::Unsupported(capability) => ModelError::Unsupported(*capability),
+        ModelError::Provider(_) => ModelError::Provider(message),
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -1568,9 +1989,16 @@ struct RateBucket {
 
 #[cfg(feature = "queue")]
 impl RateBucket {
+    #[cfg(test)]
     fn new(per_minute: f64) -> Self {
+        Self::with_burst(per_minute, 0)
+    }
+
+    /// A bucket that starts full with `burst_seconds` of budget (at least
+    /// one unit), so an idle queue may spend that much at once.
+    fn with_burst(per_minute: f64, burst_seconds: u64) -> Self {
         let rate_per_second = (per_minute / 60.0).max(0.000_001);
-        let capacity = 1.0;
+        let capacity = (rate_per_second * burst_seconds as f64).max(1.0);
         Self {
             tokens: capacity,
             capacity,
@@ -1619,17 +2047,25 @@ where
         };
         let mut wait: Option<Duration> = None;
         if let Some(requests_per_minute) = config.requests_per_minute {
-            let key = format!("{}:requests", queue_id.0);
-            let bucket = guard
-                .entry(key)
-                .or_insert_with(|| RateBucket::new(requests_per_minute as f64));
+            // Keyed by policy too: providers of one model with the same
+            // limits share a bucket; a different policy gets its own.
+            let key = format!(
+                "{}:requests:{requests_per_minute}:{}",
+                queue_id.0, config.rate_burst_seconds
+            );
+            let bucket = guard.entry(key).or_insert_with(|| {
+                RateBucket::with_burst(requests_per_minute as f64, config.rate_burst_seconds)
+            });
             wait = wait.max(bucket.reserve(1.0));
         }
         if let Some(input_units_per_minute) = config.input_units_per_minute {
-            let key = format!("{}:input-units", queue_id.0);
-            let bucket = guard
-                .entry(key)
-                .or_insert_with(|| RateBucket::new(input_units_per_minute as f64));
+            let key = format!(
+                "{}:input-units:{input_units_per_minute}:{}",
+                queue_id.0, config.rate_burst_seconds
+            );
+            let bucket = guard.entry(key).or_insert_with(|| {
+                RateBucket::with_burst(input_units_per_minute as f64, config.rate_burst_seconds)
+            });
             wait = wait.max(bucket.reserve(request.input_budget_units() as f64));
         }
         wait
@@ -1691,7 +2127,7 @@ async fn note_model_cooldown(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
     err: &ModelError,
-    retry_after_seconds: u64,
+    retry_delay_ms: u64,
 ) -> Result<(), ModelError> {
     let multiplier = match err {
         ModelError::RateLimited(_) => 4,
@@ -1699,9 +2135,9 @@ async fn note_model_cooldown(
         ModelError::Timeout(_) => 1,
         _ => 1,
     };
-    let seconds = retry_after_seconds.saturating_mul(multiplier).clamp(1, 60);
-    let until_instant = Instant::now() + Duration::from_secs(seconds);
-    let until_utc = Utc::now() + ChronoDuration::seconds(seconds as i64);
+    let millis = retry_delay_ms.saturating_mul(multiplier).clamp(1, 60_000);
+    let until_instant = Instant::now() + Duration::from_millis(millis);
+    let until_utc = Utc::now() + ChronoDuration::milliseconds(millis as i64);
     {
         let map = MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
         let Ok(mut guard) = map.lock() else {
@@ -1803,47 +2239,6 @@ fn hash_json<T: Serialize>(value: &T) -> Result<String, ModelError> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))
-}
-
-#[cfg(feature = "queue")]
-fn cache_path(root: &Path, kind: &str, hash: &str) -> PathBuf {
-    root.join(kind).join(format!("{hash}.json"))
-}
-
-#[cfg(feature = "queue")]
-fn load_cache<T: for<'de> Deserialize<'de>>(
-    root: &Path,
-    kind: &str,
-    hash: &str,
-) -> Result<Option<T>, ModelError> {
-    let path = cache_path(root, kind, hash);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path).map_err(|err| ModelError::Cache(err.to_string()))?;
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|err| ModelError::Cache(err.to_string()))
-}
-
-#[cfg(feature = "queue")]
-fn store_cache<T: Serialize>(
-    root: &Path,
-    kind: &str,
-    hash: &str,
-    value: &T,
-) -> Result<(), ModelError> {
-    let path = cache_path(root, kind, hash);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| ModelError::Cache(err.to_string()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(value).map_err(|err| ModelError::Cache(err.to_string()))?,
-    )
-    .map_err(|err| ModelError::Cache(err.to_string()))?;
-    std::fs::rename(tmp, path).map_err(|err| ModelError::Cache(err.to_string()))
 }
 
 #[derive(Clone)]
@@ -2925,6 +3320,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
         let results = futures::future::join_all((0..8).map(|idx| {
@@ -2961,6 +3357,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: Some(dir.path().join("cache")),
+                ..ModelQueueConfig::default()
             },
         )
         .with_trace_sink(trace_sink.clone());
@@ -3008,6 +3405,7 @@ mod tests {
                 requests_per_minute: Some(60),
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         )
         .with_trace_sink(trace_sink.clone());
@@ -3076,6 +3474,7 @@ mod tests {
                 requests_per_minute: Some(60),
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3137,6 +3536,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: Some(dir.path().join("cache")),
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3212,6 +3612,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: Some(dir.path().join("cache")),
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3219,7 +3620,13 @@ mod tests {
 
         assert_eq!(response.text, "same request");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(cache_path(dir.path().join("cache").as_path(), "chat", &request_hash).is_file());
+        assert!(
+            dir.path()
+                .join("cache")
+                .join("chat")
+                .join(format!("{request_hash}.json"))
+                .is_file()
+        );
     }
 
     #[cfg(feature = "queue")]
@@ -3241,6 +3648,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3269,6 +3677,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3297,6 +3706,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3330,6 +3740,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: None,
+                ..ModelQueueConfig::default()
             },
         );
 
@@ -3358,6 +3769,87 @@ mod tests {
             wait < Duration::from_millis(10),
             "20k rpm should pace in milliseconds, not seconds: {wait:?}"
         );
+    }
+
+    #[cfg(feature = "queue")]
+    #[test]
+    fn every_error_class_survives_a_dead_item_and_exhaustion() {
+        let errors = [
+            ModelError::Unavailable("x".into()),
+            ModelError::Auth("x".into()),
+            ModelError::RateLimited("x".into()),
+            ModelError::BudgetExhausted("x".into()),
+            ModelError::Timeout("x".into()),
+            ModelError::Unsupported(ModelCapability::Rerank),
+            ModelError::InvalidRequest("x".into()),
+            ModelError::Provider("x".into()),
+            ModelError::Queue("x".into()),
+            ModelError::Cache("x".into()),
+        ];
+        let now = Utc::now();
+        for err in errors {
+            let item = QueueItem {
+                item_id: QueueItemId::new(),
+                queue_id: QueueId::new("chat:test:classes"),
+                kind: "chat".to_string(),
+                payload: serde_json::json!({}),
+                status: QueueStatus::Dead,
+                attempt: 1,
+                max_attempts: 1,
+                run_after: now,
+                lease_owner: None,
+                lease_until: None,
+                idempotency_key: None,
+                last_error: Some(err.to_string()),
+                last_error_class: Some(error_class(&err)),
+                created_at: now,
+                updated_at: now,
+            };
+            let replayed = dead_item_retry_error(&item);
+            assert_eq!(
+                std::mem::discriminant(&replayed),
+                std::mem::discriminant(&err),
+                "{err:?} came back as {replayed:?}"
+            );
+            let exhausted = exhausted_request_error(
+                &item.queue_id,
+                &item,
+                &ModelQueueConfig::default(),
+                &replayed,
+            );
+            assert_eq!(
+                std::mem::discriminant(&exhausted),
+                std::mem::discriminant(&err),
+                "{err:?} exhausted as {exhausted:?}"
+            );
+            if let (ModelError::Unsupported(expected), ModelError::Unsupported(actual)) =
+                (&err, &exhausted)
+            {
+                assert_eq!(expected, actual);
+            }
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    #[test]
+    fn rate_bucket_burst_admits_one_window_then_paces() {
+        let mut bucket = RateBucket::with_burst(60.0, 60);
+        for _ in 0..60 {
+            assert!(bucket.reserve(1.0).is_none());
+        }
+        let wait = bucket.reserve(1.0).expect("the 61st request waits");
+        assert!(wait <= Duration::from_millis(1_050), "{wait:?}");
+    }
+
+    #[cfg(feature = "queue")]
+    #[test]
+    fn retry_backoff_doubles_from_the_base_and_caps() {
+        assert_eq!(retry_backoff_ms(1, 1_000), 1_000);
+        assert_eq!(retry_backoff_ms(2, 1_000), 2_000);
+        assert_eq!(retry_backoff_ms(6, 1_000), 30_000);
+        assert_eq!(retry_backoff_ms(1, 250), 250);
+        assert_eq!(retry_backoff_ms(3, 250), 1_000);
+        assert_eq!(retry_backoff_ms(9, 250), 8_000);
     }
 
     #[cfg(feature = "queue")]
@@ -3393,6 +3885,7 @@ mod tests {
             requests_per_minute: Some(60),
             input_units_per_minute: None,
             response_cache_dir: None,
+            ..ModelQueueConfig::default()
         };
         let queue_id = QueueId(format!(
             "test-budget-{}",
@@ -3552,6 +4045,7 @@ mod tests {
                 requests_per_minute: None,
                 input_units_per_minute: None,
                 response_cache_dir: Some(dir.path().join("cache")),
+                ..ModelQueueConfig::default()
             },
         )
         .with_trace_sink(trace_sink.clone());

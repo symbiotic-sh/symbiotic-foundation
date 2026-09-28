@@ -4,8 +4,10 @@
 //! `queue_id`; a backend enforces durable work semantics for that id.
 //!
 //! The contracts (`QueueBackend`, `QueueEventSink`, items, events, telemetry)
-//! need no storage, so this crate has no storage dependency. The local SQLite
-//! backend is the separate `symbiotic-queue-sqlite` crate.
+//! need no storage, so this crate has no storage dependency. It ships the
+//! in-process [`MemoryQueue`] backend; the local SQLite backend is the separate
+//! `symbiotic-queue-sqlite` crate. The `conformance` feature exposes the checks
+//! every backend must pass.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,6 +16,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use symbiotic_core::{QueueId, QueueItemId};
 use thiserror::Error;
+
+#[cfg(feature = "conformance")]
+pub mod conformance;
+mod memory;
+
+pub use memory::{DEFAULT_RETAINED_TERMINAL_ITEMS, MemoryQueue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +81,11 @@ pub struct QueueItem {
     pub lease_until: Option<DateTime<Utc>>,
     pub idempotency_key: Option<String>,
     pub last_error: Option<String>,
+    /// Stable class of `last_error` (for example `rate_limited`), recorded
+    /// by [`QueueBackend::fail_with`]; `None` for failures recorded without
+    /// one.
+    #[serde(default)]
+    pub last_error_class: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -96,6 +109,16 @@ pub struct QueueEvent {
     pub attempt: u32,
     pub timestamp: DateTime<Utc>,
     pub error: Option<String>,
+}
+
+/// A failed attempt as [`QueueBackend::fail_with`] records it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    pub error: String,
+    /// Stable class of the error, kept on the item as `last_error_class`.
+    pub error_class: Option<String>,
+    /// Earliest time of the next attempt. `None` means one second from now.
+    pub run_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +147,27 @@ pub enum QueueError {
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError>;
+    /// Force-enqueue `request` only while `current` is still the newest item
+    /// for its idempotency key; otherwise return that newest item unchanged,
+    /// as `ActiveDuplicate` or `TerminalDuplicate`. The check and the insert
+    /// are one step, so two callers holding the same superseded item cannot
+    /// both replace it. The default is not atomic; both Foundation backends
+    /// are.
+    async fn enqueue_replacing(
+        &self,
+        mut request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        request.force = false;
+        let newest = self.enqueue(request.clone()).await?;
+        if newest.item.item_id != *current
+            || newest.disposition != EnqueueDisposition::TerminalDuplicate
+        {
+            return Ok(newest);
+        }
+        request.force = true;
+        self.enqueue(request).await
+    }
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError>;
     async fn claim_item(
         &self,
@@ -147,6 +191,25 @@ pub trait QueueBackend: Send + Sync {
         error: &str,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError>;
+    /// Like [`fail`](Self::fail), with the error's class and an exact retry
+    /// deadline. The default keeps neither: it rounds the deadline up to
+    /// whole seconds and drops the class. Both Foundation backends record
+    /// them exactly.
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        let retry_after_seconds = failure.run_after.map(|until| {
+            let millis = (until - Utc::now()).num_milliseconds().max(0) as u64;
+            millis.div_ceil(1_000)
+        });
+        self.fail(item_id, worker_id, &failure.error, retry_after_seconds)
+            .await
+    }
+    /// Return items whose lease expired to `Failed`, or to `Dead` when that
+    /// lease was their last allowed attempt.
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError>;
     async fn cooldown_until(
         &self,

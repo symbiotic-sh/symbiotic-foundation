@@ -529,10 +529,7 @@ where
 #[derive(Clone)]
 pub struct QueuedClassifierProvider<P> {
     inner: P,
-    queue: Arc<dyn QueueBackend>,
-    trace_sink: Option<Arc<dyn TraceSink>>,
-    worker_id: String,
-    config: ModelQueueConfig,
+    runtime: QueueRuntime,
 }
 
 #[cfg(feature = "queue")]
@@ -545,17 +542,11 @@ impl<P> QueuedClassifierProvider<P> {
     ) -> Self {
         Self {
             inner,
-            queue,
-            trace_sink: None,
-            worker_id: worker_id.into(),
-            config,
+            runtime: QueueRuntime::new(queue, worker_id.into(), config),
         }
     }
 
-    pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
-        self.trace_sink = Some(sink);
-        self
-    }
+    queue_runtime_builders!();
 }
 
 #[cfg(feature = "queue")]
@@ -576,14 +567,13 @@ where
     P: ClassifierProvider + Clone + Send + Sync + 'static,
 {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        // A malformed request never takes a queue slot or a provider call.
+        request.validate()?;
         let descriptor = self.inner.descriptor().clone();
         let cache_scope = hash_json(&descriptor)?;
         run_queued(
+            &self.runtime,
             descriptor,
-            self.queue.clone(),
-            self.trace_sink.clone(),
-            self.worker_id.clone(),
-            self.config.clone(),
             ModelCapability::Classify,
             "classify",
             Some(cache_scope),
@@ -2079,7 +2069,7 @@ mod tests {
             "{err:?}"
         );
         #[cfg(feature = "queue")]
-        assert!(!is_retryable(&err));
+        assert!(!is_retryable(&err, &ModelQueueConfig::default()));
 
         let response = gateway
             .with_served_model("typesafe/jev-1.13-20260917")
@@ -2501,7 +2491,11 @@ mod tests {
             assert_eq!(got, expected, "HTTP {status}");
             // Retry classification belongs to the queue runtime.
             #[cfg(feature = "queue")]
-            assert_eq!(is_retryable(&err), retryable, "HTTP {status}");
+            assert_eq!(
+                is_retryable(&err, &ModelQueueConfig::default()),
+                retryable,
+                "HTTP {status}"
+            );
             #[cfg(not(feature = "queue"))]
             let _ = retryable;
         }
@@ -2895,6 +2889,7 @@ mod tests {
             requests_per_minute: None,
             input_units_per_minute: None,
             response_cache_dir: cache,
+            ..ModelQueueConfig::default()
         }
     }
 
