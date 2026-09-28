@@ -268,32 +268,14 @@ impl SqliteQueue {
         Ok(deleted)
     }
 
-    fn record_event_sync(&self, item: &QueueItem, error: Option<String>) -> Result<(), QueueError> {
-        let conn = self.conn.lock().map_err(lock_error)?;
-        insert_event(&conn, item, error)?;
-        Ok(())
-    }
-
-    async fn emit(&self, item: QueueItem, error: Option<String>) {
-        let _ = self.record_event_sync(&item, error.clone());
-        if let Some(sink) = &self.event_sink {
-            sink.record_queue_event(QueueEvent {
-                item_id: item.item_id,
-                queue_id: item.queue_id,
-                kind: item.kind,
-                status: item.status,
-                attempt: item.attempt,
-                timestamp: Utc::now(),
-                error,
-            })
-            .await;
-        }
-    }
-}
-
-#[async_trait]
-impl QueueBackend for SqliteQueue {
-    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+    /// Enqueue; with `replacing`, a force enqueue happens only while that
+    /// item is still the newest for the key. That check takes the write lock
+    /// first (an immediate transaction), so it holds across connections.
+    async fn enqueue_inner(
+        &self,
+        request: EnqueueRequest,
+        replacing: Option<&QueueItemId>,
+    ) -> Result<EnqueueOutcome, QueueError> {
         if request.kind.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
                 "queue item kind must not be empty".to_string(),
@@ -306,7 +288,12 @@ impl QueueBackend for SqliteQueue {
 
         let (item, disposition) = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = if replacing.is_some() {
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            } else {
+                conn.transaction()
+            }
+            .map_err(storage_error)?;
             if let Some(key) = &request.idempotency_key {
                 let existing = find_by_idempotency(&tx, &request.queue_id, key)?;
                 if let Some(existing) = existing {
@@ -316,7 +303,8 @@ impl QueueBackend for SqliteQueue {
                     );
                     let terminal =
                         matches!(existing.status, QueueStatus::Succeeded | QueueStatus::Dead);
-                    if active || (terminal && !request.force) {
+                    let superseded = replacing.is_some_and(|current| existing.item_id != *current);
+                    if active || (terminal && !request.force) || superseded {
                         tx.commit().map_err(storage_error)?;
                         let disposition = if active {
                             EnqueueDisposition::ActiveDuplicate
@@ -385,6 +373,44 @@ impl QueueBackend for SqliteQueue {
 
         self.emit(item.clone(), None).await;
         Ok(EnqueueOutcome { item, disposition })
+    }
+
+    fn record_event_sync(&self, item: &QueueItem, error: Option<String>) -> Result<(), QueueError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        insert_event(&conn, item, error)?;
+        Ok(())
+    }
+
+    async fn emit(&self, item: QueueItem, error: Option<String>) {
+        let _ = self.record_event_sync(&item, error.clone());
+        if let Some(sink) = &self.event_sink {
+            sink.record_queue_event(QueueEvent {
+                item_id: item.item_id,
+                queue_id: item.queue_id,
+                kind: item.kind,
+                status: item.status,
+                attempt: item.attempt,
+                timestamp: Utc::now(),
+                error,
+            })
+            .await;
+        }
+    }
+}
+
+#[async_trait]
+impl QueueBackend for SqliteQueue {
+    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+        self.enqueue_inner(request, None).await
+    }
+
+    async fn enqueue_replacing(
+        &self,
+        mut request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        request.force = true;
+        self.enqueue_inner(request, Some(current)).await
     }
 
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {

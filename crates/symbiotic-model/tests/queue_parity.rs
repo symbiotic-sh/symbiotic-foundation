@@ -695,3 +695,132 @@ async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
     );
     assert!(waited < Duration::from_millis(2_400), "{waited:?}");
 }
+
+/// Pauses the first enqueue after it is armed, after the backend answered
+/// and before the caller sees the answer: a caller delayed while holding a
+/// stale item.
+struct PausesOneEnqueue {
+    inner: MemoryQueue,
+    armed: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl QueueBackend for PausesOneEnqueue {
+    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+        let outcome = self.inner.enqueue(request).await;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.resume.notified().await;
+        }
+        outcome
+    }
+    async fn enqueue_replacing(
+        &self,
+        request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        self.inner.enqueue_replacing(request, current).await
+    }
+    async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
+        self.inner.claim(request).await
+    }
+    async fn claim_item(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_in_flight: Option<usize>,
+    ) -> Result<Option<QueueItem>, QueueError> {
+        self.inner
+            .claim_item(item_id, worker_id, lease_seconds, max_in_flight)
+            .await
+    }
+    async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
+        self.inner.get_item(item_id).await
+    }
+    async fn heartbeat(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<(), QueueError> {
+        self.inner
+            .heartbeat(item_id, worker_id, lease_seconds)
+            .await
+    }
+    async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
+        self.inner.complete(item_id, worker_id).await
+    }
+    async fn fail(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        error: &str,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner
+            .fail(item_id, worker_id, error, retry_after_seconds)
+            .await
+    }
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: symbiotic_queue::Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner.fail_with(item_id, worker_id, failure).await
+    }
+    async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
+        self.inner.reclaim_expired_leases(queue_id).await
+    }
+}
+
+#[tokio::test]
+async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
+    let backend = Arc::new(PausesOneEnqueue {
+        inner: MemoryQueue::new(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let raw = Loopback::new(unique_identity()).failing_first(
+        (0..8)
+            .map(|_| ModelError::Unavailable("down".to_string()))
+            .collect(),
+    );
+    let provider = queued(
+        raw.clone(),
+        backend.clone(),
+        ModelQueueConfig {
+            logical_retry_attempts: 1,
+            retry_attempts: 1,
+            budget_renewal_seconds: Some(1),
+            ..config()
+        },
+    );
+    provider.chat(request("renewal race")).await.unwrap_err();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // The delayed caller sees the first, renewable, dead item and stalls.
+    backend.armed.store(true, Ordering::SeqCst);
+    let delayed = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("renewal race")).await }
+    });
+    backend.reached.notified().await;
+    // Meanwhile another caller renews the budget and exhausts it.
+    provider.chat(request("renewal race")).await.unwrap_err();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+
+    backend.resume.notify_one();
+    let err = delayed.await.unwrap().unwrap_err();
+    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        2,
+        "the fresh budget is still inside its renewal interval"
+    );
+}

@@ -126,7 +126,10 @@ per binding.
   while the queue remembers it. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
   `Some(0)` gives every call its own budget, for hosts that schedule their own
-  retries.
+  retries. Renewing (and continuing a retry chain) replaces the dead item
+  only while it is still the newest for the request
+  (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
+  budget over one another caller renewed in the meantime.
 
 A classify request that fails validation returns `InvalidRequest` before it
 takes a queue slot.
@@ -163,7 +166,7 @@ twice keeps its reader as a `Custom` cache.
 ## Backends and conformance
 
 `symbiotic-queue` ships `MemoryQueue`, the in-process backend with no storage
-dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 20
+dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 21
 checks of the `QueueBackend` contract. Both `MemoryQueue` and `SqliteQueue` run
 them in CI:
 
@@ -179,6 +182,7 @@ them in CI:
 - retry delay;
 - expired-lease reclaim, with an expired final attempt ending dead;
 - `fail_with` recording the error class and the exact retry deadline;
+- `enqueue_replacing` superseding only the current newest item, atomically;
 - cooldown monotonicity;
 - unknown items.
 

@@ -42,6 +42,7 @@ macro_rules! queue_backend_conformance {
             expired_lease_cannot_complete_and_is_reclaimed,
             an_expired_final_attempt_is_dead_not_claimable,
             fail_with_records_the_class_and_the_exact_deadline,
+            enqueue_replacing_supersedes_only_the_current_item,
             cooldown_only_moves_forward,
             unknown_item_is_absent,
         );
@@ -537,4 +538,62 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
     queue.complete(&item.item_id, "worker").await.unwrap();
     let done = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(done.last_error_class, None);
+}
+
+async fn finish(queue: &dyn QueueBackend, item_id: &QueueItemId) {
+    claim_one(queue, item_id, 60).await;
+    queue.complete(item_id, "worker").await.unwrap();
+}
+
+pub async fn enqueue_replacing_supersedes_only_the_current_item(queue: Arc<dyn QueueBackend>) {
+    let first = queue.enqueue(request("replace")).await.unwrap().item;
+    finish(queue.as_ref(), &first.item_id).await;
+
+    let second = queue
+        .enqueue_replacing(request("replace"), &first.item_id)
+        .await
+        .unwrap();
+    assert_eq!(second.disposition, EnqueueDisposition::Inserted);
+    let second = second.item;
+    assert_ne!(second.item_id, first.item_id);
+
+    // A caller still holding the first item cannot replace the second.
+    let stale = queue
+        .enqueue_replacing(request("replace"), &first.item_id)
+        .await
+        .unwrap();
+    assert_eq!(stale.disposition, EnqueueDisposition::ActiveDuplicate);
+    assert_eq!(stale.item.item_id, second.item_id);
+    finish(queue.as_ref(), &second.item_id).await;
+    let stale = queue
+        .enqueue_replacing(request("replace"), &first.item_id)
+        .await
+        .unwrap();
+    assert_eq!(stale.disposition, EnqueueDisposition::TerminalDuplicate);
+    assert_eq!(stale.item.item_id, second.item_id);
+
+    // Two callers holding the current item: exactly one replaces it.
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            let queue = queue.clone();
+            let current = second.item_id.clone();
+            tokio::spawn(async move {
+                queue
+                    .enqueue_replacing(request("replace"), &current)
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut inserted = 0;
+    let mut ids = HashSet::new();
+    for racer in racers {
+        let outcome = racer.await.unwrap();
+        if outcome.disposition == EnqueueDisposition::Inserted {
+            inserted += 1;
+        }
+        ids.insert(outcome.item.item_id);
+    }
+    assert_eq!(inserted, 1);
+    assert_eq!(ids.len(), 1, "both callers end on the same replacement");
 }

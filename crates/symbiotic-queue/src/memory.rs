@@ -99,6 +99,73 @@ impl MemoryQueue {
         }
     }
 
+    /// Enqueue; with `replacing`, a force enqueue happens only while that
+    /// item is still the newest for the key.
+    async fn enqueue_inner(
+        &self,
+        request: EnqueueRequest,
+        replacing: Option<&QueueItemId>,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        if request.kind.trim().is_empty() {
+            return Err(QueueError::InvalidRequest(
+                "queue item kind must not be empty".to_string(),
+            ));
+        }
+        let now = Utc::now();
+        let item = {
+            let mut state = self.lock()?;
+            if let Some(key) = &request.idempotency_key
+                && let Some(existing_id) = state
+                    .idempotency
+                    .get(&(request.queue_id.0.clone(), key.clone()))
+                && let Some(existing) = state.items.get(existing_id)
+            {
+                let active = State::is_active(existing.status);
+                let superseded = replacing.is_some_and(|current| existing.item_id != *current);
+                if active || !request.force || superseded {
+                    return Ok(EnqueueOutcome {
+                        item: existing.clone(),
+                        disposition: if active {
+                            EnqueueDisposition::ActiveDuplicate
+                        } else {
+                            EnqueueDisposition::TerminalDuplicate
+                        },
+                    });
+                }
+            }
+            let item = QueueItem {
+                item_id: QueueItemId::new(),
+                queue_id: request.queue_id,
+                kind: request.kind,
+                payload: request.payload,
+                status: QueueStatus::Pending,
+                attempt: 0,
+                max_attempts: request.max_attempts.unwrap_or(3).max(1),
+                run_after: request.run_after.unwrap_or(now),
+                lease_owner: None,
+                lease_until: None,
+                idempotency_key: request.idempotency_key,
+                last_error: None,
+                last_error_class: None,
+                created_at: now,
+                updated_at: now,
+            };
+            if let Some(key) = &item.idempotency_key {
+                state.idempotency.insert(
+                    (item.queue_id.0.clone(), key.clone()),
+                    item.item_id.0.clone(),
+                );
+            }
+            state.items.insert(item.item_id.0.clone(), item.clone());
+            item
+        };
+        self.emit(vec![(item.clone(), None)]).await;
+        Ok(EnqueueOutcome {
+            item,
+            disposition: EnqueueDisposition::Inserted,
+        })
+    }
+
     fn update_running(
         &self,
         item_id: &QueueItemId,
@@ -255,63 +322,16 @@ fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<String>)> {
 #[async_trait]
 impl QueueBackend for MemoryQueue {
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
-        if request.kind.trim().is_empty() {
-            return Err(QueueError::InvalidRequest(
-                "queue item kind must not be empty".to_string(),
-            ));
-        }
-        let now = Utc::now();
-        let item = {
-            let mut state = self.lock()?;
-            if let Some(key) = &request.idempotency_key
-                && let Some(existing_id) = state
-                    .idempotency
-                    .get(&(request.queue_id.0.clone(), key.clone()))
-                && let Some(existing) = state.items.get(existing_id)
-            {
-                let active = State::is_active(existing.status);
-                if active || !request.force {
-                    return Ok(EnqueueOutcome {
-                        item: existing.clone(),
-                        disposition: if active {
-                            EnqueueDisposition::ActiveDuplicate
-                        } else {
-                            EnqueueDisposition::TerminalDuplicate
-                        },
-                    });
-                }
-            }
-            let item = QueueItem {
-                item_id: QueueItemId::new(),
-                queue_id: request.queue_id,
-                kind: request.kind,
-                payload: request.payload,
-                status: QueueStatus::Pending,
-                attempt: 0,
-                max_attempts: request.max_attempts.unwrap_or(3).max(1),
-                run_after: request.run_after.unwrap_or(now),
-                lease_owner: None,
-                lease_until: None,
-                idempotency_key: request.idempotency_key,
-                last_error: None,
-                last_error_class: None,
-                created_at: now,
-                updated_at: now,
-            };
-            if let Some(key) = &item.idempotency_key {
-                state.idempotency.insert(
-                    (item.queue_id.0.clone(), key.clone()),
-                    item.item_id.0.clone(),
-                );
-            }
-            state.items.insert(item.item_id.0.clone(), item.clone());
-            item
-        };
-        self.emit(vec![(item.clone(), None)]).await;
-        Ok(EnqueueOutcome {
-            item,
-            disposition: EnqueueDisposition::Inserted,
-        })
+        self.enqueue_inner(request, None).await
+    }
+
+    async fn enqueue_replacing(
+        &self,
+        mut request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        request.force = true;
+        self.enqueue_inner(request, Some(current)).await
     }
 
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
@@ -381,7 +401,7 @@ impl QueueBackend for MemoryQueue {
             ));
         }
         let now = Utc::now();
-        let (reclaimed, retired, claimed) = {
+        let (reclaimed, retired, claimed, missing) = {
             let mut state = self.lock()?;
             let queue_id = state
                 .items
@@ -391,16 +411,23 @@ impl QueueBackend for MemoryQueue {
                 .0
                 .clone();
             let reclaimed = state.reclaim_expired(&queue_id, now);
-            let retired = state.retire_if_exhausted(&item_id.0, now);
-            let current = &state.items[&item_id.0];
-            let claimable = matches!(current.status, QueueStatus::Pending | QueueStatus::Failed)
-                && current.run_after <= now
-                && max_in_flight.is_none_or(|cap| state.running_count(&queue_id) < cap);
-            let claimed = claimable.then(|| {
-                state.lease(&item_id.0, worker_id, lease_seconds, now);
-                state.items[&item_id.0].clone()
-            });
-            (reclaimed, retired, claimed)
+            // Reclaiming can end other items and push the requested one out
+            // of the terminal window.
+            if !state.items.contains_key(&item_id.0) {
+                (reclaimed, None, None, true)
+            } else {
+                let retired = state.retire_if_exhausted(&item_id.0, now);
+                let current = &state.items[&item_id.0];
+                let claimable =
+                    matches!(current.status, QueueStatus::Pending | QueueStatus::Failed)
+                        && current.run_after <= now
+                        && max_in_flight.is_none_or(|cap| state.running_count(&queue_id) < cap);
+                let claimed = claimable.then(|| {
+                    state.lease(&item_id.0, worker_id, lease_seconds, now);
+                    state.items[&item_id.0].clone()
+                });
+                (reclaimed, retired, claimed, false)
+            }
         };
         let mut events = lease_events(reclaimed);
         events.extend(retired.map(|item| {
@@ -409,6 +436,9 @@ impl QueueBackend for MemoryQueue {
         }));
         events.extend(claimed.iter().cloned().map(|item| (item, None)));
         self.emit(events).await;
+        if missing {
+            return Err(QueueError::NotFound(item_id.0.clone()));
+        }
         Ok(claimed)
     }
 
@@ -601,6 +631,39 @@ mod tests {
         let duplicate = queue.enqueue(request("same")).await.unwrap();
         assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
         assert_eq!(duplicate.item.item_id, second.item_id);
+    }
+
+    #[tokio::test]
+    async fn claiming_an_item_evicted_by_reclamation_is_not_found_and_keeps_the_queue_usable() {
+        let queue = MemoryQueue::with_terminal_retention(1);
+        let finished = run_to_success(&queue, "finished").await;
+        let mut crashing = request("crashing");
+        crashing.max_attempts = Some(1);
+        let crashing = queue.enqueue(crashing).await.unwrap().item;
+        queue
+            .claim_item(&crashing.item_id, "worker", 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+        // Reclaiming the crashed final attempt ends it and evicts `finished`.
+        let err = queue
+            .claim_item(&finished, "worker", 60, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QueueError::NotFound(_)), "{err:?}");
+        assert_eq!(
+            queue
+                .get_item(&crashing.item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            QueueStatus::Dead
+        );
+        // The lock is intact: the queue still serves requests.
+        run_to_success(&queue, "after").await;
     }
 
     struct CountingSink(AtomicUsize);

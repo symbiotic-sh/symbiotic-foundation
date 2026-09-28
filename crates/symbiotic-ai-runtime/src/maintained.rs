@@ -62,6 +62,14 @@ impl QueueBackend for MaintainedQueue {
         self.queue.enqueue(request).await
     }
 
+    async fn enqueue_replacing(
+        &self,
+        request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        self.queue.enqueue_replacing(request, current).await
+    }
+
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
         self.queue.claim(request).await
     }

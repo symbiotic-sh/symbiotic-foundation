@@ -1146,6 +1146,7 @@ where
                     &request_hash,
                     &idempotency_key,
                     config,
+                    &enqueue.item.item_id,
                 )
                 .await?;
             }
@@ -1188,6 +1189,7 @@ where
                     &request_hash,
                     &idempotency_key,
                     config,
+                    &enqueue.item.item_id,
                 )
                 .await?;
             }
@@ -1270,6 +1272,7 @@ where
                             &request_hash,
                             &idempotency_key,
                             config,
+                            &current.item_id,
                         )
                         .await?;
                         continue;
@@ -1326,6 +1329,7 @@ where
                             &request_hash,
                             &idempotency_key,
                             config,
+                            &current.item_id,
                         )
                         .await?;
                         continue;
@@ -1449,7 +1453,7 @@ where
                         worker_id,
                         Failure {
                             error: err.to_string(),
-                            error_class: Some(error_class(&err).to_string()),
+                            error_class: Some(error_class(&err)),
                             run_after: Some(
                                 Utc::now() + ChronoDuration::milliseconds(delay_ms as i64),
                             ),
@@ -1510,7 +1514,7 @@ where
                         worker_id,
                         Failure {
                             error: err.to_string(),
-                            error_class: Some(error_class(&err).to_string()),
+                            error_class: Some(error_class(&err)),
                             run_after: None,
                         },
                     )
@@ -1704,18 +1708,24 @@ fn logical_max_attempts(config: &ModelQueueConfig) -> u32 {
 /// Stable class name of an error, kept on failed queue items so a later
 /// call reports the same class.
 #[cfg(feature = "queue")]
-fn error_class(err: &ModelError) -> &'static str {
+fn error_class(err: &ModelError) -> String {
     match err {
-        ModelError::Unavailable(_) => "unavailable",
-        ModelError::Auth(_) => "auth",
-        ModelError::RateLimited(_) => "rate_limited",
-        ModelError::BudgetExhausted(_) => "budget_exhausted",
-        ModelError::Timeout(_) => "timeout",
-        ModelError::Unsupported(_) => "unsupported",
-        ModelError::InvalidRequest(_) => "invalid_request",
-        ModelError::Provider(_) => "provider",
-        ModelError::Queue(_) => "queue",
-        ModelError::Cache(_) => "cache",
+        ModelError::Unavailable(_) => "unavailable".to_string(),
+        ModelError::Auth(_) => "auth".to_string(),
+        ModelError::RateLimited(_) => "rate_limited".to_string(),
+        ModelError::BudgetExhausted(_) => "budget_exhausted".to_string(),
+        ModelError::Timeout(_) => "timeout".to_string(),
+        ModelError::Unsupported(capability) => format!(
+            "unsupported:{}",
+            serde_json::to_value(capability)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default()
+        ),
+        ModelError::InvalidRequest(_) => "invalid_request".to_string(),
+        ModelError::Provider(_) => "provider".to_string(),
+        ModelError::Queue(_) => "queue".to_string(),
+        ModelError::Cache(_) => "cache".to_string(),
     }
 }
 
@@ -1736,7 +1746,12 @@ fn dead_item_retry_error(item: &QueueItem) -> ModelError {
         Some("invalid_request") => ModelError::InvalidRequest(error),
         Some("queue") => ModelError::Queue(error),
         Some("cache") => ModelError::Cache(error),
-        Some(_) => ModelError::Provider(error),
+        Some(class) => class
+            .strip_prefix("unsupported:")
+            .and_then(|capability| {
+                serde_json::from_value(Value::String(capability.to_string())).ok()
+            })
+            .map_or(ModelError::Provider(error), ModelError::Unsupported),
         None => {
             let lower = error.to_ascii_lowercase();
             if lower.contains("rate") || lower.contains("429") {
@@ -1822,16 +1837,21 @@ async fn reenqueue_dead_item(
     };
     let payload = model_queue_payload(&capability, request_hash, descriptor, next_state);
     let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err);
+    // Replace the dead item only while it is still the newest for the
+    // request: a caller holding a stale item must not start a second chain.
     let outcome = queue
-        .enqueue(EnqueueRequest {
-            queue_id: queue_id.clone(),
-            kind: kind.to_string(),
-            payload,
-            idempotency_key: idempotency_key.clone(),
-            run_after: Some(Utc::now() + ChronoDuration::milliseconds(retry_after_ms as i64)),
-            max_attempts: Some(remaining_attempts.min(config.retry_attempts.max(1)).max(1)),
-            force: true,
-        })
+        .enqueue_replacing(
+            EnqueueRequest {
+                queue_id: queue_id.clone(),
+                kind: kind.to_string(),
+                payload,
+                idempotency_key: idempotency_key.clone(),
+                run_after: Some(Utc::now() + ChronoDuration::milliseconds(retry_after_ms as i64)),
+                max_attempts: Some(remaining_attempts.min(config.retry_attempts.max(1)).max(1)),
+                force: true,
+            },
+            &item.item_id,
+        )
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))?;
     Ok(Some(outcome))
@@ -1849,6 +1869,7 @@ async fn reenqueue_with_fresh_budget(
     request_hash: &str,
     idempotency_key: &Option<String>,
     config: &ModelQueueConfig,
+    current: &QueueItemId,
 ) -> Result<EnqueueOutcome, ModelError> {
     let payload = model_queue_payload(
         &capability,
@@ -1862,16 +1883,21 @@ async fn reenqueue_with_fresh_budget(
                 .max(1),
         },
     );
+    // Conditional on `current` still being the newest item, so a delayed
+    // caller cannot renew over a budget another caller renewed meanwhile.
     queue
-        .enqueue(EnqueueRequest {
-            queue_id: queue_id.clone(),
-            kind: kind.to_string(),
-            payload,
-            idempotency_key: idempotency_key.clone(),
-            run_after: None,
-            max_attempts: Some(config.retry_attempts.max(1)),
-            force: true,
-        })
+        .enqueue_replacing(
+            EnqueueRequest {
+                queue_id: queue_id.clone(),
+                kind: kind.to_string(),
+                payload,
+                idempotency_key: idempotency_key.clone(),
+                run_after: None,
+                max_attempts: Some(config.retry_attempts.max(1)),
+                force: true,
+            },
+            current,
+        )
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))
 }
@@ -1903,7 +1929,10 @@ fn exhausted_request_error(
         ModelError::Auth(_) => ModelError::Auth(message),
         ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(message),
         ModelError::InvalidRequest(_) => ModelError::InvalidRequest(message),
-        _ => ModelError::Provider(message),
+        ModelError::Queue(_) => ModelError::Queue(message),
+        ModelError::Cache(_) => ModelError::Cache(message),
+        ModelError::Unsupported(capability) => ModelError::Unsupported(*capability),
+        ModelError::Provider(_) => ModelError::Provider(message),
     }
 }
 
@@ -3740,6 +3769,65 @@ mod tests {
             wait < Duration::from_millis(10),
             "20k rpm should pace in milliseconds, not seconds: {wait:?}"
         );
+    }
+
+    #[cfg(feature = "queue")]
+    #[test]
+    fn every_error_class_survives_a_dead_item_and_exhaustion() {
+        let errors = [
+            ModelError::Unavailable("x".into()),
+            ModelError::Auth("x".into()),
+            ModelError::RateLimited("x".into()),
+            ModelError::BudgetExhausted("x".into()),
+            ModelError::Timeout("x".into()),
+            ModelError::Unsupported(ModelCapability::Rerank),
+            ModelError::InvalidRequest("x".into()),
+            ModelError::Provider("x".into()),
+            ModelError::Queue("x".into()),
+            ModelError::Cache("x".into()),
+        ];
+        let now = Utc::now();
+        for err in errors {
+            let item = QueueItem {
+                item_id: QueueItemId::new(),
+                queue_id: QueueId::new("chat:test:classes"),
+                kind: "chat".to_string(),
+                payload: serde_json::json!({}),
+                status: QueueStatus::Dead,
+                attempt: 1,
+                max_attempts: 1,
+                run_after: now,
+                lease_owner: None,
+                lease_until: None,
+                idempotency_key: None,
+                last_error: Some(err.to_string()),
+                last_error_class: Some(error_class(&err)),
+                created_at: now,
+                updated_at: now,
+            };
+            let replayed = dead_item_retry_error(&item);
+            assert_eq!(
+                std::mem::discriminant(&replayed),
+                std::mem::discriminant(&err),
+                "{err:?} came back as {replayed:?}"
+            );
+            let exhausted = exhausted_request_error(
+                &item.queue_id,
+                &item,
+                &ModelQueueConfig::default(),
+                &replayed,
+            );
+            assert_eq!(
+                std::mem::discriminant(&exhausted),
+                std::mem::discriminant(&err),
+                "{err:?} exhausted as {exhausted:?}"
+            );
+            if let (ModelError::Unsupported(expected), ModelError::Unsupported(actual)) =
+                (&err, &exhausted)
+            {
+                assert_eq!(expected, actual);
+            }
+        }
     }
 
     #[cfg(feature = "queue")]

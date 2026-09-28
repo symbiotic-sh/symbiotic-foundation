@@ -147,6 +147,27 @@ pub enum QueueError {
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError>;
+    /// Force-enqueue `request` only while `current` is still the newest item
+    /// for its idempotency key; otherwise return that newest item unchanged,
+    /// as `ActiveDuplicate` or `TerminalDuplicate`. The check and the insert
+    /// are one step, so two callers holding the same superseded item cannot
+    /// both replace it. The default is not atomic; both Foundation backends
+    /// are.
+    async fn enqueue_replacing(
+        &self,
+        mut request: EnqueueRequest,
+        current: &QueueItemId,
+    ) -> Result<EnqueueOutcome, QueueError> {
+        request.force = false;
+        let newest = self.enqueue(request.clone()).await?;
+        if newest.item.item_id != *current
+            || newest.disposition != EnqueueDisposition::TerminalDuplicate
+        {
+            return Ok(newest);
+        }
+        request.force = true;
+        self.enqueue(request).await
+    }
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError>;
     async fn claim_item(
         &self,
