@@ -319,3 +319,64 @@ async fn an_in_memory_runtime_caches_nothing_by_default_and_binding_sinks_apply(
         2
     );
 }
+
+#[tokio::test]
+async fn a_queue_id_isolates_a_role_or_pools_models() {
+    let runtime = Runtime::in_memory();
+    let raw = Loopback::new(unique_identity());
+    let one_slot = ModelQueueConfig {
+        max_in_flight: 1,
+        ..policy()
+    };
+    // The same model on its own queue and on an isolated role queue: the two
+    // queues do not share the one slot.
+    let shared = runtime
+        .chat(ModelBinding::new(raw.clone()).with_policy(one_slot.clone()))
+        .unwrap();
+    let isolated = runtime
+        .chat(
+            ModelBinding::new(raw.clone())
+                .with_policy(one_slot.clone())
+                .with_queue_id(symbiotic_core::QueueId::new("answer:isolated")),
+        )
+        .unwrap();
+    let (a, b) = tokio::join!(shared.chat(request("a")), isolated.chat(request("b")));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(raw.peak.load(Ordering::SeqCst), 2);
+
+    // Two models pooled on one queue share its slot: count their calls on
+    // one gauge.
+    let first = Loopback::new(unique_identity());
+    let mut second = Loopback::new(unique_identity());
+    second.active = first.active.clone();
+    second.peak = first.peak.clone();
+    let pool = symbiotic_core::QueueId::new("chat:pool:shared");
+    let first_chat = runtime
+        .chat(
+            ModelBinding::new(first.clone())
+                .with_policy(one_slot.clone())
+                .with_queue_id(pool.clone()),
+        )
+        .unwrap();
+    let second_chat = runtime
+        .chat(
+            ModelBinding::new(second.clone())
+                .with_policy(one_slot)
+                .with_queue_id(pool),
+        )
+        .unwrap();
+    let (a, b) = tokio::join!(
+        first_chat.chat(request("x")),
+        second_chat.chat(request("y"))
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        first.peak.load(Ordering::SeqCst),
+        1,
+        "pooled models share one slot"
+    );
+}

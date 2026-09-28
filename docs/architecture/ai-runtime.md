@@ -34,6 +34,7 @@ the same state.
 
 | Field | Default | Meaning |
 |---|---|---|
+| `queue_id` | The model's own queue (`operation:operator:model`) | Queue whose limits and cooldown the binding shares: isolate a role, or pool models |
 | `policy` | Catalog default for the model (`default_model_queue_config`), else `ModelQueueConfig::default()` | Concurrency, rate limits, retries, timeout |
 | `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
@@ -71,8 +72,10 @@ one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
 
 ## Shared limits
 
-Every provider handed out for one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`)
-shares:
+Every provider handed out for one queue shares the limits below. By default a
+queue is one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`); a
+binding's `queue_id` moves it to another queue. The providers of a queue
+share:
 
 - one concurrency cap. Callers wait FIFO for a slot (`ModelAdmission`), and the
   backend enforces the same cap;

@@ -117,6 +117,10 @@ pub enum ResponseCacheMode {
 #[derive(Clone)]
 pub struct ModelBinding<P> {
     pub provider: P,
+    /// Queue whose limits and cooldown this binding shares. `None` uses the
+    /// model's own queue (`operation:operator:model`); set it to isolate a
+    /// role from its model's other callers, or to pool several models.
+    pub queue_id: Option<QueueId>,
     /// Queue policy. `None` uses the catalog default for the provider's
     /// model ([`default_model_queue_config`]), else [`ModelQueueConfig::default`].
     /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
@@ -132,11 +136,17 @@ impl<P> ModelBinding<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
+            queue_id: None,
             policy: None,
             response_cache: ResponseCacheMode::Default,
             receipt_sink: None,
             trace_sink: None,
         }
+    }
+
+    pub fn with_queue_id(mut self, queue_id: QueueId) -> Self {
+        self.queue_id = Some(queue_id);
+        self
     }
 
     pub fn with_policy(mut self, policy: ModelQueueConfig) -> Self {
@@ -305,7 +315,10 @@ impl Runtime {
         descriptor: &ProviderDescriptor,
         binding: &ModelBinding<P>,
     ) -> Result<Bound, ModelError> {
-        let queue_id = descriptor.queue_id();
+        let queue_id = binding
+            .queue_id
+            .clone()
+            .unwrap_or_else(|| descriptor.queue_id());
         let mut policy = binding
             .policy
             .clone()
@@ -328,6 +341,7 @@ impl Runtime {
             worker_id: self.inner.worker_id.clone(),
             policy,
             sinks: Sinks {
+                queue_id,
                 trace: binding
                     .trace_sink
                     .clone()
@@ -377,6 +391,7 @@ struct Bound {
 }
 
 struct Sinks {
+    queue_id: QueueId,
     trace: Option<Arc<dyn TraceSink>>,
     receipt: Option<Arc<dyn QueueReceiptSink>>,
     cache: Option<Arc<dyn ResponseCache>>,
@@ -385,6 +400,7 @@ struct Sinks {
 macro_rules! apply_sinks {
     ($name:ident, $ty:ident) => {
         fn $name<P>(self, mut provider: $ty<P>) -> $ty<P> {
+            provider = provider.with_queue_id(self.queue_id);
             if let Some(sink) = self.trace {
                 provider = provider.with_trace_sink(sink);
             }

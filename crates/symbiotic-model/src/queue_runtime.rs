@@ -281,6 +281,8 @@ pub(crate) struct QueueRuntime {
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
+    /// Queue identity override; `None` uses the descriptor's `queue_id`.
+    pub(crate) queue_id: Option<QueueId>,
     pub(crate) worker_id: String,
     pub(crate) config: crate::ModelQueueConfig,
 }
@@ -297,6 +299,7 @@ impl QueueRuntime {
             receipt_sink: None,
             admission: None,
             response_cache: None,
+            queue_id: None,
             worker_id,
             config,
         }
@@ -332,6 +335,14 @@ macro_rules! queue_runtime_builders {
         /// built from the same [`ModelAdmission`](crate::ModelAdmission).
         pub fn with_admission(mut self, admission: $crate::ModelAdmission) -> Self {
             self.runtime.admission = Some(admission);
+            self
+        }
+
+        /// Run on `queue_id` instead of the model's own queue, so its limits
+        /// and cooldown are shared with (or isolated from) other providers by
+        /// that id.
+        pub fn with_queue_id(mut self, queue_id: symbiotic_core::QueueId) -> Self {
+            self.runtime.queue_id = Some(queue_id);
             self
         }
 

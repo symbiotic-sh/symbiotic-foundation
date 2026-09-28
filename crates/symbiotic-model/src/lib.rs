@@ -1047,7 +1047,10 @@ where
     let trace_sink = &runtime.trace_sink;
     let config = &runtime.config;
     let worker_id = &runtime.worker_id;
-    let queue_id = descriptor.queue_id();
+    let queue_id = runtime
+        .queue_id
+        .clone()
+        .unwrap_or_else(|| descriptor.queue_id());
     let request_hash = hash_json(request)?;
     let request_value =
         serde_json::to_value(request).map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
@@ -1123,6 +1126,7 @@ where
                 let dead_err = dead_item_retry_error(&enqueue.item);
                 if let Some(next) = reenqueue_dead_item(
                     queue.as_ref(),
+                    &queue_id,
                     &descriptor,
                     capability,
                     kind,
@@ -1136,7 +1140,7 @@ where
                 {
                     enqueue = next;
                 } else {
-                    return Err(exhausted_request_error(&descriptor, &enqueue.item, config));
+                    return Err(exhausted_request_error(&queue_id, &enqueue.item, config));
                 }
             }
             // A finished identical request whose response is not cached (or
@@ -1145,6 +1149,7 @@ where
             QueueStatus::Succeeded => {
                 enqueue = reenqueue_succeeded_without_cache(
                     queue.as_ref(),
+                    &queue_id,
                     &descriptor,
                     capability,
                     kind,
@@ -1227,6 +1232,7 @@ where
                         let dead_err = dead_item_retry_error(&current);
                         if let Some(next) = reenqueue_dead_item(
                             queue.as_ref(),
+                            &queue_id,
                             &descriptor,
                             capability,
                             kind,
@@ -1240,7 +1246,7 @@ where
                         {
                             enqueue = next;
                         } else {
-                            return Err(exhausted_request_error(&descriptor, &current, config));
+                            return Err(exhausted_request_error(&queue_id, &current, config));
                         }
                     }
                     QueueStatus::Succeeded => {
@@ -1265,6 +1271,7 @@ where
                         }
                         enqueue = reenqueue_succeeded_without_cache(
                             queue.as_ref(),
+                            &queue_id,
                             &descriptor,
                             capability,
                             kind,
@@ -1405,6 +1412,7 @@ where
                         .unwrap_or(item);
                     if let Some(next) = reenqueue_dead_item(
                         queue.as_ref(),
+                        &queue_id,
                         &descriptor,
                         capability,
                         kind,
@@ -1428,7 +1436,7 @@ where
                         err.to_string(),
                     )
                     .await?;
-                    return Err(exhausted_request_error(&descriptor, &dead_item, config));
+                    return Err(exhausted_request_error(&queue_id, &dead_item, config));
                 }
                 // The backend schedules whole seconds; sleep the remainder
                 // here so sub-second backoff holds.
@@ -1689,6 +1697,7 @@ fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRet
 #[allow(clippy::too_many_arguments)]
 async fn reenqueue_dead_item(
     queue: &dyn QueueBackend,
+    queue_id: &QueueId,
     descriptor: &ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
@@ -1712,7 +1721,7 @@ async fn reenqueue_dead_item(
     let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err);
     let outcome = queue
         .enqueue(EnqueueRequest {
-            queue_id: descriptor.queue_id(),
+            queue_id: queue_id.clone(),
             kind: kind.to_string(),
             payload,
             idempotency_key: idempotency_key.clone(),
@@ -1725,9 +1734,12 @@ async fn reenqueue_dead_item(
     Ok(Some(outcome))
 }
 
+// Same execution boundary as `reenqueue_dead_item`.
 #[cfg(feature = "queue")]
+#[allow(clippy::too_many_arguments)]
 async fn reenqueue_succeeded_without_cache(
     queue: &dyn QueueBackend,
+    queue_id: &QueueId,
     descriptor: &ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
@@ -1749,7 +1761,7 @@ async fn reenqueue_succeeded_without_cache(
     );
     queue
         .enqueue(EnqueueRequest {
-            queue_id: descriptor.queue_id(),
+            queue_id: queue_id.clone(),
             kind: kind.to_string(),
             payload,
             idempotency_key: idempotency_key.clone(),
@@ -1763,7 +1775,7 @@ async fn reenqueue_succeeded_without_cache(
 
 #[cfg(feature = "queue")]
 fn exhausted_request_error(
-    descriptor: &ProviderDescriptor,
+    queue_id: &QueueId,
     item: &QueueItem,
     config: &ModelQueueConfig,
 ) -> ModelError {
@@ -1777,7 +1789,7 @@ fn exhausted_request_error(
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
     ModelError::Provider(format!(
         "{} request exhausted after {}/{} logical attempt(s): {}",
-        descriptor.queue_id().0,
+        queue_id.0,
         attempts_used,
         state.max_attempts,
         item.last_error
