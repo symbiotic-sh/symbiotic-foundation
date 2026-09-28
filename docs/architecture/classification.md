@@ -72,10 +72,11 @@ when it reaches the minimum and is more probable than the abstain option.
 Exact ties go to the answer's `chosen` option, so without an abstain option
 `decide_choice` always agrees with `chosen`.
 
-`QueuedClassifierProvider` runs classification through the same `run_queued`
-path as `QueuedChatProvider`, `QueuedEmbeddingProvider` and
-`QueuedRerankProvider`: idempotent enqueue, model cap, rate buckets, cooldowns,
-retry classification, exact response cache, and one trace per call. Its cache
+`QueuedClassifierProvider` (default `queue` feature) runs classification
+through the same `run_queued` path as `QueuedChatProvider`,
+`QueuedEmbeddingProvider` and `QueuedRerankProvider`: idempotent enqueue,
+model cap, rate buckets, cooldowns, retry classification, exact response cache,
+and one trace per call. Its cache
 entries live under `{cache}/classify/{descriptor hash}/`, so classifiers with
 different identities or expected served models never share an entry. The
 other wrappers keep the historical `{cache}/{kind}/{request hash}` path, which

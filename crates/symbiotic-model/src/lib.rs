@@ -2,37 +2,57 @@
 //!
 //! Implementations may wrap HTTP SDKs, local CLIs, subscription-backed tools,
 //! or host-owned adapters. Policy and scheduling are supplied by the host.
+//!
+//! The default `queue` feature adds the `Queued*` providers, which run calls
+//! through a `symbiotic-queue` backend. Without it, the crate is the provider
+//! contracts and HTTP providers alone: no queue runtime and no SQLite.
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 use symbiotic_core::{
     InvocationSource, ModelIdentity, ModelName, ModelTier, Operation, Operator, QueueId,
-    QueueItemId, RoleBinding, Sensitivity, TraceId,
+    RoleBinding, Sensitivity, TraceId,
 };
+use symbiotic_trace::{
+    CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
+};
+use thiserror::Error;
+
+// The queue runtime behind the `Queued*` providers.
+#[cfg(feature = "queue")]
+use chrono::Duration as ChronoDuration;
+#[cfg(feature = "queue")]
+use std::path::Path;
+#[cfg(feature = "queue")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "queue")]
+use std::time::Duration;
+#[cfg(feature = "queue")]
+use symbiotic_core::QueueItemId;
+#[cfg(feature = "queue")]
 use symbiotic_queue::{
     EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend, QueueItem,
     QueueStatus,
 };
-use symbiotic_trace::{
-    CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, TraceSink,
-    UsageTrace,
-};
-use thiserror::Error;
+#[cfg(feature = "queue")]
+use symbiotic_trace::TraceSink;
 
 mod classify;
+#[cfg(feature = "queue")]
+pub use classify::QueuedClassifierProvider;
 pub use classify::{
     AnswerValue, ChatClassifierProvider, ChoiceDecision, ChoiceOption, ClassifierAnswer,
     ClassifierProvider, ClassifierQuestion, ClassifyRequest, ClassifyResponse, JEV_DEFAULT_MODEL,
     JEV_MAX_CHOICE_OPTIONS, JEV_MAX_REQUEST_TOKENS, JEV_MAX_SCORE_LEVELS,
     JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS, JevClassifierProvider, OptionProbability,
-    QuestionKind, QueuedClassifierProvider, StaticClassifierProvider, TYPESAFE_BASE_URL,
+    QuestionKind, StaticClassifierProvider, TYPESAFE_BASE_URL,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,6 +670,7 @@ pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapab
     }
 }
 
+#[cfg(feature = "queue")]
 #[derive(Clone)]
 pub struct QueuedChatProvider<C> {
     inner: C,
@@ -659,6 +680,7 @@ pub struct QueuedChatProvider<C> {
     config: ModelQueueConfig,
 }
 
+#[cfg(feature = "queue")]
 impl<C> QueuedChatProvider<C> {
     pub fn new(
         inner: C,
@@ -681,6 +703,7 @@ impl<C> QueuedChatProvider<C> {
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<C> ModelProvider for QueuedChatProvider<C>
 where
@@ -691,6 +714,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<C> ChatProvider for QueuedChatProvider<C>
 where
@@ -714,6 +738,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 #[derive(Clone)]
 pub struct QueuedEmbeddingProvider<E> {
     inner: E,
@@ -723,6 +748,7 @@ pub struct QueuedEmbeddingProvider<E> {
     config: ModelQueueConfig,
 }
 
+#[cfg(feature = "queue")]
 impl<E> QueuedEmbeddingProvider<E> {
     pub fn new(
         inner: E,
@@ -745,6 +771,7 @@ impl<E> QueuedEmbeddingProvider<E> {
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<E> ModelProvider for QueuedEmbeddingProvider<E>
 where
@@ -755,6 +782,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<E> EmbeddingProvider for QueuedEmbeddingProvider<E>
 where
@@ -778,6 +806,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 /// Queue-bound wrapper for a [`RerankProvider`], mirroring [`QueuedChatProvider`]
 /// and [`QueuedEmbeddingProvider`]. Reranking is a first-class model seam (the
 /// recall cascade's relevance stage), so it earns the same idempotency,
@@ -793,6 +822,7 @@ pub struct QueuedRerankProvider<R> {
     config: ModelQueueConfig,
 }
 
+#[cfg(feature = "queue")]
 impl<R> QueuedRerankProvider<R> {
     pub fn new(
         inner: R,
@@ -815,6 +845,7 @@ impl<R> QueuedRerankProvider<R> {
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<R> ModelProvider for QueuedRerankProvider<R>
 where
@@ -825,6 +856,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 #[async_trait]
 impl<R> RerankProvider for QueuedRerankProvider<R>
 where
@@ -849,6 +881,7 @@ where
 }
 
 // These arguments are the existing queue execution boundary; keep its behavior stable.
+#[cfg(feature = "queue")]
 #[allow(clippy::too_many_arguments)]
 async fn run_queued<P, Req, Res, Fut>(
     descriptor: ProviderDescriptor,
@@ -1187,6 +1220,7 @@ where
     }
 }
 
+#[cfg(feature = "queue")]
 fn spawn_queue_heartbeat(
     queue: Arc<dyn QueueBackend>,
     item_id: QueueItemId,
@@ -1245,6 +1279,7 @@ impl TraceCarrier for RerankResponse {
     }
 }
 
+#[cfg(feature = "queue")]
 fn is_retryable(err: &ModelError) -> bool {
     matches!(
         err,
@@ -1252,11 +1287,13 @@ fn is_retryable(err: &ModelError) -> bool {
     )
 }
 
+#[cfg(feature = "queue")]
 fn retry_backoff_seconds(attempt: u32) -> u64 {
     2u64.saturating_pow(attempt.saturating_sub(1).min(5))
         .min(30)
 }
 
+#[cfg(feature = "queue")]
 fn retry_after_seconds(
     attempt: u32,
     max_jitter_seconds: u64,
@@ -1275,6 +1312,7 @@ fn retry_after_seconds(
         .clamp(1, 120)
 }
 
+#[cfg(feature = "queue")]
 fn retry_jitter_seconds(
     max_jitter_seconds: u64,
     item_id: &QueueItemId,
@@ -1302,6 +1340,7 @@ fn retry_jitter_seconds(
     u64::from_le_bytes(bytes) % (max_jitter_seconds + 1)
 }
 
+#[cfg(feature = "queue")]
 fn dead_item_retry_error(item: &QueueItem) -> ModelError {
     let error = item
         .last_error
@@ -1317,12 +1356,14 @@ fn dead_item_retry_error(item: &QueueItem) -> ModelError {
     }
 }
 
+#[cfg(feature = "queue")]
 #[derive(Clone, Copy, Debug)]
 struct LogicalRetryState {
     attempts_used: u32,
     max_attempts: u32,
 }
 
+#[cfg(feature = "queue")]
 fn model_queue_payload(
     capability: &ModelCapability,
     request_hash: &str,
@@ -1340,6 +1381,7 @@ fn model_queue_payload(
     })
 }
 
+#[cfg(feature = "queue")]
 fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRetryState {
     let retry = payload.get("logical_retry");
     let attempts_used = retry
@@ -1360,6 +1402,7 @@ fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRet
 }
 
 // Retry bookkeeping follows the same execution boundary rather than another state type.
+#[cfg(feature = "queue")]
 #[allow(clippy::too_many_arguments)]
 async fn reenqueue_dead_item(
     queue: &dyn QueueBackend,
@@ -1411,6 +1454,7 @@ async fn reenqueue_dead_item(
     Ok(Some(outcome))
 }
 
+#[cfg(feature = "queue")]
 async fn reenqueue_succeeded_without_cache(
     queue: &dyn QueueBackend,
     descriptor: &ProviderDescriptor,
@@ -1446,6 +1490,7 @@ async fn reenqueue_succeeded_without_cache(
         .map_err(|err| ModelError::Queue(err.to_string()))
 }
 
+#[cfg(feature = "queue")]
 fn exhausted_request_error(
     descriptor: &ProviderDescriptor,
     item: &QueueItem,
@@ -1470,25 +1515,31 @@ fn exhausted_request_error(
     ))
 }
 
+#[cfg(feature = "queue")]
 static MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+#[cfg(feature = "queue")]
 static MODEL_RATE_BUCKETS: OnceLock<Mutex<HashMap<String, RateBucket>>> = OnceLock::new();
 
+#[cfg(feature = "queue")]
 trait BudgetedModelRequest {
     fn input_budget_units(&self) -> u64;
 }
 
+#[cfg(feature = "queue")]
 impl BudgetedModelRequest for ChatRequest {
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(self.messages.iter().map(|message| message.content.as_str()))
     }
 }
 
+#[cfg(feature = "queue")]
 impl BudgetedModelRequest for EmbeddingRequest {
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(self.inputs.iter().map(String::as_str))
     }
 }
 
+#[cfg(feature = "queue")]
 impl BudgetedModelRequest for RerankRequest {
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(
@@ -1497,6 +1548,7 @@ impl BudgetedModelRequest for RerankRequest {
     }
 }
 
+#[cfg(feature = "queue")]
 fn estimate_token_budget_units<'a>(parts: impl IntoIterator<Item = &'a str>) -> u64 {
     parts
         .into_iter()
@@ -1505,6 +1557,7 @@ fn estimate_token_budget_units<'a>(parts: impl IntoIterator<Item = &'a str>) -> 
         .max(1)
 }
 
+#[cfg(feature = "queue")]
 #[derive(Clone, Debug)]
 struct RateBucket {
     tokens: f64,
@@ -1513,6 +1566,7 @@ struct RateBucket {
     updated_at: Instant,
 }
 
+#[cfg(feature = "queue")]
 impl RateBucket {
     fn new(per_minute: f64) -> Self {
         let rate_per_second = (per_minute / 60.0).max(0.000_001);
@@ -1546,6 +1600,7 @@ impl RateBucket {
     }
 }
 
+#[cfg(feature = "queue")]
 async fn wait_for_model_budget<R>(
     queue_id: &QueueId,
     config: &ModelQueueConfig,
@@ -1585,6 +1640,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "queue")]
 async fn wait_for_model_cooldown(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
@@ -1630,6 +1686,7 @@ async fn wait_for_model_cooldown(
     Ok(())
 }
 
+#[cfg(feature = "queue")]
 async fn note_model_cooldown(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
@@ -1670,6 +1727,7 @@ async fn note_model_cooldown(
     Ok(())
 }
 
+#[cfg(feature = "queue")]
 async fn emit_failure_trace(
     descriptor: &ProviderDescriptor,
     trace_sink: &Option<Arc<dyn TraceSink>>,
@@ -1704,6 +1762,7 @@ async fn emit_failure_trace(
     Ok(())
 }
 
+#[cfg(feature = "queue")]
 async fn return_cached_response<Res: TraceCarrier>(
     mut response: Res,
     descriptor: &ProviderDescriptor,
@@ -1730,6 +1789,7 @@ async fn return_cached_response<Res: TraceCarrier>(
     Ok(response)
 }
 
+#[cfg(feature = "queue")]
 fn request_sensitivity<T: Serialize>(request: &T) -> Sensitivity {
     serde_json::to_value(request)
         .ok()
@@ -1745,10 +1805,12 @@ fn hash_json<T: Serialize>(value: &T) -> Result<String, ModelError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[cfg(feature = "queue")]
 fn cache_path(root: &Path, kind: &str, hash: &str) -> PathBuf {
     root.join(kind).join(format!("{hash}.json"))
 }
 
+#[cfg(feature = "queue")]
 fn load_cache<T: for<'de> Deserialize<'de>>(
     root: &Path,
     kind: &str,
@@ -1764,6 +1826,7 @@ fn load_cache<T: for<'de> Deserialize<'de>>(
         .map_err(|err| ModelError::Cache(err.to_string()))
 }
 
+#[cfg(feature = "queue")]
 fn store_cache<T: Serialize>(
     root: &Path,
     kind: &str,
@@ -2443,10 +2506,16 @@ fn hash_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "queue")]
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use symbiotic_queue::SqliteQueue;
+    #[cfg(feature = "queue")]
+    use std::time::Duration;
+    #[cfg(feature = "queue")]
+    use symbiotic_queue_sqlite::SqliteQueue;
 
+    #[cfg(feature = "queue")]
     static TEST_QUEUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "queue")]
     use symbiotic_trace::InMemoryTraceSink;
 
     #[test]
@@ -2550,6 +2619,7 @@ mod tests {
         assert_eq!(sparse, ModelCapabilities::default());
     }
 
+    #[cfg(feature = "queue")]
     #[test]
     fn model_budget_units_are_token_estimates() {
         let request = EmbeddingRequest {
@@ -2576,6 +2646,7 @@ mod tests {
         assert_eq!(config.retry_attempts, 2);
     }
 
+    #[cfg(feature = "queue")]
     #[derive(Clone)]
     struct SlowCountingChat {
         descriptor: ProviderDescriptor,
@@ -2584,6 +2655,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "queue")]
     impl SlowCountingChat {
         fn new(
             active: Arc<AtomicUsize>,
@@ -2619,6 +2691,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for SlowCountingChat {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2626,6 +2699,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ChatProvider for SlowCountingChat {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
@@ -2654,12 +2728,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[derive(Clone)]
     struct DeadThenSuccessChat {
         descriptor: ProviderDescriptor,
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "queue")]
     impl DeadThenSuccessChat {
         fn new(calls: Arc<AtomicUsize>) -> Self {
             Self {
@@ -2675,6 +2751,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for DeadThenSuccessChat {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2682,6 +2759,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ChatProvider for DeadThenSuccessChat {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
@@ -2709,12 +2787,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[derive(Clone)]
     struct SlowUnavailableChat {
         descriptor: ProviderDescriptor,
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "queue")]
     impl SlowUnavailableChat {
         fn new(calls: Arc<AtomicUsize>) -> Self {
             // Independent fixtures must not inherit another test's model cooldown.
@@ -2735,6 +2815,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for SlowUnavailableChat {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2742,6 +2823,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ChatProvider for SlowUnavailableChat {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ModelError> {
@@ -2751,11 +2833,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[derive(Clone)]
     struct LeaseCrossingChat {
         descriptor: ProviderDescriptor,
     }
 
+    #[cfg(feature = "queue")]
     impl LeaseCrossingChat {
         fn new() -> Self {
             Self {
@@ -2770,6 +2854,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for LeaseCrossingChat {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -2777,6 +2862,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ChatProvider for LeaseCrossingChat {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
@@ -2801,6 +2887,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     fn chat_request(text: &str) -> ChatRequest {
         ChatRequest {
             messages: vec![ChatMessage {
@@ -2817,6 +2904,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_enforces_model_cap() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -2850,6 +2938,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 8);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_uses_exact_response_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -2888,6 +2977,7 @@ mod tests {
         assert_eq!(records[1].cache.response_cache, CacheStatus::Hit);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_trace_separates_queue_wait_from_provider_time() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -2956,6 +3046,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_rate_budget_wait_does_not_hold_running_slot() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -3024,6 +3115,7 @@ mod tests {
         second.await.unwrap().unwrap();
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_shares_cached_response_with_concurrent_duplicate() {
         let dir = tempfile::tempdir().unwrap();
@@ -3058,6 +3150,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_replays_succeeded_item_when_cache_is_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3129,6 +3222,7 @@ mod tests {
         assert!(cache_path(dir.path().join("cache").as_path(), "chat", &request_hash).is_file());
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_reenqueues_dead_item_until_logical_retry_limit() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -3156,6 +3250,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_stops_at_logical_retry_limit() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -3183,6 +3278,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_waiter_shares_logical_retry_envelope() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -3216,6 +3312,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_provider_heartbeats_long_provider_call() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
@@ -3241,6 +3338,7 @@ mod tests {
         assert_eq!(response.text, "hello");
     }
 
+    #[cfg(feature = "queue")]
     #[test]
     fn rate_bucket_waits_after_burst_without_consuming_request_timeout() {
         let mut bucket = RateBucket::new(60.0);
@@ -3248,6 +3346,7 @@ mod tests {
         assert!(bucket.reserve(1.0).is_some());
     }
 
+    #[cfg(feature = "queue")]
     #[test]
     fn rate_bucket_smooths_high_rpm_instead_of_cold_start_bursting() {
         let mut bucket = RateBucket::new(20_000.0);
@@ -3261,6 +3360,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "queue")]
     #[test]
     fn retry_jitter_spreads_same_attempt_failures_deterministically() {
         let err = ModelError::Unavailable("connect timeout".to_string());
@@ -3280,6 +3380,7 @@ mod tests {
         assert!((1..=21).contains(&second_delay));
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn model_budget_wait_reserves_once_then_proceeds() {
         let config = ModelQueueConfig {
@@ -3347,12 +3448,14 @@ mod tests {
         assert_eq!(selected[0].operator.0, "ollama");
     }
 
+    #[cfg(feature = "queue")]
     #[derive(Clone)]
     struct CountingRerank {
         descriptor: ProviderDescriptor,
         calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "queue")]
     impl CountingRerank {
         fn new(calls: Arc<AtomicUsize>) -> Self {
             Self {
@@ -3368,6 +3471,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for CountingRerank {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -3375,6 +3479,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[async_trait]
     impl RerankProvider for CountingRerank {
         async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
@@ -3409,6 +3514,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     fn rerank_request(query: &str) -> RerankRequest {
         RerankRequest {
             query: query.to_string(),
@@ -3425,6 +3531,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_rerank_provider_reuses_exact_response_cache_and_traces() {
         let dir = tempfile::tempdir().unwrap();

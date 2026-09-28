@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "Provider-neutral model runtime contracts"
 
+[features]
+default = ["queue"]
+# The `Queued*` providers over a `symbiotic-queue` backend. Without it the crate
+# is the provider contracts and HTTP providers, with no queue runtime.
+queue = ["dep:symbiotic-queue"]
+
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
@@ -16,12 +22,14 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
-symbiotic-queue = { path = "../symbiotic-queue" }
+symbiotic-queue = { path = "../symbiotic-queue", optional = true }
 symbiotic-trace = { path = "../symbiotic-trace" }
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# Tests run the queued providers on the SQLite backend.
+symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 futures = "0.3"
 # Tests run with the `arbitrary_precision` serde_json feature that
 # symbiotic-portability enables in workspace builds, so numeric parsing is

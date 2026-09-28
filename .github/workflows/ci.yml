@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # One package per command: features unify across the packages of one
+      # invocation, which would re-enable a default under test.
+      - name: Clippy (symbiotic-model without default features)
+        run: cargo clippy -p symbiotic-model --no-default-features --all-targets --locked -- -D warnings
+      - name: Test (default features)
+        run: cargo test --workspace --locked
+      - name: Test (symbiotic-model without default features)
+        run: cargo test -p symbiotic-model --no-default-features --locked
