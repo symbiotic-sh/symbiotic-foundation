@@ -61,8 +61,8 @@ pub use symbiotic_model::{
     CacheEntry, ChatProvider, ChatRequest, ChatResponse, ClassifierProvider, ClassifyRequest,
     ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
     InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig, ProviderDescriptor,
-    QueueReceipt, QueueReceiptSink, ReceiptStatus, RerankProvider, RerankRequest, RerankResponse,
-    ResponseCache, default_model_queue_config,
+    QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, RerankProvider,
+    RerankRequest, RerankResponse, ResponseCache, default_model_queue_config,
 };
 
 /// File name of the persistent queue database inside `state_dir`.

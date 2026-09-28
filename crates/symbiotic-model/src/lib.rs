@@ -53,7 +53,7 @@ mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
     CacheEntry, DirResponseCache, InMemoryReceiptSink, ModelAdmission, QueueReceipt,
-    QueueReceiptSink, ReceiptStatus, ResponseCache,
+    QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
@@ -1171,50 +1171,150 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 AttemptTiming::NONE,
             )
             .await;
-        return_cached_response(
-            cached,
-            &self.descriptor,
-            &self.trace_sink,
-            self.request_hash.clone(),
-            item.map(|item| item.item_id.clone()),
-        )
-        .await
-        .map(Some)
+        Ok(Some(
+            self.traced_cache_hit(cached, item.map(|item| item.item_id.clone()))
+                .await,
+        ))
     }
 
-    /// Trace a successful attempt and cache its response; hands the
-    /// response back with the result of the writes.
-    async fn record_success<Res>(
-        self: &Arc<Self>,
-        trace: &ModelInvocationTrace,
-        response: Res,
-    ) -> (Res, Result<(), ModelError>)
+    /// Cache a successful attempt's response, then trace it. The provider
+    /// has answered and been paid, so neither write can fail the call: a
+    /// failure is noted on the response ([`note_side_effect`]).
+    async fn record_success<Res>(self: &Arc<Self>, response: Res) -> Res
     where
-        Res: Serialize + Clone + Send + Sync + 'static,
+        Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
-        if let Some(trace_sink) = &self.trace_sink
-            && let Err(err) = trace_sink.record_model_invocation(trace.clone()).await
-        {
-            return (response, Err(ModelError::Provider(err.to_string())));
-        }
-        let Some(cache) = self.cache.clone() else {
-            return (response, Ok(()));
-        };
-        let call = self.clone();
-        let response = Arc::new(response);
-        let stored = run_blocking({
-            let response = response.clone();
-            move || {
-                let value = serde_json::to_value(&*response)
-                    .map_err(|err| ModelError::Cache(err.to_string()))?;
-                cache.store(&call.cache_entry(), &value)
+        let mut response = response;
+        if let Some(cache) = self.cache.clone() {
+            let call = self.clone();
+            let shared = Arc::new(response);
+            let stored = run_blocking({
+                let shared = shared.clone();
+                move || {
+                    let value = serde_json::to_value(&*shared)
+                        .map_err(|err| ModelError::Cache(err.to_string()))?;
+                    cache.store(&call.cache_entry(), &value)
+                }
+            })
+            .await;
+            // The blocking task has dropped its handle by the time it is joined.
+            response = Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone());
+            if let Err(err) = stored {
+                note_side_effect(
+                    &mut response,
+                    &self.queue_id,
+                    "response_cache_write_failed",
+                    &err,
+                );
             }
-        })
-        .await;
-        // The blocking task has dropped its handle by the time it is joined.
-        let response = Arc::try_unwrap(response).unwrap_or_else(|shared| (*shared).clone());
-        (response, stored)
+        }
+        if let Some(trace_sink) = &self.trace_sink
+            && let Err(err) = trace_sink
+                .record_model_invocation(response.trace().clone())
+                .await
+        {
+            note_side_effect(&mut response, &self.queue_id, "trace_write_failed", &err);
+        }
+        response
     }
+}
+
+#[cfg(feature = "queue")]
+impl<Req> QueuedCall<Req> {
+    /// A cached response, traced as a cache hit. A failed trace write is
+    /// noted on the response; it does not fail the call.
+    async fn traced_cache_hit<Res: TraceCarrier>(
+        &self,
+        mut response: Res,
+        queue_item_id: Option<QueueItemId>,
+    ) -> Res {
+        let mut trace = response.trace().clone();
+        trace.trace_id = TraceId::new();
+        trace.queue_item_id = queue_item_id;
+        trace.model = self.descriptor.identity.clone();
+        trace.request_hash = self.request_hash.clone();
+        trace.cache.response_cache = CacheStatus::Hit;
+        trace.outcome = InvocationOutcome::Succeeded;
+        trace.error_class = None;
+        trace.timestamp = Utc::now();
+        response.set_trace(trace.clone());
+        if let Some(trace_sink) = &self.trace_sink
+            && let Err(err) = trace_sink.record_model_invocation(trace).await
+        {
+            note_side_effect(&mut response, &self.queue_id, "trace_write_failed", &err);
+        }
+        response
+    }
+
+    /// Trace a failed call. A failed trace write is logged; the call still
+    /// fails with its own error.
+    async fn trace_failure(&self, queue_item_id: Option<QueueItemId>, err: &ModelError) {
+        let Some(trace_sink) = &self.trace_sink else {
+            return;
+        };
+        let written = trace_sink
+            .record_model_invocation(ModelInvocationTrace {
+                trace_id: TraceId::new(),
+                queue_item_id,
+                model: self.descriptor.identity.clone(),
+                role_binding: None,
+                source: None,
+                sensitivity: self.sensitivity,
+                request_hash: self.request_hash.clone(),
+                response_hash: None,
+                cache: CacheTrace::default(),
+                usage: UsageTrace::default(),
+                timing: TimingTrace::default(),
+                outcome: InvocationOutcome::Failed,
+                error_class: Some(err.to_string()),
+                audit_refs: Vec::new(),
+                metadata: serde_json::json!({}),
+                timestamp: Utc::now(),
+            })
+            .await;
+        if let Err(trace_err) = written {
+            warn_side_effect(&self.queue_id, "failure_trace_write_failed", &trace_err);
+        }
+    }
+}
+
+/// A side effect of a call (a cache, trace, cooldown or queue write)
+/// failed. The call's outcome stands; the failure is logged as a warning.
+#[cfg(feature = "queue")]
+fn warn_side_effect(queue_id: &QueueId, kind: &str, error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        queue_id = %queue_id.0,
+        kind,
+        %error,
+        "model call side effect failed; the call's outcome stands"
+    );
+}
+
+/// As [`warn_side_effect`], and also listed under [`RUNTIME_DIAGNOSTICS`] in
+/// the response's trace metadata, which its usage receipt carries.
+#[cfg(feature = "queue")]
+fn note_side_effect<Res: TraceCarrier>(
+    response: &mut Res,
+    queue_id: &QueueId,
+    kind: &str,
+    error: &dyn std::fmt::Display,
+) {
+    warn_side_effect(queue_id, kind, error);
+    let mut trace = response.trace().clone();
+    if !trace.metadata.is_object() {
+        let original = std::mem::take(&mut trace.metadata);
+        trace.metadata = if original.is_null() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "value": original })
+        };
+    }
+    let entry = serde_json::json!({ "kind": kind, "error": error.to_string() });
+    match trace.metadata.get_mut(RUNTIME_DIAGNOSTICS) {
+        Some(Value::Array(list)) => list.push(entry),
+        _ => trace.metadata[RUNTIME_DIAGNOSTICS] = serde_json::json!([entry]),
+    }
+    response.set_trace(trace);
 }
 
 // The arguments are the queue execution boundary: one queued call.
@@ -1353,7 +1453,7 @@ where
         };
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
-        wait_for_model_budget(queue_id, config, &this.request).await?;
+        let rate = wait_for_model_budget(queue_id, config, &this.request).await?;
         let attempt_throttle = throttle_started.elapsed();
         throttle_wait += attempt_throttle;
 
@@ -1364,6 +1464,7 @@ where
             call_state.clone(),
             enqueue.item.item_id.clone(),
             permit,
+            rate,
             provider.clone(),
             call.clone(),
             AttemptClock {
@@ -1479,6 +1580,7 @@ async fn run_attempt<P, Req, Res, F, Fut>(
     call_state: Arc<QueuedCall<Req>>,
     item_id: QueueItemId,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    rate: Option<RateGrant>,
     provider: P,
     call: F,
     clock: AttemptClock,
@@ -1507,6 +1609,10 @@ where
         Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
         Err(err) => return Err(queue_error(err)),
     };
+    // Only an attempt that reaches the provider spends rate budget.
+    if let Some(rate) = rate {
+        rate.charge();
+    }
 
     let settled = holding_lease(
         queue,
@@ -1522,13 +1628,15 @@ where
     // continue the request's retry chain if the item is dead.
     match settled {
         Settled::Succeeded {
-            response,
+            mut response,
             provider_ms,
-            recorded,
             completed,
         } => {
-            recorded?;
-            completed.map_err(queue_error)?;
+            // The answer is paid for: a failed completion is noted, not
+            // returned in its place.
+            if let Err(err) = completed {
+                note_side_effect(&mut response, &this.queue_id, "queue_complete_failed", &err);
+            }
             this.receipts
                 .record(
                     ReceiptStatus::Succeeded,
@@ -1544,12 +1652,7 @@ where
                 .await;
             Ok(AttemptEnd::Succeeded(response))
         }
-        Settled::Retryable {
-            err,
-            cooled,
-            failed,
-        } => {
-            cooled?;
+        Settled::Retryable { err, failed } => {
             if failed.map_err(queue_error)? == FailOutcome::RetryScheduled {
                 return Ok(AttemptEnd::Retry(None));
             }
@@ -1561,15 +1664,8 @@ where
             if let Some(next) = this.continue_chain(&dead_item, &err).await? {
                 return Ok(AttemptEnd::Retry(Some(Box::new(next))));
             }
-            emit_failure_trace(
-                &this.descriptor,
-                &this.trace_sink,
-                Some(dead_item.item_id.clone()),
-                this.request_hash.clone(),
-                this.sensitivity,
-                err.to_string(),
-            )
-            .await?;
+            this.trace_failure(Some(dead_item.item_id.clone()), &err)
+                .await;
             Err(exhausted_request_error(
                 &this.queue_id,
                 &dead_item,
@@ -1579,35 +1675,23 @@ where
         }
         Settled::Failed { err, failed } => {
             failed.map_err(queue_error)?;
-            emit_failure_trace(
-                &this.descriptor,
-                &this.trace_sink,
-                Some(item.item_id),
-                this.request_hash.clone(),
-                this.sensitivity,
-                err.to_string(),
-            )
-            .await?;
+            this.trace_failure(Some(item.item_id), &err).await;
             Err(err)
         }
     }
 }
 
 /// How the leased part of an attempt ended: the item is completed or failed,
-/// and the writes on the way returned these results.
+/// with the result of that queue write.
 #[cfg(feature = "queue")]
 enum Settled<Res> {
     Succeeded {
         response: Res,
         provider_ms: u64,
-        /// The trace and cache writes.
-        recorded: Result<(), ModelError>,
         completed: Result<(), symbiotic_queue::QueueError>,
     },
     Retryable {
         err: ModelError,
-        /// The cooldown write.
-        cooled: Result<(), ModelError>,
         failed: Result<FailOutcome, symbiotic_queue::QueueError>,
     },
     Failed {
@@ -1681,13 +1765,12 @@ where
             trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
             trace.timing.provider_ms = Some(provider_ms);
             trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
-            response.set_trace(trace.clone());
-            let (response, recorded) = this.record_success(&trace, response).await;
+            response.set_trace(trace);
+            let response = this.record_success(response).await;
             let completed = queue.complete(&item.item_id, worker_id).await;
             Settled::Succeeded {
                 response,
                 provider_ms,
-                recorded,
                 completed,
             }
         }
@@ -1708,11 +1791,14 @@ where
                 &this.request_hash,
                 &err,
             );
-            let cooled = if is_transient(&err) {
-                note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
-            } else {
-                Ok(())
-            };
+            // The cooldown protects the provider; failing to record it does
+            // not change this attempt's outcome or its retry.
+            if is_transient(&err)
+                && let Err(cooldown_err) =
+                    note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
+            {
+                warn_side_effect(&this.queue_id, "cooldown_write_failed", &cooldown_err);
+            }
             // One exact deadline, kept by the backend: this caller and any
             // duplicate waiting on the item retry no earlier than it.
             let failed = queue
@@ -1726,11 +1812,7 @@ where
                     },
                 )
                 .await;
-            Settled::Retryable {
-                err,
-                cooled,
-                failed,
-            }
+            Settled::Retryable { err, failed }
         }
         Err(err) => {
             this.receipts
@@ -2192,6 +2274,10 @@ fn exhausted_request_error(
 static MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 #[cfg(feature = "queue")]
 static MODEL_RATE_BUCKETS: OnceLock<Mutex<HashMap<String, RateBucket>>> = OnceLock::new();
+/// Per queue: held from an attempt's rate-budget check through its claim.
+#[cfg(feature = "queue")]
+static MODEL_RATE_GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
@@ -2259,8 +2345,9 @@ impl RateBucket {
         }
     }
 
-    fn reserve(&mut self, amount: f64) -> Option<Duration> {
-        let amount = amount.max(1.0);
+    /// Add the budget earned since the last update. A request larger than
+    /// the bucket raises its capacity, so it can still run once full.
+    fn refill(&mut self, amount: f64) {
         if self.capacity < amount {
             self.capacity = amount;
         }
@@ -2269,63 +2356,132 @@ impl RateBucket {
         self.updated_at = now;
         self.tokens =
             (self.tokens + elapsed.as_secs_f64() * self.rate_per_second).min(self.capacity);
+    }
+
+    /// How long until `amount` is available. Spends nothing.
+    fn wait_for(&mut self, amount: f64) -> Option<Duration> {
+        let amount = amount.max(1.0);
+        self.refill(amount);
+        (self.tokens < amount)
+            .then(|| Duration::from_secs_f64((amount - self.tokens) / self.rate_per_second))
+    }
+
+    fn charge(&mut self, amount: f64) {
+        let amount = amount.max(1.0);
+        self.refill(amount);
         self.tokens -= amount;
-        if self.tokens >= 0.0 {
-            None
-        } else {
-            Some(Duration::from_secs_f64(
-                (-self.tokens) / self.rate_per_second,
-            ))
+    }
+}
+
+/// One rate bucket an attempt draws on.
+#[cfg(feature = "queue")]
+struct RateCharge {
+    /// Keyed by policy too: providers of one model with the same limits
+    /// share a bucket; a different policy gets its own.
+    key: String,
+    per_minute: f64,
+    amount: f64,
+}
+
+/// Rate budget cleared for one attempt that is about to claim its item.
+///
+/// It holds the queue's rate gate from the budget check through the claim,
+/// so no other caller is cleared for the same budget meanwhile.
+/// [`RateGrant::charge`] spends it once the claim succeeded, just before
+/// the provider call. Dropping it, because the item was not claimable (a
+/// duplicate holds it, or its retry time has not come), spends nothing.
+#[cfg(feature = "queue")]
+struct RateGrant {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+    charges: Vec<RateCharge>,
+}
+
+#[cfg(feature = "queue")]
+impl RateGrant {
+    fn charge(self) {
+        let map = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut buckets) = map.lock() else {
+            return;
+        };
+        for charge in &self.charges {
+            if let Some(bucket) = buckets.get_mut(&charge.key) {
+                bucket.charge(charge.amount);
+            }
         }
     }
 }
 
+/// Wait until the queue's rate limits allow one more attempt of `request`,
+/// without spending anything; the attempt spends it on a successful claim.
+/// `None` when the policy sets no rate limit.
 #[cfg(feature = "queue")]
 async fn wait_for_model_budget<R>(
     queue_id: &QueueId,
     config: &ModelQueueConfig,
     request: &R,
-) -> Result<(), ModelError>
+) -> Result<Option<RateGrant>, ModelError>
 where
     R: BudgetedModelRequest,
 {
-    if config.requests_per_minute.is_none() && config.input_units_per_minute.is_none() {
-        return Ok(());
-    }
-    let sleep_for = {
-        let map = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut guard) = map.lock() else {
-            return Ok(());
-        };
-        let mut wait: Option<Duration> = None;
-        if let Some(requests_per_minute) = config.requests_per_minute {
-            // Keyed by policy too: providers of one model with the same
-            // limits share a bucket; a different policy gets its own.
-            let key = format!(
+    let mut charges = Vec::new();
+    if let Some(requests_per_minute) = config.requests_per_minute {
+        charges.push(RateCharge {
+            key: format!(
                 "{}:requests:{requests_per_minute}:{}",
                 queue_id.0, config.rate_burst_seconds
-            );
-            let bucket = guard.entry(key).or_insert_with(|| {
-                RateBucket::with_burst(requests_per_minute as f64, config.rate_burst_seconds)
-            });
-            wait = wait.max(bucket.reserve(1.0));
-        }
-        if let Some(input_units_per_minute) = config.input_units_per_minute {
-            let key = format!(
+            ),
+            per_minute: requests_per_minute as f64,
+            amount: 1.0,
+        });
+    }
+    if let Some(input_units_per_minute) = config.input_units_per_minute {
+        charges.push(RateCharge {
+            key: format!(
                 "{}:input-units:{input_units_per_minute}:{}",
                 queue_id.0, config.rate_burst_seconds
-            );
-            let bucket = guard.entry(key).or_insert_with(|| {
-                RateBucket::with_burst(input_units_per_minute as f64, config.rate_burst_seconds)
-            });
-            wait = wait.max(bucket.reserve(request.input_budget_units() as f64));
-        }
-        wait
-    };
-    if let Some(sleep_for) = sleep_for {
-        tokio::time::sleep(sleep_for).await;
+            ),
+            per_minute: input_units_per_minute as f64,
+            amount: request.input_budget_units() as f64,
+        });
     }
-    Ok(())
+    if charges.is_empty() {
+        return Ok(None);
+    }
+    let gate = {
+        let gates = MODEL_RATE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut gates) = gates.lock() else {
+            return Ok(None);
+        };
+        gates.entry(queue_id.0.clone()).or_default().clone()
+    };
+    loop {
+        let held = gate.clone().lock_owned().await;
+        let wait = {
+            let buckets = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+            let Ok(mut buckets) = buckets.lock() else {
+                return Ok(None);
+            };
+            charges
+                .iter()
+                .filter_map(|charge| {
+                    buckets
+                        .entry(charge.key.clone())
+                        .or_insert_with(|| {
+                            RateBucket::with_burst(charge.per_minute, config.rate_burst_seconds)
+                        })
+                        .wait_for(charge.amount)
+                })
+                .max()
+        };
+        let Some(wait) = wait else {
+            return Ok(Some(RateGrant {
+                _gate: held,
+                charges,
+            }));
+        };
+        drop(held);
+        tokio::time::sleep(wait).await;
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -2413,68 +2569,6 @@ async fn note_model_cooldown(
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))?;
     Ok(())
-}
-
-#[cfg(feature = "queue")]
-async fn emit_failure_trace(
-    descriptor: &ProviderDescriptor,
-    trace_sink: &Option<Arc<dyn TraceSink>>,
-    queue_item_id: Option<symbiotic_core::QueueItemId>,
-    request_hash: String,
-    sensitivity: Sensitivity,
-    error: String,
-) -> Result<(), ModelError> {
-    if let Some(trace_sink) = trace_sink {
-        trace_sink
-            .record_model_invocation(ModelInvocationTrace {
-                trace_id: TraceId::new(),
-                queue_item_id,
-                model: descriptor.identity.clone(),
-                role_binding: None,
-                source: None,
-                sensitivity,
-                request_hash,
-                response_hash: None,
-                cache: CacheTrace::default(),
-                usage: UsageTrace::default(),
-                timing: TimingTrace::default(),
-                outcome: InvocationOutcome::Failed,
-                error_class: Some(error),
-                audit_refs: Vec::new(),
-                metadata: serde_json::json!({}),
-                timestamp: Utc::now(),
-            })
-            .await
-            .map_err(|err| ModelError::Provider(err.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "queue")]
-async fn return_cached_response<Res: TraceCarrier>(
-    mut response: Res,
-    descriptor: &ProviderDescriptor,
-    trace_sink: &Option<Arc<dyn TraceSink>>,
-    request_hash: String,
-    queue_item_id: Option<symbiotic_core::QueueItemId>,
-) -> Result<Res, ModelError> {
-    let mut trace = response.trace().clone();
-    trace.trace_id = TraceId::new();
-    trace.queue_item_id = queue_item_id;
-    trace.model = descriptor.identity.clone();
-    trace.request_hash = request_hash;
-    trace.cache.response_cache = CacheStatus::Hit;
-    trace.outcome = InvocationOutcome::Succeeded;
-    trace.error_class = None;
-    trace.timestamp = Utc::now();
-    if let Some(trace_sink) = trace_sink {
-        trace_sink
-            .record_model_invocation(trace.clone())
-            .await
-            .map_err(|err| ModelError::Provider(err.to_string()))?;
-    }
-    response.set_trace(trace);
-    Ok(response)
 }
 
 #[cfg(feature = "queue")]
@@ -4005,17 +4099,19 @@ mod tests {
     #[test]
     fn rate_bucket_waits_after_burst_without_consuming_request_timeout() {
         let mut bucket = RateBucket::new(60.0);
-        assert!(bucket.reserve(1.0).is_none());
-        assert!(bucket.reserve(1.0).is_some());
+        assert!(bucket.wait_for(1.0).is_none());
+        bucket.charge(1.0);
+        assert!(bucket.wait_for(1.0).is_some());
     }
 
     #[cfg(feature = "queue")]
     #[test]
     fn rate_bucket_smooths_high_rpm_instead_of_cold_start_bursting() {
         let mut bucket = RateBucket::new(20_000.0);
-        assert!(bucket.reserve(1.0).is_none());
+        assert!(bucket.wait_for(1.0).is_none());
+        bucket.charge(1.0);
         let wait = bucket
-            .reserve(1.0)
+            .wait_for(1.0)
             .expect("second request should be paced even for high-rpm queues");
         assert!(
             wait < Duration::from_millis(10),
@@ -4087,9 +4183,10 @@ mod tests {
     fn rate_bucket_burst_admits_one_window_then_paces() {
         let mut bucket = RateBucket::with_burst(60.0, 60);
         for _ in 0..60 {
-            assert!(bucket.reserve(1.0).is_none());
+            assert!(bucket.wait_for(1.0).is_none());
+            bucket.charge(1.0);
         }
-        let wait = bucket.reserve(1.0).expect("the 61st request waits");
+        let wait = bucket.wait_for(1.0).expect("the 61st request waits");
         assert!(wait <= Duration::from_millis(1_050), "{wait:?}");
     }
 
@@ -4126,7 +4223,7 @@ mod tests {
 
     #[cfg(feature = "queue")]
     #[tokio::test]
-    async fn model_budget_wait_reserves_once_then_proceeds() {
+    async fn model_budget_is_spent_only_by_a_charged_grant() {
         let config = ModelQueueConfig {
             max_in_flight: 1,
             lease_seconds: 60,
@@ -4144,16 +4241,36 @@ mod tests {
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
 
-        wait_for_model_budget(&queue_id, &config, &chat_request("first"))
+        // Cleared without a claim: nothing is spent, and the next caller
+        // is cleared at once.
+        let unclaimed = wait_for_model_budget(&queue_id, &config, &chat_request("first"))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("a rate-limited policy returns a grant");
+        drop(unclaimed);
+        let claimed = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_model_budget(&queue_id, &config, &chat_request("first")),
+        )
+        .await
+        .expect("an unspent grant leaves the budget in place")
+        .unwrap()
+        .unwrap();
+        claimed.charge();
+
+        let started = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_millis(1500),
             wait_for_model_budget(&queue_id, &config, &chat_request("second")),
         )
         .await
-        .expect("second reservation should sleep for the already-reserved slot and proceed")
+        .expect("the next caller waits for the spent budget to refill, then proceeds")
         .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

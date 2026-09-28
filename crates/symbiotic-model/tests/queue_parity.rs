@@ -853,11 +853,13 @@ fn leased() -> ModelQueueConfig {
 }
 
 /// Forwards to a backend and counts lease renewals. Cooldown writes fail
-/// while `fail_cooldown_writes` is set.
+/// while `fail_cooldown_writes` is set, and completions while
+/// `fail_completions` is set.
 struct CountsRenewals {
     inner: Arc<dyn QueueBackend>,
     renewals: AtomicUsize,
     fail_cooldown_writes: std::sync::atomic::AtomicBool,
+    fail_completions: std::sync::atomic::AtomicBool,
 }
 
 impl CountsRenewals {
@@ -871,6 +873,7 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         inner,
         renewals: AtomicUsize::new(0),
         fail_cooldown_writes: std::sync::atomic::AtomicBool::new(false),
+        fail_completions: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -912,6 +915,13 @@ on_both_backends!(
     a_waiters_slow_cache_read_does_not_stall_lease_renewal,
     a_failed_trace_write_still_completes_the_item,
     a_failed_cooldown_write_still_records_the_failure,
+    a_failed_trace_write_keeps_the_providers_error,
+    a_failed_completion_still_returns_the_paid_answer,
+    an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage,
+    a_retryable_errors_backoff_spends_no_rate_budget,
+    identical_concurrent_requests_spend_rate_budget_once_per_attempt,
+    a_request_limit_admits_its_burst_then_paces,
+    an_input_unit_limit_paces_large_requests,
 );
 
 #[async_trait]
@@ -955,6 +965,9 @@ impl QueueBackend for CountsRenewals {
             .await
     }
     async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
+        if self.fail_completions.load(Ordering::SeqCst) {
+            return Err(QueueError::Storage("queue store down".to_string()));
+        }
         self.inner.complete(item_id, worker_id).await
     }
     async fn fail(
@@ -1160,14 +1173,18 @@ async fn a_failed_cache_write_still_releases_the_lease(backend: &str, queue: Arc
         .with_receipt_sink(receipts.clone())
         .with_response_cache(Arc::new(FullCache));
 
-    let err = tokio::time::timeout(
+    let answer = tokio::time::timeout(
         Duration::from_secs(5),
         provider.chat(request("uncacheable")),
     )
     .await
     .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
-    .unwrap_err();
-    assert!(matches!(err, ModelError::Cache(_)), "{backend}: {err:?}");
+    .unwrap_or_else(|err| panic!("{backend}: a cache failure is not the call's failure: {err}"));
+    assert_eq!(
+        diagnostics(&answer.trace.metadata),
+        ["response_cache_write_failed"],
+        "{backend}"
+    );
     let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
     assert_eq!(
         item.status,
@@ -1421,19 +1438,30 @@ async fn a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded(
 }
 
 async fn a_failed_trace_write_still_completes_the_item(backend: &str, queue: Arc<CountsRenewals>) {
+    let cache = tempfile::tempdir().unwrap();
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_200));
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(raw.clone(), queue.clone(), leased())
-        .with_receipt_sink(receipts.clone())
-        .with_trace_sink(Arc::new(BrokenTrace));
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            response_cache_dir: Some(cache.path().to_path_buf()),
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone())
+    .with_trace_sink(Arc::new(BrokenTrace));
 
-    let err = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("untraced")))
+    let answer = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("untraced")))
         .await
         .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("trace store down"),
-        "{backend}: {err}"
+        .unwrap_or_else(|err| {
+            panic!("{backend}: a trace failure is not the call's failure: {err}")
+        });
+    assert_eq!(
+        diagnostics(&answer.trace.metadata),
+        ["trace_write_failed"],
+        "{backend}"
     );
     let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
     assert_eq!(
@@ -1443,6 +1471,20 @@ async fn a_failed_trace_write_still_completes_the_item(backend: &str, queue: Arc
     );
     assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
     assert_no_more_renewals(&queue, backend).await;
+
+    // The answer was cached despite the trace failure, and a cache hit whose
+    // trace fails is still an answer.
+    let again = provider
+        .chat(request("untraced"))
+        .await
+        .unwrap_or_else(|err| panic!("{backend}: {err}"));
+    assert_eq!(again.text, "untraced", "{backend}");
+    assert_eq!(
+        diagnostics(&again.trace.metadata),
+        ["trace_write_failed"],
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
 }
 
 async fn a_failed_cooldown_write_still_records_the_failure(
@@ -1460,8 +1502,13 @@ async fn a_failed_cooldown_write_still_records_the_failure(
         .await
         .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
         .unwrap_err();
+    // The provider's failure, not the cooldown store's.
     assert!(
-        err.to_string().contains("cooldown store down"),
+        matches!(err, ModelError::Unavailable(_)),
+        "{backend}: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("provider down"),
         "{backend}: {err}"
     );
     let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
@@ -1621,5 +1668,304 @@ async fn a_waiters_slow_cache_read_does_not_stall_lease_renewal(
         raw.calls.load(Ordering::SeqCst),
         1,
         "{backend}: no second provider call"
+    );
+}
+
+/// The kinds of the runtime diagnostics in a trace's metadata.
+fn diagnostics(metadata: &Value) -> Vec<String> {
+    metadata
+        .get("runtime_diagnostics")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| entry.get("kind").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn succeeded_receipts(receipts: &InMemoryReceiptSink) -> Vec<symbiotic_model::QueueReceipt> {
+    receipts
+        .receipts()
+        .into_iter()
+        .filter(|receipt| receipt.status == ReceiptStatus::Succeeded)
+        .collect()
+}
+
+async fn a_failed_trace_write_keeps_the_providers_error(backend: &str, queue: Arc<CountsRenewals>) {
+    let raw = Loopback::new(unique_identity())
+        .failing_first(vec![ModelError::Provider("unparsable answer".to_string())]);
+    let provider = queued(raw.clone(), queue, leased()).with_trace_sink(Arc::new(BrokenTrace));
+
+    let err = provider.chat(request("rejected")).await.unwrap_err();
+    assert!(
+        err.to_string().contains("unparsable answer"),
+        "{backend}: the provider's error, not the trace store's: {err}"
+    );
+}
+
+async fn a_failed_completion_still_returns_the_paid_answer(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    queue.fail_completions.store(true, Ordering::SeqCst);
+    let raw = Loopback::new(unique_identity());
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+
+    let answer = provider
+        .chat(request("paid"))
+        .await
+        .unwrap_or_else(|err| panic!("{backend}: {err}"));
+    assert_eq!(answer.text, "paid", "{backend}");
+    assert_eq!(
+        diagnostics(&answer.trace.metadata),
+        ["queue_complete_failed"],
+        "{backend}"
+    );
+    assert_eq!(succeeded_receipts(&receipts).len(), 1, "{backend}");
+}
+
+async fn an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    // A cache directory below a regular file cannot be created.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"").unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(100));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            response_cache_dir: Some(file.join("cache")),
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone());
+
+    let answer = provider
+        .chat(request("paid"))
+        .await
+        .unwrap_or_else(|err| panic!("{backend}: the paid answer is returned: {err}"));
+    assert_eq!(answer.text, "paid", "{backend}");
+    assert_eq!(
+        diagnostics(&answer.trace.metadata),
+        ["response_cache_write_failed"],
+        "{backend}"
+    );
+
+    // Its usage is recorded once, and the receipt carries the diagnostic.
+    let succeeded = succeeded_receipts(&receipts);
+    assert_eq!(succeeded.len(), 1, "{backend}: {succeeded:?}");
+    assert_eq!(
+        succeeded[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.input_tokens),
+        Some(10),
+        "{backend}"
+    );
+    assert_eq!(
+        diagnostics(&succeeded[0].metadata),
+        ["response_cache_write_failed"],
+        "{backend}"
+    );
+    let item = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, QueueStatus::Succeeded, "{backend}: {item:?}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+/// One request a minute with `burst` requests available at once: the
+/// bucket barely refills during a test, so it counts what was charged.
+fn slow_refill(burst: u64) -> ModelQueueConfig {
+    ModelQueueConfig {
+        requests_per_minute: Some(1),
+        rate_burst_seconds: burst * 60,
+        max_in_flight: 5,
+        ..leased()
+    }
+}
+
+async fn a_retryable_errors_backoff_spends_no_rate_budget(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity())
+        .slow(Duration::from_millis(20))
+        .failing_first(vec![ModelError::Provider("unparsable answer".to_string())]);
+    // Three requests of budget: the failed attempt, its retry and one more.
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            retry_provider_errors: true,
+            retry_base_delay_ms: 1_000,
+            logical_retry_attempts: 3,
+            retry_attempts: 3,
+            ..slow_refill(3)
+        },
+    );
+
+    // The retry waits a one-second backoff; polling through it is free.
+    let answer = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("retried")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the backoff spent the rate budget"))
+        .unwrap();
+    assert_eq!(answer.text, "retried", "{backend}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2, "{backend}");
+
+    tokio::time::timeout(Duration::from_secs(2), provider.chat(request("third")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the third request's budget was spent"))
+        .unwrap();
+    // Three provider attempts spent the three requests of budget.
+    let fourth =
+        tokio::time::timeout(Duration::from_secs(1), provider.chat(request("fourth"))).await;
+    assert!(fourth.is_err(), "{backend}: the budget is spent");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3, "{backend}");
+}
+
+async fn identical_concurrent_requests_spend_rate_budget_once_per_attempt(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let cache = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(300));
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            response_cache_dir: Some(cache.path().to_path_buf()),
+            ..slow_refill(2)
+        },
+    );
+
+    let identical: Vec<_> = (0..5)
+        .map(|_| {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.chat(request("same")).await })
+        })
+        .collect();
+    for call in identical {
+        let answer = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{backend}: waiting on a duplicate spent the budget"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.text, "same", "{backend}");
+    }
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+
+    // One attempt spent one request of budget: one more request runs now,
+    // the next waits for the refill.
+    tokio::time::timeout(Duration::from_secs(2), provider.chat(request("other")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the second request's budget was spent"))
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(1), provider.chat(request("third"))).await;
+    assert!(third.is_err(), "{backend}: the budget is spent");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2, "{backend}");
+}
+
+/// Provider start times of `count` distinct requests sent at once, relative
+/// to the first.
+async fn start_offsets(
+    raw: &Loopback,
+    provider: &QueuedChatProvider<Loopback>,
+    texts: Vec<String>,
+) -> Vec<Duration> {
+    let calls: Vec<_> = texts
+        .into_iter()
+        .map(|text| {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.chat(request(&text)).await })
+        })
+        .collect();
+    for call in calls {
+        tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("paced, not stuck")
+            .unwrap()
+            .unwrap();
+    }
+    let mut starts = raw.starts.lock().unwrap().clone();
+    starts.sort();
+    starts.iter().map(|start| *start - starts[0]).collect()
+}
+
+async fn a_request_limit_admits_its_burst_then_paces(backend: &str, queue: Arc<CountsRenewals>) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(10));
+    // 60 requests a minute, three seconds of it at once.
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            requests_per_minute: Some(60),
+            rate_burst_seconds: 3,
+            max_in_flight: 5,
+            ..leased()
+        },
+    );
+    let offsets = start_offsets(
+        &raw,
+        &provider,
+        (0..5).map(|idx| format!("request {idx}")).collect(),
+    )
+    .await;
+    assert!(
+        offsets[2] < Duration::from_millis(300),
+        "{backend}: {offsets:?}"
+    );
+    assert!(
+        offsets[3] >= Duration::from_millis(900),
+        "{backend}: {offsets:?}"
+    );
+    assert!(
+        offsets[4] >= Duration::from_millis(1_900),
+        "{backend}: {offsets:?}"
+    );
+    assert!(
+        offsets[4] < Duration::from_millis(3_500),
+        "{backend}: {offsets:?}"
+    );
+}
+
+async fn an_input_unit_limit_paces_large_requests(backend: &str, queue: Arc<CountsRenewals>) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(10));
+    // Ten input units a second, two seconds of it at once: one 20-unit
+    // request (80 characters) runs now, the next two seconds later.
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            input_units_per_minute: Some(600),
+            rate_burst_seconds: 2,
+            max_in_flight: 5,
+            ..leased()
+        },
+    );
+    let offsets = start_offsets(
+        &raw,
+        &provider,
+        (0..2)
+            .map(|idx| format!("{idx}{}", "x".repeat(79)))
+            .collect(),
+    )
+    .await;
+    assert!(
+        offsets[1] >= Duration::from_millis(1_900),
+        "{backend}: {offsets:?}"
+    );
+    assert!(
+        offsets[1] < Duration::from_millis(3_500),
+        "{backend}: {offsets:?}"
     );
 }

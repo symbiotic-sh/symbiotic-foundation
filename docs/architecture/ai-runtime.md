@@ -120,6 +120,15 @@ share:
   one request charge per call or batch);
 - one cooldown after rate-limit, unavailable or timeout errors.
 
+Only a provider attempt spends rate budget. Before its claim, a caller waits,
+with its item still pending, until the buckets hold enough for one attempt.
+It holds the queue's rate gate from that check through the claim, and the
+attempt charges the buckets once its claim succeeds, immediately before the
+provider call. A caller whose item is not claimable spends nothing: one
+waiting on an identical call in flight, or one waiting out a retry backoff.
+Each attempt, including each retry, is charged once, and pacing stays exact
+because no two callers can be cleared for the same budget.
+
 Pooling shares limits only. Deduplication, attempt budgets and results stay
 per provider: the idempotency key is the queue, the provider descriptor and
 the request hash.
@@ -186,6 +195,28 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 Cost estimation stays with the host's tariff: the receipt carries the token
 counts it needs. `QueueReceipt::redacted` replaces error text for logs that
 must not keep response bodies.
+
+## Side effects never change an outcome
+
+Once the provider has answered, the call has been paid for, and the runtime
+returns the answer. The writes that follow are best-effort: the response
+cache, the trace, and the queue item's completion. The cache is an
+optimisation, never a condition for returning a paid result. When one of
+these writes fails:
+
+- the response is returned, and its `Succeeded` usage receipt is recorded
+  once;
+- the failure is listed in the response trace's `metadata` under
+  `RUNTIME_DIAGNOSTICS` (`"runtime_diagnostics"`), as
+  `{"kind": ..., "error": ...}` entries, and the receipt's `metadata` carries
+  the same list. The kinds are `response_cache_write_failed`,
+  `trace_write_failed` and `queue_complete_failed`;
+- it is logged as a `tracing` warning.
+
+The same holds elsewhere. A cache hit whose trace write fails is still
+returned, with the diagnostic. A failed call keeps its own error when its
+failure trace or its cooldown cannot be written; those failures are logged,
+and the retry proceeds as scheduled.
 
 ## Response-cache compatibility
 
