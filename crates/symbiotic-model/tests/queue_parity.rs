@@ -921,6 +921,7 @@ on_both_backends!(
     a_retryable_errors_backoff_spends_no_rate_budget,
     identical_concurrent_requests_spend_rate_budget_once_per_attempt,
     a_duplicate_waiting_for_rate_budget_takes_the_answer_at_once,
+    a_running_receipt_counts_the_whole_rate_budget_wait,
     a_request_limit_admits_its_burst_then_paces,
     an_input_unit_limit_paces_large_requests,
 );
@@ -2033,4 +2034,42 @@ async fn a_duplicate_waiting_for_rate_budget_takes_the_answer_at_once(
     // The one request of budget went to the one provider call.
     let other = tokio::time::timeout(Duration::from_secs(1), provider.chat(request("other"))).await;
     assert!(other.is_err(), "{backend}: the budget is spent");
+}
+
+async fn a_running_receipt_counts_the_whole_rate_budget_wait(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity());
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    // One request a second, none in reserve: the second call waits about a
+    // second for budget, in several slices.
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            requests_per_minute: Some(60),
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone());
+    provider.chat(request("first")).await.unwrap();
+    provider.chat(request("second")).await.unwrap();
+
+    let running: Vec<_> = receipts
+        .receipts()
+        .into_iter()
+        .filter(|receipt| receipt.status == ReceiptStatus::Running)
+        .collect();
+    assert_eq!(running.len(), 2, "{backend}");
+    let throttled = running[1].throttle_wait_ms.unwrap_or_default();
+    assert!(
+        throttled >= 800,
+        "{backend}: the second attempt's receipt reports {throttled} ms of throttle"
+    );
+    let queued_ms = running[1].queue_wait_ms.unwrap_or(u64::MAX);
+    assert!(
+        queued_ms < 500,
+        "{backend}: the wait is throttle, not queue wait: {queued_ms} ms"
+    );
 }

@@ -1443,11 +1443,16 @@ where
         }
     }
 
+    // An attempt that waits for rate budget in slices keeps its start and
+    // its throttle time across them, for its receipts.
+    let mut waiting_attempt: Option<(std::time::Instant, Duration)> = None;
     loop {
         if let Some(cached) = call_state.cached::<Res>(Some(&enqueue.item)).await? {
             return Ok(cached);
         }
-        let attempt_started = std::time::Instant::now();
+        let (attempt_started, mut attempt_throttle) = waiting_attempt
+            .take()
+            .unwrap_or_else(|| (std::time::Instant::now(), Duration::ZERO));
         let permit = match &runtime.admission {
             Some(admission) => Some(
                 admission
@@ -1466,7 +1471,9 @@ where
                 // duplicate whose answer arrives returns without spending.
                 drop(permit);
                 tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
-                throttle_wait += throttle_started.elapsed();
+                let slice = throttle_started.elapsed();
+                throttle_wait += slice;
+                waiting_attempt = Some((attempt_started, attempt_throttle + slice));
                 if let Followed::Answer(answer) = this
                     .waiting_on_item(&call_state, &mut enqueue, config)
                     .await?
@@ -1476,8 +1483,9 @@ where
                 continue;
             }
         };
-        let attempt_throttle = throttle_started.elapsed();
-        throttle_wait += attempt_throttle;
+        let throttled = throttle_started.elapsed();
+        attempt_throttle += throttled;
+        throttle_wait += throttled;
 
         // From its claim on, the attempt runs as a task of its own, holding
         // the model slot. A caller that stops waiting for it does not cancel
