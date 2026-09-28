@@ -2053,7 +2053,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn jev_rejects_a_different_served_model_unless_configured() {
         // A gateway (OpenRouter's `/systemone`) reports a dated snapshot and
@@ -2079,6 +2078,7 @@ mod tests {
             matches!(err, ModelError::Provider(ref m) if m.contains("served model")),
             "{err:?}"
         );
+        #[cfg(feature = "queue")]
         assert!(!is_retryable(&err));
 
         let response = gateway
@@ -2469,7 +2469,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "queue")]
     #[tokio::test]
     async fn jev_http_statuses_use_the_shared_retry_classification() {
         let cases: [(u16, &str, bool); 10] = [
@@ -2500,7 +2499,11 @@ mod tests {
                 ref other => panic!("HTTP {status}: unexpected {other:?}"),
             };
             assert_eq!(got, expected, "HTTP {status}");
+            // Retry classification belongs to the queue runtime.
+            #[cfg(feature = "queue")]
             assert_eq!(is_retryable(&err), retryable, "HTTP {status}");
+            #[cfg(not(feature = "queue"))]
+            let _ = retryable;
         }
     }
 
