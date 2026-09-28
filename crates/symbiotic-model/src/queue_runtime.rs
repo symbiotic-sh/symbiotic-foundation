@@ -326,19 +326,23 @@ impl DirResponseCache {
         Ok(removed)
     }
 
-    /// Every entry file under the root, without following symlinks.
+    /// Every entry file under the root. The whole tree is checked before
+    /// anyone deletes from it: the root and every component in it must be
+    /// the current user's own and not a symlink, or the walk is refused, so
+    /// a prune or purge can never reach outside the cache.
     fn entries(&self) -> Result<Vec<(PathBuf, std::fs::Metadata)>, ModelError> {
         let mut found = Vec::new();
+        if owned_or_missing(&self.root)?.is_none() {
+            return Ok(found);
+        }
         let mut pending = vec![self.root.clone()];
         while let Some(dir) = pending.pop() {
-            let listing = match std::fs::read_dir(&dir) {
-                Ok(listing) => listing,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(cache_io(&dir, err)),
-            };
+            let listing = std::fs::read_dir(&dir).map_err(|err| cache_io(&dir, err))?;
             for entry in listing {
                 let path = entry.map_err(|err| cache_io(&dir, err))?.path();
-                let meta = std::fs::symlink_metadata(&path).map_err(|err| cache_io(&path, err))?;
+                let Some(meta) = owned_or_missing(&path)? else {
+                    continue;
+                };
                 if meta.is_dir() {
                     pending.push(path);
                 } else if meta.is_file() && path.extension().is_some_and(|ext| ext == "json") {

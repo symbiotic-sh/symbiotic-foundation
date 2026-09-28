@@ -833,16 +833,14 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
         );
     }
     if let Some(state) = runtime.state_dir() {
-        for (path, _) in modes(state) {
-            if path.is_file() {
-                let bytes = std::fs::read(&path).unwrap();
-                for key in [KEY_A, KEY_B] {
-                    assert!(
-                        !bytes.windows(key.len()).any(|part| part == key.as_bytes()),
-                        "{} holds a key",
-                        path.display()
-                    );
-                }
+        for path in files_under(state) {
+            let bytes = std::fs::read(&path).unwrap();
+            for key in [KEY_A, KEY_B] {
+                assert!(
+                    !bytes.windows(key.len()).any(|part| part == key.as_bytes()),
+                    "{} holds a key",
+                    path.display()
+                );
             }
         }
     }
@@ -882,7 +880,6 @@ mod rotation_and_cap {
         a_rotated_credential_gets_a_fresh_budget(Runtime::in_memory()).await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn persistent_a_rotated_credential_gets_a_fresh_budget() {
         let dir = private_tempdir();
@@ -899,6 +896,24 @@ mod rotation_and_cap {
         let dir = private_tempdir();
         logical_attempts_cap_provider_calls(persistent(dir.path())).await;
     }
+}
+
+/// Every file under `root`, without following symlinks.
+fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// The cached response files under `state`.

@@ -1402,6 +1402,7 @@ dependencies = [
  "symbiotic-trace",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

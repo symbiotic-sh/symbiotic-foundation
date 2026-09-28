@@ -80,7 +80,11 @@ default):
   `response_max_bytes` (1 GiB by default). `None` disables either limit.
 
 An expired response also misses on read, before any sweep removes it.
-Periodic sweeps run on the blocking pool.
+Periodic sweeps run on the blocking pool. A failed sweep is logged as a
+`tracing` warning and retried at the next interval; it never fails a call.
+A sweep or purge checks the whole cache tree before it deletes anything.
+If the root or any component in it is a symlink or belongs to another user,
+it refuses and removes nothing, so it can never reach outside the cache.
 
 **Purge.** `Runtime::purge_responses(|cached| ...)` removes the cached
 responses whose recorded owner matches. It is the hook for erasure: when a

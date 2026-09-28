@@ -84,7 +84,15 @@ impl MaintainedQueue {
             // interval and never fails the call that triggered it. It does
             // file and database I/O, so it runs on the blocking pool.
             let sweep = self.sweep.clone();
-            let _ = tokio::task::spawn_blocking(move || sweep.run()).await;
+            match tokio::task::spawn_blocking(move || sweep.run()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "runtime retention sweep failed; it retries at the next interval");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "runtime retention sweep did not finish; it retries at the next interval");
+                }
+            }
         }
     }
 }

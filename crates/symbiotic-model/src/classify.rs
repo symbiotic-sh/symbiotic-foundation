@@ -558,6 +558,10 @@ where
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.inner.credential_fingerprint()
+    }
 }
 
 #[cfg(feature = "queue")]
