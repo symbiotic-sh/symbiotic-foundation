@@ -20,7 +20,10 @@
 //! and persistence:
 //!
 //! - With a `state_dir`, state lives in a private SQLite database there, so
-//!   cooldowns, attempt budgets and cached responses survive restarts.
+//!   cooldowns, attempt budgets and cached responses survive restarts. The
+//!   directory and everything the runtime keeps in it are owner-only; the
+//!   runtime refuses a state directory open to others, owned by someone
+//!   else or reached through a symlink.
 //! - Without one, state is in memory and ends with the process.
 //!
 //! Once a provider call starts, it belongs to the runtime. A caller that
@@ -40,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use symbiotic_core::{QueueId, QueueItemId};
+use symbiotic_model::private_fs;
 use symbiotic_model::{
     ModelAdmission, QueuedChatProvider, QueuedClassifierProvider, QueuedEmbeddingProvider,
     QueuedRerankProvider,
@@ -50,7 +54,7 @@ use symbiotic_trace::TraceSink;
 
 mod maintained;
 
-use maintained::MaintainedQueue;
+use maintained::{MaintainedQueue, ResponseRetention};
 
 /// The provider contracts and HTTP providers, for implementing or
 /// constructing the raw transports a [`ModelBinding`] wraps. Its `Queued*`
@@ -58,11 +62,11 @@ use maintained::MaintainedQueue;
 /// unsupported.
 pub use symbiotic_model as model;
 pub use symbiotic_model::{
-    CacheEntry, ChatProvider, ChatRequest, ChatResponse, ClassifierProvider, ClassifyRequest,
-    ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
-    InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig, ProviderDescriptor,
-    QueueReceipt, QueueReceiptSink, ReceiptStatus, RerankProvider, RerankRequest, RerankResponse,
-    ResponseCache, default_model_queue_config,
+    CacheEntry, CachedResponse, ChatProvider, ChatRequest, ChatResponse, ClassifierProvider,
+    ClassifyRequest, ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest,
+    EmbeddingResponse, InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig,
+    ProviderDescriptor, QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus,
+    RerankProvider, RerankRequest, RerankResponse, ResponseCache, default_model_queue_config,
 };
 
 /// File name of the persistent queue database inside `state_dir`.
@@ -88,8 +92,14 @@ pub struct RuntimeConfig {
     /// Persistent state older than this is retired: queue records of
     /// finished calls, and calls orphaned by a crash. Seven days by default.
     /// Retiring a finished call only drops its deduplication record; cached
-    /// responses stay.
+    /// responses follow `response_max_age` and `response_max_bytes`.
     pub retention: Duration,
+    /// Cached responses older than this miss, and the retention sweep
+    /// removes them. 30 days by default; `None` keeps them indefinitely.
+    pub response_max_age: Option<Duration>,
+    /// Past this total size, the retention sweep removes the oldest cached
+    /// responses. 1 GiB by default; `None` sets no limit.
+    pub response_max_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -100,6 +110,8 @@ impl Default for RuntimeConfig {
             trace_sink: None,
             receipt_sink: None,
             retention: Duration::from_secs(7 * 24 * 60 * 60),
+            response_max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+            response_max_bytes: Some(1 << 30),
         }
     }
 }
@@ -200,6 +212,7 @@ struct Inner {
     admission: ModelAdmission,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
+    response_max_age: Option<Duration>,
     worker_id: String,
     trace_sink: Option<Arc<dyn TraceSink>>,
     receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
@@ -222,7 +235,7 @@ impl Runtime {
             .unwrap_or_else(|| format!("symbiotic-ai-runtime:{}", std::process::id()));
         let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
         let queue: Arc<dyn QueueBackend> = match &config.state_dir {
-            Some(dir) => Arc::new(open_persistent_queue(dir, config.retention)?),
+            Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
             None => Arc::new(MemoryQueue::new()),
         };
         Ok(Self {
@@ -231,6 +244,7 @@ impl Runtime {
                 admission: ModelAdmission::new(),
                 limits: Mutex::new(HashMap::new()),
                 state_dir: config.state_dir,
+                response_max_age: config.response_max_age,
                 worker_id,
                 trace_sink: config.trace_sink,
                 receipt_sink: config.receipt_sink,
@@ -249,6 +263,21 @@ impl Runtime {
 
     pub fn is_persistent(&self) -> bool {
         self.inner.state_dir.is_some()
+    }
+
+    /// Remove every cached response whose recorded owner `matches`, for
+    /// example all responses to requests from one source when that source
+    /// is erased. It sees what the response's trace records: the request's
+    /// `source` and `role_binding`, and the model. Returns how many
+    /// responses were removed; an in-memory runtime keeps none.
+    pub fn purge_responses(
+        &self,
+        matches: impl Fn(&CachedResponse) -> bool,
+    ) -> Result<usize, ModelError> {
+        match &self.inner.state_dir {
+            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches),
+            None => Ok(0),
+        }
     }
 
     /// A queued chat provider for `binding`.
@@ -336,9 +365,12 @@ impl Runtime {
             ResponseCacheMode::Off => None,
             ResponseCacheMode::Custom(cache) => Some(cache.clone()),
             ResponseCacheMode::Default => self.inner.state_dir.as_ref().map(|dir| {
-                Arc::new(DirResponseCache::new(
-                    dir.join(RESPONSES_DIR).join(descriptor_scope(descriptor)),
-                )) as Arc<dyn ResponseCache>
+                Arc::new(
+                    DirResponseCache::new(
+                        dir.join(RESPONSES_DIR).join(descriptor_scope(descriptor)),
+                    )
+                    .with_max_age(self.inner.response_max_age),
+                ) as Arc<dyn ResponseCache>
             }),
         };
         Ok(Bound {
@@ -435,56 +467,47 @@ fn descriptor_scope(descriptor: &ProviderDescriptor) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn open_persistent_queue(dir: &Path, retention: Duration) -> Result<MaintainedQueue, ModelError> {
-    create_private_dir(dir)?;
+fn open_persistent_queue(
+    dir: &Path,
+    config: &RuntimeConfig,
+) -> Result<MaintainedQueue, ModelError> {
+    // The state directory is the host's: it must already be private, or be
+    // created so. Inside it, everything is the runtime's own: owner-only,
+    // with wider permissions from earlier versions tightened, and no
+    // symlinks.
+    private_fs::ensure_private_dir(dir).map_err(|err| io_error(dir, err))?;
+    let responses = dir.join(RESPONSES_DIR);
+    match std::fs::symlink_metadata(&responses) {
+        Ok(_) => {
+            private_fs::ensure_owned_tree(&responses).map_err(|err| io_error(&responses, err))?
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error(&responses, err)),
+    }
     let path = dir.join(QUEUE_DATABASE);
-    create_private_file(&path)?;
+    private_fs::ensure_private_file(&path).map_err(|err| io_error(&path, err))?;
+    // SQLite gives its journal files the database's mode; adopt any that
+    // an earlier version left.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = dir.join(format!("{QUEUE_DATABASE}{suffix}"));
+        if std::fs::symlink_metadata(&sidecar).is_ok() {
+            private_fs::ensure_owned_file(&sidecar).map_err(|err| io_error(&sidecar, err))?;
+        }
+    }
     let queue = SqliteQueue::open(&path).map_err(|err| ModelError::Queue(err.to_string()))?;
-    let queue = MaintainedQueue::new(queue, retention);
+    let queue = MaintainedQueue::new(
+        queue,
+        config.retention,
+        ResponseRetention {
+            cache: DirResponseCache::new(responses),
+            max_age: config.response_max_age,
+            max_bytes: config.response_max_bytes,
+        },
+    );
     queue.maintain()?;
     Ok(queue)
 }
 
 fn io_error(path: &Path, err: std::io::Error) -> ModelError {
     ModelError::Queue(format!("runtime state {}: {err}", path.display()))
-}
-
-#[cfg(unix)]
-fn create_private_dir(dir: &Path) -> Result<(), ModelError> {
-    use std::os::unix::fs::DirBuilderExt;
-    if dir.is_dir() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|err| io_error(dir, err))
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> Result<(), ModelError> {
-    std::fs::create_dir_all(dir).map_err(|err| io_error(dir, err))
-}
-
-/// Create the database file owner-only before SQLite opens it; SQLite gives
-/// its journal files the same mode.
-#[cfg(unix)]
-fn create_private_file(path: &Path) -> Result<(), ModelError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(io_error(path, err)),
-    }
-}
-
-#[cfg(not(unix))]
-fn create_private_file(_path: &Path) -> Result<(), ModelError> {
-    Ok(())
 }

@@ -26,6 +26,10 @@ symbiotic-queue = { path = "../symbiotic-queue", optional = true }
 symbiotic-trace = { path = "../symbiotic-trace" }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Tests run the queued providers on the SQLite backend.

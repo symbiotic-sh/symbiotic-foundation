@@ -21,6 +21,7 @@ symbiotic-queue = { path = "../symbiotic-queue" }
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 symbiotic-trace = { path = "../symbiotic-trace" }
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["arbitrary_precision"] }

@@ -558,6 +558,10 @@ where
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.inner.credential_fingerprint()
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -1083,6 +1087,10 @@ impl ModelProvider for JevClassifierProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
     }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        api_key_fingerprint(&self.api_key)
+    }
 }
 
 #[async_trait]
@@ -1502,6 +1510,10 @@ fn count_word(count: usize) -> String {
 impl ModelProvider for ChatClassifierProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
+    }
+
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.chat.credential_fingerprint()
     }
 }
 

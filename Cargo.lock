@@ -1402,6 +1402,7 @@ dependencies = [
  "symbiotic-trace",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1420,6 +1421,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -1431,6 +1433,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -47,9 +47,21 @@ the same state.
 | Cooldowns, attempt budgets, deduplication | End with the process | Survive restarts |
 | Response cache (`Default` mode) | None | `dir/responses/<descriptor hash>/<kind>[/<scope>]/<request hash>.json` |
 
-A missing `state_dir` is created with mode `0700` and the database with mode
-`0600` (SQLite gives its journal files the database's mode). An existing
-directory's mode is left alone.
+**Private state.** Cached responses and queue state can hold private text,
+so the state directory and everything in it are owner-only:
+
+- A missing `state_dir` is created `0700`, with any missing parents.
+- An existing `state_dir` must be a directory owned by the current user,
+  not a symlink, and closed to group and others. Otherwise `Runtime::open`
+  fails with a message naming the path, for example
+  `is open to group or others; make it owner-only (chmod 700)`.
+- Inside it, the runtime creates directories `0700` and files `0600`: the
+  database (SQLite gives its journal files the database's mode) and cache
+  entries, written through a temporary file and a rename.
+- A symlink, or a component owned by another user, anywhere under
+  `responses/` or at the database files, is refused. It is never followed.
+  At open, components that an earlier version wrote with wider permissions
+  are tightened to `0700`/`0600`, so existing state keeps working.
 
 Queue records hold the request hash, never the request. A crash therefore
 cannot resume an in-flight call from the queue: the host re-issues its work,
@@ -62,9 +74,26 @@ runtime retires state older than `RuntimeConfig::retention` (seven days by
 default):
 
 - calls orphaned by a crash are marked dead;
-- finished calls' queue records are deleted, along with queue events.
+- finished calls' queue records are deleted, along with queue events;
+- cached responses older than `RuntimeConfig::response_max_age` (30 days by
+  default) are deleted, then the oldest ones until the rest fit in
+  `response_max_bytes` (1 GiB by default). `None` disables either limit.
 
-Cached responses are kept.
+An expired response also misses on read, before any sweep removes it.
+Periodic sweeps run on the blocking pool. A failed sweep is logged as a
+`tracing` warning and retried at the next interval; it never fails a call.
+A sweep or purge checks the whole cache tree before it deletes anything.
+If the root or any component in it is a symlink or belongs to another user,
+it refuses and removes nothing, so it can never reach outside the cache.
+
+**Purge.** `Runtime::purge_responses(|cached| ...)` removes the cached
+responses whose recorded owner matches. It is the hook for erasure: when a
+source or tenant is erased, the host purges its responses. Each entry is
+matched by what its response's trace records: the request's `source` and
+`role_binding`, and the model (`CachedResponse`). A host that needs erasure
+by tenant or source puts that identity in the request's `source` or
+`role_binding`. The purge reads every entry once, so it suits erasure, not a
+hot path.
 
 Measured on one laptop with a 15 ms loopback provider, cap 64, 3,000 calls on
 one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
@@ -120,9 +149,31 @@ share:
   one request charge per call or batch);
 - one cooldown after rate-limit, unavailable or timeout errors.
 
+Only a provider attempt spends rate budget. Before its claim, a caller waits,
+with its item still pending, until the buckets hold enough for one attempt.
+It holds the queue's rate gate from that check through the claim, and the
+attempt charges the buckets once its claim succeeds, immediately before the
+provider call. A caller whose item is not claimable spends nothing: one
+waiting on an identical call in flight, or one waiting out a retry backoff.
+Each attempt, including each retry, is charged once, and pacing stays exact
+because no two callers can be cleared for the same budget.
+A caller waiting for budget gives up its model slot and sleeps in slices of
+at most 250 ms. Between slices it looks at its item and the cache, so a
+duplicate whose answer has arrived returns at once and spends nothing.
+
 Pooling shares limits only. Deduplication, attempt budgets and results stay
 per provider: the idempotency key is the queue, the provider descriptor and
 the request hash.
+
+The key also includes the provider's credential generation,
+`ModelProvider::credential_fingerprint`. The HTTP providers derive it from
+their API key with `api_key_fingerprint`, a domain-separated SHA-256 of the
+key. Rotating a key therefore starts a fresh attempt budget: a request
+exhausted by a bad key is tried again with the new one. The fingerprint is
+one-way, and only a hash of it enters the queue's idempotency key. Neither
+the key nor the fingerprint is written to traces, receipts or queue
+payloads. A host provider without a credential returns `None`, and its
+budgets are keyed as before.
 
 Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
@@ -148,9 +199,12 @@ per binding.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
   debugging only: requests can contain sensitive text.
-- `logical_retry_attempts` / `retry_attempts`: the request's total attempt
-  budget and the attempts per queue item. They are unchanged. When the budget
-  runs out, the error keeps the class of the last failure and says
+- `logical_retry_attempts` / `retry_attempts`: the request's total provider
+  attempts across every retry layer, and the attempts per queue item. The
+  logical budget is a cap: an item runs at most
+  `min(retry_attempts, logical_retry_attempts)` attempts, so
+  `logical_retry_attempts = 1` makes exactly one provider call. When the
+  budget runs out, the error keeps the class of the last failure and says
   `exhausted after n/m`. The class is stored on the queue item
   (`last_error_class`), so a later call or a restarted runtime reports the
   same class.
@@ -186,6 +240,28 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 Cost estimation stays with the host's tariff: the receipt carries the token
 counts it needs. `QueueReceipt::redacted` replaces error text for logs that
 must not keep response bodies.
+
+## Side effects never change an outcome
+
+Once the provider has answered, the call has been paid for, and the runtime
+returns the answer. The writes that follow are best-effort: the response
+cache, the trace, and the queue item's completion. The cache is an
+optimisation, never a condition for returning a paid result. When one of
+these writes fails:
+
+- the response is returned, and its `Succeeded` usage receipt is recorded
+  once;
+- the failure is listed in the response trace's `metadata` under
+  `RUNTIME_DIAGNOSTICS` (`"runtime_diagnostics"`), as
+  `{"kind": ..., "error": ...}` entries, and the receipt's `metadata` carries
+  the same list. The kinds are `response_cache_write_failed`,
+  `trace_write_failed` and `queue_complete_failed`;
+- it is logged as a `tracing` warning.
+
+The same holds elsewhere. A cache hit whose trace write fails is still
+returned, with the diagnostic. A failed call keeps its own error when its
+failure trace or its cooldown cannot be written; those failures are logged,
+and the retry proceeds as scheduled.
 
 ## Response-cache compatibility
 
