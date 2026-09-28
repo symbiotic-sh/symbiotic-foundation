@@ -88,11 +88,14 @@ An identical caller waiting on the item, or a later identical request, gets
 the result through deduplication and the cache. Without a cache, it runs the
 request again once the item has finished, as for any finished request.
 
-The attempt renews its lease every third of `lease_seconds` while the
-provider works. The renewal is part of the attempt's own future, so it ends
-with the call and cannot outlive it. It also stops once a renewal fails
-because the lease was lost. Every exit of an attempt releases the lease,
-including a failed trace, cache or cooldown write.
+The attempt renews its lease every third of `lease_seconds`, from its claim
+until the item is completed or failed. That covers the provider call and
+every receipt, trace, cache and cooldown write before the release, so a slow
+sink cannot let the lease expire and hand the item to another caller. The
+renewal is part of the attempt's own future, so it ends with the attempt and
+cannot outlive it. It also stops once a renewal fails because the lease was
+lost. Every exit of an attempt releases the lease, including a failed trace,
+cache or cooldown write.
 
 There is no cancellation API. A provider that panics propagates the panic to
 the waiting caller; its lease is not renewed and expires after

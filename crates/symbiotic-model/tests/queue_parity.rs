@@ -852,10 +852,12 @@ fn leased() -> ModelQueueConfig {
     }
 }
 
-/// Forwards to a backend and counts lease renewals.
+/// Forwards to a backend and counts lease renewals. Cooldown writes fail
+/// while `fail_cooldown_writes` is set.
 struct CountsRenewals {
     inner: Arc<dyn QueueBackend>,
     renewals: AtomicUsize,
+    fail_cooldown_writes: std::sync::atomic::AtomicBool,
 }
 
 impl CountsRenewals {
@@ -868,6 +870,7 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
     Arc::new(CountsRenewals {
         inner,
         renewals: AtomicUsize::new(0),
+        fail_cooldown_writes: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -903,6 +906,10 @@ on_both_backends!(
     a_failed_cache_write_still_releases_the_lease,
     an_abandoned_call_keeps_its_model_slot_until_it_finishes,
     a_provider_panic_reaches_its_caller_and_ends_lease_renewal,
+    a_slow_trace_write_keeps_the_lease_until_the_item_completes,
+    a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded,
+    a_failed_trace_write_still_completes_the_item,
+    a_failed_cooldown_write_still_records_the_failure,
 );
 
 #[async_trait]
@@ -981,6 +988,9 @@ impl QueueBackend for CountsRenewals {
         queue_id: &QueueId,
         until: chrono::DateTime<Utc>,
     ) -> Result<(), QueueError> {
+        if self.fail_cooldown_writes.load(Ordering::SeqCst) {
+            return Err(QueueError::Unavailable("cooldown store down".to_string()));
+        }
         self.inner.note_cooldown(queue_id, until).await
     }
 }
@@ -1228,5 +1238,237 @@ async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
         queue.renewals() >= 1,
         "{backend}: the lease is renewed while the provider works"
     );
+    assert_no_more_renewals(&queue, backend).await;
+}
+
+/// A trace sink whose first write takes `delay`.
+struct SlowFirstTrace {
+    delay: Duration,
+    slowed: std::sync::atomic::AtomicBool,
+}
+
+impl SlowFirstTrace {
+    fn new(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            slowed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl symbiotic_trace::TraceSink for SlowFirstTrace {
+    async fn record_model_invocation(
+        &self,
+        _trace: ModelInvocationTrace,
+    ) -> Result<(), symbiotic_trace::TraceError> {
+        if !self.slowed.swap(true, Ordering::SeqCst) {
+            tokio::time::sleep(self.delay).await;
+        }
+        Ok(())
+    }
+}
+
+/// A trace sink that cannot write.
+struct BrokenTrace;
+
+#[async_trait]
+impl symbiotic_trace::TraceSink for BrokenTrace {
+    async fn record_model_invocation(
+        &self,
+        _trace: ModelInvocationTrace,
+    ) -> Result<(), symbiotic_trace::TraceError> {
+        Err(symbiotic_trace::TraceError::Sink(
+            "trace store down".to_string(),
+        ))
+    }
+}
+
+/// Keeps receipts; recording the first `Failed` one takes `delay`.
+struct SlowFirstFailureReceipt {
+    receipts: InMemoryReceiptSink,
+    delay: Duration,
+    slowed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl symbiotic_model::QueueReceiptSink for SlowFirstFailureReceipt {
+    async fn record_receipt(&self, receipt: symbiotic_model::QueueReceipt) {
+        if receipt.status == ReceiptStatus::Failed && !self.slowed.swap(true, Ordering::SeqCst) {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.receipts.record_receipt(receipt).await;
+    }
+}
+
+/// Past the 3 s lease of `leased()`, while the attempt is still recording:
+/// how many expired leases a claim on `queue_id` would reclaim now.
+async fn reclaimable_after_the_lease(queue: &CountsRenewals, queue_id: &QueueId) -> usize {
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    queue.reclaim_expired_leases(queue_id).await.unwrap()
+}
+
+async fn a_slow_trace_write_keeps_the_lease_until_the_item_completes(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let cache = tempfile::tempdir().unwrap();
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(100));
+    let queue_id = raw.descriptor.queue_id();
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    // Two attempts per item: a reclaimed item would be claimed and paid for
+    // again.
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            response_cache_dir: Some(cache.path().to_path_buf()),
+            logical_retry_attempts: 2,
+            retry_attempts: 2,
+            ..leased()
+        },
+    )
+    .with_receipt_sink(receipts.clone())
+    .with_trace_sink(SlowFirstTrace::new(Duration::from_millis(4_000)));
+
+    let call = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("traced")).await }
+    });
+    assert_eq!(
+        reclaimable_after_the_lease(&queue, &queue_id).await,
+        0,
+        "{backend}: the lease expired while the trace was written"
+    );
+    let answer = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.text, "traced", "{backend}");
+    let item = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, QueueStatus::Succeeded, "{backend}: {item:?}");
+    assert_eq!(item.attempt, 1, "{backend}: {item:?}");
+
+    let again = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("traced")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the identical request finishes"))
+        .unwrap();
+    assert_eq!(again.text, "traced", "{backend}");
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "{backend}: no second provider call"
+    );
+}
+
+async fn a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity())
+        .slow(Duration::from_millis(100))
+        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+    let queue_id = raw.descriptor.queue_id();
+    let receipts = Arc::new(SlowFirstFailureReceipt {
+        receipts: InMemoryReceiptSink::default(),
+        delay: Duration::from_millis(4_000),
+        slowed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+
+    let call = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("refused")).await }
+    });
+    assert_eq!(
+        reclaimable_after_the_lease(&queue, &queue_id).await,
+        0,
+        "{backend}: the lease expired while the failure receipt was written"
+    );
+    let err = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, ModelError::Unavailable(_)),
+        "{backend}: {err:?}"
+    );
+    let item = queue
+        .get_item(&queued_item(&receipts.receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, QueueStatus::Dead, "{backend}: {item:?}");
+    assert_eq!(
+        item.last_error_class.as_deref(),
+        Some("unavailable"),
+        "{backend}: {item:?}"
+    );
+    assert_eq!(
+        item.last_error.as_deref(),
+        Some("provider unavailable: provider down"),
+        "{backend}: the provider's failure, not an expired lease"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+async fn a_failed_trace_write_still_completes_the_item(backend: &str, queue: Arc<CountsRenewals>) {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_200));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased())
+        .with_receipt_sink(receipts.clone())
+        .with_trace_sink(Arc::new(BrokenTrace));
+
+    let err = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("untraced")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("trace store down"),
+        "{backend}: {err}"
+    );
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
+    assert_eq!(
+        item.status,
+        QueueStatus::Succeeded,
+        "{backend}: the provider answered"
+    );
+    assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
+    assert_no_more_renewals(&queue, backend).await;
+}
+
+async fn a_failed_cooldown_write_still_records_the_failure(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    queue.fail_cooldown_writes.store(true, Ordering::SeqCst);
+    let raw = Loopback::new(unique_identity())
+        .slow(Duration::from_millis(1_200))
+        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+
+    let err = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("cooling")))
+        .await
+        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cooldown store down"),
+        "{backend}: {err}"
+    );
+    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
+    assert_eq!(item.status, QueueStatus::Dead, "{backend}: {item:?}");
+    assert_eq!(
+        item.last_error_class.as_deref(),
+        Some("unavailable"),
+        "{backend}: {item:?}"
+    );
+    assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
     assert_no_more_renewals(&queue, backend).await;
 }

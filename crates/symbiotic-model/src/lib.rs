@@ -1422,9 +1422,12 @@ enum AttemptEnd<Res> {
 /// cancel the provider call: the attempt still records its result or error
 /// class, fills the response cache, completes or fails its item and frees
 /// the model slot, and identical requests find the outcome through
-/// deduplication and the cache. Every path after a successful claim
-/// releases the item's lease. The call is bounded by the policy's
+/// deduplication and the cache. The call is bounded by the policy's
 /// `request_timeout_seconds`, not by any caller.
+///
+/// The lease is renewed from the claim until the item is completed or
+/// failed ([`settle`]), so slow receipt, trace, cache or cooldown writes
+/// cannot let it expire, and every path after the claim releases it.
 #[cfg(feature = "queue")]
 async fn run_attempt<P, Req, Res, F, Fut>(
     call_state: Arc<QueuedCall<Req>>,
@@ -1459,68 +1462,32 @@ where
         Err(err) => return Err(queue_error(err)),
     };
 
-    // Queue wait of this attempt: admission plus claim, without throttle.
-    let attempt_throttle_ms = u64::try_from(clock.attempt_throttle.as_millis()).unwrap_or(u64::MAX);
-    let attempt_queue_wait_ms =
-        elapsed_ms(clock.attempt_started).saturating_sub(attempt_throttle_ms);
-    this.receipts
-        .record(
-            ReceiptStatus::Running,
-            Some(&item),
-            None,
-            None,
-            AttemptTiming {
-                queue_wait_ms: Some(attempt_queue_wait_ms),
-                throttle_wait_ms: Some(attempt_throttle_ms),
-                provider_ms: None,
-            },
-        )
-        .await;
-    let provider_started = std::time::Instant::now();
-    let result = holding_lease(
+    let settled = holding_lease(
         queue,
         &item.item_id,
         worker_id,
         config.lease_seconds,
-        within_timeout(
-            &this.queue_id,
-            config.request_timeout_seconds,
-            call(provider, this.request.clone()),
-        ),
+        settle(this, &item, provider, call, &clock),
     )
     .await;
-    let provider_ms = elapsed_ms(provider_started);
-    let failed_timing = || AttemptTiming {
-        queue_wait_ms: None,
-        throttle_wait_ms: None,
-        provider_ms: Some(provider_ms),
-    };
+    drop(permit);
 
-    match result {
-        Ok(mut response) => {
-            let mut trace = response.trace().clone();
-            trace.queue_item_id = Some(item.item_id.clone());
-            trace.request_hash = this.request_hash.clone();
-            let queued_ms = provider_started.duration_since(clock.queued_at).as_millis() as u64;
-            let throttle_wait_ms = clock.throttle_wait.as_millis() as u64;
-            trace.timing.queued_ms = Some(queued_ms);
-            trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
-            trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
-            trace.timing.provider_ms = Some(provider_ms);
-            trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
-            response.set_trace(trace.clone());
-            // Complete the item even when the trace or cache write failed,
-            // so the failure cannot leave it running.
-            let recorded = this.record_success(&trace, &response).await;
-            let completed = queue.complete(&item.item_id, worker_id).await;
-            drop(permit);
+    // The item is completed or failed: report what the writes returned, then
+    // continue the request's retry chain if the item is dead.
+    match settled {
+        Settled::Succeeded {
+            response,
+            provider_ms,
+            recorded,
+            completed,
+        } => {
             recorded?;
             completed.map_err(queue_error)?;
             this.receipts
                 .record(
                     ReceiptStatus::Succeeded,
                     Some(&item),
-                    Some(&trace),
+                    Some(response.trace()),
                     None,
                     AttemptTiming {
                         queue_wait_ms: None,
@@ -1531,43 +1498,11 @@ where
                 .await;
             Ok(AttemptEnd::Succeeded(response))
         }
-        Err(err) if is_retryable(&err, config) => {
-            this.receipts
-                .record(
-                    ReceiptStatus::Failed,
-                    Some(&item),
-                    None,
-                    Some(err.to_string()),
-                    failed_timing(),
-                )
-                .await;
-            let delay_ms = retry_delay_ms(
-                item.attempt,
-                config,
-                &item.item_id,
-                &this.request_hash,
-                &err,
-            );
-            let cooled = if is_transient(&err) {
-                note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
-            } else {
-                Ok(())
-            };
-            // One exact deadline, kept by the backend: this caller and any
-            // duplicate waiting on the item retry no earlier than it. The
-            // failure is recorded even when the cooldown could not be.
-            let failed = queue
-                .fail_with(
-                    &item.item_id,
-                    worker_id,
-                    Failure {
-                        error: err.to_string(),
-                        error_class: Some(error_class(&err)),
-                        run_after: Some(Utc::now() + ChronoDuration::milliseconds(delay_ms as i64)),
-                    },
-                )
-                .await;
-            drop(permit);
+        Settled::Retryable {
+            err,
+            cooled,
+            failed,
+        } => {
             cooled?;
             if failed.map_err(queue_error)? == FailOutcome::RetryScheduled {
                 return Ok(AttemptEnd::Retry(None));
@@ -1596,11 +1531,165 @@ where
                 &err,
             ))
         }
+        Settled::Failed { err, failed } => {
+            failed.map_err(queue_error)?;
+            emit_failure_trace(
+                &this.descriptor,
+                &this.trace_sink,
+                Some(item.item_id),
+                this.request_hash.clone(),
+                this.sensitivity,
+                err.to_string(),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
+/// How the leased part of an attempt ended: the item is completed or failed,
+/// and the writes on the way returned these results.
+#[cfg(feature = "queue")]
+enum Settled<Res> {
+    Succeeded {
+        response: Res,
+        provider_ms: u64,
+        /// The trace and cache writes.
+        recorded: Result<(), ModelError>,
+        completed: Result<(), symbiotic_queue::QueueError>,
+    },
+    Retryable {
+        err: ModelError,
+        /// The cooldown write.
+        cooled: Result<(), ModelError>,
+        failed: Result<FailOutcome, symbiotic_queue::QueueError>,
+    },
+    Failed {
+        err: ModelError,
+        failed: Result<FailOutcome, symbiotic_queue::QueueError>,
+    },
+}
+
+/// The leased part of an attempt: the running receipt, the provider call,
+/// and recording its outcome up to completing or failing the item. Every
+/// path ends with `complete` or `fail_with`, whatever the writes before it
+/// returned.
+#[cfg(feature = "queue")]
+async fn settle<P, Req, Res, F, Fut>(
+    this: &QueuedCall<Req>,
+    item: &QueueItem,
+    provider: P,
+    call: F,
+    clock: &AttemptClock,
+) -> Settled<Res>
+where
+    Req: Clone,
+    Res: Serialize + TraceCarrier,
+    F: FnOnce(P, Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Res, ModelError>>,
+{
+    let queue = this.queue.as_ref();
+    let config = &this.config;
+    let worker_id = this.worker_id.as_str();
+    // Queue wait of this attempt: admission plus claim, without throttle.
+    let attempt_throttle_ms = u64::try_from(clock.attempt_throttle.as_millis()).unwrap_or(u64::MAX);
+    let attempt_queue_wait_ms =
+        elapsed_ms(clock.attempt_started).saturating_sub(attempt_throttle_ms);
+    this.receipts
+        .record(
+            ReceiptStatus::Running,
+            Some(item),
+            None,
+            None,
+            AttemptTiming {
+                queue_wait_ms: Some(attempt_queue_wait_ms),
+                throttle_wait_ms: Some(attempt_throttle_ms),
+                provider_ms: None,
+            },
+        )
+        .await;
+    let provider_started = std::time::Instant::now();
+    let result = within_timeout(
+        &this.queue_id,
+        config.request_timeout_seconds,
+        call(provider, this.request.clone()),
+    )
+    .await;
+    let provider_ms = elapsed_ms(provider_started);
+    let failed_timing = || AttemptTiming {
+        queue_wait_ms: None,
+        throttle_wait_ms: None,
+        provider_ms: Some(provider_ms),
+    };
+
+    match result {
+        Ok(mut response) => {
+            let mut trace = response.trace().clone();
+            trace.queue_item_id = Some(item.item_id.clone());
+            trace.request_hash = this.request_hash.clone();
+            let queued_ms = provider_started.duration_since(clock.queued_at).as_millis() as u64;
+            let throttle_wait_ms = clock.throttle_wait.as_millis() as u64;
+            trace.timing.queued_ms = Some(queued_ms);
+            trace.timing.queue_wait_ms = Some(queued_ms.saturating_sub(throttle_wait_ms));
+            trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
+            trace.timing.provider_ms = Some(provider_ms);
+            trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
+            response.set_trace(trace.clone());
+            let recorded = this.record_success(&trace, &response).await;
+            let completed = queue.complete(&item.item_id, worker_id).await;
+            Settled::Succeeded {
+                response,
+                provider_ms,
+                recorded,
+                completed,
+            }
+        }
+        Err(err) if is_retryable(&err, config) => {
+            this.receipts
+                .record(
+                    ReceiptStatus::Failed,
+                    Some(item),
+                    None,
+                    Some(err.to_string()),
+                    failed_timing(),
+                )
+                .await;
+            let delay_ms = retry_delay_ms(
+                item.attempt,
+                config,
+                &item.item_id,
+                &this.request_hash,
+                &err,
+            );
+            let cooled = if is_transient(&err) {
+                note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
+            } else {
+                Ok(())
+            };
+            // One exact deadline, kept by the backend: this caller and any
+            // duplicate waiting on the item retry no earlier than it.
+            let failed = queue
+                .fail_with(
+                    &item.item_id,
+                    worker_id,
+                    Failure {
+                        error: err.to_string(),
+                        error_class: Some(error_class(&err)),
+                        run_after: Some(Utc::now() + ChronoDuration::milliseconds(delay_ms as i64)),
+                    },
+                )
+                .await;
+            Settled::Retryable {
+                err,
+                cooled,
+                failed,
+            }
+        }
         Err(err) => {
             this.receipts
                 .record(
                     ReceiptStatus::Failed,
-                    Some(&item),
+                    Some(item),
                     None,
                     Some(err.to_string()),
                     failed_timing(),
@@ -1617,18 +1706,7 @@ where
                     },
                 )
                 .await;
-            drop(permit);
-            failed.map_err(queue_error)?;
-            emit_failure_trace(
-                &this.descriptor,
-                &this.trace_sink,
-                Some(item.item_id),
-                this.request_hash.clone(),
-                this.sensitivity,
-                err.to_string(),
-            )
-            .await?;
-            Err(err)
+            Settled::Failed { err, failed }
         }
     }
 }
@@ -1653,18 +1731,18 @@ async fn within_timeout<T>(
         })
 }
 
-/// Run `call` while renewing its item's lease every third of the lease.
+/// Run `work` while renewing its item's lease every third of the lease.
 ///
 /// The renewal is part of this future, not a task of its own, so it cannot
-/// outlive the call: it ends when the call does, or earlier once a renewal
-/// fails because the lease was lost.
+/// outlive `work`: it ends when `work` does, or earlier once a renewal fails
+/// because the lease was lost.
 #[cfg(feature = "queue")]
 async fn holding_lease<T>(
     queue: &dyn QueueBackend,
     item_id: &QueueItemId,
     worker_id: &str,
     lease_seconds: u64,
-    call: impl std::future::Future<Output = T>,
+    work: impl std::future::Future<Output = T>,
 ) -> T {
     let renew = async {
         let interval = Duration::from_secs((lease_seconds / 3).clamp(1, 60));
@@ -1679,11 +1757,11 @@ async fn holding_lease<T>(
             }
         }
     };
-    let mut call = std::pin::pin!(call);
+    let mut work = std::pin::pin!(work);
     tokio::select! {
         biased;
-        output = &mut call => output,
-        () = renew => call.await,
+        output = &mut work => output,
+        () = renew => work.await,
     }
 }
 
