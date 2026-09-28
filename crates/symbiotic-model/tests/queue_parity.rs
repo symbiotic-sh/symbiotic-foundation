@@ -488,3 +488,70 @@ async fn a_host_response_cache_answers_before_the_queue() {
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
     assert_eq!(cache.stores.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn exhausted_retries_keep_the_class_of_the_last_failure() {
+    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let raw = Loopback::new(unique_identity()).failing_first(vec![
+        ModelError::RateLimited("slow down".to_string()),
+        ModelError::RateLimited("slow down".to_string()),
+        ModelError::Timeout("still slow".to_string()),
+    ]);
+    let err = queued(raw.clone(), queue, config())
+        .chat(request("give up"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ModelError::Timeout(_)), "{err:?}");
+    assert!(err.to_string().contains("exhausted after 3/3"), "{err}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+}
+
+#[derive(Clone)]
+struct CountingClassifier {
+    inner: symbiotic_model::StaticClassifierProvider,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ModelProvider for CountingClassifier {
+    fn descriptor(&self) -> &ProviderDescriptor {
+        self.inner.descriptor()
+    }
+}
+
+#[async_trait]
+impl symbiotic_model::ClassifierProvider for CountingClassifier {
+    async fn classify(
+        &self,
+        request: symbiotic_model::ClassifyRequest,
+    ) -> Result<symbiotic_model::ClassifyResponse, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.classify(request).await
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_classify_request_takes_no_queue_slot() {
+    use symbiotic_model::ClassifierProvider as _;
+    let queue = Arc::new(MemoryQueue::new());
+    let raw = CountingClassifier {
+        inner: symbiotic_model::StaticClassifierProvider::new([
+            symbiotic_model::ClassifierAnswer::noul("goal", 0.7),
+        ]),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let classifier = symbiotic_model::QueuedClassifierProvider::new(
+        raw.clone(),
+        queue.clone(),
+        "worker",
+        config(),
+    );
+    let mut state = serde_json::Map::new();
+    state.insert("message".into(), json!("synthetic"));
+    let err = classifier
+        .classify(symbiotic_model::ClassifyRequest::new(state, Vec::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ModelError::InvalidRequest(_)), "{err:?}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+    assert!(queue.is_empty());
+}

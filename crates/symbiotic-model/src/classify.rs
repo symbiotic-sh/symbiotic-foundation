@@ -567,6 +567,8 @@ where
     P: ClassifierProvider + Clone + Send + Sync + 'static,
 {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        // A malformed request never takes a queue slot or a provider call.
+        request.validate()?;
         let descriptor = self.inner.descriptor().clone();
         let cache_scope = hash_json(&descriptor)?;
         run_queued(

@@ -106,7 +106,12 @@ per binding.
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
   debugging only: requests can contain sensitive text.
 - `logical_retry_attempts` / `retry_attempts`: the request's total attempt
-  budget and the attempts per queue item. They are unchanged.
+  budget and the attempts per queue item. They are unchanged. When the budget
+  runs out, the error keeps the class of the last failure (`RateLimited`,
+  `Timeout`, `Unavailable`, else `Provider`) and says `exhausted after n/m`.
+
+A classify request that fails validation returns `InvalidRequest` before it
+takes a queue slot.
 
 ## Receipts
 

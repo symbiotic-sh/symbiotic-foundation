@@ -1140,7 +1140,12 @@ where
                 {
                     enqueue = next;
                 } else {
-                    return Err(exhausted_request_error(&queue_id, &enqueue.item, config));
+                    return Err(exhausted_request_error(
+                        &queue_id,
+                        &enqueue.item,
+                        config,
+                        &dead_err,
+                    ));
                 }
             }
             // A finished identical request whose response is not cached (or
@@ -1246,7 +1251,9 @@ where
                         {
                             enqueue = next;
                         } else {
-                            return Err(exhausted_request_error(&queue_id, &current, config));
+                            return Err(exhausted_request_error(
+                                &queue_id, &current, config, &dead_err,
+                            ));
                         }
                     }
                     QueueStatus::Succeeded => {
@@ -1436,7 +1443,7 @@ where
                         err.to_string(),
                     )
                     .await?;
-                    return Err(exhausted_request_error(&queue_id, &dead_item, config));
+                    return Err(exhausted_request_error(&queue_id, &dead_item, config, &err));
                 }
                 // The backend schedules whole seconds; sleep the remainder
                 // here so sub-second backoff holds.
@@ -1778,16 +1785,11 @@ fn exhausted_request_error(
     queue_id: &QueueId,
     item: &QueueItem,
     config: &ModelQueueConfig,
+    last_error: &ModelError,
 ) -> ModelError {
-    let state = logical_retry_state(
-        &item.payload,
-        config
-            .logical_retry_attempts
-            .max(config.retry_attempts)
-            .max(1),
-    );
+    let state = logical_retry_state(&item.payload, logical_max_attempts(config));
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
-    ModelError::Provider(format!(
+    let message = format!(
         "{} request exhausted after {}/{} logical attempt(s): {}",
         queue_id.0,
         attempts_used,
@@ -1795,7 +1797,15 @@ fn exhausted_request_error(
         item.last_error
             .clone()
             .unwrap_or_else(|| "unknown provider error".to_string())
-    ))
+    );
+    // Keep the class of the last failure, so callers can still tell a rate
+    // limit or timeout from a provider fault once retries run out.
+    match last_error {
+        ModelError::RateLimited(_) => ModelError::RateLimited(message),
+        ModelError::Timeout(_) => ModelError::Timeout(message),
+        ModelError::Unavailable(_) => ModelError::Unavailable(message),
+        _ => ModelError::Provider(message),
+    }
 }
 
 #[cfg(feature = "queue")]
