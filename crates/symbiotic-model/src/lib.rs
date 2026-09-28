@@ -42,8 +42,8 @@ use std::time::Duration;
 use symbiotic_core::QueueItemId;
 #[cfg(feature = "queue")]
 use symbiotic_queue::{
-    EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend, QueueItem,
-    QueueStatus,
+    EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure, QueueBackend,
+    QueueItem, QueueStatus,
 };
 #[cfg(feature = "queue")]
 use symbiotic_trace::TraceSink;
@@ -1098,7 +1098,13 @@ where
     // trace can report the throttle-wait vs http-time split (the measured
     // lesson) without changing `queued_ms` semantics.
     let mut throttle_wait = Duration::ZERO;
-    let idempotency_key = Some(format!("{}:{request_hash}", queue_id.0));
+    // The provider is part of the key: models pooled on one queue share its
+    // limits, never each other's attempt budgets or results.
+    let idempotency_key = Some(format!(
+        "{}:{}:{request_hash}",
+        queue_id.0,
+        hash_json(&descriptor)?
+    ));
     let fresh_enqueue = || {
         queue.enqueue(EnqueueRequest {
             queue_id: queue_id.clone(),
@@ -1435,12 +1441,19 @@ where
                 if is_transient(&err) {
                     note_model_cooldown(queue.as_ref(), &queue_id, &err, delay_ms).await?;
                 }
+                // One exact deadline, kept by the backend: this caller and any
+                // duplicate waiting on the item retry no earlier than it.
                 let outcome = queue
-                    .fail(
+                    .fail_with(
                         &item.item_id,
                         worker_id,
-                        &err.to_string(),
-                        Some(delay_ms / 1_000),
+                        Failure {
+                            error: err.to_string(),
+                            error_class: Some(error_class(&err).to_string()),
+                            run_after: Some(
+                                Utc::now() + ChronoDuration::milliseconds(delay_ms as i64),
+                            ),
+                        },
                     )
                     .await;
                 heartbeat.abort();
@@ -1480,9 +1493,6 @@ where
                     .await?;
                     return Err(exhausted_request_error(&queue_id, &dead_item, config, &err));
                 }
-                // The backend schedules whole seconds; sleep the remainder
-                // here so sub-second backoff holds.
-                tokio::time::sleep(Duration::from_millis(delay_ms % 1_000)).await;
             }
             Err(err) => {
                 receipts
@@ -1495,7 +1505,15 @@ where
                     )
                     .await;
                 let failed = queue
-                    .fail(&item.item_id, worker_id, &err.to_string(), None)
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: err.to_string(),
+                            error_class: Some(error_class(&err).to_string()),
+                            run_after: None,
+                        },
+                    )
                     .await;
                 heartbeat.abort();
                 drop(permit);
@@ -1683,19 +1701,52 @@ fn logical_max_attempts(config: &ModelQueueConfig) -> u32 {
         .max(1)
 }
 
+/// Stable class name of an error, kept on failed queue items so a later
+/// call reports the same class.
+#[cfg(feature = "queue")]
+fn error_class(err: &ModelError) -> &'static str {
+    match err {
+        ModelError::Unavailable(_) => "unavailable",
+        ModelError::Auth(_) => "auth",
+        ModelError::RateLimited(_) => "rate_limited",
+        ModelError::BudgetExhausted(_) => "budget_exhausted",
+        ModelError::Timeout(_) => "timeout",
+        ModelError::Unsupported(_) => "unsupported",
+        ModelError::InvalidRequest(_) => "invalid_request",
+        ModelError::Provider(_) => "provider",
+        ModelError::Queue(_) => "queue",
+        ModelError::Cache(_) => "cache",
+    }
+}
+
+/// The error a dead item stands for, from its recorded class. Items failed
+/// before classes were recorded fall back to reading the message.
 #[cfg(feature = "queue")]
 fn dead_item_retry_error(item: &QueueItem) -> ModelError {
     let error = item
         .last_error
         .clone()
         .unwrap_or_else(|| "dead queue item".to_string());
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("rate") || lower.contains("429") {
-        ModelError::RateLimited(error)
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        ModelError::Timeout(error)
-    } else {
-        ModelError::Unavailable(error)
+    match item.last_error_class.as_deref() {
+        Some("unavailable") => ModelError::Unavailable(error),
+        Some("auth") => ModelError::Auth(error),
+        Some("rate_limited") => ModelError::RateLimited(error),
+        Some("budget_exhausted") => ModelError::BudgetExhausted(error),
+        Some("timeout") => ModelError::Timeout(error),
+        Some("invalid_request") => ModelError::InvalidRequest(error),
+        Some("queue") => ModelError::Queue(error),
+        Some("cache") => ModelError::Cache(error),
+        Some(_) => ModelError::Provider(error),
+        None => {
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("rate") || lower.contains("429") {
+                ModelError::RateLimited(error)
+            } else if lower.contains("timeout") || lower.contains("timed out") {
+                ModelError::Timeout(error)
+            } else {
+                ModelError::Unavailable(error)
+            }
+        }
     }
 }
 
@@ -1849,6 +1900,9 @@ fn exhausted_request_error(
         ModelError::RateLimited(_) => ModelError::RateLimited(message),
         ModelError::Timeout(_) => ModelError::Timeout(message),
         ModelError::Unavailable(_) => ModelError::Unavailable(message),
+        ModelError::Auth(_) => ModelError::Auth(message),
+        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(message),
+        ModelError::InvalidRequest(_) => ModelError::InvalidRequest(message),
         _ => ModelError::Provider(message),
     }
 }

@@ -7,7 +7,8 @@ use std::time::Duration;
 use symbiotic_core::{QueueId, QueueItemId};
 use symbiotic_model::ModelError;
 use symbiotic_queue::{
-    ClaimRequest, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend, QueueError, QueueItem,
+    ClaimRequest, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure, QueueBackend, QueueError,
+    QueueItem,
 };
 use symbiotic_queue_sqlite::SqliteQueue;
 
@@ -109,6 +110,17 @@ impl QueueBackend for MaintainedQueue {
             .queue
             .fail(item_id, worker_id, error, retry_after_seconds)
             .await;
+        self.finished_one();
+        result
+    }
+
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        let result = self.queue.fail_with(item_id, worker_id, failure).await;
         self.finished_one();
         result
     }

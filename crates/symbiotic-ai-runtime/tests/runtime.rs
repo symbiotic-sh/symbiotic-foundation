@@ -60,7 +60,7 @@ struct Loopback {
     calls: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
-    fail: bool,
+    fail: Option<Arc<ModelError>>,
 }
 
 impl Loopback {
@@ -76,12 +76,16 @@ impl Loopback {
             calls: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
-            fail: false,
+            fail: None,
         }
     }
 
-    fn unavailable(mut self) -> Self {
-        self.fail = true;
+    fn unavailable(self) -> Self {
+        self.failing(ModelError::Unavailable("loopback is down".to_string()))
+    }
+
+    fn failing(mut self, err: ModelError) -> Self {
+        self.fail = Some(Arc::new(err));
         self
     }
 }
@@ -100,8 +104,12 @@ impl ChatProvider for Loopback {
         self.peak.fetch_max(active, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(15)).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
-        if self.fail {
-            return Err(ModelError::Unavailable("loopback is down".to_string()));
+        if let Some(err) = &self.fail {
+            return Err(match err.as_ref() {
+                ModelError::Unavailable(message) => ModelError::Unavailable(message.clone()),
+                ModelError::Provider(message) => ModelError::Provider(message.clone()),
+                other => ModelError::Provider(other.to_string()),
+            });
         }
         Ok(ChatResponse {
             text: format!(
@@ -379,4 +387,62 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
         1,
         "pooled models share one slot"
     );
+}
+
+#[tokio::test]
+async fn pooled_models_keep_separate_budgets_for_the_same_request() {
+    let runtime = Runtime::in_memory();
+    let pool = symbiotic_core::QueueId::new("chat:pool:budgets");
+    let down = Loopback::new(unique_identity()).unavailable();
+    let up = Loopback::new(unique_identity());
+    let bind = |raw: Loopback| {
+        runtime
+            .chat(
+                ModelBinding::new(raw)
+                    .with_policy(policy())
+                    .with_queue_id(pool.clone()),
+            )
+            .unwrap()
+    };
+    bind(down.clone())
+        .chat(request("identical"))
+        .await
+        .unwrap_err();
+    // The other model's identical request is its own call, not the first
+    // model's exhausted one.
+    let answer = bind(up.clone()).chat(request("identical")).await.unwrap();
+    assert!(answer.text.ends_with(":identical"));
+    assert_eq!(up.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_exhausted_error_keeps_its_class_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken =
+        Loopback::new(unique_identity()).failing(ModelError::Provider("bad json".to_string()));
+    let binding = || {
+        ModelBinding::new(broken.clone())
+            .with_policy(ModelQueueConfig {
+                retry_provider_errors: true,
+                ..policy()
+            })
+            .with_response_cache(ResponseCacheMode::Off)
+    };
+    let first = persistent(dir.path())
+        .chat(binding())
+        .unwrap()
+        .chat(request("unparsable"))
+        .await
+        .unwrap_err();
+    assert!(matches!(first, ModelError::Provider(_)), "{first:?}");
+
+    let again = persistent(dir.path())
+        .chat(binding())
+        .unwrap()
+        .chat(request("unparsable"))
+        .await
+        .unwrap_err();
+    assert!(matches!(again, ModelError::Provider(_)), "{again:?}");
+    assert!(again.to_string().contains("exhausted"), "{again}");
+    assert_eq!(broken.calls.load(Ordering::SeqCst), 1);
 }

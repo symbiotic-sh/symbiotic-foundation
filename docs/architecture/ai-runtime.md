@@ -83,6 +83,10 @@ share:
   one request charge per call or batch);
 - one cooldown after rate-limit, unavailable or timeout errors.
 
+Pooling shares limits only. Deduplication, attempt budgets and results stay
+per provider: the idempotency key is the queue, the provider descriptor and
+the request hash.
+
 Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
 fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
@@ -98,7 +102,9 @@ per binding.
 - `retry_base_delay_ms` (default `1000`): the first retry delay. It doubles per
   attempt up to 32x, capped at 30 s (or at the base, if that is longer), plus
   up to `retry_jitter_seconds` of deterministic jitter. The total is at most
-  two minutes, and sub-second delays are honoured.
+  two minutes. The backend stores the exact retry deadline
+  (`QueueBackend::fail_with`), so no caller of the request retries earlier,
+  and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
   failures. Unavailable, rate-limited and timed-out calls always retry. Provider
   errors never start a cooldown.
@@ -107,8 +113,13 @@ per binding.
   debugging only: requests can contain sensitive text.
 - `logical_retry_attempts` / `retry_attempts`: the request's total attempt
   budget and the attempts per queue item. They are unchanged. When the budget
-  runs out, the error keeps the class of the last failure (`RateLimited`,
-  `Timeout`, `Unavailable`, else `Provider`) and says `exhausted after n/m`.
+  runs out, the error keeps the class of the last failure and says
+  `exhausted after n/m`. The class is stored on the queue item
+  (`last_error_class`), so a later call or a restarted runtime reports the
+  same class.
+- A lease that expires on an item's last allowed attempt, for example
+  because the process crashed mid-call, ends the item as dead. A restarted
+  runtime does not make another paid attempt.
 
 - `budget_renewal_seconds` (default `None`): once a request has exhausted
   its budget, later calls for the same request fail without a provider call
@@ -152,7 +163,7 @@ twice keeps its reader as a `Custom` cache.
 ## Backends and conformance
 
 `symbiotic-queue` ships `MemoryQueue`, the in-process backend with no storage
-dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 18
+dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 20
 checks of the `QueueBackend` contract. Both `MemoryQueue` and `SqliteQueue` run
 them in CI:
 
@@ -166,7 +177,8 @@ them in CI:
 - heartbeat;
 - retry to dead;
 - retry delay;
-- expired-lease reclaim;
+- expired-lease reclaim, with an expired final attempt ending dead;
+- `fail_with` recording the error class and the exact retry deadline;
 - cooldown monotonicity;
 - unknown items.
 

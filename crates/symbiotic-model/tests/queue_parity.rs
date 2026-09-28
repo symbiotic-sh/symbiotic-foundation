@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use symbiotic_core::{ModelIdentity, QueueId, QueueItemId, Sensitivity, TraceId};
@@ -73,6 +73,7 @@ struct Loopback {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     failures: Arc<Mutex<Vec<ModelError>>>,
+    starts: Arc<Mutex<Vec<Instant>>>,
     delay: Duration,
 }
 
@@ -90,6 +91,7 @@ impl Loopback {
             active: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
             failures: Arc::new(Mutex::new(Vec::new())),
+            starts: Arc::new(Mutex::new(Vec::new())),
             delay: Duration::ZERO,
         }
     }
@@ -115,6 +117,7 @@ impl ModelProvider for Loopback {
 impl ChatProvider for Loopback {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.starts.lock().unwrap().push(Instant::now());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
@@ -331,11 +334,56 @@ async fn provider_errors_retry_only_when_the_policy_opts_in() {
     assert_eq!(lenient.calls.load(Ordering::SeqCst), 2);
 }
 
-/// Reports the first claimed item as missing, as a retention-bounded
-/// backend does after evicting it.
+/// A retention-bounded backend that evicts the caller's item just before
+/// its first claim: another request finishes and pushes it out of a
+/// one-item terminal window.
 struct EvictsOnce {
     inner: MemoryQueue,
-    evicted: AtomicBool,
+    evicted: Mutex<Option<QueueItemId>>,
+}
+
+impl EvictsOnce {
+    fn new() -> Self {
+        Self {
+            inner: MemoryQueue::with_terminal_retention(1),
+            evicted: Mutex::new(None),
+        }
+    }
+
+    /// Finish `item_id` as another worker, then finish a filler item so the
+    /// one-item terminal window drops it.
+    async fn evict(&self, item_id: &QueueItemId) {
+        self.inner
+            .claim_item(item_id, "other-worker", 60, None)
+            .await
+            .unwrap()
+            .expect("the target is claimable");
+        self.inner.complete(item_id, "other-worker").await.unwrap();
+        let filler = self
+            .inner
+            .enqueue(EnqueueRequest {
+                queue_id: QueueId::new("chat:filler:filler"),
+                kind: "chat".to_string(),
+                payload: json!({}),
+                idempotency_key: None,
+                run_after: None,
+                max_attempts: None,
+                force: false,
+            })
+            .await
+            .unwrap()
+            .item;
+        self.inner
+            .claim_item(&filler.item_id, "other-worker", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        self.inner
+            .complete(&filler.item_id, "other-worker")
+            .await
+            .unwrap();
+        assert!(self.inner.get_item(item_id).await.unwrap().is_none());
+    }
 }
 
 #[async_trait]
@@ -353,8 +401,16 @@ impl QueueBackend for EvictsOnce {
         lease_seconds: u64,
         max_in_flight: Option<usize>,
     ) -> Result<Option<QueueItem>, QueueError> {
-        if !self.evicted.swap(true, Ordering::SeqCst) {
-            return Err(QueueError::NotFound(item_id.0.clone()));
+        let first = {
+            let mut evicted = self.evicted.lock().unwrap();
+            let first = evicted.is_none();
+            if first {
+                *evicted = Some(item_id.clone());
+            }
+            first
+        };
+        if first {
+            self.evict(item_id).await;
         }
         self.inner
             .claim_item(item_id, worker_id, lease_seconds, max_in_flight)
@@ -394,17 +450,28 @@ impl QueueBackend for EvictsOnce {
 
 #[tokio::test]
 async fn an_evicted_queue_item_is_queued_again_instead_of_failing() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(EvictsOnce {
-        inner: MemoryQueue::new(),
-        evicted: AtomicBool::new(false),
-    });
+    let backend = Arc::new(EvictsOnce::new());
     let raw = Loopback::new(unique_identity());
-    let response = queued(raw.clone(), queue, config())
+    let response = queued(raw.clone(), backend.clone(), config())
         .chat(request("still here"))
         .await
         .unwrap();
     assert_eq!(response.text, "still here");
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    let evicted = backend.evicted.lock().unwrap().clone().unwrap();
+    let replacement = response
+        .trace
+        .queue_item_id
+        .expect("the call ran on a queue item");
+    assert_ne!(replacement, evicted, "a replacement item was created");
+    assert!(
+        backend
+            .inner
+            .get_item(&replacement)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -594,4 +661,37 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
         2,
         "each call has its own budget"
     );
+}
+
+#[tokio::test]
+async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
+    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let raw = Loopback::new(unique_identity())
+        .failing_first(vec![ModelError::Provider("bad json".to_string())]);
+    let provider = queued(
+        raw.clone(),
+        queue,
+        ModelQueueConfig {
+            retry_base_delay_ms: 1_500,
+            retry_provider_errors: true,
+            max_in_flight: 2,
+            ..config()
+        },
+    );
+    // Two callers of the same request: one runs the failing attempt, the
+    // other waits on the same queue item.
+    let (first, second) = tokio::join!(
+        provider.chat(request("fractional")),
+        provider.chat(request("fractional"))
+    );
+    first.unwrap();
+    second.unwrap();
+    let starts = raw.starts.lock().unwrap().clone();
+    assert!(starts.len() >= 2, "{starts:?}");
+    let waited = starts[1].duration_since(starts[0]);
+    assert!(
+        waited >= Duration::from_millis(1_490),
+        "no attempt may start before the 1.5 s retry deadline: {waited:?}"
+    );
+    assert!(waited < Duration::from_millis(2_400), "{waited:?}");
 }

@@ -8,8 +8,8 @@
 //! evicted first. Active items are never evicted.
 
 use crate::{
-    ClaimRequest, EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, QueueBackend,
-    QueueError, QueueEvent, QueueEventSink, QueueItem, QueueStatus,
+    ClaimRequest, EnqueueDisposition, EnqueueOutcome, EnqueueRequest, FailOutcome, Failure,
+    QueueBackend, QueueError, QueueEvent, QueueEventSink, QueueItem, QueueStatus,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -186,7 +186,8 @@ impl State {
         }
     }
 
-    /// Return expired running items of `queue_id` to `Failed`.
+    /// Return expired running items of `queue_id` to `Failed`, or to `Dead`
+    /// when the expired lease was their last allowed attempt.
     fn reclaim_expired(&mut self, queue_id: &str, now: DateTime<Utc>) -> Vec<QueueItem> {
         let expired: Vec<String> = self
             .running
@@ -201,7 +202,13 @@ impl State {
             .unwrap_or_default();
         let mut reclaimed = Vec::with_capacity(expired.len());
         for id in expired {
-            self.set_status(&id, QueueStatus::Failed);
+            let item = &self.items[&id];
+            let status = if item.attempt >= item.max_attempts {
+                QueueStatus::Dead
+            } else {
+                QueueStatus::Failed
+            };
+            self.set_status(&id, status);
             let item = self.items.get_mut(&id).expect("running item exists");
             item.lease_owner = None;
             item.lease_until = None;
@@ -211,6 +218,21 @@ impl State {
             reclaimed.push(item.clone());
         }
         reclaimed
+    }
+
+    /// A waiting item whose attempts are all used is dead, not claimable.
+    fn retire_if_exhausted(&mut self, item_id: &str, now: DateTime<Utc>) -> Option<QueueItem> {
+        let item = self.items.get_mut(item_id)?;
+        if !matches!(item.status, QueueStatus::Pending | QueueStatus::Failed)
+            || item.attempt < item.max_attempts
+        {
+            return None;
+        }
+        item.updated_at = now;
+        item.last_error
+            .get_or_insert_with(|| "attempt budget exhausted".to_string());
+        self.set_status(item_id, QueueStatus::Dead);
+        self.items.get(item_id).cloned()
     }
 
     fn lease(&mut self, item_id: &str, worker_id: &str, lease_seconds: u64, now: DateTime<Utc>) {
@@ -272,6 +294,7 @@ impl QueueBackend for MemoryQueue {
                 lease_until: None,
                 idempotency_key: request.idempotency_key,
                 last_error: None,
+                last_error_class: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -313,6 +336,7 @@ impl QueueBackend for MemoryQueue {
                 .filter(|item| {
                     item.queue_id.0 == queue_id
                         && matches!(item.status, QueueStatus::Pending | QueueStatus::Failed)
+                        && item.attempt < item.max_attempts
                         && item.run_after <= now
                 })
                 .collect();
@@ -357,7 +381,7 @@ impl QueueBackend for MemoryQueue {
             ));
         }
         let now = Utc::now();
-        let (reclaimed, claimed) = {
+        let (reclaimed, retired, claimed) = {
             let mut state = self.lock()?;
             let queue_id = state
                 .items
@@ -367,6 +391,7 @@ impl QueueBackend for MemoryQueue {
                 .0
                 .clone();
             let reclaimed = state.reclaim_expired(&queue_id, now);
+            let retired = state.retire_if_exhausted(&item_id.0, now);
             let current = &state.items[&item_id.0];
             let claimable = matches!(current.status, QueueStatus::Pending | QueueStatus::Failed)
                 && current.run_after <= now
@@ -375,9 +400,13 @@ impl QueueBackend for MemoryQueue {
                 state.lease(&item_id.0, worker_id, lease_seconds, now);
                 state.items[&item_id.0].clone()
             });
-            (reclaimed, claimed)
+            (reclaimed, retired, claimed)
         };
         let mut events = lease_events(reclaimed);
+        events.extend(retired.map(|item| {
+            let error = item.last_error.clone();
+            (item, error)
+        }));
         events.extend(claimed.iter().cloned().map(|item| (item, None)));
         self.emit(events).await;
         Ok(claimed)
@@ -415,6 +444,7 @@ impl QueueBackend for MemoryQueue {
             item.lease_owner = None;
             item.lease_until = None;
             item.last_error = None;
+            item.last_error_class = None;
             item.updated_at = now;
             state.set_status(&item_id.0, QueueStatus::Succeeded);
             Ok(())
@@ -430,6 +460,26 @@ impl QueueBackend for MemoryQueue {
         error: &str,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
+        let run_after =
+            Utc::now() + ChronoDuration::seconds(retry_after_seconds.unwrap_or(1) as i64);
+        self.fail_with(
+            item_id,
+            worker_id,
+            Failure {
+                error: error.to_string(),
+                error_class: None,
+                run_after: Some(run_after),
+            },
+        )
+        .await
+    }
+
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
         let mut outcome = FailOutcome::RetryScheduled;
         let item = self.update_running(item_id, worker_id, |state, now| {
             let item = state
@@ -437,10 +487,13 @@ impl QueueBackend for MemoryQueue {
                 .get_mut(&item_id.0)
                 .expect("running item exists");
             let exhausted = item.attempt >= item.max_attempts;
-            item.run_after = now + ChronoDuration::seconds(retry_after_seconds.unwrap_or(1) as i64);
+            item.run_after = failure
+                .run_after
+                .unwrap_or_else(|| now + ChronoDuration::seconds(1));
             item.lease_owner = None;
             item.lease_until = None;
-            item.last_error = Some(error.to_string());
+            item.last_error = Some(failure.error.clone());
+            item.last_error_class = failure.error_class.clone();
             item.updated_at = now;
             let status = if exhausted {
                 outcome = FailOutcome::MovedToDead;
@@ -451,7 +504,7 @@ impl QueueBackend for MemoryQueue {
             state.set_status(&item_id.0, status);
             Ok(())
         })?;
-        self.emit(vec![(item, Some(error.to_string()))]).await;
+        self.emit(vec![(item, Some(failure.error))]).await;
         Ok(outcome)
     }
 

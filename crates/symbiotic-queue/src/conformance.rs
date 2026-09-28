@@ -7,8 +7,8 @@
 //! documented semantics, not an implementation.
 
 use crate::{
-    ClaimRequest, EnqueueDisposition, EnqueueRequest, FailOutcome, QueueBackend, QueueError,
-    QueueStatus,
+    ClaimRequest, EnqueueDisposition, EnqueueRequest, FailOutcome, Failure, QueueBackend,
+    QueueError, QueueStatus,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::collections::HashSet;
@@ -40,6 +40,8 @@ macro_rules! queue_backend_conformance {
             fail_retries_until_dead_and_complete_clears_the_error,
             fail_schedules_the_retry_delay,
             expired_lease_cannot_complete_and_is_reclaimed,
+            an_expired_final_attempt_is_dead_not_claimable,
+            fail_with_records_the_class_and_the_exact_deadline,
             cooldown_only_moves_forward,
             unknown_item_is_absent,
         );
@@ -454,4 +456,85 @@ pub async fn cooldown_only_moves_forward(queue: Arc<dyn QueueBackend>) {
 
 pub async fn unknown_item_is_absent(queue: Arc<dyn QueueBackend>) {
     assert!(queue.get_item(&QueueItemId::new()).await.unwrap().is_none());
+}
+
+/// A crash during the last allowed attempt must not buy another attempt:
+/// once that lease expires the item is dead, whether a sweep or a claim
+/// finds it first. Sleeps just over one second.
+pub async fn an_expired_final_attempt_is_dead_not_claimable(queue: Arc<dyn QueueBackend>) {
+    let mut swept = request("final-swept");
+    swept.max_attempts = Some(1);
+    let mut claimed = request("final-claimed");
+    claimed.max_attempts = Some(1);
+    let swept = queue.enqueue(swept).await.unwrap().item;
+    let claimed = queue.enqueue(claimed).await.unwrap().item;
+    claim_one(queue.as_ref(), &swept.item_id, 1).await;
+    claim_one(queue.as_ref(), &claimed.item_id, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // A claim of the expired item reclaims every expired lease of the queue.
+    assert!(
+        queue
+            .claim_item(&claimed.item_id, "restarted", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for item_id in [&swept.item_id, &claimed.item_id] {
+        let item = queue.get_item(item_id).await.unwrap().unwrap();
+        assert_eq!(item.status, QueueStatus::Dead, "{item:?}");
+        assert_eq!(item.attempt, 1);
+        assert!(item.lease_owner.is_none());
+    }
+    assert!(
+        queue
+            .claim(claim("restarted", 5, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut again = request("final-swept");
+    again.max_attempts = Some(1);
+    let duplicate = queue.enqueue(again).await.unwrap();
+    assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
+}
+
+pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn QueueBackend>) {
+    let item = queue.enqueue(request("classified")).await.unwrap().item;
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    let deadline = Utc::now() + ChronoDuration::milliseconds(400);
+    let outcome = queue
+        .fail_with(
+            &item.item_id,
+            "worker",
+            Failure {
+                error: "slow down".to_string(),
+                error_class: Some("rate_limited".to_string()),
+                run_after: Some(deadline),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, FailOutcome::RetryScheduled);
+    let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(failed.last_error.as_deref(), Some("slow down"));
+    assert_eq!(failed.last_error_class.as_deref(), Some("rate_limited"));
+    assert!(
+        (failed.run_after - deadline).num_milliseconds().abs() < 5,
+        "{} vs {deadline}",
+        failed.run_after
+    );
+    assert!(
+        queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "not before the deadline"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    queue.complete(&item.item_id, "worker").await.unwrap();
+    let done = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(done.last_error_class, None);
 }
