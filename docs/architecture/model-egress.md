@@ -119,9 +119,11 @@ Completion after the deadline persists accounting but never stores recovery outp
 Expiry neither permits a new dispatch nor deletes accounting or replay tombstones.
 Permitted and uncertain dispatched attempts keep their state after the deadline.
 
-Expired result rows are cleared at startup, before operations, and every second during
-socket serving, even when idle or connection slots are occupied. Embedded users must
-periodically call `CredentialProcess::purge_expired_results()` while idle. Cleanup failure
+Expired result rows are cleared incrementally at startup, before operations, and every
+second during socket serving, even when idle or connection slots are occupied. Each call
+clears at most 64 results selected by the partial deadline index, regardless of the
+expired backlog. Status lookup enforces the deadline even before physical cleanup.
+Embedded users must periodically call `CredentialProcess::purge_expired_results()` while idle. Cleanup failure
 returns `StateUnavailable`; the daemon fails visibly. SQLite secure-delete is enabled;
 this is logical retention, not a forensic erasure guarantee for WAL files, backups, or
 filesystem snapshots. These recovery records are protected by filesystem permissions,
@@ -189,7 +191,11 @@ a visible stop.
 
 A received success reports measured provider requests (one) and available measured
 input/output/reasoning/media/cost fields. Missing usage remains `None`; it is never
-invented. Every failed dispatch returns a static credential-free `error` alongside
+invented. `UsageTrace.reported_cost_usd` preserves validated provider-reported USD cost
+as an exact decimal string, including sub-micro-dollar precision, in immediate receipts
+and recovered results. It is separate from integer `cost_micro_usd`; the process neither
+rounds it nor estimates prices, and `ChargeReport` still measures provider requests.
+Every failed dispatch returns a static credential-free `error` alongside
 its receipt (`None` on success). Credential-loading and setup/queue failures before
 transport handoff report known zero requests and release that reservation for a
 subsequent admitted attempt, while the attempt-count limit still applies. Once the

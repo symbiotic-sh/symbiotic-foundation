@@ -77,7 +77,7 @@ impl Fixture {
                     count.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
                     let body = if status == 200 {
-                        serde_json::json!({"choices":[{"message":{"content":output},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}).to_string()
+                        serde_json::json!({"choices":[{"message":{"content":output},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"cost_usd":"0.00001234567890123456789"}}).to_string()
                     } else {
                         output
                     };
@@ -1139,6 +1139,15 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
         .unwrap(),
     );
     assert!(result.receipt_persisted);
+    assert_eq!(
+        serde_json::to_value(&result.receipt.usage).unwrap()["reported_cost_usd"],
+        "0.00001234567890123456789"
+    );
+    assert_eq!(result.receipt.usage.cost_micro_usd, None);
+    assert!(matches!(
+        result.receipt.charge,
+        ChargeReport::Measured { amount: 1, .. }
+    ));
     drop(process);
     let process = fixture.process();
     let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {

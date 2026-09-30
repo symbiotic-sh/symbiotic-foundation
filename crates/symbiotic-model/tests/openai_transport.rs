@@ -117,6 +117,10 @@ async fn low_thinking_and_metadata_without_reasoning_text() {
     );
     assert_eq!(response.trace.usage.reasoning_tokens, Some(3));
     assert_eq!(response.trace.usage.cost_micro_usd, None);
+    assert_eq!(
+        response.trace.usage.reported_cost_usd.as_deref(),
+        Some("0.00001234")
+    );
     assert_eq!(response.trace.cache.prompt_cache, CacheStatus::PartialHit);
     assert_eq!(response.trace.metadata["cache_miss_tokens"], 6);
     assert!(
@@ -148,6 +152,7 @@ async fn disabled_thinking_omits_effort_and_nullable_content_keeps_identity() {
         "no-usage"
     );
     assert_eq!(response.trace.usage.input_tokens, None);
+    assert_eq!(response.trace.usage.reported_cost_usd, None);
 }
 
 #[test]
@@ -179,6 +184,27 @@ fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
 }
 
 #[tokio::test]
+async fn provider_cost_usd_is_preserved_in_typed_usage() {
+    for cost in ["0.01", "0.0000001234567890123456789"] {
+        let (url, server) = fixture(serde_json::json!({
+            "choices":[{"message":{"content":"OK"}}],
+            "usage":{"cost_usd":cost}
+        }));
+        let response =
+            OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+                .chat(request())
+                .await
+                .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            response.trace.usage.reported_cost_usd.as_deref(),
+            Some(cost)
+        );
+        assert_eq!(response.trace.usage.cost_micro_usd, None);
+    }
+}
+
+#[tokio::test]
 async fn invalid_reported_costs_remain_unknown() {
     for cost in [
         serde_json::json!(-0.1),
@@ -197,6 +223,7 @@ async fn invalid_reported_costs_remain_unknown() {
                 .unwrap();
         server.join().unwrap();
         assert!(response.trace.metadata["provider"]["reported_cost_usd"].is_null());
+        assert_eq!(response.trace.usage.reported_cost_usd, None);
     }
 }
 

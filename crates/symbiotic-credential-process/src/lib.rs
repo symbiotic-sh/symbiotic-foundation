@@ -263,7 +263,8 @@ impl CredentialProcess {
         }
     }
 
-    /// Remove expired recovery results. Socket serving runs this every second even when idle.
+    /// Remove at most 64 expired recovery results, selected by the deadline index.
+    /// Socket serving runs this every second even when idle.
     /// Embedded hosts must also call it periodically while idle; all operations purge first.
     pub fn purge_expired_results(&self) -> Result<(), EgressError> {
         self.inner

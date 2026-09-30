@@ -45,6 +45,9 @@ pub struct UsageTrace {
     pub reasoning_tokens: Option<u64>,
     pub media_units: Option<u64>,
     pub cost_micro_usd: Option<u64>,
+    /// Explicit provider-reported USD cost, preserved as a validated decimal string.
+    /// Independent of integer micro-USD accounting; never rounded or price-estimated.
+    pub reported_cost_usd: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -418,6 +421,7 @@ mod tests {
                 reasoning_tokens: None,
                 media_units: None,
                 cost_micro_usd: Some(42),
+                reported_cost_usd: Some("0.000042123456789".into()),
             },
             timing: TimingTrace {
                 queued_ms: Some(1),
@@ -463,6 +467,10 @@ mod tests {
         let records = JsonlTraceSink::read(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].usage.input_tokens, Some(10));
+        assert_eq!(
+            records[0].usage.reported_cost_usd.as_deref(),
+            Some("0.000042123456789")
+        );
     }
 
     #[tokio::test]

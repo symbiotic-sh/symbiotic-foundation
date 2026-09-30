@@ -3081,6 +3081,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 .and_then(|details| details.reasoning_tokens),
             media_units: None,
             cost_micro_usd: None,
+            reported_cost_usd: reported_cost_usd(&raw),
         };
         let nested_hit = usage
             .prompt_tokens_details
@@ -3097,7 +3098,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 "served_model": raw.get("model").and_then(Value::as_str),
                 "created": raw.get("created").and_then(Value::as_i64),
                 "reasoning_tokens": trace.usage.reasoning_tokens,
-                "reported_cost_usd": reported_cost_usd(&raw),
+                "reported_cost_usd": trace.usage.reported_cost_usd,
             },
             "cache_miss_tokens": miss,
             "observed_cache_tokens": {

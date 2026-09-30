@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 pub(crate) struct Registry(Connection);
 
+// A request or idle tick must never drain an arbitrarily large expired cohort.
+const EXPIRY_BATCH_SIZE: usize = 64;
+
 fn state(_: rusqlite::Error) -> EgressError {
     EgressError::StateUnavailable
 }
@@ -266,7 +269,7 @@ impl Registry {
 
     pub(crate) fn purge_expired(&mut self, time: u64) -> Result<(), EgressError> {
         // Recovery polling must not contend with the runtime's writer when no
-        // result is due. The partial expiry index also bounds idle cleanup work.
+        // result is due. Use the partial deadline index for both the probe and batch.
         let due: bool = self.0.query_row(
             "SELECT EXISTS(SELECT 1 FROM egress_permits WHERE recovery_expires_at<=?1 AND result IS NOT NULL)",
             [time], |row| row.get(0),
@@ -274,10 +277,16 @@ impl Registry {
         if !due {
             return Ok(());
         }
-        self.0.execute(
-            "UPDATE egress_permits SET result=NULL WHERE recovery_expires_at<=?1 AND result IS NOT NULL",
-            [time],
-        ).map_err(state)?;
+        self.0
+            .execute(
+                "UPDATE egress_permits SET result=NULL WHERE rowid IN (
+                SELECT rowid FROM egress_permits
+                WHERE recovery_expires_at<=?1 AND result IS NOT NULL
+                ORDER BY recovery_expires_at LIMIT ?2
+            )",
+                params![time, EXPIRY_BATCH_SIZE],
+            )
+            .map_err(state)?;
         Ok(())
     }
 
@@ -321,6 +330,83 @@ mod tests {
             "reserved_budget": { "unit": "provider_requests", "amount": 1, "invocation_limit": 1 }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn recovery_expiry_cleanup_is_incremental_and_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
+        let attempt = attempt();
+        let grant = registry.issue(&attempt).unwrap();
+        let receipt = registry.consume(&attempt, &grant.permit).unwrap();
+        registry
+            .finish(&DispatchResult {
+                receipt,
+                output: Some(ProviderOutput::Chat {
+                    text: "retained".into(),
+                }),
+                error: None,
+                receipt_persisted: true,
+            })
+            .unwrap();
+        // A large cohort sharing one deadline must take multiple bounded sweeps.
+        registry
+            .0
+            .execute_batch(
+                "WITH RECURSIVE ord(n) AS (
+                VALUES(2) UNION ALL SELECT n+1 FROM ord WHERE n<10000
+            ) INSERT INTO egress_permits
+                (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
+                 token, recovery_expires_at, consumed, finished, receipt, result)
+                SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
+                       token, recovery_expires_at, 1, 1, receipt, result
+                FROM egress_permits, ord WHERE ordinal=1;",
+            )
+            .unwrap();
+        // Bound VM work as well as updated rows: LIMIT alone must not hide a scan.
+        registry.0.progress_handler(20000, Some(|| true));
+        registry.purge_expired(attempt.recovery_expires_at).unwrap();
+        registry.0.progress_handler(0, None::<fn() -> bool>);
+        let remaining = || {
+            registry
+                .0
+                .query_row(
+                    "SELECT count(*) FROM egress_permits WHERE result IS NOT NULL",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(remaining(), 10000 - 64);
+        // Lookup must enforce logical expiry even for rows not yet swept.
+        let mut id = attempt.attempt_id();
+        id.attempt_ordinal = 10000;
+        assert!(matches!(
+            registry
+                .attempt_status(&id, attempt.recovery_expires_at)
+                .unwrap(),
+            AttemptStatus::Expired
+        ));
+        assert!(registry.receipt(&attempt).unwrap().is_some());
+        assert!(matches!(
+            registry.consume(&attempt, &grant.permit),
+            Err(EgressError::PermitRefused)
+        ));
+        registry.purge_expired(attempt.recovery_expires_at).unwrap();
+        let remaining: usize = registry
+            .0
+            .query_row(
+                "SELECT count(*) FROM egress_permits WHERE result IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 10000 - 128);
+        // Before the next deadline, lookup must not scan the remaining results.
+        registry.0.progress_handler(1000, Some(|| true));
+        registry
+            .purge_expired(attempt.recovery_expires_at - 1)
+            .unwrap();
     }
 
     #[test]
