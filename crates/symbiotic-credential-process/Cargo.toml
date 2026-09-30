@@ -26,5 +26,6 @@ zeroize = "1"
 security-framework = "3.7"
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tracing.workspace = true

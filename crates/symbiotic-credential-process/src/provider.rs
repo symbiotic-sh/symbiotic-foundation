@@ -1,7 +1,10 @@
 //! Sanitize inside the raw provider, before runtime receipts/logging see any result.
 use crate::{RouteConfig, RouteProvider, secrets::Secret};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use symbiotic_ai_runtime::{
     model::{GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
     *,
@@ -13,11 +16,13 @@ use symbiotic_trace::UsageTrace;
 struct SafeChat {
     inner: OpenAiCompatibleChatProvider,
     secret: Arc<Secret>,
+    started: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 struct SafeEmbedding {
     inner: GeminiEmbeddingProvider,
     secret: Arc<Secret>,
+    started: Arc<AtomicBool>,
 }
 
 fn safe_error(error: ModelError) -> ModelError {
@@ -75,6 +80,7 @@ impl ModelProvider for SafeEmbedding {
 #[async_trait]
 impl ChatProvider for SafeChat {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.chat(request).await.map_err(safe_error)?;
         check_response(&response, &self.secret)?;
         response.raw_provider_response = None;
@@ -85,6 +91,7 @@ impl ChatProvider for SafeChat {
 #[async_trait]
 impl EmbeddingProvider for SafeEmbedding {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
+        self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.embed(request).await.map_err(safe_error)?;
         check_response(&response, &self.secret)?;
         response.raw_provider_response = None;
@@ -93,24 +100,27 @@ impl EmbeddingProvider for SafeEmbedding {
     }
 }
 
-pub(crate) async fn execute(
-    runtime: &Runtime,
-    route: &RouteConfig,
-    secret: Arc<Secret>,
-    payload: ProviderPayload,
-    attempt_digest: &str,
-) -> Result<(ProviderOutput, UsageTrace), EgressError> {
-    // Ambient proxies must not reroute an admitted destination or receive its secret.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(std::time::Duration::from_secs(route.timeout_seconds))
-        .build()
-        .map_err(|_| EgressError::InvalidRequest)?;
+// Once the raw adapter starts, conservatively retain the reservation even if
+// it fails while building/sending the request. Queue/setup failures before that
+// boundary are known not to have reached HTTP.
+pub(crate) struct ExecuteError {
+    pub(crate) code: EgressError,
+    pub(crate) may_have_dispatched: bool,
+}
+
+impl From<EgressError> for ExecuteError {
+    fn from(code: EgressError) -> Self {
+        Self {
+            code,
+            may_have_dispatched: false,
+        }
+    }
+}
+
+fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
     // No hidden retry layer may spend a permit twice. Every retry must come back
     // through Memory's admission/barrier with its next ordinal.
-    let policy = ModelQueueConfig {
+    ModelQueueConfig {
         max_in_flight: route.max_in_flight,
         requests_per_minute: route.requests_per_minute,
         input_units_per_minute: route.input_units_per_minute,
@@ -119,7 +129,54 @@ pub(crate) async fn execute(
         request_timeout_seconds: Some(route.timeout_seconds),
         budget_renewal_seconds: None,
         ..ModelQueueConfig::default()
-    };
+    }
+}
+
+/// Register all routes against the runtime's actual shared-limit rules without
+/// resolving a provider credential or submitting a request.
+pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result<(), EgressError> {
+    let policy = queue_policy(route);
+    match &route.provider {
+        RouteProvider::OpenAiChat { operator } => runtime
+            .chat(
+                ModelBinding::new(OpenAiCompatibleChatProvider::new(
+                    operator,
+                    &route.model,
+                    &route.destination,
+                    "",
+                ))
+                .with_policy(policy)
+                .with_response_cache(ResponseCacheMode::Off),
+            )
+            .map(|_| ()),
+        RouteProvider::GeminiEmbedding { dimensions } => runtime
+            .embedding(
+                ModelBinding::new(GeminiEmbeddingProvider::new(&route.model, "", *dimensions))
+                    .with_policy(policy)
+                    .with_response_cache(ResponseCacheMode::Off),
+            )
+            .map(|_| ()),
+    }
+    .map_err(|_| EgressError::InvalidRequest)
+}
+
+pub(crate) async fn execute(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    secret: Arc<Secret>,
+    payload: ProviderPayload,
+    attempt_digest: &str,
+) -> Result<(ProviderOutput, UsageTrace), ExecuteError> {
+    // Ambient proxies must not reroute an admitted destination or receive its secret.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(std::time::Duration::from_secs(route.timeout_seconds))
+        .build()
+        .map_err(|_| EgressError::InvalidRequest)?;
+    let policy = queue_policy(route);
+    let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
         (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(mut request)) => {
             // Per-attempt queue identity without changing provider-visible inputs.
@@ -137,6 +194,7 @@ pub(crate) async fn execute(
                 .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes),
                 secret,
+                started: started.clone(),
             };
             let provider = runtime
                 .chat(
@@ -145,10 +203,14 @@ pub(crate) async fn execute(
                         .with_response_cache(ResponseCacheMode::Off),
                 )
                 .map_err(|_| EgressError::StateUnavailable)?;
-            let response = provider
-                .chat(request)
-                .await
-                .map_err(|_| EgressError::Transport)?;
+            let response = provider.chat(request).await.map_err(|error| ExecuteError {
+                code: match error {
+                    ModelError::Queue(_) => EgressError::StateUnavailable,
+                    ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
+                    _ => EgressError::Transport,
+                },
+                may_have_dispatched: started.load(Ordering::SeqCst),
+            })?;
             Ok((
                 ProviderOutput::Chat {
                     text: response.text,
@@ -169,6 +231,7 @@ pub(crate) async fn execute(
                     .with_request_limit(route.max_input_bytes)
                     .with_response_limit(route.max_response_bytes),
                 secret,
+                started: started.clone(),
             };
             let provider = runtime
                 .embedding(
@@ -180,7 +243,14 @@ pub(crate) async fn execute(
             let response = provider
                 .embed(request)
                 .await
-                .map_err(|_| EgressError::Transport)?;
+                .map_err(|error| ExecuteError {
+                    code: match error {
+                        ModelError::Queue(_) => EgressError::StateUnavailable,
+                        ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
+                        _ => EgressError::Transport,
+                    },
+                    may_have_dispatched: started.load(Ordering::SeqCst),
+                })?;
             Ok((
                 ProviderOutput::Embedding {
                     vectors: response.vectors,
@@ -189,7 +259,7 @@ pub(crate) async fn execute(
                 response.trace.usage,
             ))
         }
-        _ => Err(EgressError::InvalidRequest),
+        _ => Err(EgressError::InvalidRequest.into()),
     }
 }
 

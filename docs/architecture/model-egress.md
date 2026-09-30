@@ -25,7 +25,7 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 | `ProviderPayload` | `Chat(ChatRequest)` or `Embedding(EmbeddingRequest)`; use its `digest()` helper, never a separately implemented serialization |
 | `DispatchPermit { token, attempt_digest }` | Opaque random capability, accepted exactly once, including across process restarts |
 | `InjectProviderCredential` | `operation_version`, `admission`, `permit`, `payload` |
-| `DispatchResult` | `receipt`, optional typed `output`, `receipt_persisted` |
+| `DispatchResult` | `receipt`, optional typed `output`, optional static `error: EgressError`, `receipt_persisted` |
 | `DispatchReceipt` | `attempt_digest`, `DispatchStatus`, provider-reported `UsageTrace`, `ChargeReport` |
 | `ProviderOutput` | Chat text or embedding vectors/dimensions; no raw provider response, raw error, credentials or trace metadata |
 
@@ -125,9 +125,15 @@ no output replay. Unknown sends require reconciliation or a visible stop.
 
 A received success reports measured provider requests (one) and available measured
 input/output/reasoning/media/cost fields. Missing usage remains `None`; it is never
-invented. Credential-loading failure reports known zero requests and releases that reservation
-for a subsequent admitted attempt, while the attempt-count limit still applies. If the final receipt
-write fails, the paid output still returns with `receipt_persisted = false`; restart
+invented. Every failed dispatch returns a static credential-free `error` alongside
+its receipt (`None` on success). Credential-loading and setup/queue failures before
+transport handoff report known zero requests and release that reservation for a
+subsequent admitted attempt, while the attempt-count limit still applies. Once the
+raw transport starts, failures conservatively retain the unknown reservation.
+Retry admission checks only the latest receipt using the invocation/ordinal index:
+it must be a measured zero-charge failure in the reserved unit. Success is terminal,
+and other charges require reconciliation, so earlier history needs no aggregate scan.
+If the final receipt write fails, the paid output still returns with `receipt_persisted = false`; restart
 retains the earlier unknown reservation. Memory must record the received receipt itself.
 
 V1 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
@@ -150,7 +156,9 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 `ProcessConfig` version 1 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
 Each route requires all `RouteConfig` fields documented in the Rust type, including
-finite field/input/response/token/concurrency/timeout limits. Unknown config fields
+finite field/input/response/token/concurrency/timeout limits. Startup registers every
+route with the runtime and refuses conflicting concurrency or pacing limits for a
+shared model queue, including routes in different tenants. Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` can be null.
 
 Both admission and provider sources use one of:

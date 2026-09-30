@@ -362,6 +362,7 @@ async fn retry_is_a_new_attempt_same_invocation_without_response_cache() {
             .unwrap(),
     );
     assert_eq!(failed.receipt.status, DispatchStatus::CredentialUnavailable);
+    assert_eq!(failed.error, Some(EgressError::CredentialUnavailable));
     std::fs::write(&key_path, SECRET).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     // The retry and a different invocation have byte-identical provider input.
@@ -406,6 +407,7 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
             .unwrap(),
     );
     assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+    assert_eq!(result.error, Some(EgressError::Transport));
     assert_eq!(
         result.receipt.charge,
         ChargeReport::Unknown {
@@ -514,6 +516,7 @@ async fn credentials_and_declared_encodings_never_return_in_success_or_error() {
             );
             let serialized = serde_json::to_string(&result).unwrap();
             assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+            assert_eq!(result.error, Some(EgressError::Transport));
             assert!(result.output.is_none());
             for encoding in &encodings {
                 assert!(!serialized.contains(encoding));
@@ -627,6 +630,7 @@ async fn redirects_and_oversized_provider_responses_fail_without_a_second_call()
                 .unwrap(),
         );
         assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+        assert_eq!(result.error, Some(EgressError::Transport));
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
         assert!(result.output.is_none());
     }
@@ -942,4 +946,86 @@ async fn expanded_wire_payload_is_refused(embedding: bool) {
         Ok(Reply::Receipt(None))
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn conflicting_shared_route_limits_are_refused_at_startup() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    for field in ["concurrency", "requests", "input"] {
+        let mut config = fixture.config.clone();
+        let mut second = config.routes[0].clone();
+        second.route = "second-route".into();
+        second.tenant = "other-tenant".into();
+        match field {
+            "concurrency" => second.max_in_flight += 1,
+            "requests" => second.requests_per_minute = Some(60),
+            _ => second.input_units_per_minute = Some(1000),
+        }
+        config.routes.push(second);
+        assert!(matches!(
+            CredentialProcess::open(config),
+            Err(EgressError::InvalidRequest)
+        ));
+    }
+    let mut config = fixture.config.clone();
+    let mut second = config.routes[0].clone();
+    second.route = "same-limits".into();
+    config.routes.push(second);
+    assert!(CredentialProcess::open(config).is_ok());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failure_before_dispatch_returns_safe_error_and_releases_reservation() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let db = rusqlite::Connection::open(fixture.config.state_dir.join("queue.sqlite")).unwrap();
+    // Inject a real queue write failure after permit consumption, before HTTP.
+    db.execute_batch(
+        "CREATE TRIGGER refuse_queue BEFORE INSERT ON queue_items
+        BEGIN SELECT RAISE(FAIL, 'synthetic queue unavailable'); END;",
+    )
+    .unwrap();
+    let (first, payload) = fixture.attempt("pre-dispatch", 1, 1);
+    let granted = permit(&process, &first).await;
+    let result = dispatched(
+        exchange(&process, inject(first.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["error"], "state_unavailable");
+    let decoded: DispatchResult = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(decoded.error, Some(EgressError::StateUnavailable));
+    assert!(!wire.to_string().contains(SECRET));
+    assert!(result.output.is_none());
+    assert!(result.receipt_persisted);
+    assert_eq!(
+        result.receipt.charge,
+        ChargeReport::Measured {
+            unit: "provider_requests".into(),
+            amount: 0
+        }
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    drop(process);
+    db.execute_batch("DROP TRIGGER refuse_queue").unwrap();
+    let process = fixture.process();
+    let stored = exchange(&process, Operation::Receipt(first)).await.unwrap();
+    assert!(matches!(
+        stored,
+        Reply::Receipt(Some(DispatchReceipt {
+            charge: ChargeReport::Measured { amount: 0, .. },
+            ..
+        }))
+    ));
+    let (retry, payload) = fixture.attempt("pre-dispatch", 2, 2);
+    let granted = permit(&process, &retry).await;
+    let result = dispatched(
+        exchange(&process, inject(retry, payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }

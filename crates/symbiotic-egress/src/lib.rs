@@ -324,6 +324,8 @@ pub struct DispatchReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchResult {
+    /// Static failure code alongside accounting; absent only on success.
+    pub error: Option<EgressError>,
     /// False if the receipt write failed; restart still reports the earlier unknown charge.
     pub receipt_persisted: bool,
     /// Status and accounting.

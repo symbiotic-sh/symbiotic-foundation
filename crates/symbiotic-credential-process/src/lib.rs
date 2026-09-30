@@ -138,6 +138,9 @@ impl CredentialProcess {
             ..RuntimeConfig::default()
         })
         .map_err(|_| EgressError::StateUnavailable)?;
+        for route in &config.routes {
+            provider::validate_binding(&runtime, route)?;
+        }
         // Extend the existing runtime database with replay protection, not a new
         // execution ledger or scheduling queue. Memory remains the accounting owner.
         let registry =
@@ -305,9 +308,10 @@ impl CredentialProcess {
         let secret =
             tokio::task::spawn_blocking(move || Secret::from_bytes(source.load(max)?)).await;
         let mut output = None;
+        let mut error = None;
         match secret {
             Ok(Ok(secret)) => {
-                if let Ok((answer, usage)) = provider::execute(
+                match provider::execute(
                     &self.inner.runtime,
                     &route,
                     Arc::new(secret),
@@ -316,16 +320,28 @@ impl CredentialProcess {
                 )
                 .await
                 {
-                    receipt.status = DispatchStatus::Succeeded;
-                    receipt.usage = usage;
-                    receipt.charge = ChargeReport::Measured {
-                        unit: "provider_requests".into(),
-                        amount: 1,
-                    };
-                    output = Some(answer);
+                    Ok((answer, usage)) => {
+                        receipt.status = DispatchStatus::Succeeded;
+                        receipt.usage = usage;
+                        receipt.charge = ChargeReport::Measured {
+                            unit: "provider_requests".into(),
+                            amount: 1,
+                        };
+                        output = Some(answer);
+                    }
+                    Err(failure) => {
+                        error = Some(failure.code);
+                        if !failure.may_have_dispatched {
+                            receipt.charge = ChargeReport::Measured {
+                                unit: "provider_requests".into(),
+                                amount: 0,
+                            };
+                        }
+                    }
                 }
             }
             _ => {
+                error = Some(EgressError::CredentialUnavailable);
                 receipt.status = DispatchStatus::CredentialUnavailable;
                 receipt.charge = ChargeReport::Measured {
                     unit: "provider_requests".into(),
@@ -341,6 +357,7 @@ impl CredentialProcess {
             .lock()
             .is_ok_and(|mut registry| registry.finish(&receipt).is_ok());
         DispatchResult {
+            error,
             receipt,
             output,
             receipt_persisted,

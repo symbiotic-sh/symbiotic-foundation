@@ -81,21 +81,19 @@ impl Registry {
             if receipt.status == DispatchStatus::Succeeded {
                 return Err(EgressError::InvocationComplete);
             }
-            if matches!(receipt.charge, ChargeReport::Unknown { .. }) {
+            // Every admitted predecessor must be a settled zero-charge failure.
+            // Success is terminal and any other charge requires reconciliation,
+            // so this invariant inductively covers the entire retry history.
+            if !matches!(receipt.charge, ChargeReport::Measured { ref unit, amount: 0 }
+                if unit == &a.reserved_budget.unit)
+            {
                 return Err(EgressError::ReconciliationRequired);
             }
         } else if a.attempt_ordinal != 1 {
             return Err(EgressError::InvalidRequest);
         }
-        // Unsettled permits retain their full one-request reservation. Settled
-        // zero-charge failures release it; attempt count and spend are independent.
-        let charged: u64 = tx.query_row(
-            "SELECT COALESCE(SUM(COALESCE(json_extract(receipt, '$.charge.amount'), 1)), 0) FROM egress_permits WHERE invocation_key=?1",
-            [&invocation_key], |row| row.get(0),
-        ).map_err(state)?;
-        if charged
-            .checked_add(a.reserved_budget.amount)
-            .is_none_or(|total| total > a.reserved_budget.invocation_limit)
+        // Only the current reservation can spend: prior attempts were zero.
+        if a.reserved_budget.amount > a.reserved_budget.invocation_limit
             || a.attempt_ordinal > a.max_attempts
         {
             return Err(EgressError::BudgetRefused);
@@ -171,5 +169,85 @@ impl Registry {
             .map_err(state)?;
         json.map(|json| serde_json::from_str(&json).map_err(|_| EgressError::StateUnavailable))
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt() -> DurableAttempt {
+        serde_json::from_value(serde_json::json!({
+            "tenant": "tenant", "incarnation": "incarnation", "invocation_id": "retry",
+            "attempt_ordinal": 1, "record_sequence": 1, "recorded_at": 100, "expires_at": 200,
+            "caller_binding": "caller", "route": "chat", "destination": "https://example.test",
+            "model": "model", "method": "POST", "secret_ref": "key", "manifest_ref": "manifest",
+            "input_manifest_digest": "a".repeat(64), "input_digest": "b".repeat(64),
+            "markings": [], "max_attempts": 20000,
+            "reserved_budget": { "unit": "provider_requests", "amount": 1, "invocation_limit": 1 }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn retry_admission_uses_bounded_indexed_work_with_large_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
+        let mut attempt = attempt();
+        let permit = registry.issue(&attempt).unwrap();
+        let mut receipt = registry.consume(&attempt, &permit).unwrap();
+        receipt.status = DispatchStatus::CredentialUnavailable;
+        receipt.charge = ChargeReport::Measured {
+            unit: "provider_requests".into(),
+            amount: 0,
+        };
+        registry.finish(&receipt).unwrap();
+        // Populate settled zero-charge predecessors in one transaction. Each has
+        // the same immutable binding; only sequence, ordinal and digest differ.
+        registry
+            .0
+            .execute_batch(
+                "WITH RECURSIVE ord(n) AS (
+            VALUES(2) UNION ALL SELECT n+1 FROM ord WHERE n<10000
+        ) INSERT INTO egress_permits
+            SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
+                   token_hash, 1, receipt FROM egress_permits, ord WHERE ordinal=1;",
+            )
+            .unwrap();
+        attempt.attempt_ordinal = 10001;
+        attempt.record_sequence = 10001;
+        // Interrupt any admission needing 1,000 VM instructions. An indexed
+        // predecessor lookup fits; an aggregate over 10,000 receipts cannot.
+        registry.0.progress_handler(1000, Some(|| true));
+        assert!(registry.issue(&attempt).is_ok());
+    }
+
+    #[test]
+    fn retry_requires_a_zero_charge_predecessor_in_the_reserved_unit() {
+        for charge in [
+            ChargeReport::Measured {
+                unit: "provider_requests".into(),
+                amount: 1,
+            },
+            ChargeReport::Measured {
+                unit: "other".into(),
+                amount: 0,
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
+            let mut attempt = attempt();
+            attempt.reserved_budget.invocation_limit = 10;
+            let permit = registry.issue(&attempt).unwrap();
+            let mut receipt = registry.consume(&attempt, &permit).unwrap();
+            receipt.charge = charge;
+            registry.finish(&receipt).unwrap();
+            attempt.attempt_ordinal += 1;
+            attempt.record_sequence += 1;
+            assert!(matches!(
+                registry.issue(&attempt),
+                Err(EgressError::ReconciliationRequired)
+            ));
+        }
     }
 }
