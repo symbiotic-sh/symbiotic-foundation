@@ -1,0 +1,25 @@
+[package]
+name = "symbiotic-egress"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned admitted model egress protocol and local socket client"
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+hmac = "0.12"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+symbiotic-core = { path = "../symbiotic-core" }
+symbiotic-model = { path = "../symbiotic-model", default-features = false }
+symbiotic-trace = { path = "../symbiotic-trace" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

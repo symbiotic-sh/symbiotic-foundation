@@ -27,6 +27,7 @@ symbiotic-trace = { path = "../symbiotic-trace" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

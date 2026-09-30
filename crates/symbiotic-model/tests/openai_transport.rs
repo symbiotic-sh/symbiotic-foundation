@@ -199,3 +199,18 @@ async fn invalid_reported_costs_remain_unknown() {
         assert!(response.trace.metadata["provider"]["reported_cost_usd"].is_null());
     }
 }
+
+#[tokio::test]
+async fn configured_response_limit_refuses_oversized_body() {
+    let (url, server) = fixture(serde_json::json!({
+        "choices": [{"message": {"content": "x".repeat(4096)}}]
+    }));
+    let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_response_limit(1024)
+        .chat(request())
+        .await;
+    server.join().unwrap();
+    assert!(
+        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
+    );
+}

@@ -152,8 +152,17 @@ The one way hosts run model calls. `Runtime::open(RuntimeConfig { state_dir, .. 
 returns a runtime that hands out ready `Arc<dyn …Provider>`s per binding. It
 owns queueing, retries, per-model shared limits, cooldowns, attempt budgets,
 the response cache, traces, receipts and persistence: SQLite under
-`state_dir`, or in memory. It is the only crate besides the SQLite backend that
-links SQLite. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+`state_dir`, or in memory. Alongside the SQLite backend and credential-process implementation, it
+links SQLite; contract crates do not. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+
+### `symbiotic-egress` and `symbiotic-credential-process`
+
+The versioned WP14 schema/client is `symbiotic-egress`; Memory consumes its
+`EgressClient` trait. `symbiotic-credential-process` authenticates Memory's durable
+attempt records, issues/consumes single-use permits, resolves local file/keychain
+credentials and invokes existing HTTP adapters through `symbiotic-ai-runtime`.
+It extends the runtime database with durable replay metadata, has no second scheduler,
+and disables response caching. Details: [model egress](architecture/model-egress.md).
 
 ### `symbiotic-trace`
 
@@ -194,8 +203,9 @@ Auth is modeled as provider modes, not as one global OAuth abstraction:
 | `oauth_mints_api_key` | OAuth flow returns a provider API key, e.g. OpenRouter |
 | `cli_session` | local tool session, e.g. Codex ChatGPT sign-in |
 
-The foundation describes these modes. The product runtime resolves them through
-Vault/Gatekeeper or through local trusted tooling.
+The foundation describes these modes. For WP14, Foundation’s credential process
+resolves configured file/keychain provider credentials after admitted single-use
+permit consumption. Other product integrations supply their own resolution.
 
 ## Product-Owned Policy
 
@@ -229,7 +239,8 @@ port only proven behavior.
 ## Non-Goals
 
 - No Archive or memory fact model.
-- No Gatekeeper or credential Vault implementation.
+- No Gatekeeper or general credential Vault platform. WP14 has only local provider
+  credential injection.
 - No Matrix/app event protocol.
 - No product-specific agent role evolution.
 - No benchmark-specific selectors or scoring logic.

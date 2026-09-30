@@ -121,6 +121,14 @@ Status: in progress.
 - add `capture_model_trace` or accept an Archive trace document from the host;
 - preserve benchmark reproducibility.
 
+WP14 Foundation boundary: Memory can now depend on `symbiotic-egress` for the
+version-1 signed durable-attempt / single-use dispatch schema and `EgressClient`.
+Deploy `symbiotic-credential-process` separately with local file/keychain credentials;
+Memory retains K admission, barriers, reservations and protected recovery state.
+See [model egress](architecture/model-egress.md) for the exact schema, revocation
+ordering, charge limitations and consumer integration. Consumer adoption remains
+under symbiotic-sh/symbiotic-memory#208.
+
 Foundation side done (#8): `symbiotic-ai-runtime` is the stateful provider
 runtime consumers call instead of assembling queues. It has an in-memory
 backend and the parity Memory's local stack needed: shared per-model
