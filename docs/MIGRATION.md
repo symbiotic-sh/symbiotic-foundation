@@ -122,7 +122,7 @@ Status: in progress.
 - preserve benchmark reproducibility.
 
 WP14 Foundation boundary: Memory can now depend on `symbiotic-egress` for the
-version-1 signed durable-attempt / single-use dispatch schema and `EgressClient`.
+version-2 signed durable-attempt / single-use dispatch schema and `EgressClient`.
 Deploy `symbiotic-credential-process` separately with local file/keychain credentials;
 Memory retains K admission, barriers, reservations and protected recovery state.
 See [model egress](architecture/model-egress.md) for the exact schema, revocation

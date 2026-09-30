@@ -31,6 +31,9 @@ jobs:
         run: cargo clippy -p symbiotic-model --no-default-features --all-targets --locked -- -D warnings
       - name: Test (default features)
         run: cargo test --workspace --locked
+      # Keep workspace dev features out of the executable's provider-cost regression.
+      - name: Test (credential executable production features)
+        run: cargo test --locked -p symbiotic-credential-process --test egress executable_preserves_numeric_provider_cost_after_restart -- --exact
       - name: Test (symbiotic-model without default features)
         run: cargo test -p symbiotic-model --no-default-features --locked
       # The in-process backend runs the shared conformance checks; the SQLite

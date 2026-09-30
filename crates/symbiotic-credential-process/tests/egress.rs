@@ -27,6 +27,14 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(status: u16, output: String, delay: Duration) -> Self {
+        Self::with_cost(status, output, delay, r#""0.00001234567890123456789""#).await
+    }
+    async fn with_cost(
+        status: u16,
+        output: String,
+        delay: Duration,
+        cost_json: &'static str,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for (name, value) in [("provider", SECRET.as_bytes()), ("admission", KEY)] {
@@ -77,7 +85,12 @@ impl Fixture {
                     count.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
                     let body = if status == 200 {
-                        serde_json::json!({"choices":[{"message":{"content":output},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"cost_usd":"0.00001234567890123456789"}}).to_string()
+                        // Insert the raw JSON literal so the test's own serde_json
+                        // feature set cannot round a numeric cost before transmission.
+                        format!(
+                            r#"{{"choices":[{{"message":{{"content":{}}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":7,"completion_tokens":3,"cost":{cost_json}}}}}"#,
+                            serde_json::to_string(&output).unwrap()
+                        )
                     } else {
                         output
                     };
@@ -721,17 +734,24 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
 
 #[tokio::test]
 async fn executable_recovery_lost_permit_and_completion_replies() {
-    executable_dispatch(None).await;
+    executable_dispatch(None, None).await;
+}
+
+#[tokio::test]
+async fn executable_preserves_numeric_provider_cost_after_restart() {
+    // Run this package alone (also a separate CI step): workspace tests unify
+    // serde_json dev features that the production executable does not inherit.
+    executable_dispatch(None, Some("0.1234567890123456789")).await;
 }
 
 #[tokio::test]
 async fn ambient_proxies_cannot_receive_credentials_or_private_inputs() {
     let proxy = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
-    executable_dispatch(Some(&proxy.config.routes[0].destination)).await;
+    executable_dispatch(Some(&proxy.config.routes[0].destination), None).await;
     assert_eq!(proxy.calls.load(Ordering::SeqCst), 0);
 }
 
-async fn executable_dispatch(proxy: Option<&str>) {
+async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static str>) {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -739,7 +759,33 @@ async fn executable_dispatch(proxy: Option<&str>) {
             let _ = self.0.wait();
         }
     }
-    let fixture = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
+    async fn ready_status(
+        child: &mut Child,
+        client: &socket::UnixEgressClient,
+        signed_id: &SignedAttemptId,
+    ) -> AttemptStatus {
+        // The socket path can appear before the server is accepting.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none());
+                match client.attempt_status(signed_id.clone()).await {
+                    Ok(status) => break status,
+                    Err(EgressError::Transport) => {}
+                    Err(error) => panic!("startup status failed: {error:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    let fixture = Fixture::with_cost(
+        200,
+        "process answer".into(),
+        Duration::ZERO,
+        numeric_cost.unwrap_or(r#""0.00001234567890123456789""#),
+    )
+    .await;
     let config_path = fixture.dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -779,14 +825,6 @@ async fn executable_dispatch(proxy: Option<&str>) {
             .spawn()
             .unwrap(),
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !fixture.config.socket_path.exists() {
-            assert!(child.0.try_wait().unwrap().is_none());
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
     let client = socket::UnixEgressClient {
         path: fixture.config.socket_path.clone(),
         max_frame_bytes: fixture.config.max_frame_bytes,
@@ -798,7 +836,7 @@ async fn executable_dispatch(proxy: Option<&str>) {
         .sign_attempt_id(admission.attempt.attempt_id())
         .unwrap();
     assert!(matches!(
-        client.attempt_status(signed_id.clone()).await.unwrap(),
+        ready_status(&mut child, &client, &signed_id).await,
         AttemptStatus::NotIssued
     ));
     // Never read the permit reply. Observe its commit via a separate connection
@@ -851,9 +889,24 @@ async fn executable_dispatch(proxy: Option<&str>) {
     assert!(result.receipt_persisted);
     assert_eq!(result.receipt.usage.input_tokens, Some(7));
     assert_eq!(result.receipt.usage.output_tokens, Some(3));
+    assert_eq!(
+        result.receipt.usage.reported_cost_usd.as_deref(),
+        Some(numeric_cost.unwrap_or("0.00001234567890123456789"))
+    );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert!(
-        matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
+        matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
+    );
+    drop(child);
+    std::fs::remove_file(&fixture.config.socket_path).unwrap();
+    let mut child = Child(command.spawn().unwrap());
+    let recovered = ready_status(&mut child, &client, &signed_id).await;
+    let AttemptStatus::Completed { result: recovered } = recovered else {
+        panic!("missing result after executable restart");
+    };
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        serde_json::to_value(recovered).unwrap()
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
