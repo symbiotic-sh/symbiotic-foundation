@@ -1,4 +1,4 @@
-//! WP14 v1: Memory attests durable admission; Foundation owns credentials and dispatch.
+//! WP14 v2: Memory attests durable admission; Foundation owns credentials and dispatch.
 //! A signer must never sign an attempt until its K durability barrier has succeeded.
 
 pub use symbiotic_core::Sensitivity;
@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 pub mod socket;
 
 /// Current wire and operation version. Unknown versions fail closed.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Static, safe-to-log errors. Never carry transport/provider bodies or credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -58,13 +58,13 @@ pub enum EgressError {
     Transport,
 }
 
-/// Trusted upper reservation. V1 supports provider requests, not inferred money.
+/// Trusted upper reservation. V2 supports provider requests, not inferred money.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReservedBudget {
-    /// Explicit unit; v1 dispatch supports `provider_requests` only.
+    /// Explicit unit; v2 dispatch supports `provider_requests` only.
     pub unit: String,
-    /// Upper bound for this attempt; one request for the v1 adapters.
+    /// Upper bound for this attempt; one request for the v2 adapters.
     pub amount: u64,
     /// Invocation total, reserved atomically by Memory across attempts.
     pub invocation_limit: u64,
@@ -88,6 +88,8 @@ pub struct DurableAttempt {
     pub recorded_at: u64,
     /// Authority expiry checked at serialization, exclusive Unix seconds.
     pub expires_at: u64,
+    /// Exclusive Unix-second deadline for recovering terminal results. Signed and immutable.
+    pub recovery_expires_at: u64,
     /// Verified caller binding.
     pub caller_binding: String,
     /// Approved route identifier.
@@ -114,6 +116,42 @@ pub struct DurableAttempt {
     pub reserved_budget: ReservedBudget,
 }
 
+/// Durable attempt identity, independent of its signed contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptId {
+    /// Tenant namespace.
+    pub tenant: String,
+    /// Restore incarnation.
+    pub incarnation: String,
+    /// Logical invocation.
+    pub invocation_id: String,
+    /// One-based ordinal within the invocation.
+    pub attempt_ordinal: u32,
+}
+
+impl DurableAttempt {
+    /// Identity used for idempotent issuance and authenticated status lookup.
+    pub fn attempt_id(&self) -> AttemptId {
+        AttemptId {
+            tenant: self.tenant.clone(),
+            incarnation: self.incarnation.clone(),
+            invocation_id: self.invocation_id.clone(),
+            attempt_ordinal: self.attempt_ordinal,
+        }
+    }
+}
+
+/// Authenticated lookup; knowing an attempt identity alone grants no result access.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAttemptId {
+    /// Identity to query.
+    pub attempt_id: AttemptId,
+    /// Domain-separated HMAC-SHA256.
+    pub authentication: String,
+}
+
 /// One supported provider call; neither variant contains credentials or URLs.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
@@ -125,7 +163,7 @@ pub enum ProviderPayload {
 }
 
 impl ProviderPayload {
-    /// Digest the exact version-1 typed JSON representation; Memory uses this helper.
+    /// Digest the exact version-2 typed JSON representation; Memory uses this helper.
     pub fn digest(&self) -> Result<String, EgressError> {
         digest(self)
     }
@@ -181,11 +219,29 @@ impl AdmissionKey {
 
     /// Attest an attempt after the Memory durability barrier (never before).
     pub fn sign_attempt(&self, attempt: DurableAttempt) -> Result<SignedAttempt, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v1/attempt\0", &attempt)?;
+        let authentication = self.sign(b"symbiotic-egress/v2/attempt\0", &attempt)?;
         Ok(SignedAttempt {
             attempt,
             authentication,
         })
+    }
+
+    /// Authorize result recovery for an attempt identity.
+    pub fn sign_attempt_id(&self, attempt_id: AttemptId) -> Result<SignedAttemptId, EgressError> {
+        let authentication = self.sign(b"symbiotic-egress/v2/attempt-status\0", &attempt_id)?;
+        Ok(SignedAttemptId {
+            attempt_id,
+            authentication,
+        })
+    }
+
+    /// Verify status authorization in constant time.
+    pub fn verify_attempt_id(&self, signed: &SignedAttemptId) -> Result<(), EgressError> {
+        self.verify(
+            b"symbiotic-egress/v2/attempt-status\0",
+            &signed.attempt_id,
+            &signed.authentication,
+        )
     }
 
     /// Authenticate a serialized route removal.
@@ -193,7 +249,7 @@ impl AdmissionKey {
         &self,
         revocation: RouteRevocation,
     ) -> Result<SignedRevocation, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v1/revocation\0", &revocation)?;
+        let authentication = self.sign(b"symbiotic-egress/v2/revocation\0", &revocation)?;
         Ok(SignedRevocation {
             revocation,
             authentication,
@@ -203,7 +259,7 @@ impl AdmissionKey {
     /// Verify a durable admission attestation in constant time.
     pub fn verify_attempt(&self, signed: &SignedAttempt) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v1/attempt\0",
+            b"symbiotic-egress/v2/attempt\0",
             &signed.attempt,
             &signed.authentication,
         )
@@ -212,7 +268,7 @@ impl AdmissionKey {
     /// Verify a route restriction in constant time.
     pub fn verify_revocation(&self, signed: &SignedRevocation) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v1/revocation\0",
+            b"symbiotic-egress/v2/revocation\0",
             &signed.revocation,
             &signed.authentication,
         )
@@ -330,8 +386,36 @@ pub struct DispatchResult {
     pub receipt_persisted: bool,
     /// Status and accounting.
     pub receipt: DispatchReceipt,
-    /// Present only on success; never persisted as a cache by Foundation.
+    /// Present only on success; retained until the signed recovery deadline.
     pub output: Option<ProviderOutput>,
+}
+
+/// Durable execution state. A dispatched attempt must never be blindly resubmitted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AttemptStatus {
+    /// No permit has been issued for this identity.
+    NotIssued,
+    /// Permit committed, but not consumed.
+    Permitted,
+    /// Permit consumed; completion is not durably known (including a process crash).
+    Dispatched { receipt: DispatchReceipt },
+    /// Recoverable typed output, usage and settlement.
+    Completed { result: DispatchResult },
+    /// Recoverable static safe error and settlement, possibly an unknown charge.
+    Failed { result: DispatchResult },
+    /// Terminal result recovery window elapsed; accounting remains available via Receipt.
+    Expired,
+}
+
+/// New or existing capability with a snapshot of its execution state.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermitGrant {
+    /// Same capability on every replay of the exact signed attempt.
+    pub permit: DispatchPermit,
+    /// Current state; only Permitted can be dispatched.
+    pub status: AttemptStatus,
 }
 
 /// Versioned request envelope. One frame/request/response per socket connection.
@@ -350,6 +434,8 @@ pub struct Request {
 pub enum Operation {
     /// Verify durable admission and issue its single-use permit.
     IssuePermit(SignedAttempt),
+    /// Recover execution state/results using an authenticated durable identity.
+    AttemptStatus(SignedAttemptId),
     /// Inject credential and execute exactly one attempt.
     InjectProviderCredential(Box<InjectProviderCredential>),
     /// Publish a route restriction.
@@ -372,8 +458,10 @@ pub struct Response {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", content = "body", rename_all = "snake_case")]
 pub enum Reply {
-    /// Newly issued capability.
-    Permit(DispatchPermit),
+    /// Newly issued or reattached capability and current execution state.
+    Permit(PermitGrant),
+    /// State and bounded recovery result for an authenticated attempt identity.
+    AttemptStatus(AttemptStatus),
     /// Provider answer and usage.
     Dispatched(DispatchResult),
     /// Revocation recorded.
@@ -387,4 +475,24 @@ pub enum Reply {
 pub trait EgressClient: Send + Sync {
     /// Submit one versioned operation. Transport failures after dispatch are unknown charges.
     async fn exchange(&self, request: Request) -> Result<Response, EgressError>;
+
+    /// Query an identity signed with AdmissionKey::sign_attempt_id, without issuing a permit.
+    async fn attempt_status(
+        &self,
+        attempt_id: SignedAttemptId,
+    ) -> Result<AttemptStatus, EgressError> {
+        let response = self
+            .exchange(Request {
+                version: PROTOCOL_VERSION,
+                operation: Operation::AttemptStatus(attempt_id),
+            })
+            .await?;
+        if response.version != PROTOCOL_VERSION {
+            return Err(EgressError::Version);
+        }
+        match response.result? {
+            Reply::AttemptStatus(status) => Ok(status),
+            _ => Err(EgressError::InvalidRequest),
+        }
+    }
 }

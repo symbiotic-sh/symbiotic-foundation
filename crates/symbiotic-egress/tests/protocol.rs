@@ -1,17 +1,17 @@
 use symbiotic_egress::*;
 
 #[test]
-fn v1_refusal_has_the_documented_wire_shape() {
+fn v2_refusal_has_the_documented_wire_shape() {
     let response = Response {
         version: PROTOCOL_VERSION,
         result: Err(EgressError::PermitRefused),
     };
     assert_eq!(
         serde_json::to_string(&response).unwrap(),
-        r#"{"version":1,"result":{"Err":"permit_refused"}}"#
+        r#"{"version":2,"result":{"Err":"permit_refused"}}"#
     );
     let decoded: Response =
-        serde_json::from_str(r#"{"version":1,"result":{"Err":"permit_refused"}}"#).unwrap();
+        serde_json::from_str(r#"{"version":2,"result":{"Err":"permit_refused"}}"#).unwrap();
     assert!(matches!(decoded.result, Err(EgressError::PermitRefused)));
 }
 
@@ -37,7 +37,7 @@ async fn memory_can_use_a_trait_object_test_double_without_the_credential_proces
     assert!(matches!(
         client
             .exchange(Request {
-                version: 1,
+                version: PROTOCOL_VERSION,
                 operation: Operation::RevokeRoute(signed)
             })
             .await,
@@ -53,4 +53,44 @@ async fn frame_limit_is_checked_without_waiting_for_or_allocating_the_declared_b
     client.write_u32(u32::MAX).await.unwrap();
     let response = socket::read_frame::<Response>(&mut server, 4096).await;
     assert!(matches!(response, Err(EgressError::LimitExceeded)));
+}
+
+#[tokio::test]
+async fn recovery_status_method_uses_v2_and_rejects_old_replies() {
+    struct Double(u16);
+    #[async_trait::async_trait]
+    impl EgressClient for Double {
+        async fn exchange(&self, request: Request) -> Result<Response, EgressError> {
+            assert_eq!(request.version, 2);
+            let Operation::AttemptStatus(signed) = request.operation else {
+                panic!("wrong operation");
+            };
+            AdmissionKey::new(vec![42; 32])
+                .unwrap()
+                .verify_attempt_id(&signed)
+                .unwrap();
+            Ok(Response {
+                version: self.0,
+                result: Ok(Reply::AttemptStatus(AttemptStatus::NotIssued)),
+            })
+        }
+    }
+    let signed = AdmissionKey::new(vec![42; 32])
+        .unwrap()
+        .sign_attempt_id(AttemptId {
+            tenant: "tenant".into(),
+            incarnation: "incarnation".into(),
+            invocation_id: "invocation".into(),
+            attempt_ordinal: 1,
+        })
+        .unwrap();
+    let client: Box<dyn EgressClient> = Box::new(Double(2));
+    assert!(matches!(
+        client.attempt_status(signed.clone()).await.unwrap(),
+        AttemptStatus::NotIssued
+    ));
+    assert!(matches!(
+        Double(1).attempt_status(signed).await,
+        Err(EgressError::Version)
+    ));
 }

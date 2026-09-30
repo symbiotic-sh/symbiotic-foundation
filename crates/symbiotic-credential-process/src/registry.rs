@@ -1,4 +1,4 @@
-//! Durable permit replay protection; no prompts, results, credentials or scheduling.
+//! Durable permit replay protection and bounded result recovery; no provider credentials.
 use rusqlite::{Connection, OptionalExtension, params};
 use symbiotic_egress::*;
 use uuid::Uuid;
@@ -16,29 +16,57 @@ impl Registry {
         let conn = Connection::open(path).map_err(state)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(state)?;
+        let existing: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='egress_permits')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(state)?;
+        if existing {
+            let version: u16 = conn
+                .query_row("SELECT version FROM egress_schema", [], |row| row.get(0))
+                .map_err(|_| EgressError::Version)?;
+            if version != PROTOCOL_VERSION {
+                return Err(EgressError::Version);
+            }
+        }
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
+            INSERT INTO egress_schema SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
                 invocation_binding TEXT NOT NULL,
                 ordinal INTEGER NOT NULL,
                 record_sequence INTEGER NOT NULL,
-                token_hash TEXT NOT NULL,
+                token TEXT NOT NULL,
+                recovery_expires_at INTEGER NOT NULL,
+                finished INTEGER NOT NULL DEFAULT 0,
+                result TEXT,
                 consumed INTEGER NOT NULL DEFAULT 0,
                 receipt TEXT,
                 UNIQUE(invocation_key, ordinal)
             );
+            CREATE INDEX IF NOT EXISTS egress_result_expiry
+                ON egress_permits(recovery_expires_at) WHERE result IS NOT NULL;
             CREATE TABLE IF NOT EXISTS egress_revocations (
                 route_key TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
-            );",
+            ); COMMIT;",
         )
         .map_err(state)?;
-        Ok(Self(conn))
+        let mut registry = Self(conn);
+        registry.purge_expired(now()?)?;
+        Ok(registry)
     }
 
-    pub(crate) fn issue(&mut self, a: &DurableAttempt) -> Result<DispatchPermit, EgressError> {
+    pub(crate) fn issue(&mut self, a: &DurableAttempt) -> Result<PermitGrant, EgressError> {
+        if let Some(grant) = self.existing(a)? {
+            return Ok(grant);
+        }
         let attempt_digest = digest(a)?;
         let invocation_key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
         let route_key = digest(&(&a.tenant, &a.incarnation, &a.route))?;
@@ -99,12 +127,15 @@ impl Registry {
             return Err(EgressError::BudgetRefused);
         }
         let token = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token_hash, record_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, digest(&token)?, a.record_sequence]).map_err(state)?;
+        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at]).map_err(state)?;
         tx.commit().map_err(state)?;
-        Ok(DispatchPermit {
-            token,
-            attempt_digest,
+        Ok(PermitGrant {
+            permit: DispatchPermit {
+                token,
+                attempt_digest,
+            },
+            status: AttemptStatus::Permitted,
         })
     }
 
@@ -136,21 +167,117 @@ impl Registry {
             },
         };
         let json = serde_json::to_string(&receipt).map_err(|_| EgressError::StateUnavailable)?;
-        let changed = self.0.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token_hash=?3 AND consumed=0", params![json, attempt_digest, digest(&permit.token)?]).map_err(state)?;
+        let changed = self.0.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
         if changed != 1 {
             return Err(EgressError::PermitRefused);
         }
         Ok(receipt)
     }
 
-    pub(crate) fn finish(&mut self, receipt: &DispatchReceipt) -> Result<(), EgressError> {
-        let json = serde_json::to_string(receipt).map_err(|_| EgressError::StateUnavailable)?;
-        self.0
+    pub(crate) fn finish(&mut self, result: &DispatchResult) -> Result<(), EgressError> {
+        let receipt =
+            serde_json::to_string(&result.receipt).map_err(|_| EgressError::StateUnavailable)?;
+        let json = serde_json::to_string(result).map_err(|_| EgressError::StateUnavailable)?;
+        let changed = self
+            .0
             .execute(
-                "UPDATE egress_permits SET receipt=?1 WHERE attempt_digest=?2 AND consumed=1",
-                params![json, receipt.attempt_digest],
+                "UPDATE egress_permits SET receipt=?1, finished=1,
+             result=CASE WHEN recovery_expires_at>?4 THEN ?2 ELSE NULL END
+             WHERE attempt_digest=?3 AND consumed=1 AND finished=0",
+                params![receipt, json, result.receipt.attempt_digest, now()?],
             )
             .map_err(state)?;
+        if changed != 1 {
+            return Err(EgressError::StateUnavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn existing(&self, a: &DurableAttempt) -> Result<Option<PermitGrant>, EgressError> {
+        let key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
+        let existing: Option<(String, String)> = self.0.query_row(
+            "SELECT attempt_digest, token FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
+            params![key, a.attempt_ordinal], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(state)?;
+        existing
+            .map(|(attempt_digest, token)| {
+                if attempt_digest != digest(a)? {
+                    return Err(EgressError::InvalidRequest);
+                }
+                Ok(PermitGrant {
+                    permit: DispatchPermit {
+                        token,
+                        attempt_digest,
+                    },
+                    status: self.attempt_status(&a.attempt_id(), now()?)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn attempt_status(
+        &self,
+        id: &AttemptId,
+        time: u64,
+    ) -> Result<AttemptStatus, EgressError> {
+        let key = digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?;
+        let row = self
+            .0
+            .query_row(
+                "SELECT consumed, finished, recovery_expires_at, receipt, result
+             FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
+                params![key, id.attempt_ordinal],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(state)?;
+        let Some((consumed, finished, expires, receipt, result)) = row else {
+            return Ok(AttemptStatus::NotIssued);
+        };
+        if !consumed {
+            return Ok(AttemptStatus::Permitted);
+        }
+        if !finished {
+            return Ok(AttemptStatus::Dispatched {
+                receipt: serde_json::from_str(&receipt.ok_or(EgressError::StateUnavailable)?)
+                    .map_err(|_| EgressError::StateUnavailable)?,
+            });
+        }
+        if time >= expires {
+            return Ok(AttemptStatus::Expired);
+        }
+        let result: DispatchResult =
+            serde_json::from_str(&result.ok_or(EgressError::StateUnavailable)?)
+                .map_err(|_| EgressError::StateUnavailable)?;
+        Ok(if result.error.is_some() {
+            AttemptStatus::Failed { result }
+        } else {
+            AttemptStatus::Completed { result }
+        })
+    }
+
+    pub(crate) fn purge_expired(&mut self, time: u64) -> Result<(), EgressError> {
+        // Recovery polling must not contend with the runtime's writer when no
+        // result is due. The partial expiry index also bounds idle cleanup work.
+        let due: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM egress_permits WHERE recovery_expires_at<=?1 AND result IS NOT NULL)",
+            [time], |row| row.get(0),
+        ).map_err(state)?;
+        if !due {
+            return Ok(());
+        }
+        self.0.execute(
+            "UPDATE egress_permits SET result=NULL WHERE recovery_expires_at<=?1 AND result IS NOT NULL",
+            [time],
+        ).map_err(state)?;
         Ok(())
     }
 
@@ -172,6 +299,13 @@ impl Registry {
     }
 }
 
+pub(crate) fn now() -> Result<u64, EgressError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .map_err(|_| EgressError::StateUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,7 +314,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "tenant": "tenant", "incarnation": "incarnation", "invocation_id": "retry",
             "attempt_ordinal": 1, "record_sequence": 1, "recorded_at": 100, "expires_at": 200,
-            "caller_binding": "caller", "route": "chat", "destination": "https://example.test",
+            "recovery_expires_at": 4000000000u64, "caller_binding": "caller", "route": "chat", "destination": "https://example.test",
             "model": "model", "method": "POST", "secret_ref": "key", "manifest_ref": "manifest",
             "input_manifest_digest": "a".repeat(64), "input_digest": "b".repeat(64),
             "markings": [], "max_attempts": 20000,
@@ -194,14 +328,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
         let mut attempt = attempt();
-        let permit = registry.issue(&attempt).unwrap();
+        let permit = registry.issue(&attempt).unwrap().permit;
         let mut receipt = registry.consume(&attempt, &permit).unwrap();
         receipt.status = DispatchStatus::CredentialUnavailable;
         receipt.charge = ChargeReport::Measured {
             unit: "provider_requests".into(),
             amount: 0,
         };
-        registry.finish(&receipt).unwrap();
+        registry
+            .finish(&DispatchResult {
+                receipt,
+                output: None,
+                error: Some(EgressError::CredentialUnavailable),
+                receipt_persisted: true,
+            })
+            .unwrap();
         // Populate settled zero-charge predecessors in one transaction. Each has
         // the same immutable binding; only sequence, ordinal and digest differ.
         registry
@@ -210,8 +351,10 @@ mod tests {
                 "WITH RECURSIVE ord(n) AS (
             VALUES(2) UNION ALL SELECT n+1 FROM ord WHERE n<10000
         ) INSERT INTO egress_permits
+            (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
+             token, recovery_expires_at, consumed, receipt)
             SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
-                   token_hash, 1, receipt FROM egress_permits, ord WHERE ordinal=1;",
+                   token, recovery_expires_at, 1, receipt FROM egress_permits, ord WHERE ordinal=1;",
             )
             .unwrap();
         attempt.attempt_ordinal = 10001;
@@ -238,10 +381,17 @@ mod tests {
             let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
             let mut attempt = attempt();
             attempt.reserved_budget.invocation_limit = 10;
-            let permit = registry.issue(&attempt).unwrap();
+            let permit = registry.issue(&attempt).unwrap().permit;
             let mut receipt = registry.consume(&attempt, &permit).unwrap();
             receipt.charge = charge;
-            registry.finish(&receipt).unwrap();
+            registry
+                .finish(&DispatchResult {
+                    receipt,
+                    output: None,
+                    error: Some(EgressError::CredentialUnavailable),
+                    receipt_persisted: true,
+                })
+                .unwrap();
             attempt.attempt_ordinal += 1;
             attempt.record_sequence += 1;
             assert!(matches!(
@@ -249,5 +399,87 @@ mod tests {
                 Err(EgressError::ReconciliationRequired)
             ));
         }
+    }
+    #[test]
+    fn recovery_expiry_is_exclusive_and_purges_only_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&dir.path().join("registry.sqlite")).unwrap();
+        let attempt = attempt();
+        let grant = registry.issue(&attempt).unwrap();
+        assert!(matches!(
+            registry
+                .attempt_status(&attempt.attempt_id(), now().unwrap())
+                .unwrap(),
+            AttemptStatus::Permitted
+        ));
+        let mut receipt = registry.consume(&attempt, &grant.permit).unwrap();
+        assert!(matches!(
+            registry
+                .attempt_status(&attempt.attempt_id(), now().unwrap())
+                .unwrap(),
+            AttemptStatus::Dispatched {
+                receipt: DispatchReceipt {
+                    charge: ChargeReport::Unknown { .. },
+                    ..
+                }
+            }
+        ));
+        receipt.status = DispatchStatus::Succeeded;
+        receipt.charge = ChargeReport::Measured {
+            unit: "provider_requests".into(),
+            amount: 1,
+        };
+        registry
+            .finish(&DispatchResult {
+                receipt,
+                output: Some(ProviderOutput::Chat {
+                    text: "retained".into(),
+                }),
+                error: None,
+                receipt_persisted: true,
+            })
+            .unwrap();
+        let id = attempt.attempt_id();
+        assert!(matches!(
+            registry
+                .attempt_status(&id, attempt.recovery_expires_at - 1)
+                .unwrap(),
+            AttemptStatus::Completed { .. }
+        ));
+        assert!(matches!(
+            registry
+                .attempt_status(&id, attempt.recovery_expires_at)
+                .unwrap(),
+            AttemptStatus::Expired
+        ));
+        registry.purge_expired(attempt.recovery_expires_at).unwrap();
+        assert_eq!(
+            registry
+                .0
+                .query_row(
+                    "SELECT count(*) FROM egress_permits WHERE result IS NOT NULL",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(registry.receipt(&attempt).unwrap().is_some());
+        assert!(matches!(
+            registry.consume(&attempt, &grant.permit),
+            Err(EgressError::PermitRefused)
+        ));
+    }
+
+    #[test]
+    fn recovery_v1_registry_is_refused_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE egress_permits (attempt_digest TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        assert!(matches!(Registry::open(&path), Err(EgressError::Version)));
     }
 }

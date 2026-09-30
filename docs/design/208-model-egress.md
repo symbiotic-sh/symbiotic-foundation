@@ -15,3 +15,9 @@ is refused. No additional model scheduler or persistent response cache was added
 
 Publication and Memory adoption remain with the lead under memory#208; this work makes
 no external writes and does not claim a merged or deployed release.
+
+The round-3 Foundation attachment finding is addressed by the v2 recovery contract in
+that architecture document: idempotent permit issuance by durable attempt identity and
+signed-record digest, authenticated status/result retrieval, and a signed absolute
+recovery deadline. This operator-authorized protocol replaces v1 without aliases;
+Memory pinning and client adoption remain with the lead.

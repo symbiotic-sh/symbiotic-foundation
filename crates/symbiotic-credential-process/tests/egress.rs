@@ -90,7 +90,7 @@ impl Fixture {
             }
         });
         let config = ProcessConfig {
-            version: 1,
+            version: PROTOCOL_VERSION,
             state_dir: dir.path().join("state"),
             socket_path: dir.path().join("egress.sock"),
             admission_key: SecretSource::OwnerOnlyFile {
@@ -155,6 +155,7 @@ impl Fixture {
             record_sequence: sequence,
             recorded_at: 100,
             expires_at: 101,
+            recovery_expires_at: 4_000_000_000,
             caller_binding: "caller".into(),
             route: "chat".into(),
             destination: self.config.routes[0].destination.clone(),
@@ -184,7 +185,7 @@ impl Fixture {
 async fn exchange(process: &CredentialProcess, operation: Operation) -> Result<Reply, EgressError> {
     process
         .handle(Request {
-            version: 1,
+            version: PROTOCOL_VERSION,
             operation,
         })
         .await
@@ -195,13 +196,13 @@ async fn permit(process: &CredentialProcess, admission: &SignedAttempt) -> Dispa
         .await
         .unwrap()
     {
-        Reply::Permit(permit) => permit,
+        Reply::Permit(grant) => grant.permit,
         _ => panic!("wrong reply"),
     }
 }
 fn inject(admission: SignedAttempt, payload: ProviderPayload, permit: DispatchPermit) -> Operation {
     Operation::InjectProviderCredential(Box::new(InjectProviderCredential {
-        operation_version: 1,
+        operation_version: PROTOCOL_VERSION,
         admission,
         permit,
         payload,
@@ -256,7 +257,10 @@ async fn permit_replay_refused_concurrently_and_after_restart() {
     ));
     assert!(matches!(
         exchange(&process, Operation::IssuePermit(admission)).await,
-        Err(EgressError::PermitRefused)
+        Ok(Reply::Permit(PermitGrant {
+            status: AttemptStatus::Completed { .. },
+            ..
+        }))
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
@@ -389,7 +393,7 @@ async fn retry_is_a_new_attempt_same_invocation_without_response_cache() {
     assert!(!fixture.config.state_dir.join("responses").exists());
     for entry in std::fs::read_dir(&fixture.config.state_dir).unwrap() {
         let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-        for canary in [SECRET.as_bytes(), b"private test input", b"\"answer\""] {
+        for canary in [SECRET.as_bytes(), b"private test input"] {
             assert!(!bytes.windows(canary.len()).any(|window| window == canary));
         }
     }
@@ -550,7 +554,7 @@ async fn owner_only_socket_roundtrip_and_oversized_frame_refusal() {
     let (admission, payload) = fixture.attempt("socket", 1, 1);
     let response = client
         .exchange(Request {
-            version: 1,
+            version: PROTOCOL_VERSION,
             operation: Operation::IssuePermit(admission.clone()),
         })
         .await
@@ -560,8 +564,8 @@ async fn owner_only_socket_roundtrip_and_oversized_frame_refusal() {
     };
     let response = client
         .exchange(Request {
-            version: 1,
-            operation: inject(admission, payload, granted),
+            version: PROTOCOL_VERSION,
+            operation: inject(admission, payload, granted.permit),
         })
         .await
         .unwrap();
@@ -716,7 +720,7 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
 }
 
 #[tokio::test]
-async fn executable_dispatches_over_socket_with_only_configured_secret_locations() {
+async fn executable_recovery_lost_permit_and_completion_replies() {
     executable_dispatch(None).await;
 }
 
@@ -789,9 +793,35 @@ async fn executable_dispatch(proxy: Option<&str>) {
         timeout: Duration::from_secs(3),
     };
     let (admission, payload) = fixture.attempt("executable", 1, 1);
+    let signed_id = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt_id(admission.attempt.attempt_id())
+        .unwrap();
+    assert!(matches!(
+        client.attempt_status(signed_id.clone()).await.unwrap(),
+        AttemptStatus::NotIssued
+    ));
+    // Never read the permit reply. Observe its commit via a separate connection
+    // before dropping it, so this proves loss after commit rather than before accept.
+    let lost_permit_reply =
+        send_without_reading(&client, Operation::IssuePermit(admission.clone())).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                client.attempt_status(signed_id.clone()).await.unwrap(),
+                AttemptStatus::Permitted
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(lost_permit_reply);
     let Reply::Permit(granted) = client
         .exchange(Request {
-            version: 1,
+            version: PROTOCOL_VERSION,
             operation: Operation::IssuePermit(admission.clone()),
         })
         .await
@@ -801,14 +831,26 @@ async fn executable_dispatch(proxy: Option<&str>) {
     else {
         panic!("wrong reply")
     };
-    let response = client
-        .exchange(Request {
-            version: 1,
-            operation: inject(admission, payload, granted),
-        })
-        .await
-        .unwrap();
-    let result = dispatched(response.result.unwrap());
+    assert!(matches!(granted.status, AttemptStatus::Permitted));
+    // Lose the completion reply as well. No second injection is needed to settle.
+    let lost_completion_reply =
+        send_without_reading(&client, inject(admission, payload, granted.permit)).await;
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let AttemptStatus::Completed { result } =
+                client.attempt_status(signed_id.clone()).await.unwrap()
+            {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(lost_completion_reply);
+    assert!(result.receipt_persisted);
+    assert_eq!(result.receipt.usage.input_tokens, Some(7));
+    assert_eq!(result.receipt.usage.output_tokens, Some(3));
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert!(
         matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
@@ -1028,4 +1070,300 @@ async fn failure_before_dispatch_returns_safe_error_and_releases_reservation() {
     );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovery_lost_permit_reply_reattaches_after_restart() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, payload) = fixture.attempt("lost-permit", 1, 10);
+    let committed = permit(&process, &admission).await;
+    drop(process);
+    let process = fixture.process();
+    let recovered = permit(&process, &admission).await;
+    assert_eq!(committed.token, recovered.token);
+    assert_eq!(committed.attempt_digest, recovered.attempt_digest);
+    let result = dispatched(
+        exchange(&process, inject(admission, payload, recovered))
+            .await
+            .unwrap(),
+    );
+    assert!(result.error.is_none());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+async fn send_without_reading(
+    client: &socket::UnixEgressClient,
+    operation: Operation,
+) -> tokio::net::UnixStream {
+    let mut stream = tokio::net::UnixStream::connect(&client.path).await.unwrap();
+    socket::write_frame(
+        &mut stream,
+        &Request {
+            version: PROTOCOL_VERSION,
+            operation,
+        },
+        client.max_frame_bytes,
+    )
+    .await
+    .unwrap();
+    stream
+}
+
+async fn status(process: &CredentialProcess, admission: &SignedAttempt) -> AttemptStatus {
+    let id = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt_id(admission.attempt.attempt_id())
+        .unwrap();
+    match exchange(process, Operation::AttemptStatus(id))
+        .await
+        .unwrap()
+    {
+        Reply::AttemptStatus(status) => status,
+        _ => panic!("wrong reply"),
+    }
+}
+
+#[tokio::test]
+async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage() {
+    let fixture = Fixture::new(200, "retained answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, payload) = fixture.attempt("lost-completion", 1, 10);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(
+            &process,
+            inject(admission.clone(), payload, granted.clone()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(result.receipt_persisted);
+    drop(process);
+    let process = fixture.process();
+    let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {
+        panic!("missing result");
+    };
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    let Reply::Permit(reattached) = exchange(&process, Operation::IssuePermit(admission))
+        .await
+        .unwrap()
+    else {
+        panic!("missing permit");
+    };
+    assert_eq!(reattached.permit.token, granted.token);
+    assert!(matches!(reattached.status, AttemptStatus::Completed { .. }));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovery_same_identity_with_different_signed_digest_is_refused() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, _) = fixture.attempt("digest-mismatch", 1, 10);
+    permit(&process, &admission).await;
+    let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+    for field in 0..3 {
+        let mut changed = admission.attempt.clone();
+        match field {
+            0 => changed.record_sequence += 1,
+            1 => changed.input_digest = "c".repeat(64),
+            _ => changed.recovery_expires_at += 1,
+        }
+        assert!(matches!(
+            exchange(
+                &process,
+                Operation::IssuePermit(key.sign_attempt(changed).unwrap())
+            )
+            .await,
+            Err(EgressError::InvalidRequest)
+        ));
+    }
+    let mut signed_id = key.sign_attempt_id(admission.attempt.attempt_id()).unwrap();
+    signed_id.attempt_id.tenant = "other".into();
+    assert!(matches!(
+        exchange(&process, Operation::AttemptStatus(signed_id)).await,
+        Err(EgressError::Unauthorized)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn recovery_failed_status_preserves_safe_error_and_charge() {
+    let fixture = Fixture::new(500, SECRET.into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, payload) = fixture.attempt("failed-status", 1, 10);
+    let granted = permit(&process, &admission).await;
+    exchange(&process, inject(admission.clone(), payload, granted))
+        .await
+        .unwrap();
+    let AttemptStatus::Failed { result } = status(&process, &admission).await else {
+        panic!("missing failure");
+    };
+    assert!(result.error.is_some());
+    assert!(result.output.is_none());
+    assert!(matches!(
+        result.receipt.charge,
+        ChargeReport::Unknown { .. }
+    ));
+    assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+}
+
+#[tokio::test]
+async fn recovery_expired_status_does_not_retain_late_completion() {
+    let fixture = Fixture::new(200, "expired answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (mut admission, payload) = fixture.attempt("expired-status", 1, 10);
+    admission.attempt.recovery_expires_at = 102; // Declared window already elapsed.
+    admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(&process, inject(admission.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert!(result.receipt_persisted);
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Expired
+    ));
+    drop(process);
+    let process = fixture.process();
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Expired
+    ));
+    assert!(matches!(
+        exchange(&process, Operation::Receipt(admission.clone()))
+            .await
+            .unwrap(),
+        Reply::Receipt(Some(_))
+    ));
+    let Reply::Permit(grant) = exchange(&process, Operation::IssuePermit(admission))
+        .await
+        .unwrap()
+    else {
+        panic!("missing permit");
+    };
+    assert!(matches!(grant.status, AttemptStatus::Expired));
+    let db = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM egress_permits WHERE result IS NOT NULL",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovery_idle_server_purges_completed_results_at_deadline() {
+    let fixture = Fixture::new(200, "short-lived answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, payload) = fixture.attempt("idle-expiry", 1, 10);
+    let granted = permit(&process, &admission).await;
+    exchange(&process, inject(admission.clone(), payload, granted))
+        .await
+        .unwrap();
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Completed { .. }
+    ));
+    let listener = server::bind(&process).unwrap();
+    let task = tokio::spawn(server::serve(process.clone(), listener));
+    let db = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    // Advance the stored deadline in this fixture so slow debug builds cannot
+    // expire the answer before the test observes completion. The registry test
+    // separately checks the exact signed deadline boundary with an injected time.
+    db.execute("UPDATE egress_permits SET recovery_expires_at=0", [])
+        .unwrap();
+    // No further IPC/handle requests: the daemon must expire results while idle.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let retained: u64 = db
+                .query_row(
+                    "SELECT count(*) FROM egress_permits WHERE result IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if retained == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Expired
+    ));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn recovery_concurrent_permit_requests_share_one_capability() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let (admission, _) = fixture.attempt("concurrent-issue", 1, 10);
+    let (first, second) = tokio::join!(permit(&process, &admission), permit(&process, &admission));
+    assert_eq!(first.token, second.token);
+    assert_eq!(first.attempt_digest, second.attempt_digest);
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Permitted
+    ));
+    let request = Request {
+        version: 1,
+        operation: Operation::IssuePermit(admission),
+    };
+    assert!(matches!(
+        process.handle(request).await.result,
+        Err(EgressError::Version)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn recovery_disconnected_peer_does_not_stop_socket_server() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let listener = server::bind(&process).unwrap();
+    // Disconnect before accept/peer authentication, as can happen with a lost reply.
+    let stream = tokio::net::UnixStream::connect(&fixture.config.socket_path)
+        .await
+        .unwrap();
+    drop(stream);
+    let task = tokio::spawn(server::serve(process, listener));
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "one disconnected peer stopped the server: {:?}",
+        task.await
+    );
+    task.abort();
+    let _ = task.await;
 }

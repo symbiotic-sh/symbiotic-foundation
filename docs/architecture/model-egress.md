@@ -10,18 +10,18 @@ reservations; it does not import the process implementation or own another provi
 ## Shared schema and Memory integration
 
 The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
-`PROTOCOL_VERSION = 1`. The credential operation also requires
-`InjectProviderCredential.operation_version = 1`.
+`PROTOCOL_VERSION = 2`. The credential operation also requires
+`InjectProviderCredential.operation_version = 2`.
 
 | Type / API | Contract |
 | --- | --- |
 | `EgressClient::exchange(Request) -> Result<Response, EgressError>` | Async, object-safe seam for Memory and its test doubles |
 | `socket::UnixEgressClient` | Local socket implementation, configured path, frame bound and timeout |
-| `Request { version, operation }` | Operations are `IssuePermit(SignedAttempt)`, `InjectProviderCredential(Box<InjectProviderCredential>)`, `RevokeRoute(SignedRevocation)`, `Receipt(SignedAttempt)` |
+| `Request { version, operation }` | Operations are `IssuePermit(SignedAttempt)`, `InjectProviderCredential(Box<InjectProviderCredential>)`, `RevokeRoute(SignedRevocation)`, `Receipt(SignedAttempt)`, `AttemptStatus(SignedAttemptId)` |
 | `Response { version, result }` | Result is `Result<Reply, EgressError>`; error codes contain no arbitrary provider strings |
-| `Reply` | `Permit(DispatchPermit)`, `Dispatched(DispatchResult)`, `Revoked`, `Receipt(Option<DispatchReceipt>)` |
+| `Reply` | `Permit(PermitGrant)`, `Dispatched(DispatchResult)`, `Revoked`, `Receipt(Option<DispatchReceipt>)`, `AttemptStatus(AttemptStatus)` |
 | `DurableAttempt` | Exact record binding described below |
-| `AdmissionKey` | Non-Debug/non-Serialize, zeroized HMAC key; `sign_attempt`, `verify_attempt`, `sign_revocation`, `verify_revocation` |
+| `AdmissionKey` | Non-Debug/non-Serialize, zeroized HMAC key; `sign_attempt`, `verify_attempt`, `sign_attempt_id`, `verify_attempt_id`, `sign_revocation`, `verify_revocation` |
 | `ProviderPayload` | `Chat(ChatRequest)` or `Embedding(EmbeddingRequest)`; use its `digest()` helper, never a separately implemented serialization |
 | `DispatchPermit { token, attempt_digest }` | Opaque random capability, accepted exactly once, including across process restarts |
 | `InjectProviderCredential` | `operation_version`, `admission`, `permit`, `payload` |
@@ -32,7 +32,7 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 `DurableAttempt` fields are exactly:
 
 - `tenant`, `incarnation`, `invocation_id`, `attempt_ordinal`, `record_sequence`;
-- `recorded_at`, `expires_at`, `caller_binding`;
+- `recorded_at`, `expires_at`, `recovery_expires_at`, `caller_binding`;
 - `route`, `destination`, `model`, `method`, `secret_ref`;
 - `manifest_ref`, `input_manifest_digest`, `input_digest`, `markings`;
 - `max_attempts`, `reserved_budget: ReservedBudget { unit, amount, invocation_limit }`.
@@ -57,8 +57,9 @@ Memory's ordered integration:
    payload. Foundation authenticates/binds them, durably consumes the permit, resolves
    the configured credential, and hands one attempt to the existing Foundation runtime.
 4. Record the returned receipt/usage in Memory's canonical EffectRecord accounting.
-   Accept output under Memory's WP09/WP11 rules. Provider output is never persistently
-   cached or saved by this process; Memory owns any encrypted recovery payload.
+   Accept output under Memory's WP09/WP11 rules. Foundation atomically retains the safe
+   typed result with its receipt until `recovery_expires_at`; this is attempt recovery,
+   never a response cache for other invocations.
 5. A retry requires a new K record, next ordinal, later K sequence and a fresh permit.
    It cannot change invocation input, destination, model, manifest, caller, markings,
    expiry or limits. A successful invocation is terminal. An uncertain attempt stops
@@ -67,6 +68,64 @@ Memory's ordered integration:
 Memory's test double implements `EgressClient`, including an unknown-charge result.
 The crate re-exports `ChatMessage`, `ChatRequest`, `EmbeddingRequest` and `Sensitivity`
 for constructing the payload without importing the credential process.
+
+## Same-attempt recovery (v2)
+
+V2 replaces v1 without aliases or fallback. Both request and credential-operation
+versions, configuration version, and HMAC domains are 2. Opening a v1 egress registry
+fails with `Version`; no migration or reset is performed. The lead must reconcile any
+old live attempts before provisioning fresh v2 state; never delete active replay history.
+The crate package version remains 0.2.0 on this unreleased branch.
+
+The exact public API is:
+
+```rust
+DurableAttempt::attempt_id(&self) -> AttemptId
+AdmissionKey::sign_attempt_id(&self, AttemptId) -> Result<SignedAttemptId, EgressError>
+EgressClient::attempt_status(&self, SignedAttemptId) -> Result<AttemptStatus, EgressError> // async
+```
+
+`AttemptId { tenant, incarnation, invocation_id, attempt_ordinal }` is the durable
+identity. Status requests use `Operation::AttemptStatus(SignedAttemptId { attempt_id,
+authentication })`, authenticated over `b"symbiotic-egress/v2/attempt-status\0"` plus
+its typed identity JSON. The reply is `Reply::AttemptStatus(AttemptStatus)`. Knowing an
+identity alone does not authorize lookup; Memory signs it only for its trusted recovery
+path and applies its own caller/output disclosure checks before releasing recovered output.
+
+`IssuePermit(SignedAttempt)` returns `Reply::Permit(PermitGrant { permit, status })`.
+For the same identity and exact authenticated attempt digest, the permit token and digest
+are unchanged, including after restart, consumption, completion, revocation, or expiry.
+A different signed record for the same identity returns `InvalidRequest`. Reattachment
+runs before current route configuration/admission checks; it grants no second dispatch.
+`InjectProviderCredential` still consumes a capability exactly once. Concurrent issue
+requests converge on one permit, and concurrent injections admit at most one handoff.
+
+`AttemptStatus` is tagged by `state` in snake case:
+
+| State | Fields / meaning |
+| --- | --- |
+| `NotIssued` | No permit for this identity; lookup does not issue one |
+| `Permitted` | Committed permit has not been consumed |
+| `Dispatched { receipt }` | Consumed, with no durable completion; receipt retains unknown reservation |
+| `Completed { result }` | `DispatchResult` with typed `ProviderOutput`, measured usage/charge, no error |
+| `Failed { result }` | `DispatchResult` with static `EgressError`, no output, and known-zero or unknown charge |
+| `Expired` | Terminal result recovery deadline elapsed; `Receipt` still returns accounting |
+
+The required signed `DurableAttempt.recovery_expires_at` is an exclusive absolute Unix
+second deadline, greater than `recorded_at` and at most `i64::MAX`. It is immutable
+across invocation retries, distinct from authority `expires_at`, and chosen by Memory
+for its recovery window. Terminal results are unavailable at or after that deadline.
+Completion after the deadline persists accounting but never stores recovery output.
+Expiry neither permits a new dispatch nor deletes accounting or replay tombstones.
+Permitted and uncertain dispatched attempts keep their state after the deadline.
+
+Expired result rows are cleared at startup, before operations, and every second during
+socket serving, even when idle or connection slots are occupied. Embedded users must
+periodically call `CredentialProcess::purge_expired_results()` while idle. Cleanup failure
+returns `StateUnavailable`; the daemon fails visibly. SQLite secure-delete is enabled;
+this is logical retention, not a forensic erasure guarantee for WAL files, backups, or
+filesystem snapshots. These recovery records are protected by filesystem permissions,
+not encrypted at rest. Deployments must keep the state directory owner-only.
 
 ## Wire format
 
@@ -80,20 +139,20 @@ has `kind` / `request`; `Reply` has `reply` / `body`. Rust's `Result` is seriali
 `{"Ok": ...}` or `{"Err": "error_code"}`. For example a refusal is:
 
 ```json
-{"version":1,"result":{"Err":"permit_refused"}}
+{"version":2,"result":{"Err":"permit_refused"}}
 ```
 
 `IssuePermit` requests have the outer form:
 
 ```json
-{"version":1,"operation":{"operation":"issue_permit","body":{"attempt":{},"authentication":"..."}}}
+{"version":2,"operation":{"operation":"issue_permit","body":{"attempt":{},"authentication":"..."}}}
 ```
 
 The empty object above stands for **all** `DurableAttempt` fields, not a valid request.
 Use the shared Rust types, which reject absent required fields.
 `SignedAttempt.authentication` is HMAC-SHA256 over
-`b"symbiotic-egress/v1/attempt\0" || serde_json::to_vec(attempt)`.
-Revocations use `b"symbiotic-egress/v1/revocation\0"` and the `RouteRevocation` value.
+`b"symbiotic-egress/v2/attempt\0" || serde_json::to_vec(attempt)`.
+Revocations use `b"symbiotic-egress/v2/revocation\0"` and the `RouteRevocation` value.
 The `AdmissionKey` helpers define serialization and constant-time verification.
 
 ## Revocation, replay and unknown charges
@@ -109,7 +168,9 @@ Later expiry/revocation never withdraws an already recorded attempt's handoff.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_revocations` replay-protection tables. They store hashes, ordinal/sequence,
-consumption status and accounting receipts, never prompts, outputs or credential values.
+consumption status, recoverable permit tokens and accounting receipts. V2 also stores
+safe typed results until the signed recovery deadline, never prompts or provider credentials.
+The owner-only database and same-UID authenticated IPC protect these recovery values.
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede
 handoff. A process lock prevents two credential processes using one state directory.
 These tables do not schedule jobs or replace Memory's canonical EffectRecord/spend
@@ -119,9 +180,12 @@ Before handoff the consumed permit has a durable `ChargeReport::Unknown` carryin
 full reservation. Timeout, uncertain provider failure or crash leaves it reserved.
 `Receipt` returns accounting only, never a cached output. An absent receipt means no
 consumption record exists, not permission to reuse an already refused permit.
-A lost issue-permit reply is not automatically reissued. A lost dispatch reply is
-resolved through `Receipt`; there is no exactly-once external execution claim and
-no output replay. Unknown sends require reconciliation or a visible stop.
+A lost issue-permit reply is recovered by replaying the exact signed `IssuePermit`:
+it returns the same capability and current state without allocating another attempt.
+A lost dispatch reply is recovered with `AttemptStatus`; never resend a consumed permit.
+There is no exactly-once external execution claim. A process crash before durable
+completion leaves `Dispatched` with unknown accounting, requiring reconciliation or
+a visible stop.
 
 A received success reports measured provider requests (one) and available measured
 input/output/reasoning/media/cost fields. Missing usage remains `None`; it is never
@@ -133,10 +197,11 @@ raw transport starts, failures conservatively retain the unknown reservation.
 Retry admission checks only the latest receipt using the invocation/ordinal index:
 it must be a measured zero-charge failure in the reserved unit. Success is terminal,
 and other charges require reconciliation, so earlier history needs no aggregate scan.
-If the final receipt write fails, the paid output still returns with `receipt_persisted = false`; restart
-retains the earlier unknown reservation. Memory must record the received receipt itself.
+If the atomic final result/receipt write fails, the paid output still returns with
+`receipt_persisted = false`; restart retains the earlier unknown reservation and
+`Dispatched` state. Memory must record the received receipt itself.
 
-V1 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
+V2 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
 invocation limit and `max_attempts`. The adapters enforce one HTTP request per permit:
 HTTP protocol retries, redirects and ambient proxies are disabled; runtime retry budgets are one.
 Strict monetary budgets are refused (`BudgetRefused`) because these transports cannot
@@ -149,11 +214,12 @@ must be an owner-only regular file. Before reading configuration or secrets, the
 sets both core resource limits to zero and, on Linux, clears dumpability with
 `PR_SET_DUMPABLE` (piped core collectors ignore the resource limit). Either failure
 refuses startup. Hosts embedding the library must establish equivalent process protection. Socket and runtime directories must be owner-only; socket peers must match the
-process UID. No credential is passed in argv, an environment fallback, protocol reply,
+process UID. A failed peer-credential lookup refuses only that connection, so a
+client disconnect cannot terminate the recovery service. No credential is passed in argv, an environment fallback, protocol reply,
 provider prompt, routine log or raw diagnostic. This local IPC boundary trusts the
 same-user deployment; it is not an OS sandbox against a compromised same-UID process.
 
-`ProcessConfig` version 1 requires `state_dir`, `socket_path`, `admission_key`,
+`ProcessConfig` version 2 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
 Each route requires all `RouteConfig` fields documented in the Rust type, including
 finite field/input/response/token/concurrency/timeout limits. Startup registers every
@@ -191,7 +257,7 @@ the adapters send its resulting bytes without re-serializing them. Oversized adm
 returns `LimitExceeded` without consuming the permit.
 
 The safe provider wrapper rejects a response containing the injected credential in
-any declared v1 representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8
+any declared representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8
 (upper/lower hex), standard Base64 and URL-safe Base64 (padded/unpadded). It scans string
 values before forwarding and discards raw errors before the runtime can log them.
 Other transformations are outside that finite guarantee. Persistent response caching,
@@ -207,7 +273,9 @@ socket. Preserve the state directory to preserve single-use and accounting histo
 
 Targeted synthetic loopback tests exercise credential injection, all declared encodings,
 response/error/log isolation, durable replay, K-ordered revocation, unknown charges,
-cancellation, no cache, new-attempt retry, pinned destinations, redirects, response/frame
+cancellation, same-attempt attachment after lost permit/completion IPC replies, restart
+recovery, digest mismatch refusal, exclusive result expiry, no cache, new-attempt retry,
+pinned destinations, redirects, response/frame
 limits, file protection and real executable IPC. The macOS keychain API is compiled;
 no real user credential or keychain item is read or created by tests. These fixtures
 are not a live-provider qualification or physical power-loss certification. Memory's

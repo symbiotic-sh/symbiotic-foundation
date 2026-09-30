@@ -70,7 +70,7 @@ pub struct RouteConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
-    /// Must equal protocol version 1.
+    /// Must equal protocol version 2.
     pub version: u16,
     /// Owner-only runtime directory (queue plus permit replay metadata).
     pub state_dir: PathBuf,
@@ -176,9 +176,19 @@ impl CredentialProcess {
     }
 
     async fn operation(&self, operation: Operation) -> Result<Reply, EgressError> {
+        self.purge_expired_results()?;
         match operation {
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
+                if let Some(grant) = self
+                    .inner
+                    .registry
+                    .lock()
+                    .map_err(|_| EgressError::StateUnavailable)?
+                    .existing(&signed.attempt)?
+                {
+                    return Ok(Reply::Permit(grant));
+                }
                 self.validate_attempt(&signed.attempt)?;
                 let permit = self
                     .inner
@@ -187,6 +197,16 @@ impl CredentialProcess {
                     .map_err(|_| EgressError::StateUnavailable)?
                     .issue(&signed.attempt)?;
                 Ok(Reply::Permit(permit))
+            }
+            Operation::AttemptStatus(signed) => {
+                self.inner.key.verify_attempt_id(&signed)?;
+                let status = self
+                    .inner
+                    .registry
+                    .lock()
+                    .map_err(|_| EgressError::StateUnavailable)?
+                    .attempt_status(&signed.attempt_id, registry::now()?)?;
+                Ok(Reply::AttemptStatus(status))
             }
             Operation::RevokeRoute(signed) => {
                 self.inner.key.verify_revocation(&signed)?;
@@ -243,6 +263,16 @@ impl CredentialProcess {
         }
     }
 
+    /// Remove expired recovery results. Socket serving runs this every second even when idle.
+    /// Embedded hosts must also call it periodically while idle; all operations purge first.
+    pub fn purge_expired_results(&self) -> Result<(), EgressError> {
+        self.inner
+            .registry
+            .lock()
+            .map_err(|_| EgressError::StateUnavailable)?
+            .purge_expired(registry::now()?)
+    }
+
     fn validate_attempt(&self, a: &DurableAttempt) -> Result<&RouteConfig, EgressError> {
         let route = self
             .inner
@@ -276,6 +306,8 @@ impl CredentialProcess {
             || a.record_sequence == 0
             || a.record_sequence > i64::MAX as u64
             || a.recorded_at >= a.expires_at
+            || a.recovery_expires_at <= a.recorded_at
+            || a.recovery_expires_at > i64::MAX as u64
             || !is_digest(&a.input_digest)
             || !is_digest(&a.input_manifest_digest)
         {
@@ -351,17 +383,18 @@ impl CredentialProcess {
         }
         // A paid answer is returned even if its bookkeeping write fails. The
         // previously committed Unknown remains conservative for restart/reconciliation.
-        let receipt_persisted = self
-            .inner
-            .registry
-            .lock()
-            .is_ok_and(|mut registry| registry.finish(&receipt).is_ok());
-        DispatchResult {
+        let mut result = DispatchResult {
             error,
             receipt,
             output,
-            receipt_persisted,
-        }
+            receipt_persisted: true,
+        };
+        result.receipt_persisted = self
+            .inner
+            .registry
+            .lock()
+            .is_ok_and(|mut registry| registry.finish(&result).is_ok());
+        result
     }
 }
 
