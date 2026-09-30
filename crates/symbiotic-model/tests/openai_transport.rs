@@ -214,3 +214,43 @@ async fn configured_response_limit_refuses_oversized_body() {
         matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
     );
 }
+
+#[tokio::test]
+async fn configured_request_limit_refuses_wire_body_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_request_limit(1)
+        .chat(request())
+        .await;
+    assert!(
+        matches!(result, Err(symbiotic_model::ModelError::InvalidRequest(message)) if message == "provider request limit exceeded")
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn configured_request_limit_accepts_exact_encoded_body_size() {
+    let mut request = request();
+    request.messages[0].content = "quotes: \" newline: \n unicode: é".into();
+    let expected = serde_json::json!({
+        "model": "fixture",
+        "messages": [{"role": "user", "content": request.messages[0].content}],
+        "max_tokens": 128,
+        "temperature": 0.0,
+        "stream": false
+    });
+    let (url, server) = fixture(serde_json::json!({"choices":[{"message":{"content":"OK"}}]}));
+    OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_request_limit(serde_json::to_vec(&expected).unwrap().len())
+        .chat(request)
+        .await
+        .unwrap();
+    assert_eq!(server.join().unwrap(), expected);
+}

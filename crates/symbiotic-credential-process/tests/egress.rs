@@ -713,6 +713,17 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
 
 #[tokio::test]
 async fn executable_dispatches_over_socket_with_only_configured_secret_locations() {
+    executable_dispatch(None).await;
+}
+
+#[tokio::test]
+async fn ambient_proxies_cannot_receive_credentials_or_private_inputs() {
+    let proxy = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
+    executable_dispatch(Some(&proxy.config.routes[0].destination)).await;
+    assert_eq!(proxy.calls.load(Ordering::SeqCst), 0);
+}
+
+async fn executable_dispatch(proxy: Option<&str>) {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -724,8 +735,36 @@ async fn executable_dispatches_over_socket_with_only_configured_secret_locations
     let config_path = fixture.dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"));
+    // Isolate environment changes in the child; parallel tests retain their environment.
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    if let Some(proxy) = proxy {
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(name, proxy);
+        }
+        command.env("NO_PROXY", "").env("no_proxy", "");
+    }
     let mut child = Child(
-        std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"))
+        command
             .arg(&config_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -846,5 +885,61 @@ async fn known_zero_charge_releases_reservation_for_next_attempt() {
             }
         );
     }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expanded_gemini_wire_payload_is_refused_before_consumption() {
+    expanded_wire_payload_is_refused(true).await;
+}
+
+#[tokio::test]
+async fn expanded_chat_wire_payload_is_refused_before_consumption() {
+    expanded_wire_payload_is_refused(false).await;
+}
+
+async fn expanded_wire_payload_is_refused(embedding: bool) {
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.routes[0].max_input_bytes = 1024;
+    let payload = if embedding {
+        fixture.config.routes[0].provider = RouteProvider::GeminiEmbedding { dimensions: 8 };
+        fixture.config.routes[0].destination =
+            "https://generativelanguage.googleapis.com/v1beta".into();
+        fixture.config.routes[0].model = "gemini-embedding-001".into();
+        ProviderPayload::Embedding(EmbeddingRequest {
+            inputs: vec!["x".into(); 128],
+            dimensions: Some(8),
+            task: None,
+            sensitivity: Sensitivity::Private,
+            role_binding: None,
+            source: None,
+            metadata: serde_json::Value::Null,
+        })
+    } else {
+        // The configured model is absent from the typed payload but present on the wire.
+        fixture.config.routes[0].model = "m".repeat(1024);
+        fixture.attempt("wire-limit", 1, 1).1
+    };
+    assert!(serde_json::to_vec(&payload).unwrap().len() < 1024);
+    let process = fixture.process();
+    // A regression must stop before loading this missing secret, and cannot reach Google.
+    std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
+    let (mut admission, _) = fixture.attempt("wire-limit", 1, 1);
+    admission.attempt.model = fixture.config.routes[0].model.clone();
+    admission.attempt.input_digest = payload.digest().unwrap();
+    let admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    let granted = permit(&process, &admission).await;
+    let result = exchange(&process, inject(admission.clone(), payload, granted)).await;
+    assert!(
+        matches!(result, Err(EgressError::LimitExceeded)),
+        "oversized wire body accepted (embedding={embedding})"
+    );
+    assert!(matches!(
+        exchange(&process, Operation::Receipt(admission)).await,
+        Ok(Reply::Receipt(None))
+    ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }

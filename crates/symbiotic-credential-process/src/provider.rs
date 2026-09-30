@@ -100,7 +100,9 @@ pub(crate) async fn execute(
     payload: ProviderPayload,
     attempt_digest: &str,
 ) -> Result<(ProviderOutput, UsageTrace), EgressError> {
+    // Ambient proxies must not reroute an admitted destination or receive its secret.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .timeout(std::time::Duration::from_secs(route.timeout_seconds))
@@ -132,6 +134,7 @@ pub(crate) async fn execute(
                     secret.value(),
                 )
                 .with_client(client)
+                .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes),
                 secret,
             };
@@ -163,6 +166,7 @@ pub(crate) async fn execute(
             let provider = SafeEmbedding {
                 inner: GeminiEmbeddingProvider::new(&route.model, secret.value(), *dimensions)
                     .with_client(client)
+                    .with_request_limit(route.max_input_bytes)
                     .with_response_limit(route.max_response_bytes),
                 secret,
             };

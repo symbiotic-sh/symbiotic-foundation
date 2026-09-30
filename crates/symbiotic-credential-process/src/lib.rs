@@ -423,14 +423,29 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
                     .max_output_tokens
                     .is_some_and(|limit| limit > 0 && limit <= route.max_output_tokens) =>
         {
-            Ok(())
+            symbiotic_ai_runtime::model::wire::openai_chat_body(
+                &route.model,
+                request,
+                None,
+                None,
+                Some(route.max_input_bytes),
+            )
+            .map(|_| ())
+            .map_err(|_| EgressError::LimitExceeded)
         }
         (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request))
             if !request.inputs.is_empty()
                 && request.inputs.len() <= 128
                 && request.dimensions.is_none_or(|value| value == *dimensions) =>
         {
-            Ok(())
+            symbiotic_ai_runtime::model::wire::gemini_embedding_body(
+                &route.model,
+                *dimensions,
+                request,
+                Some(route.max_input_bytes),
+            )
+            .map(|_| ())
+            .map_err(|_| EgressError::LimitExceeded)
         }
         _ => Err(EgressError::InvalidRequest),
     }

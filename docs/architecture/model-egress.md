@@ -132,15 +132,17 @@ retains the earlier unknown reservation. Memory must record the received receipt
 
 V1 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
 invocation limit and `max_attempts`. The adapters enforce one HTTP request per permit:
-HTTP protocol retries and redirects are disabled, runtime retry budgets are one.
+HTTP protocol retries, redirects and ambient proxies are disabled; runtime retry budgets are one.
 Strict monetary budgets are refused (`BudgetRefused`) because these transports cannot
 enforce a monetary upper bound. Token counts are measurements, never substituted money.
 
 ## Deployment and credentials
 
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
-must be an owner-only regular file. The executable disables core dumps before reading
-secrets. Socket and runtime directories must be owner-only; socket peers must match the
+must be an owner-only regular file. Before reading configuration or secrets, the executable
+sets both core resource limits to zero and, on Linux, clears dumpability with
+`PR_SET_DUMPABLE` (piped core collectors ignore the resource limit). Either failure
+refuses startup. Hosts embedding the library must establish equivalent process protection. Socket and runtime directories must be owner-only; socket peers must match the
 process UID. No credential is passed in argv, an environment fallback, protocol reply,
 provider prompt, routine log or raw diagnostic. This local IPC boundary trusts the
 same-user deployment; it is not an OS sandbox against a compromised same-UID process.
@@ -171,7 +173,14 @@ Configured providers are `open_ai_chat { operator }` and
 `gemini_embedding { dimensions }`. Chat uses its configured base URL; Gemini is pinned
 to `https://generativelanguage.googleapis.com/v1beta` and safe model-name characters.
 HTTPS is required except explicitly enabled loopback HTTP. Userinfo, URL queries,
-fragments, caller-controlled hosts and redirects are refused.
+fragments, caller-controlled hosts and redirects are refused. The credential process ignores
+ambient HTTP/HTTPS/ALL proxy settings so only the configured destination receives secrets.
+
+`max_input_bytes` bounds both the typed payload and the complete encoded HTTP body,
+including model names, repeated Gemini batch wrappers and JSON escaping. The same capped
+provider encoder runs before permit consumption/secret loading and at transmission;
+the adapters send its resulting bytes without re-serializing them. Oversized admission
+returns `LimitExceeded` without consuming the permit.
 
 The safe provider wrapper rejects a response containing the injected credential in
 any declared v1 representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8

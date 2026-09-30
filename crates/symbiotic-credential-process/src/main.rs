@@ -1,5 +1,8 @@
 //! Launch with one protected JSON configuration path; diagnostics contain static codes only.
 #[cfg(unix)]
+mod process_security;
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -14,15 +17,7 @@ async fn run() -> Result<(), symbiotic_egress::EgressError> {
         CredentialProcess, ProcessConfig, secrets::SecretSource, server,
     };
     use symbiotic_egress::EgressError;
-    // This executable owns its process, so disabling core dumps precedes all secret reads.
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: setrlimit reads the initialized rlimit and retains no pointer.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
-        return Err(EgressError::StateUnavailable);
-    }
+    process_security::disable_core_dumps().map_err(|_| EgressError::StateUnavailable)?;
     let mut args = std::env::args_os().skip(1);
     let path = args.next().ok_or(EgressError::InvalidRequest)?;
     if args.next().is_some() {
