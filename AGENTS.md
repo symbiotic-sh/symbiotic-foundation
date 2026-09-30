@@ -1,0 +1,30 @@
+# Symbiotic Foundation — Agent Instructions
+
+Shared operating rules: the installed House Rules `AGENTS.md`; layout and naming: its `STRUCTURE.md`.
+
+## Project references
+
+- [README.md](README.md): workspace purpose and crate responsibilities.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): crate boundaries and host-owned policy.
+- [docs/architecture/ai-runtime.md](docs/architecture/ai-runtime.md): the model-call entry point and runtime behavior.
+- [docs/MIGRATION.md](docs/MIGRATION.md): consumer adoption and remaining migration work.
+
+## Build and verification
+
+[CI](.github/workflows/ci.yml) uses Rust 1.93.0 and the **debug** profile on
+pull requests and pushes to `master`. Its full test matrix covers workspace
+default features, `symbiotic-model` without default features, and
+`symbiotic-queue` with `conformance` enabled.
+
+Local commands for a touched crate (replace the placeholders):
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked -p <crate> --all-targets -- -D warnings
+cargo test --locked -p <crate> <test-filter>
+```
+
+For `symbiotic-model` feature-boundary changes, also use
+`--no-default-features` in its separate targeted invocation; queue backend
+conformance targets use `--features conformance` on `symbiotic-queue`.
+CI owns the full matrix; local full runs follow House Rules verification exceptions.
