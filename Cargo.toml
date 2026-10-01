@@ -14,8 +14,7 @@ resolver = "2"
 
 [workspace.package]
 # 0.2.x: distinct from the runtime's same-named `symbiotic-core` / `symbiotic-queue`
-# (0.1.0) so both can path-coexist in the runtime lockfile until the Stage-4
-# crate rename lands. See convergence-and-interfaces-2026-07 §5 Stage 4/7.
+# (0.1.0) so both can coexist in the runtime lockfile. Crate map: docs/ARCHITECTURE.md.
 version = "0.2.0"
 edition = "2024"
 authors = ["Symbiotic Contributors"]
