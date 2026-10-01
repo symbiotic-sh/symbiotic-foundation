@@ -856,7 +856,7 @@ fn classify_trace(
 #[derive(Clone)]
 pub struct JevClassifierProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
     api_key: SecretValue<String>,
     max_request_bytes: Option<usize>,
@@ -885,7 +885,7 @@ impl JevClassifierProvider {
                 },
                 metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": base_url }),
             },
-            client: reqwest::Client::new(),
+            client: HttpClient::default(),
             base_url,
             api_key: api_key.into(),
             max_request_bytes: None,
@@ -936,7 +936,7 @@ impl JevClassifierProvider {
 
     /// Reuse the consumer's connection pool and timeout policy.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
+        self.client = HttpClient(Ok(client));
         self
     }
 
@@ -1112,6 +1112,7 @@ impl ModelProvider for JevClassifierProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;
         Ok(())
@@ -1137,6 +1138,7 @@ impl ClassifierProvider for JevClassifierProvider {
         let started = Instant::now();
         let builder = self
             .client
+            .get()?
             .post(format!("{}/systemone", self.base_url.trim_end_matches('/')))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
