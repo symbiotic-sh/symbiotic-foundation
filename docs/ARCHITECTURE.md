@@ -11,10 +11,6 @@ ownership, provider-principal authorization, grant-revision ordering, spend,
 storage scope and supported modes. This document maps the current crates; existing
 APIs still require changes to meet that contract.
 
-Foundation remains reusable: no product business logic, memory fact model or
-benchmark-specific behavior. Products configure policy; Foundation owns execution
-and its operational persistence.
-
 ## Crate Boundaries
 
 ```mermaid
@@ -199,18 +195,16 @@ Auth is modeled as provider modes, not as one global OAuth abstraction:
 | `cli_session` | local tool session, e.g. Codex ChatGPT sign-in |
 
 These describe provider authentication, distinct from gateway authentication of
-callers. Foundation resolves provider credentials through its credential boundary;
-current file/keychain support is described in [model egress](architecture/model-egress.md).
+callers. Current file/keychain support is described in
+[model egress](architecture/model-egress.md).
 The full mode and ownership contract is in
 [boundary.md](architecture/boundary.md#supported-modes-and-trusted-channels).
 
 ## Policy and integration
 
 See [boundary.md](architecture/boundary.md#ownership) for the ownership contract.
-Products supply prompts, meaning and explicit task requests. Memory supplies checked
-data authority. Hosts configure providers and account policies; Foundation enforces
-execution settings. The gateway supplies authenticated callers. Existing provider
-class metadata grants no data authority.
+Provider-class metadata is described under
+[tenant provider bindings and data access](architecture/boundary.md#tenant-provider-bindings-and-data-access).
 
 ## Non-Goals
 

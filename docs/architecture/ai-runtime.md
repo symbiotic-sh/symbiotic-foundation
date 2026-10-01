@@ -238,8 +238,9 @@ per binding.
   its budget, later calls for the same request fail without a provider call
   while the queue remembers it. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
-  `Some(0)` gives every call its own budget, for hosts that schedule their own
-  retries. Renewing (and continuing a retry chain) replaces the dead item
+  `Some(0)` gives every call its own budget. Retry admission and recovery after
+  uncertain timeouts follow [boundary.md](boundary.md#spend-ledger-and-budgets).
+  Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
   budget over one another caller renewed in the meantime.

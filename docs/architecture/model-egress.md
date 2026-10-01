@@ -49,9 +49,8 @@ policy contents. Secret references are tenant scoped, not file paths.
 The replacement integration order is specified once in
 [boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The admission MAC
 key is distinct from provider credentials and authenticates trusted admission;
-it is not end-user authentication. Memory retains input authorization and guarded
-output commits. Foundation owns execution reservations, settlement and recovery;
-Memory retains receipt references.
+it is not end-user authentication. Integration responsibilities are defined in
+the [ownership contract](boundary.md#ownership).
 
 The current `EgressClient` test seam supports unknown-charge results. It re-exports
 the payload construction types; consumers do not import the credential-process

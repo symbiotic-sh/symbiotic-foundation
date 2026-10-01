@@ -99,18 +99,22 @@ agent, Memory cannot control which model that agent subsequently uses.
 
 ## Grant revision and dispatch ordering
 
-A **grant revision** identifies the current effective provider authorization,
-including group-derived grants. It is the linearization point: grant updates and
-dispatch acceptance must be ordered against the same current revision. An old
-signed admission or issued permit is not continuing permission to dispatch.
+A **grant revision** identifies the current effective authorization of both the
+requesting principal and the provider against the stored inputs. It covers their
+authorization dependencies, including group memberships, group-derived grants
+and input access rules. It is the linearization point: changes to either
+principal's input authorization and dispatch acceptance must be ordered against
+the same current revision. An old signed admission or issued permit is not
+continuing permission to dispatch.
 
 The ordered call contract is:
 
 1. Memory checks the requesting principal and provider against all stored inputs
    and binds admission to the effective grant revision and exact invocation inputs.
 2. Pending admissions, including queued work and retries, re-check the current
-   provider grant revision before dispatch. A changed revision requires current
-   authorization; a call no longer authorized is refused.
+   grant revision for both the requesting principal and provider before dispatch.
+   A changed revision requires current authorization of both against all stored
+   inputs; a call no longer authorized is refused.
 3. Foundation accepts a handoff only after the revision check is ordered with grant
    updates and the attempt's reservation/replay state is durable. The handoff is
    the acceptance of that specific provider attempt, not enqueue or permit issuance.
@@ -120,16 +124,22 @@ The ordered call contract is:
 5. Memory checks current commit guards and output authority before committing a
    derivation. Execution success alone does not authorize an output commit.
 
-The revision check and handoff must not leave a race in which a grant update has
-completed but pending work can still dispatch under an old revision. The trusted
-admission integration must establish this ordering; wall-clock timestamps or
-asynchronous revocation notification alone do not establish it.
+The revision check and handoff must not leave a race in which either principal's
+input authorization has changed but pending work can still dispatch under an old
+revision. The trusted admission integration must establish this ordering;
+wall-clock timestamps or asynchronous revocation notification alone do not
+establish it.
 
 For example, attempt A waits under revision 10. Removing the provider's input grant
 publishes revision 11 before A's handoff is accepted. A is refused even if its
 permit was issued under revision 10. Attempt B accepted before revision 11 may
 finish; Foundation keeps B's spend and receipt. A retry of B is a new handoff and
 must check revision 11.
+
+Likewise, if the caller loses access to an input while attempt C is queued,
+the grant revision changes even when the provider's grants remain unchanged.
+C is refused before handoff; a later commit check cannot undo disclosure to
+the provider.
 
 Grant changes apply going forward. Stored outputs remain; the provider loses read
 access through the input intersection rule. The audit trail stays global. Changing
