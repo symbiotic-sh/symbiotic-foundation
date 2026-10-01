@@ -322,10 +322,8 @@ admission; the current policy's charge-certainty gap is described above.
 `ResponseCache` is the seam for an alternate cache. `load` receives request kind,
 scope, request hash and the serialized request; `Ok(None)` falls through to a
 provider call. Custom caches must respect the result-identity and data-lifecycle
-contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
-There is no pre-release requirement to retain historical cache readers or migrate
-old layouts. Rebuildable caches are distinct from unresolved paid-attempt state;
-see [storage and credentials](boundary.md#storage-and-credentials).
+contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access) and its
+[storage rules](boundary.md#storage-and-credentials).
 
 ## Backends and conformance
 
