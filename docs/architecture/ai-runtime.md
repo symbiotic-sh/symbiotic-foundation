@@ -11,9 +11,9 @@ provider-principal authorization, spend, storage and supported modes. This page
 records current runtime behavior. Complete tenant/provider/configuration binding,
 explicit account isolation, canonical spend accounting and admission/maintenance
 bounds remain implementation work; this API alone supplies none of Memory's data
-authorization checks. The runtime also retries timeouts without proving zero charge,
-contrary to the [spend contract](boundary.md#spend-ledger-and-budgets). Retry admission
-and same-attempt recovery alignment are assigned to audit PRs 5/6.
+authorization checks. The error-class retry gaps listed under
+[policy knobs](#policy-knobs) remain assigned to audit PRs 5/6 under the
+[spend contract](boundary.md#spend-ledger-and-budgets).
 
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 (issue #8).
@@ -79,8 +79,7 @@ so the state directory and everything in it are owner-only:
   [boundary.md](boundary.md#storage-and-credentials).
 
 Queue records hold the request hash, never the request. A crash therefore
-cannot resume an in-flight call from the queue. Every Foundation execution path
-must recover an uncertain attempt rather than blindly re-issue it, under the
+cannot resume an in-flight call from the queue. Recovery requirements follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). The current credential backend
 provides [same-attempt recovery](model-egress.md#same-attempt-recovery-v2); the general
 runtime still requires that recovery integration in audit PRs 5/6. The cache and
@@ -198,7 +197,11 @@ exhausted by a bad key is tried again with the new one. The fingerprint is
 one-way, and only a hash of it enters the queue's idempotency key. Neither
 the key nor the fingerprint is written to traces, receipts or queue
 payloads. A host provider without a credential returns `None`, and its
-budgets are keyed as before.
+budgets are keyed as before. This fresh queue budget does not establish charge
+certainty for an earlier attempt or authorize resubmitting an unknown charge;
+admission and recovery follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
+a known gap assigned to audit PRs 5/6.
 
 Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
@@ -207,11 +210,13 @@ per binding.
 
 ## Policy knobs
 
-Required retry admission follows the
-[spend contract](boundary.md#spend-ledger-and-budgets): only known pre-transport or
-otherwise zero-charge failures can be automatically retried. Uncertain timeouts
-enter Foundation recovery. The current error-class-based policy below does not
-meet that requirement; its correction belongs to audit PRs 5/6.
+Retry admission and recovery follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). The current `is_retryable`
+policy retries `ModelError::Timeout`, `ModelError::Unavailable` (5xx, including 529)
+and `ModelError::RateLimited` (429) without checking charge certainty. Opt-in
+`retry_provider_errors` adds `ModelError::Provider` to that policy. All four classes
+are known gaps across the shared queued chat, embedding, rerank and classification
+paths, assigned to audit PRs 5/6.
 
 `ModelQueueConfig` fields:
 
@@ -225,11 +230,10 @@ meet that requirement; its correction belongs to audit PRs 5/6.
   (`QueueBackend::fail_with`), so no caller of the request retries earlier,
   and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
-  failures. Currently `is_retryable` treats unavailable, rate-limited and timed-out
-  calls as retryable without checking charge certainty. `ModelQueueConfig::default()`
+  failures. `ModelQueueConfig::default()`
   allows three attempts; DeepSeek catalogue policies allow four, and other catalogue
-  entries also permit multiple attempts. These settings can resend an uncertain
-  timeout and are a known contract gap, not accepted retry behavior. Provider errors
+  entries also permit multiple attempts. These settings expose the error-class
+  retry gaps listed above. Provider errors
   never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
@@ -245,7 +249,11 @@ meet that requirement; its correction belongs to audit PRs 5/6.
   same class.
 - A lease that expires on an item's last allowed attempt, for example
   because the process crashed mid-call, ends the item as dead. A restarted
-  runtime does not make another paid attempt.
+  runtime does not make another paid attempt from that item. On a non-final
+  attempt, both queue backends instead mark the item failed and allow another
+  claim without checking the earlier attempt's charge certainty. This is another
+  recovery gap assigned to audit PRs 5/6 under the
+  [spend contract](boundary.md#spend-ledger-and-budgets).
 
 - `budget_renewal_seconds` (default `None`): once a request has exhausted
   its budget, later calls for the same request fail without a provider call

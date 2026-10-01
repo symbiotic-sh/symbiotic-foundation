@@ -175,8 +175,13 @@ attempt was pre-transport or otherwise known zero-charge. An attempt whose trans
 may have started is never blindly resent: an uncertain timeout or other unknown
 outcome enters Foundation's same-attempt recovery and reconciliation path. An error
 class or unused attempt allowance alone does not establish that retry is safe.
-The current runtime's timeout retries violate this contract; correcting retry
-admission and recovery is assigned to audit PRs 5/6.
+The current runtime retries `ModelError::Timeout`, `ModelError::Unavailable`
+(5xx, including 529) and `ModelError::RateLimited` (429) by error class without
+checking charge certainty. Enabling `retry_provider_errors` also retries
+`ModelError::Provider` on that basis. These are known violations across the shared
+queued chat, embedding, rerank and classification paths; correcting retry admission
+and same-attempt recovery is assigned to audit PRs 5/6. The current credential-process
+backend disables these retries with one runtime attempt per permit.
 
 For example, a request-bound invocation allows at most two provider requests. One
 attempt is accepted, then times out after transport starts. Foundation retains its

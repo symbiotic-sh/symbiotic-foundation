@@ -3,8 +3,7 @@
 Model and queue invocations produce data that is useful for many systems, but
 the foundation must not choose a single storage target.
 
-These sinks carry optional telemetry. Foundation's canonical spend ledger owns
-reservations, settlement and budgets under the
+These sinks carry optional telemetry. Accounting and budgets follow the
 [boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
 
 ## Principle

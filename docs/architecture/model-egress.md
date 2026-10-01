@@ -11,7 +11,7 @@ The executable and implementation crate are **`symbiotic-credential-process` 0.2
 and its operational database; it has no second provider scheduler.
 
 **Implementation gaps:** the current schema still carries obsolete policy fields
-and a caller-supplied reservation, uses route-sequence revocation rather than
+and a caller-supplied reservation, compares record sequences on route keys rather than
 the [caller-and-provider grant-revision ordering](boundary.md#grant-revision-and-dispatch-ordering),
 still rejects a marking equal to `unclassified`, and lacks complete tenant/provider/configuration
 identity and the canonical Foundation spend ledger. Replacement protocol and
@@ -150,7 +150,8 @@ The `AdmissionKey` helpers define serialization and constant-time verification.
 
 The required grant-revision ordering is in
 [boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The current v2
-`RouteRevocation`/`RevokeRoute` API and registry compare serialized route sequences;
+`RouteRevocation`/`RevokeRoute` API and registry compare `record_sequence` on each
+route key, retaining the earliest revoked sequence;
 this is an implementation gap, not the authorization contract for new adoption.
 Already accepted handoffs and their accounting remain recoverable.
 
@@ -193,8 +194,8 @@ it must be a measured zero-charge failure in the reserved unit. Success is termi
 and other charges require reconciliation, so earlier history needs no aggregate scan.
 If the atomic final result/receipt write fails, the paid output still returns with
 `receipt_persisted = false`; restart retains the earlier unknown reservation and
-`Dispatched` state. Received receipts must be reconciled in Foundation accounting;
-Memory retains a reference alongside its derivation effects. A paid output is not
+`Dispatched` state. Receipt reconciliation and references follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). A paid output is not
 evidence that canonical settlement was durably recorded.
 Runtime queue-completion, trace-write and response-cache-write failures return the
 static `queue_complete_failed`, `trace_write_failed` and `response_cache_write_failed`
@@ -288,7 +289,7 @@ socket. Preserve the state directory to preserve single-use and accounting histo
 ## Evidence boundary
 
 Targeted synthetic loopback tests exercise credential injection, all declared encodings,
-response/error/log isolation, durable replay, current route-sequence revocation, unknown charges,
+response/error/log isolation, durable replay, current record-sequence revocation on route keys, unknown charges,
 cancellation, same-attempt attachment after lost permit/completion IPC replies, restart
 recovery, digest mismatch refusal, exclusive result expiry, no cache, new-attempt retry,
 pinned destinations, redirects, response/frame

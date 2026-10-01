@@ -39,10 +39,11 @@ rate-limiter/rerank/queue implementations.
      deduplication. SQLite already provides those.
    - *Rejected:* making persistence a Cargo feature, which would reintroduce
      per-consumer wiring.
-3. **A separate crate, `symbiotic-ai-runtime`, is the only SQLite-linking
-   crate besides the backend.** `symbiotic-model` and `symbiotic-queue` stay
-   storage-free, as #7 established. A host that bans embedded databases in its
-   own code can allow exactly this boundary.
+3. **SQLite stays outside the contract crates.** `symbiotic-ai-runtime`,
+   `symbiotic-queue-sqlite` and the credential-process implementation link SQLite;
+   `symbiotic-model` and `symbiotic-queue` stay storage-free, as #7 established.
+   Storage scope follows the
+   [boundary contract](../architecture/boundary.md#storage-and-credentials).
    - *Rejected:* `symbiotic_model::Runtime`, which would put SQLite into every
      model-contract build.
 4. **Limits are per model, shared by every binding — superseded.** Current grouping follows
@@ -70,9 +71,11 @@ rate-limiter/rerank/queue implementations.
 7. **Retry knobs over forks.** A base delay (sub-second allowed), an opt-in to
    retry provider errors, and rate burst cover the behaviour a consumer's copy
    had. The defaults are unchanged.
-   Retry knobs do not establish safe admission: uncertain attempts must follow
-   [Foundation recovery](../architecture/boundary.md#spend-ledger-and-budgets).
-   Current timeout retries remain a gap assigned to audit PRs 5/6.
+   Retry admission and recovery follow the
+   [spend contract](../architecture/boundary.md#spend-ledger-and-budgets).
+   Current error-class retries for timeout, unavailable and rate-limited calls,
+   plus `ModelError::Provider` when `retry_provider_errors` is enabled, remain
+   known gaps assigned to audit PRs 5/6.
 8. **Repeating a finished request without a cached answer runs it again.**
    Before, this returned a cache error. Queue records coordinate calls; they do
    not hold answers.
