@@ -191,7 +191,7 @@ fn assert_no_files_containing(dir: &std::path::Path, key: &str) {
 }
 
 #[tokio::test]
-async fn configured_401_echo_is_sanitized_before_runtime_bookkeeping() {
+async fn configured_401_echo_cannot_enter_error_or_runtime_bookkeeping() {
     for classifier in [false, true] {
         let (url, server) = fixture(401, format!("unauthorized key={KEY}"), None);
         let state = tempfile::tempdir().unwrap();
@@ -283,10 +283,7 @@ async fn configured_redirects_are_refused_without_contacting_the_target() {
                 configured(&url, &state.path().join("state"), classifier, KEY).await;
             let err = call(&provider).await.unwrap_err();
             server.join().unwrap();
-            assert!(
-                matches!(err, ModelError::Provider(ref message) if message == "credential-bearing provider failure"),
-                "{err:?}"
-            );
+            assert!(matches!(err, ModelError::Provider(_)), "{err:?}");
             assert_eq!(
                 target.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
@@ -321,12 +318,6 @@ async fn final_validation_and_typed_decoding_errors_cannot_reach_bookkeeping() {
         let error = call(&provider).await.unwrap_err();
         server.join().unwrap();
         assert!(matches!(error, ModelError::Provider(_)), "{error:?}");
-        assert!(
-            error
-                .to_string()
-                .contains("credential-bearing provider failure"),
-            "{error}"
-        );
         for text in [
             error.to_string(),
             serde_json::to_string(&receipts.receipts()).unwrap(),
@@ -528,9 +519,7 @@ async fn cached_credential_echo_is_refused_before_cache_hit_bookkeeping() {
         assert_eq!(changed, 1);
         let error = call(&provider).await.unwrap_err();
         if invalid_type {
-            assert!(
-                matches!(error, ModelError::Cache(ref text) if text == "credential-bearing provider failure")
-            );
+            assert!(matches!(error, ModelError::Cache(_)));
         } else {
             assert!(matches!(error, ModelError::Provider(_)));
         }
@@ -547,5 +536,26 @@ async fn cached_credential_echo_is_refused_before_cache_hit_bookkeeping() {
                 .iter()
                 .any(|receipt| receipt.status == symbiotic_ai_runtime::ReceiptStatus::CacheHit)
         );
+    }
+}
+
+#[tokio::test]
+async fn non_success_invalid_utf8_preserves_status_class() {
+    for classifier in [false, true] {
+        for status in [401, 402, 429] {
+            let (url, server) = fixture_bytes(status, vec![0xff], None);
+            let state = tempfile::tempdir().unwrap();
+            let (provider, _, _) =
+                configured(&url, &state.path().join("state"), classifier, KEY).await;
+            let error = call(&provider).await.unwrap_err();
+            server.join().unwrap();
+            match status {
+                401 => assert!(matches!(error, ModelError::Auth(_)), "{error:?}"),
+                402 => assert!(matches!(error, ModelError::BudgetExhausted(_)), "{error:?}"),
+                429 => assert!(matches!(error, ModelError::RateLimited(_)), "{error:?}"),
+                _ => unreachable!(),
+            }
+            assert!(!format!("{error:?} {error}").contains(KEY));
+        }
     }
 }

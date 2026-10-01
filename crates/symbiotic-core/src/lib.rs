@@ -209,3 +209,6 @@ mod tests {
         assert_eq!(identity.queue_id().0, "chat:deepseek:deepseek-v4-pro");
     }
 }
+
+mod diagnostics;
+pub use diagnostics::{DiagnosticCode, FailureClass};

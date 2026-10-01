@@ -1403,6 +1403,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
+ "rusqlite",
  "serde_json",
  "sha2",
  "symbiotic-core",

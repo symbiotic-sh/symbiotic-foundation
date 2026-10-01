@@ -106,7 +106,7 @@ impl From<QueueEvent> for QueueEventTrace {
             kind: event.kind,
             status: event.status,
             attempt: event.attempt,
-            error: event.error,
+            error: event.error.map(|code| code.to_string()),
             timestamp: event.timestamp,
             metadata: serde_json::json!({}),
         }
@@ -116,7 +116,16 @@ impl From<QueueEvent> for QueueEventTrace {
 #[derive(Debug, Error)]
 pub enum TraceError {
     #[error("trace sink failed: {0}")]
-    Sink(String),
+    Sink(symbiotic_core::DiagnosticCode),
+}
+
+impl TraceError {
+    /// Static diagnostic for logs and runtime bookkeeping.
+    pub const fn code(&self) -> symbiotic_core::DiagnosticCode {
+        match self {
+            Self::Sink(code) => *code,
+        }
+    }
 }
 
 #[async_trait]
@@ -254,13 +263,14 @@ pub struct JsonlTraceSink {
 impl JsonlTraceSink {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TraceError> {
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|err| TraceError::Sink(err.to_string()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path.as_ref())
-            .map_err(|err| TraceError::Sink(err.to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             file: Mutex::new(file),
@@ -275,10 +285,14 @@ impl JsonlTraceSink {
         if !path.as_ref().is_file() {
             return Ok(Vec::new());
         }
-        let raw = std::fs::read_to_string(path).map_err(|err| TraceError::Sink(err.to_string()))?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         raw.lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).map_err(|err| TraceError::Sink(err.to_string())))
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))
+            })
             .collect()
     }
 }
@@ -291,15 +305,16 @@ impl TraceSink for JsonlTraceSink {
         let mut file = self
             .file
             .lock()
-            .map_err(|_| TraceError::Sink("jsonl trace sink lock poisoned".to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         writeln!(
             file,
             "{}",
-            serde_json::to_string(&trace).map_err(|err| TraceError::Sink(err.to_string()))?
+            serde_json::to_string(&trace)
+                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?
         )
-        .map_err(|err| TraceError::Sink(err.to_string()))?;
+        .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         file.flush()
-            .map_err(|err| TraceError::Sink(err.to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(())
     }
 }
@@ -312,13 +327,14 @@ pub struct JsonlQueueTraceSink {
 impl JsonlQueueTraceSink {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TraceError> {
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|err| TraceError::Sink(err.to_string()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path.as_ref())
-            .map_err(|err| TraceError::Sink(err.to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             file: Mutex::new(file),
@@ -333,10 +349,14 @@ impl JsonlQueueTraceSink {
         if !path.as_ref().is_file() {
             return Ok(Vec::new());
         }
-        let raw = std::fs::read_to_string(path).map_err(|err| TraceError::Sink(err.to_string()))?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         raw.lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).map_err(|err| TraceError::Sink(err.to_string())))
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))
+            })
             .collect()
     }
 }
@@ -349,15 +369,16 @@ impl QueueTraceSink for JsonlQueueTraceSink {
         let mut file = self
             .file
             .lock()
-            .map_err(|_| TraceError::Sink("jsonl queue trace sink lock poisoned".to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         writeln!(
             file,
             "{}",
-            serde_json::to_string(&trace).map_err(|err| TraceError::Sink(err.to_string()))?
+            serde_json::to_string(&trace)
+                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?
         )
-        .map_err(|err| TraceError::Sink(err.to_string()))?;
+        .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         file.flush()
-            .map_err(|err| TraceError::Sink(err.to_string()))?;
+            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(())
     }
 }
@@ -483,7 +504,9 @@ mod tests {
                 &self,
                 _trace: ModelInvocationTrace,
             ) -> Result<(), TraceError> {
-                Err(TraceError::Sink("boom".to_string()))
+                Err(TraceError::Sink(
+                    symbiotic_core::DiagnosticCode::StorageFailure,
+                ))
             }
         }
 

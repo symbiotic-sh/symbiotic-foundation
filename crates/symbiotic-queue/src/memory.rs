@@ -76,12 +76,12 @@ impl MemoryQueue {
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, QueueError> {
-        self.state
-            .lock()
-            .map_err(|_| QueueError::Unavailable("memory queue lock poisoned".to_string()))
+        self.state.lock().map_err(|_| {
+            QueueError::Unavailable(symbiotic_core::DiagnosticCode::MemoryQueueLockPoisoned)
+        })
     }
 
-    async fn emit(&self, events: Vec<(QueueItem, Option<String>)>) {
+    async fn emit(&self, events: Vec<(QueueItem, Option<symbiotic_core::DiagnosticCode>)>) {
         let Some(sink) = &self.event_sink else {
             return;
         };
@@ -108,7 +108,7 @@ impl MemoryQueue {
     ) -> Result<EnqueueOutcome, QueueError> {
         if request.kind.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "queue item kind must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::QueueItemKindMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
@@ -174,21 +174,23 @@ impl MemoryQueue {
     ) -> Result<QueueItem, QueueError> {
         let now = Utc::now();
         let mut state = self.lock()?;
-        let current = state
-            .items
-            .get(&item_id.0)
-            .ok_or_else(|| QueueError::NotFound(item_id.0.clone()))?;
+        let current = state.items.get(&item_id.0).ok_or({
+            QueueError::NotFound(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+        })?;
         if current.status != QueueStatus::Running {
-            return Err(QueueError::NotRunning(item_id.0.clone()));
+            return Err(QueueError::NotRunning(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         if current.lease_owner.as_deref() != Some(worker_id) {
-            return Err(QueueError::LeaseMismatch(item_id.0.clone()));
+            return Err(QueueError::LeaseMismatch(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         if current.lease_until.is_none_or(|until| until < now) {
-            return Err(QueueError::LeaseMismatch(format!(
-                "{} lease expired",
-                item_id.0
-            )));
+            return Err(QueueError::LeaseMismatch(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         update(&mut state, now)?;
         Ok(state.items[&item_id.0].clone())
@@ -284,7 +286,7 @@ impl State {
             item.lease_until = None;
             item.updated_at = now;
             item.last_error
-                .get_or_insert_with(|| "lease expired".to_string());
+                .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
             reclaimed.push(item.clone());
         }
         reclaimed
@@ -300,7 +302,7 @@ impl State {
         }
         item.updated_at = now;
         item.last_error
-            .get_or_insert_with(|| "attempt budget exhausted".to_string());
+            .get_or_insert(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted);
         self.set_status(item_id, QueueStatus::Dead);
         self.items.get(item_id).cloned()
     }
@@ -315,10 +317,10 @@ impl State {
     }
 }
 
-fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<String>)> {
+fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<symbiotic_core::DiagnosticCode>)> {
     items
         .into_iter()
-        .map(|item| (item, Some("lease expired".to_string())))
+        .map(|item| (item, Some(symbiotic_core::DiagnosticCode::LeaseExpired)))
         .collect()
 }
 
@@ -340,7 +342,7 @@ impl QueueBackend for MemoryQueue {
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
         if request.worker_id.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "worker_id must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
@@ -400,7 +402,7 @@ impl QueueBackend for MemoryQueue {
     ) -> Result<Option<QueueItem>, QueueError> {
         if worker_id.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "worker_id must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
@@ -409,7 +411,9 @@ impl QueueBackend for MemoryQueue {
             let queue_id = state
                 .items
                 .get(&item_id.0)
-                .ok_or_else(|| QueueError::NotFound(item_id.0.clone()))?
+                .ok_or({
+                    QueueError::NotFound(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })?
                 .queue_id
                 .0
                 .clone();
@@ -434,13 +438,15 @@ impl QueueBackend for MemoryQueue {
         };
         let mut events = lease_events(reclaimed);
         events.extend(retired.map(|item| {
-            let error = item.last_error.clone();
+            let error = item.last_error;
             (item, error)
         }));
         events.extend(claimed.iter().cloned().map(|item| (item, None)));
         self.emit(events).await;
         if missing {
-            return Err(QueueError::NotFound(item_id.0.clone()));
+            return Err(QueueError::NotFound(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         Ok(claimed)
     }
@@ -490,7 +496,7 @@ impl QueueBackend for MemoryQueue {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         let run_after =
@@ -499,7 +505,7 @@ impl QueueBackend for MemoryQueue {
             item_id,
             worker_id,
             Failure {
-                error: error.to_string(),
+                error,
                 error_class: None,
                 run_after: Some(run_after),
             },
@@ -525,8 +531,8 @@ impl QueueBackend for MemoryQueue {
                 .unwrap_or_else(|| now + ChronoDuration::seconds(1));
             item.lease_owner = None;
             item.lease_until = None;
-            item.last_error = Some(failure.error.clone());
-            item.last_error_class = failure.error_class.clone();
+            item.last_error = Some(failure.error);
+            item.last_error_class = failure.error_class;
             item.updated_at = now;
             let status = if failure.run_after.is_none() {
                 outcome = FailOutcome::Stopped;

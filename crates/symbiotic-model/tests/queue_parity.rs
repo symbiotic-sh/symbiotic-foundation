@@ -295,8 +295,9 @@ async fn receipts_cover_each_step_and_a_cache_hit_keeps_the_original_receipt() {
 async fn retry_base_delay_allows_sub_second_backoff_and_receipts_record_the_failure() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
     let sink = Arc::new(InMemoryReceiptSink::default());
-    let raw = Loopback::new(unique_identity())
-        .failing_first(vec![ModelError::Unavailable("blip".to_string())]);
+    let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Unavailable(
+        symbiotic_core::DiagnosticCode::HttpUnavailable,
+    )]);
     let provider = queued(raw.clone(), queue, config()).with_receipt_sink(sink.clone());
 
     let started = Instant::now();
@@ -314,15 +315,19 @@ async fn retry_base_delay_allows_sub_second_backoff_and_receipts_record_the_fail
         .filter(|receipt| receipt.status == ReceiptStatus::Failed)
         .collect();
     assert_eq!(failed.len(), 1);
-    assert!(failed[0].error.as_deref().unwrap().contains("blip"));
+    assert_eq!(
+        failed[0].error,
+        Some(symbiotic_core::DiagnosticCode::HttpUnavailable)
+    );
     assert_eq!(failed[0].attempt, 1);
 }
 
 #[tokio::test]
 async fn provider_errors_retry_only_when_the_policy_opts_in() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
-    let strict = Loopback::new(unique_identity())
-        .failing_first(vec![ModelError::Provider("bad json".to_string())]);
+    let strict = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
     let err = queued(strict.clone(), queue.clone(), config())
         .chat(request("strict"))
         .await
@@ -330,8 +335,9 @@ async fn provider_errors_retry_only_when_the_policy_opts_in() {
     assert!(matches!(err, ModelError::Provider(_)), "{err:?}");
     assert_eq!(strict.calls.load(Ordering::SeqCst), 1);
 
-    let lenient = Loopback::new(unique_identity())
-        .failing_first(vec![ModelError::Provider("bad json".to_string())]);
+    let lenient = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
     let response = queued(
         lenient.clone(),
         queue,
@@ -449,7 +455,7 @@ impl QueueBackend for EvictsOnce {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         self.inner
@@ -595,16 +601,19 @@ async fn a_host_response_cache_answers_before_the_queue() {
 async fn exhausted_retries_keep_the_class_of_the_last_failure() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
     let raw = Loopback::new(unique_identity()).failing_first(vec![
-        ModelError::RateLimited("slow down".to_string()),
-        ModelError::RateLimited("slow down".to_string()),
-        ModelError::Timeout("still slow".to_string()),
+        ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
+        ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
+        ModelError::Timeout(symbiotic_core::DiagnosticCode::HttpTimeout),
     ]);
     let err = queued(raw.clone(), queue, config())
         .chat(request("give up"))
         .await
         .unwrap_err();
     assert!(matches!(err, ModelError::Timeout(_)), "{err:?}");
-    assert!(err.to_string().contains("exhausted after 3/3"), "{err}");
+    assert!(
+        err.to_string().contains("attempt budget exhausted"),
+        "{err}"
+    );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
 }
 
@@ -663,7 +672,7 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     let down = || {
         Loopback::new(unique_identity()).failing_first(
             (0..4)
-                .map(|_| ModelError::Unavailable("down".to_string()))
+                .map(|_| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))
                 .collect(),
         )
     };
@@ -701,8 +710,9 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
 #[tokio::test]
 async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
-    let raw = Loopback::new(unique_identity())
-        .failing_first(vec![ModelError::Provider("bad json".to_string())]);
+    let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
     let provider = queued(
         raw.clone(),
         queue,
@@ -792,7 +802,7 @@ impl QueueBackend for PausesOneEnqueue {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         self.inner
@@ -822,7 +832,7 @@ async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
     });
     let raw = Loopback::new(unique_identity()).failing_first(
         (0..8)
-            .map(|_| ModelError::Unavailable("down".to_string()))
+            .map(|_| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))
             .collect(),
     );
     let provider = queued(
@@ -991,7 +1001,9 @@ impl QueueBackend for CountsRenewals {
     }
     async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
         if self.fail_completions.load(Ordering::SeqCst) {
-            return Err(QueueError::Storage("queue store down".to_string()));
+            return Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::StorageFailure,
+            ));
         }
         self.inner.complete(item_id, worker_id).await
     }
@@ -999,7 +1011,7 @@ impl QueueBackend for CountsRenewals {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         self.inner
@@ -1029,7 +1041,9 @@ impl QueueBackend for CountsRenewals {
         until: chrono::DateTime<Utc>,
     ) -> Result<(), QueueError> {
         if self.fail_cooldown_writes.load(Ordering::SeqCst) {
-            return Err(QueueError::Unavailable("cooldown store down".to_string()));
+            return Err(QueueError::Unavailable(
+                symbiotic_core::DiagnosticCode::HttpUnavailable,
+            ));
         }
         self.inner.note_cooldown(queue_id, until).await
     }
@@ -1125,7 +1139,9 @@ async fn an_abandoned_call_that_fails_records_its_class_and_releases_its_lease(
 ) {
     let raw = Loopback::new(unique_identity())
         .slow(Duration::from_millis(1_500))
-        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+        .failing_first(vec![ModelError::Unavailable(
+            symbiotic_core::DiagnosticCode::HttpUnavailable,
+        )]);
     let receipts = Arc::new(InMemoryReceiptSink::default());
     let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
 
@@ -1187,7 +1203,9 @@ impl ResponseCache for FullCache {
     }
 
     fn store(&self, _entry: &CacheEntry<'_>, _response: &Value) -> Result<(), ModelError> {
-        Err(ModelError::Cache("disk full".to_string()))
+        Err(ModelError::Cache(
+            symbiotic_core::DiagnosticCode::CacheFailure,
+        ))
     }
 }
 
@@ -1323,7 +1341,7 @@ impl symbiotic_trace::TraceSink for BrokenTrace {
         _trace: ModelInvocationTrace,
     ) -> Result<(), symbiotic_trace::TraceError> {
         Err(symbiotic_trace::TraceError::Sink(
-            "trace store down".to_string(),
+            symbiotic_core::DiagnosticCode::StorageFailure,
         ))
     }
 }
@@ -1416,7 +1434,9 @@ async fn a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded(
 ) {
     let raw = Loopback::new(unique_identity())
         .slow(Duration::from_millis(100))
-        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+        .failing_first(vec![ModelError::Unavailable(
+            symbiotic_core::DiagnosticCode::HttpUnavailable,
+        )]);
     let queue_id = raw.descriptor.queue_id();
     let receipts = Arc::new(SlowFirstFailureReceipt {
         receipts: InMemoryReceiptSink::default(),
@@ -1456,7 +1476,7 @@ async fn a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded(
     );
     assert_eq!(
         item.last_error.as_deref(),
-        Some("provider unavailable: provider down"),
+        Some("HTTP unavailable"),
         "{backend}: the provider's failure, not an expired lease"
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
@@ -1554,7 +1574,9 @@ async fn failed_cooldown_is_terminal(
     queue.fail_cooldown_writes.store(true, Ordering::SeqCst);
     let raw = Loopback::new(unique_identity())
         .slow(Duration::from_millis(100))
-        .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
+        .failing_first(vec![ModelError::Unavailable(
+            symbiotic_core::DiagnosticCode::HttpUnavailable,
+        )]);
     let receipts = Arc::new(InMemoryReceiptSink::default());
     let provider = queued(
         raw.clone(),
@@ -1788,13 +1810,14 @@ fn succeeded_receipts(receipts: &InMemoryReceiptSink) -> Vec<symbiotic_model::Qu
 }
 
 async fn a_failed_trace_write_keeps_the_providers_error(backend: &str, queue: Arc<CountsRenewals>) {
-    let raw = Loopback::new(unique_identity())
-        .failing_first(vec![ModelError::Provider("unparsable answer".to_string())]);
+    let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
     let provider = queued(raw.clone(), queue, leased()).with_trace_sink(Arc::new(BrokenTrace));
 
     let err = provider.chat(request("rejected")).await.unwrap_err();
     assert!(
-        err.to_string().contains("unparsable answer"),
+        err.to_string().contains("provider failure"),
         "{backend}: the provider's error, not the trace store's: {err}"
     );
 }
@@ -1894,7 +1917,9 @@ async fn a_retryable_errors_backoff_spends_no_rate_budget(
 ) {
     let raw = Loopback::new(unique_identity())
         .slow(Duration::from_millis(20))
-        .failing_first(vec![ModelError::Provider("unparsable answer".to_string())]);
+        .failing_first(vec![ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        )]);
     // Three requests of budget: the failed attempt, its retry and one more.
     let provider = queued(
         raw.clone(),

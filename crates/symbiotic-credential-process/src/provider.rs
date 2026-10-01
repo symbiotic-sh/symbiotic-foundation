@@ -370,7 +370,7 @@ mod tests {
             _: ModelInvocationTrace,
         ) -> Result<(), symbiotic_trace::TraceError> {
             Err(symbiotic_trace::TraceError::Sink(
-                "private sink detail".into(),
+                model::DiagnosticCode::StorageFailure,
             ))
         }
     }
@@ -406,7 +406,7 @@ mod tests {
                 .trace
                 .metadata
                 .to_string()
-                .contains("private sink detail")
+                .contains("storage_failure")
         );
         // Extra metadata and unknown diagnostic kinds must not cross this boundary.
         response.trace.metadata[RUNTIME_DIAGNOSTICS]

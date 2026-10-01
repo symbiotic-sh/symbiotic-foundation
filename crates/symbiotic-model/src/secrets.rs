@@ -73,24 +73,6 @@ impl CredentialBoundary {
     }
 }
 
-/// Preserve useful error classes without retaining provider-controlled bytes.
-pub(crate) fn safe_error(error: crate::ModelError) -> crate::ModelError {
-    use crate::ModelError;
-    let safe = "credential-bearing provider failure".to_owned();
-    match error {
-        ModelError::Auth(_) => ModelError::Auth(safe),
-        ModelError::RateLimited(_) => ModelError::RateLimited(safe),
-        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(safe),
-        ModelError::Timeout(_) => ModelError::Timeout(safe),
-        ModelError::Unavailable(_) => ModelError::Unavailable(safe),
-        ModelError::InvalidRequest(_) => ModelError::InvalidRequest(safe),
-        ModelError::Queue(_) => ModelError::Queue(safe),
-        ModelError::Cache(_) => ModelError::Cache(safe),
-        ModelError::Unsupported(capability) => ModelError::Unsupported(capability),
-        ModelError::Provider(_) => ModelError::Provider(safe),
-    }
-}
-
 fn numeric_spellings(number: &serde_json::Number) -> Vec<String> {
     let mut spellings = vec![number.to_string()];
     if let Some(value) = number.as_f64() {
@@ -115,10 +97,9 @@ fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate:
     if let Ok(serde_json::Value::Number(number)) = serde_json::from_str(secret) {
         encodings.extend(numeric_spellings(&number));
     }
-    let escaped = SecretValue::new(
-        serde_json::to_string(secret)
-            .map_err(|_| crate::ModelError::Provider("invalid credential encoding".into()))?,
-    );
+    let escaped = SecretValue::new(serde_json::to_string(secret).map_err(|_| {
+        crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidCredentialEncoding)
+    })?);
     encodings.push(escaped[1..escaped.len() - 1].to_owned());
     for all in [false, true] {
         for upper in [false, true] {
@@ -174,11 +155,12 @@ pub(crate) fn check_response(
         return Ok(());
     }
     let encodings = credential_encodings(secret)?;
-    let wire = serde_json::to_string(value)
-        .map_err(|_| crate::ModelError::Provider("invalid provider response".into()))?;
+    let wire = serde_json::to_string(value).map_err(|_| {
+        crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidProviderResponse)
+    })?;
     if contains(value, &encodings) || contains_text(&wire, &encodings) {
         return Err(crate::ModelError::Provider(
-            "credential-bearing provider response refused".into(),
+            symbiotic_core::DiagnosticCode::CredentialBearingProviderResponseRefused,
         ));
     }
     Ok(())
@@ -198,19 +180,21 @@ pub(crate) fn composed_result<T: serde::Serialize + serde::de::DeserializeOwned>
             )
         {
             return Err(crate::ModelError::Provider(
-                "credential result boundary is unavailable".into(),
+                symbiotic_core::DiagnosticCode::CredentialResultBoundaryIsUnavailable,
             ));
         }
         return result;
     };
     let result = result.and_then(|response| {
-        serde_json::to_value(response)
-            .map_err(|_| crate::ModelError::Provider("invalid adapter response".into()))
+        serde_json::to_value(response).map_err(|_| {
+            crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidAdapterResponse)
+        })
     });
     let value = credential_boundary(result, boundary)?;
     // Decode only Foundation's own typed serialization after the boundary.
-    serde_json::from_value(value)
-        .map_err(|_| crate::ModelError::Provider("invalid adapter response".into()))
+    serde_json::from_value(value).map_err(|_| {
+        crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidAdapterResponse)
+    })
 }
 
 /// Responses crossing the credential boundary must surrender raw provider JSON.
@@ -255,9 +239,10 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
     if secret.is_empty() {
         return result;
     }
-    let mut response = result.map_err(safe_error)?;
-    let value = serde_json::to_value(&response)
-        .map_err(|_| safe_error(crate::ModelError::Provider(String::new())))?;
+    let mut response = result?;
+    let value = serde_json::to_value(&response).map_err(|_| {
+        crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidResponse)
+    })?;
     check_response(&value, secret)?;
     response.discard_raw();
     Ok(response)
@@ -294,15 +279,6 @@ mod tests {
         assert!(check_response(&raw, "123400000").is_err());
         let normalized: f32 = serde_json::from_value(raw).unwrap();
         assert!(check_response(&serde_json::json!([normalized]), "123400000").is_err());
-    }
-    #[test]
-    fn invalid_embedding_error_is_sanitized_as_provider_failure() {
-        let error = safe_error(crate::ModelError::Provider(
-            "private embedding detail".into(),
-        ));
-        assert!(
-            matches!(error, crate::ModelError::Provider(message) if message == "credential-bearing provider failure")
-        );
     }
     #[test]
     fn secret_clones_are_owned_zeroizing_containers() {

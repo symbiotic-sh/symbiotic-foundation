@@ -31,8 +31,9 @@ pub(crate) fn encode(
         bytes: Vec::new(),
         max_bytes: max_bytes.unwrap_or(usize::MAX),
     };
-    serde_json::to_writer(&mut body, value)
-        .map_err(|_| ModelError::InvalidRequest("provider request limit exceeded".into()))?;
+    serde_json::to_writer(&mut body, value).map_err(|_| {
+        ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded)
+    })?;
     Ok(body.bytes)
 }
 
@@ -114,12 +115,12 @@ pub fn validate_gemini_options(
             .is_some_and(|requested| requested != dimensions)
     {
         return Err(ModelError::InvalidRequest(
-            "Gemini request dimensions differ from configured binding".into(),
+            symbiotic_core::DiagnosticCode::GeminiRequestDimensionsDifferFromConfiguredBinding,
         ));
     }
     if request.task.is_some() {
         return Err(ModelError::InvalidRequest(
-            "Gemini task option is unsupported".into(),
+            symbiotic_core::DiagnosticCode::GeminiTaskOptionIsUnsupported,
         ));
     }
     Ok(())

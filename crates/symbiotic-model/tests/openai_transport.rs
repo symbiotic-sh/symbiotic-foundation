@@ -248,9 +248,12 @@ async fn configured_response_limit_refuses_oversized_body() {
         .chat(request())
         .await;
     server.join().unwrap();
-    assert!(
-        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "credential-bearing provider failure")
-    );
+    assert!(matches!(
+        result,
+        Err(symbiotic_model::ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded
+        ))
+    ));
 }
 
 #[tokio::test]
@@ -264,9 +267,12 @@ async fn configured_request_limit_refuses_wire_body_before_connecting() {
         .with_request_limit(1)
         .chat(request())
         .await;
-    assert!(
-        matches!(result, Err(symbiotic_model::ModelError::InvalidRequest(message)) if message == "credential-bearing provider failure")
-    );
+    assert!(matches!(
+        result,
+        Err(symbiotic_model::ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded
+        ))
+    ));
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -317,9 +323,12 @@ async fn chunked_response_is_capped_without_content_length() {
         .chat(request())
         .await;
     server.join().unwrap();
-    assert!(
-        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "credential-bearing provider failure")
-    );
+    assert!(matches!(
+        result,
+        Err(symbiotic_model::ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded
+        ))
+    ));
 }
 #[tokio::test]
 async fn output_token_limits_refuse_oversized_or_unbounded_requests_before_connecting() {

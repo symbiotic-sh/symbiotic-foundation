@@ -209,12 +209,8 @@ async fn jev_refuses_invalid_utf8_in_a_success_body() {
         stop.store(true, Ordering::Release);
         assert_eq!(server.join().unwrap(), 1);
         let error = result.expect_err("invalid UTF-8 must not become a successful classification");
-        let expected = if secret.is_empty() {
-            "provider response is not valid UTF-8"
-        } else {
-            "credential-bearing provider failure"
-        };
-        assert!(matches!(error, ModelError::Provider(message) if message == expected));
+        let expected = "provider response is not valid UTF-8";
+        assert!(matches!(error, ModelError::Provider(message) if message.as_str() == expected));
     }
 }
 
@@ -259,13 +255,9 @@ async fn built_in_clients_refuse_redirects_without_contacting_the_target() {
                     stop.store(true, Ordering::Release);
                     assert_eq!(server.join().unwrap(), 1);
                     let result = result.expect("provider redirect refusal must finish promptly");
-                    let expected = if secret.is_empty() {
-                        "provider redirect refused"
-                    } else {
-                        "credential-bearing provider failure"
-                    };
+                    let expected = "provider redirect refused";
                     assert!(
-                        matches!(result, Err(ModelError::Provider(message)) if message == expected)
+                        matches!(result, Err(ModelError::Provider(message)) if message.as_str() == expected)
                     );
                     assert_eq!(
                         target.accept().unwrap_err().kind(),

@@ -94,7 +94,9 @@ impl Loopback {
     }
 
     fn unavailable(self) -> Self {
-        self.failing(ModelError::Unavailable("loopback is down".to_string()))
+        self.failing(ModelError::Unavailable(
+            symbiotic_core::DiagnosticCode::HttpUnavailable,
+        ))
     }
 
     fn failing(mut self, err: ModelError) -> Self {
@@ -118,11 +120,7 @@ impl ChatProvider for Loopback {
         tokio::time::sleep(self.delay).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         if let Some(err) = &self.fail {
-            return Err(match err.as_ref() {
-                ModelError::Unavailable(message) => ModelError::Unavailable(message.clone()),
-                ModelError::Provider(message) => ModelError::Provider(message.clone()),
-                other => ModelError::Provider(other.to_string()),
-            });
+            return Err(*err.as_ref());
         }
         Ok(ChatResponse {
             text: format!(
@@ -451,8 +449,9 @@ async fn pooled_models_keep_separate_budgets_for_the_same_request() {
 #[tokio::test]
 async fn an_exhausted_error_keeps_its_class_after_a_restart() {
     let dir = private_tempdir();
-    let broken =
-        Loopback::new(unique_identity()).failing(ModelError::Provider("bad json".to_string()));
+    let broken = Loopback::new(unique_identity()).failing(ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    ));
     let binding = || {
         binding(broken.clone())
             .with_policy(ModelQueueConfig {
@@ -642,7 +641,7 @@ async fn an_existing_state_dir_open_to_others_is_refused() {
     })
     .err()
     .expect("a 0755 state directory is refused");
-    assert!(err.to_string().contains("group or others"), "{err}");
+    assert!(matches!(err, ModelError::Queue(_)));
 }
 
 #[cfg(unix)]
@@ -659,7 +658,7 @@ async fn a_symlinked_state_dir_is_refused() {
     })
     .err()
     .expect("a symlinked state directory is refused");
-    assert!(err.to_string().contains("symlink"), "{err}");
+    assert!(matches!(err, ModelError::Queue(_)));
 }
 
 #[cfg(unix)]
@@ -678,7 +677,7 @@ async fn a_symlinked_cache_dir_is_refused() {
     })
     .err()
     .expect("a symlinked response cache is refused");
-    assert!(err.to_string().contains("symlink"), "{err}");
+    assert!(matches!(err, ModelError::Queue(_)));
 }
 
 #[cfg(unix)]
@@ -1412,7 +1411,7 @@ fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
         .unwrap();
     assert!(
         matches!(runtime.chat(binding), Err(ModelError::InvalidRequest(message))
-        if message == "effective transport differs from configured binding")
+        if message.as_str() == "effective transport differs from configured binding")
     );
     let binding = runtime
         .registry_binding(&tenant, &principal, raw("http://127.0.0.1:9/v1"))
@@ -1549,7 +1548,9 @@ async fn injected_credential_results_without_a_boundary_are_refused_before_bookk
     impl ChatProvider for Unprotected {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
             if self.fail {
-                return Err(ModelError::Auth(format!("invalid key {KEY}")));
+                return Err(ModelError::Auth(
+                    symbiotic_core::DiagnosticCode::AuthenticationRejected,
+                ));
             }
             let mut response = self.inner.chat(request).await?;
             response.text = KEY.into();
@@ -1602,9 +1603,7 @@ async fn injected_credential_results_without_a_boundary_are_refused_before_bookk
             };
             let provider = runtime.chat(binding).unwrap();
             let error = provider.chat(request("ordinary prompt")).await.unwrap_err();
-            assert!(
-                matches!(error, ModelError::Provider(ref text) if text == "credential result boundary is unavailable")
-            );
+            assert!(matches!(error, ModelError::Provider(_)));
             for text in [
                 error.to_string(),
                 serde_json::to_string(&receipts.receipts()).unwrap(),
@@ -1625,5 +1624,111 @@ async fn injected_credential_results_without_a_boundary_are_refused_before_bookk
                 }
             }
         }
+    }
+}
+
+#[test]
+fn credential_adapter_validation_errors_have_no_text_payload() {
+    use symbiotic_ai_runtime::model::{CredentialBoundary, OpenAiCompatibleChatProvider};
+    use symbiotic_core::DiagnosticCode;
+    const KEY: &str = "synthetic-validation-key-741";
+    #[derive(Clone)]
+    struct InvalidAdapter(OpenAiCompatibleChatProvider);
+    impl ModelProvider for InvalidAdapter {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            self.0.descriptor()
+        }
+        fn credential_fingerprint(&self) -> Option<String> {
+            self.0.credential_fingerprint()
+        }
+        fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+            self.0.credential_boundary()
+        }
+        fn validate_configuration(&self) -> Result<(), ModelError> {
+            // The associated compile-fail test proves this cannot contain KEY.
+            Err(ModelError::Auth(DiagnosticCode::AuthenticationRejected))
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for InvalidAdapter {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse, ModelError> {
+            panic!("invalid configuration must refuse before dispatch")
+        }
+    }
+    let adapter = InvalidAdapter(OpenAiCompatibleChatProvider::new(
+        "fixture",
+        "fixture",
+        "http://localhost",
+        KEY,
+    ));
+    let result = Runtime::in_memory().chat(binding(adapter).with_policy(policy()));
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("invalid configuration was accepted"),
+    };
+    assert!(matches!(
+        error,
+        ModelError::Auth(DiagnosticCode::AuthenticationRejected)
+    ));
+    assert!(!format!("{error:?} {error}").contains(KEY));
+}
+
+#[tokio::test]
+async fn restored_stopped_and_exhausted_dead_items_cannot_surface_stored_text() {
+    const KEY: &str = "synthetic-stored-provider-key-741";
+    for stopped in [true, false] {
+        let dir = private_tempdir();
+        let failure = if stopped {
+            ModelError::Auth(symbiotic_core::DiagnosticCode::AuthenticationRejected)
+        } else {
+            ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable)
+        };
+        let broken = Loopback::new(unique_identity()).failing(failure);
+        let bind = || {
+            binding(broken.clone())
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off)
+        };
+        let runtime = persistent(dir.path());
+        let provider = runtime.chat(bind()).unwrap();
+        let first = provider.chat(request("restored")).await.unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&first),
+            std::mem::discriminant(&failure)
+        );
+        drop(provider);
+        drop(runtime);
+        let database = dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let conn = rusqlite::Connection::open(database).unwrap();
+        let status: String = conn
+            .query_row("select status from queue_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, if stopped { "stopped" } else { "dead" });
+        let restored = persistent(dir.path())
+            .chat(bind())
+            .unwrap()
+            .chat(request("restored"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&restored),
+            std::mem::discriminant(&failure)
+        );
+        assert!(!format!("{restored:?} {restored}").contains(KEY));
+        if !stopped {
+            assert_eq!(
+                restored.code(),
+                symbiotic_core::DiagnosticCode::AttemptBudgetExhausted
+            );
+        }
+        // Corrupt current state: decoding must reject unknown codes without repeating the bytes.
+        conn.execute("update queue_items set last_error = ?1", [KEY])
+            .unwrap();
+        drop(conn);
+        let provider = persistent(dir.path()).chat(bind()).unwrap();
+        let restored = provider.chat(request("restored")).await.unwrap_err();
+        assert!(matches!(restored, ModelError::Queue(_)), "{restored:?}");
+        assert!(!format!("{restored:?} {restored}").contains(KEY));
+        assert_eq!(broken.calls.load(Ordering::SeqCst), 1);
     }
 }

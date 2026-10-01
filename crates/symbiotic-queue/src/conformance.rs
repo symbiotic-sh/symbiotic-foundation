@@ -308,7 +308,12 @@ pub async fn lease_owner_and_running_state_are_enforced(queue: Arc<dyn QueueBack
     let err = queue.complete(&item.item_id, "other").await.unwrap_err();
     assert!(matches!(err, QueueError::LeaseMismatch(_)), "{err:?}");
     let err = queue
-        .fail(&item.item_id, "other", "boom", Some(0))
+        .fail(
+            &item.item_id,
+            "other",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, QueueError::LeaseMismatch(_)), "{err:?}");
@@ -346,13 +351,18 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
     let item = queue.enqueue(request("retry")).await.unwrap().item;
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     let outcome = queue
-        .fail(&item.item_id, "worker", "temporary", Some(0))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(failed.status, QueueStatus::Failed);
-    assert_eq!(failed.last_error.as_deref(), Some("temporary"));
+    assert_eq!(failed.last_error.as_deref(), Some("queue failure"));
     assert!(failed.lease_owner.is_none() && failed.lease_until.is_none());
     // A failed item is still active for deduplication.
     let duplicate = queue.enqueue(request("retry")).await.unwrap();
@@ -360,21 +370,31 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
 
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     let outcome = queue
-        .fail(&item.item_id, "worker", "still failing", Some(0))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, FailOutcome::MovedToDead);
     let dead = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(dead.status, QueueStatus::Dead);
     assert_eq!(dead.attempt, 2);
-    assert_eq!(dead.last_error.as_deref(), Some("still failing"));
+    assert_eq!(dead.last_error.as_deref(), Some("queue failure"));
     let terminal = queue.enqueue(request("retry")).await.unwrap();
     assert_eq!(terminal.disposition, EnqueueDisposition::TerminalDuplicate);
 
     let recovered = queue.enqueue(request("recovered")).await.unwrap().item;
     claim_one(queue.as_ref(), &recovered.item_id, 60).await;
     queue
-        .fail(&recovered.item_id, "worker", "blip", Some(0))
+        .fail(
+            &recovered.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     claim_one(queue.as_ref(), &recovered.item_id, 60).await;
@@ -389,7 +409,12 @@ pub async fn fail_schedules_the_retry_delay(queue: Arc<dyn QueueBackend>) {
     let item = queue.enqueue(request("delayed")).await.unwrap().item;
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     queue
-        .fail(&item.item_id, "worker", "slow down", Some(3_600))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(3_600),
+        )
         .await
         .unwrap();
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
@@ -510,8 +535,8 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
             &item.item_id,
             "worker",
             Failure {
-                error: "slow down".to_string(),
-                error_class: Some("rate_limited".to_string()),
+                error: symbiotic_core::DiagnosticCode::QueueFailure,
+                error_class: Some(symbiotic_core::FailureClass::RateLimited),
                 run_after: Some(deadline),
             },
         )
@@ -519,7 +544,7 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
         .unwrap();
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
-    assert_eq!(failed.last_error.as_deref(), Some("slow down"));
+    assert_eq!(failed.last_error.as_deref(), Some("queue failure"));
     assert_eq!(failed.last_error_class.as_deref(), Some("rate_limited"));
     assert!(
         (failed.run_after - deadline).num_milliseconds().abs() < 5,
@@ -610,8 +635,8 @@ pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
             &item.item_id,
             "worker",
             Failure {
-                error: "limiter unavailable".into(),
-                error_class: Some("queue".into()),
+                error: symbiotic_core::DiagnosticCode::QueueFailure,
+                error_class: Some(symbiotic_core::FailureClass::Queue),
                 run_after: None,
             },
         )

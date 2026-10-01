@@ -82,12 +82,12 @@ pub struct QueueItem {
     pub lease_owner: Option<String>,
     pub lease_until: Option<DateTime<Utc>>,
     pub idempotency_key: Option<String>,
-    pub last_error: Option<String>,
+    pub last_error: Option<symbiotic_core::DiagnosticCode>,
     /// Stable class of `last_error` (for example `rate_limited`), recorded
     /// by [`QueueBackend::fail_with`]; `None` for failures recorded without
     /// one.
     #[serde(default)]
-    pub last_error_class: Option<String>,
+    pub last_error_class: Option<symbiotic_core::FailureClass>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -110,15 +110,21 @@ pub struct QueueEvent {
     pub status: QueueStatus,
     pub attempt: u32,
     pub timestamp: DateTime<Utc>,
-    pub error: Option<String>,
+    pub error: Option<symbiotic_core::DiagnosticCode>,
 }
 
 /// A failed attempt as [`QueueBackend::fail_with`] records it.
+/// Provider or stored text cannot be attached to durable failure records.
+/// ```compile_fail
+/// use symbiotic_queue::Failure;
+/// let key = "synthetic-queue-key";
+/// let failure = Failure { error: format!("invalid key {key}"), error_class: None, run_after: None };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
-    pub error: String,
+    pub error: symbiotic_core::DiagnosticCode,
     /// Stable class of the error, kept on the item as `last_error_class`.
-    pub error_class: Option<String>,
+    pub error_class: Option<symbiotic_core::FailureClass>,
     /// Earliest time of the next attempt. `None` stops the item permanently.
     pub run_after: Option<DateTime<Utc>>,
 }
@@ -135,17 +141,31 @@ pub enum FailOutcome {
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error("queue item not found: {0}")]
-    NotFound(String),
+    NotFound(symbiotic_core::DiagnosticCode),
     #[error("queue item is not leased by worker: {0}")]
-    LeaseMismatch(String),
+    LeaseMismatch(symbiotic_core::DiagnosticCode),
     #[error("queue item is not running: {0}")]
-    NotRunning(String),
+    NotRunning(symbiotic_core::DiagnosticCode),
     #[error("queue backend unavailable: {0}")]
-    Unavailable(String),
+    Unavailable(symbiotic_core::DiagnosticCode),
     #[error("queue backend rejected request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(symbiotic_core::DiagnosticCode),
     #[error("queue storage failed: {0}")]
-    Storage(String),
+    Storage(symbiotic_core::DiagnosticCode),
+}
+
+impl QueueError {
+    /// Static diagnostic for logs and runtime bookkeeping.
+    pub const fn code(&self) -> symbiotic_core::DiagnosticCode {
+        match self {
+            Self::NotFound(code)
+            | Self::LeaseMismatch(code)
+            | Self::NotRunning(code)
+            | Self::Unavailable(code)
+            | Self::InvalidRequest(code)
+            | Self::Storage(code) => *code,
+        }
+    }
 }
 
 #[async_trait]
@@ -192,7 +212,7 @@ pub trait QueueBackend: Send + Sync {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError>;
     /// Record the error class and exact retry deadline. A failure without a

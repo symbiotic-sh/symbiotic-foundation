@@ -321,10 +321,9 @@ impl Runtime {
         principal: &symbiotic_core::ProviderPrincipalId,
         resolver: &dyn model::CredentialResolver,
     ) -> Result<ConfiguredProvider, ModelError> {
-        let registry =
-            self.inner.registry.as_ref().ok_or_else(|| {
-                ModelError::InvalidRequest("model registry is not configured".into())
-            })?;
+        let registry = self.inner.registry.as_ref().ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ModelRegistryIsNotConfigured)
+        })?;
         let resolved = registry.binding(tenant, principal)?;
         let config = resolved.binding;
         let auth_mode =
@@ -352,15 +351,13 @@ impl Runtime {
             }
             _ => {
                 return Err(ModelError::Auth(
-                    "configured credential mode is unsupported or empty".into(),
+                    symbiotic_core::DiagnosticCode::ConfiguredCredentialModeIsUnsupportedOrEmpty,
                 ));
             }
         };
-        let timeout_seconds = resolved
-            .account
-            .policy
-            .request_timeout_seconds
-            .ok_or_else(|| ModelError::InvalidRequest("finite timeout is required".into()))?;
+        let timeout_seconds = resolved.account.policy.request_timeout_seconds.ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::FiniteTimeoutIsRequired)
+        })?;
         let limits = &config.limits;
         let settings = &config.settings;
         match resolved.model.adapter {
@@ -374,8 +371,10 @@ impl Runtime {
                 .with_timeout(timeout_seconds)?
                 .with_request_limit(limits.max_request_bytes)
                 .with_response_limit(limits.max_response_bytes)
-                .with_output_limit(limits.max_output_tokens.ok_or_else(|| {
-                    ModelError::InvalidRequest("chat output limit required".into())
+                .with_output_limit(limits.max_output_tokens.ok_or({
+                    ModelError::InvalidRequest(
+                        symbiotic_core::DiagnosticCode::ChatOutputLimitRequired,
+                    )
                 })?)
                 .with_thinking(settings.thinking);
                 if let Some(effort) = &settings.reasoning_effort {
@@ -390,8 +389,10 @@ impl Runtime {
                     &resolved.model.identity.operator.0,
                     &resolved.model.identity.model.0,
                     key,
-                    settings.dimensions.ok_or_else(|| {
-                        ModelError::InvalidRequest("embedding dimensions required".into())
+                    settings.dimensions.ok_or({
+                        ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::EmbeddingDimensionsRequired,
+                        )
                     })?,
                 )
                 .with_timeout(timeout_seconds)?
@@ -428,10 +429,9 @@ impl Runtime {
         principal: &symbiotic_core::ProviderPrincipalId,
         provider: P,
     ) -> Result<ModelBinding<P>, ModelError> {
-        let registry =
-            self.inner.registry.as_ref().ok_or_else(|| {
-                ModelError::InvalidRequest("model registry is not configured".into())
-            })?;
+        let registry = self.inner.registry.as_ref().ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ModelRegistryIsNotConfigured)
+        })?;
         let resolved = registry.binding(tenant, principal)?;
         let mut binding =
             ModelBinding::new(provider).with_identity(resolved.binding.identity.clone());
@@ -520,12 +520,16 @@ impl Runtime {
             .identity
             .clone()
             .filter(BindingIdentity::is_valid)
-            .ok_or_else(|| ModelError::InvalidRequest("binding identity is required".into()))?;
+            .ok_or({
+                ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::BindingIdentityIsRequired,
+                )
+            })?;
         let account_scope = match &binding.account_sharing_key {
             Some(key) if !key.0.trim().is_empty() => serde_json::json!({"shared": key}),
             Some(_) => {
                 return Err(ModelError::InvalidRequest(
-                    "account sharing key is empty".into(),
+                    symbiotic_core::DiagnosticCode::AccountSharingKeyIsEmpty,
                 ));
             }
             None => serde_json::json!({"tenant": identity.tenant, "account": identity.account}),
@@ -540,12 +544,12 @@ impl Runtime {
                 || resolved.model.identity != descriptor.identity
             {
                 return Err(ModelError::InvalidRequest(
-                    "binding differs from configured identity/model".into(),
+                    symbiotic_core::DiagnosticCode::BindingDiffersFromConfiguredIdentityModel,
                 ));
             }
             if descriptor.capabilities != resolved.model.operations {
                 return Err(ModelError::InvalidRequest(
-                    "adapter capabilities differ from configured model".into(),
+                    symbiotic_core::DiagnosticCode::AdapterCapabilitiesDifferFromConfiguredModel,
                 ));
             }
             if descriptor
@@ -566,7 +570,7 @@ impl Runtime {
                         != resolved.binding.limits.max_output_tokens.map(u64::from))
             {
                 return Err(ModelError::InvalidRequest(
-                    "adapter bounds differ from configured binding".into(),
+                    symbiotic_core::DiagnosticCode::AdapterBoundsDifferFromConfiguredBinding,
                 ));
             }
             let settings = &resolved.binding.settings;
@@ -607,25 +611,24 @@ impl Runtime {
                 || binding.account_sharing_key != resolved.binding.account_sharing_key
             {
                 return Err(ModelError::InvalidRequest(
-                    "effective transport differs from configured binding".into(),
+                    symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding,
                 ));
             }
             if let Some(policy) = &binding.policy
-                && serde_json::to_value(policy)
-                    .map_err(|e| ModelError::InvalidRequest(e.to_string()))?
-                    != serde_json::to_value(&resolved.account.policy)
-                        .map_err(|e| ModelError::InvalidRequest(e.to_string()))?
+                && serde_json::to_value(policy).map_err(|_e| {
+                    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })? != serde_json::to_value(&resolved.account.policy).map_err(|_e| {
+                    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })?
             {
                 return Err(ModelError::InvalidRequest(
-                    "binding overrides configured account policy".into(),
+                    symbiotic_core::DiagnosticCode::BindingOverridesConfiguredAccountPolicy,
                 ));
             }
             resolved.account.policy.clone()
         } else {
-            binding.policy.clone().ok_or_else(|| {
-                ModelError::InvalidRequest(
-                    "binding requires an explicit execution policy or configured registry".into(),
-                )
+            binding.policy.clone().ok_or({
+                ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::BindingRequiresAnExplicitExecutionPolicyOrConfiguredRegistry)
             })?
         };
         policy.validate()?;
@@ -667,16 +670,13 @@ impl Runtime {
         policy: &ModelQueueConfig,
     ) -> Result<(), ModelError> {
         let limits = SharedLimits::of(policy);
-        let mut registered = self
-            .inner
-            .limits
-            .lock()
-            .map_err(|_| ModelError::Queue("runtime policy lock poisoned".to_string()))?;
+        let mut registered = self.inner.limits.lock().map_err(|_| {
+            ModelError::Queue(symbiotic_core::DiagnosticCode::RuntimePolicyLockPoisoned)
+        })?;
         match registered.get(&queue_id.0) {
-            Some(existing) if *existing != limits => Err(ModelError::InvalidRequest(format!(
-                "{} is already bound with limits {existing:?}; a binding asked for {limits:?}",
-                queue_id.0
-            ))),
+            Some(existing) if *existing != limits => Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            )),
             Some(_) => Ok(()),
             None => {
                 self.inner
@@ -758,7 +758,8 @@ fn open_persistent_queue(
             private_fs::ensure_owned_file(&sidecar).map_err(|err| io_error(&sidecar, err))?;
         }
     }
-    let queue = SqliteQueue::open(&path).map_err(|err| ModelError::Queue(err.to_string()))?;
+    let queue = SqliteQueue::open(&path)
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
     let queue = MaintainedQueue::new(
         queue,
         config.retention,
@@ -772,6 +773,6 @@ fn open_persistent_queue(
     Ok(queue)
 }
 
-fn io_error(path: &Path, err: std::io::Error) -> ModelError {
-    ModelError::Queue(format!("runtime state {}: {err}", path.display()))
+fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {
+    ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
 }

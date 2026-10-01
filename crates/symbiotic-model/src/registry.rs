@@ -147,8 +147,8 @@ pub struct RegistryBinding<'a> {
     /// Resolved account execution policy.
     pub account: &'a AccountExecutionPolicy,
 }
-fn invalid(message: &str) -> ModelError {
-    ModelError::InvalidRequest(format!("model registry: {message}"))
+fn invalid(_message: &str) -> ModelError {
+    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
 }
 fn nonempty(value: &str) -> bool {
     !value.trim().is_empty()

@@ -182,6 +182,5 @@ async fn chat_classifier_final_errors_and_normalized_answers_cross_the_same_boun
         server.join().unwrap();
         assert!(matches!(error, ModelError::Provider(_)));
         assert!(!error.to_string().contains(key));
-        assert!(error.to_string().contains("credential-bearing provider"));
     }
 }

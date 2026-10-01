@@ -216,16 +216,15 @@ impl ClassifyRequest {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.questions.is_empty() {
             return Err(ModelError::InvalidRequest(
-                "a classify request needs at least one question".to_string(),
+                symbiotic_core::DiagnosticCode::AClassifyRequestNeedsAtLeastOneQuestion,
             ));
         }
         let mut ids = std::collections::HashSet::new();
         for question in &self.questions {
             if question.id.is_empty() || !ids.insert(question.id.as_str()) {
-                return Err(ModelError::InvalidRequest(format!(
-                    "question id `{}` is empty or repeated",
-                    question.id
-                )));
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                ));
             }
             match &question.kind {
                 QuestionKind::Noul { .. } => {}
@@ -236,18 +235,16 @@ impl ClassifyRequest {
                             .iter()
                             .any(|option| option.id.is_empty() || !option_ids.insert(&option.id))
                     {
-                        return Err(ModelError::InvalidRequest(format!(
-                            "choice question `{}` needs unique, non-empty option ids",
-                            question.id
-                        )));
+                        return Err(ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                        ));
                     }
                 }
                 QuestionKind::Score { levels } => {
                     if levels.len() < 2 {
-                        return Err(ModelError::InvalidRequest(format!(
-                            "score question `{}` needs at least two levels",
-                            question.id
-                        )));
+                        return Err(ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                        ));
                     }
                 }
             }
@@ -496,7 +493,9 @@ impl BudgetedModelRequest for ClassifyRequest {
     fn input_budget_units(&self) -> Result<u64, ModelError> {
         let state = Value::Object(self.state.clone()).to_string();
         let questions = serde_json::to_string(&self.questions).map_err(|_| {
-            ModelError::InvalidRequest("classification questions cannot be encoded".into())
+            ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::ClassificationQuestionsCannotBeEncoded,
+            )
         })?;
         Ok(estimate_token_budget_units([
             state.as_str(),
@@ -607,13 +606,13 @@ where
 // Answer validation shared by the providers
 // ---------------------------------------------------------------------------
 
-fn check_probability(question: &str, key: &str, value: f64) -> Result<f64, ModelError> {
+fn check_probability(_question: &str, _key: &str, value: f64) -> Result<f64, ModelError> {
     if value.is_finite() && (-PROBABILITY_EPSILON..=1.0 + PROBABILITY_EPSILON).contains(&value) {
         Ok(value.clamp(0.0, 1.0))
     } else {
-        Err(ModelError::Provider(format!(
-            "question `{question}`: probability {key} = {value} is not within [0, 1]"
-        )))
+        Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ))
     }
 }
 
@@ -629,21 +628,18 @@ fn choice_probabilities(
 ) -> Result<Vec<OptionProbability>, ModelError> {
     let mut probabilities = Vec::with_capacity(options.len());
     for option in options {
-        let value = reported.remove(&option.id).ok_or_else(|| {
-            ModelError::Provider(format!(
-                "question `{question}`: no probability for option `{}`",
-                option.id
-            ))
-        })?;
+        let value = reported.remove(&option.id).ok_or(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ))?;
         probabilities.push(OptionProbability {
             id: option.id.clone(),
             probability: check_probability(question, &option.id, value)?,
         });
     }
-    if let Some(extra) = reported.keys().next() {
-        return Err(ModelError::Provider(format!(
-            "question `{question}`: `{extra}` is not one of the requested options"
-        )));
+    if let Some(_extra) = reported.keys().next() {
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ));
     }
     let values: Vec<f64> = probabilities
         .iter()
@@ -670,38 +666,36 @@ fn score_probabilities(
     let mut probabilities = Vec::with_capacity(level_count);
     for level in 0..level_count {
         let key = level.to_string();
-        let value = reported.remove(&key).ok_or_else(|| {
-            ModelError::Provider(format!(
-                "question `{question}`: no probability for level {key}"
-            ))
-        })?;
+        let value = reported.remove(&key).ok_or(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ))?;
         probabilities.push(check_probability(question, &key, value)?);
     }
-    if let Some(extra) = reported.keys().next() {
-        return Err(ModelError::Provider(format!(
-            "question `{question}`: `{extra}` is not one of the {level_count} levels"
-        )));
+    if let Some(_extra) = reported.keys().next() {
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ));
     }
     normalise_distribution(question, &probabilities, max_sum_error)
 }
 
 fn normalise_distribution(
-    question: &str,
+    _question: &str,
     values: &[f64],
     max_sum_error: Option<f64>,
 ) -> Result<Vec<f64>, ModelError> {
     let total: f64 = values.iter().sum();
     if total <= PROBABILITY_EPSILON {
-        return Err(ModelError::Provider(format!(
-            "question `{question}`: the probabilities are all zero"
-        )));
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ));
     }
     if let Some(max_error) = max_sum_error
         && (total - 1.0).abs() > max_error
     {
-        return Err(ModelError::Provider(format!(
-            "question `{question}`: the probabilities sum to {total}, not 1"
-        )));
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ));
     }
     Ok(values.iter().map(|value| value / total).collect())
 }
@@ -716,15 +710,13 @@ fn validate_answers(
     request: &ClassifyRequest,
     answers: &[ClassifierAnswer],
 ) -> Result<(), ModelError> {
-    let invalid = |question: &str, detail: &str| {
-        ModelError::Provider(format!("answer to `{question}` is invalid: {detail}"))
+    let invalid = |_question: &str, _detail: &str| {
+        ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
     };
     if answers.len() != request.questions.len() {
-        return Err(ModelError::Provider(format!(
-            "{} answers for {} questions",
-            answers.len(),
-            request.questions.len()
-        )));
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderFailure,
+        ));
     }
     let sums_to_one = |values: &mut dyn Iterator<Item = f64>| {
         (values.sum::<f64>() - 1.0).abs() <= PROBABILITY_EPSILON
@@ -934,7 +926,7 @@ impl JevClassifierProvider {
             ResolvedAuth::Bearer(key) | ResolvedAuth::ApiKey(key) if !key.trim().is_empty() => key,
             _ => {
                 return Err(ModelError::Auth(
-                    "System One needs a bearer API key".to_string(),
+                    symbiotic_core::DiagnosticCode::SystemOneNeedsABearerApiKey,
                 ));
             }
         };
@@ -965,7 +957,7 @@ impl JevClassifierProvider {
 
     fn check_limits(request: &ClassifyRequest) -> Result<(), ModelError> {
         for question in &request.questions {
-            let (count, max, what) = match &question.kind {
+            let (count, max, _what) = match &question.kind {
                 QuestionKind::Choice { options } => {
                     (options.len(), JEV_MAX_CHOICE_OPTIONS, "choice options")
                 }
@@ -975,10 +967,9 @@ impl JevClassifierProvider {
                 QuestionKind::Noul { .. } => continue,
             };
             if count > max {
-                return Err(ModelError::InvalidRequest(format!(
-                    "question `{}` has {count} {what}; the limit is {max}",
-                    question.id
-                )));
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                ));
             }
         }
         let tokens = |bytes: usize| bytes as u64;
@@ -988,7 +979,11 @@ impl JevClassifierProvider {
         for question in &request.questions {
             let question = tokens(
                 serde_json::to_vec(&WireQuestion(question))
-                    .map_err(|err| ModelError::InvalidRequest(err.to_string()))?
+                    .map_err(|_err| {
+                        ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                        )
+                    })?
                     .len(),
             );
             longest = longest.max(question);
@@ -996,15 +991,15 @@ impl JevClassifierProvider {
         }
         let pair = JEV_TEMPLATE_RESERVE_TOKENS + state + longest;
         if pair > JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS {
-            return Err(ModelError::InvalidRequest(format!(
-                "state plus longest question is about {pair} tokens; the limit is {JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS}"
-            )));
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         let total = JEV_TEMPLATE_RESERVE_TOKENS + state + all;
         if total > JEV_MAX_REQUEST_TOKENS {
-            return Err(ModelError::InvalidRequest(format!(
-                "request is about {total} tokens; the limit is {JEV_MAX_REQUEST_TOKENS}"
-            )));
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         Ok(())
     }
@@ -1023,8 +1018,9 @@ impl JevClassifierProvider {
         let mut parsed = Vec::with_capacity(request.questions.len());
         for question in &request.questions {
             let id = question.id.as_str();
-            let malformed =
-                |detail: &str| ModelError::Provider(format!("answer to `{id}`: {detail}"));
+            let malformed = |_detail: &str| {
+                ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+            };
             let answer = answers
                 .get(id)
                 .and_then(Value::as_object)
@@ -1107,13 +1103,13 @@ impl JevClassifierProvider {
                 value,
             });
         }
-        if let Some(extra) = answers
+        if let Some(_extra) = answers
             .keys()
             .find(|key| !request.questions.iter().any(|q| &q.id == *key))
         {
-            return Err(ModelError::Provider(format!(
-                "answer for unrequested question `{extra}`"
-            )));
+            return Err(ModelError::Provider(
+                symbiotic_core::DiagnosticCode::ProviderFailure,
+            ));
         }
         validate_answers(request, &parsed)?;
         Ok(parsed)
@@ -1171,8 +1167,8 @@ impl ClassifierProvider for JevClassifierProvider {
                 let (raw, text) =
                     provider_response_json(builder, self.max_response_bytes, ModelError::Provider)
                         .await?;
-                let unexpected = |detail: &str| {
-                    ModelError::Provider(format!("unexpected System One response: {detail}"))
+                let unexpected = |_detail: &str| {
+                    ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
                 };
                 let served_model = raw
                     .get("model")
@@ -1180,10 +1176,9 @@ impl ClassifierProvider for JevClassifierProvider {
                     .ok_or_else(|| unexpected("no model"))?
                     .to_string();
                 if served_model != self.served_model {
-                    return Err(ModelError::Provider(format!(
-                        "served model `{served_model}` is not the expected `{}`",
-                        self.served_model
-                    )));
+                    return Err(ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::ProviderFailure,
+                    ));
                 }
                 let answers = raw
                     .get("answers")
@@ -1410,9 +1405,8 @@ impl ChatClassifierProvider {
         request: &ClassifyRequest,
         reply: &str,
     ) -> Result<Vec<ClassifierAnswer>, ModelError> {
-        let malformed = |detail: String| {
-            ModelError::Provider(format!("classifier reply is malformed: {detail}"))
-        };
+        let malformed =
+            |_detail: String| ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure);
         let value: Value = serde_json::from_str(reply.trim())
             .map_err(|err| malformed(format!("not JSON ({err})")))?;
         let Value::Object(mut object) = value else {
@@ -1683,16 +1677,14 @@ impl ClassifierProvider for StaticClassifierProvider {
                 .iter()
                 .find(|answer| answer.question_id == question.id)
                 .ok_or_else(|| {
-                    ModelError::Provider(format!(
-                        "static classifier has no answer for `{}`",
-                        question.id
-                    ))
+                    ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
                 })?;
             answers.push(answer.clone());
         }
         validate_answers(&request, &answers)?;
-        let text =
-            serde_json::to_string(&answers).map_err(|err| ModelError::Provider(err.to_string()))?;
+        let text = serde_json::to_string(&answers).map_err(|_err| {
+            ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+        })?;
         Ok(ClassifyResponse {
             answers,
             served_model: self.descriptor.identity.model.0.clone(),
@@ -1853,7 +1845,7 @@ mod tests {
         provider.client = HttpClient(Err(()));
         assert!(matches!(
             provider.validate_configuration(),
-            Err(ModelError::InvalidRequest(message)) if message == "invalid HTTP client configuration"
+            Err(ModelError::InvalidRequest(message)) if message.as_str() == "invalid HTTP client configuration"
         ));
     }
 
@@ -2135,10 +2127,7 @@ mod tests {
             .classify(request(vec![route_question(), goal_question()]))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, ModelError::Provider(ref m) if m == "credential-bearing provider failure"),
-            "{err:?}"
-        );
+        assert!(matches!(err, ModelError::Provider(_)), "{err:?}");
         #[cfg(feature = "queue")]
         assert!(!is_retryable(&err, &ModelQueueConfig::default()));
 
@@ -2535,7 +2524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jev_success_and_error_bodies_use_the_shared_response_cap() {
+    async fn jev_bounds_success_bodies_and_classifies_error_status_without_body() {
         for status in [200, 429] {
             let server = mock_http(vec![(status, vec![], "x".repeat(4096))]);
             let provider = jev_at(&server).with_response_limit(1024);
@@ -2543,9 +2532,16 @@ mod tests {
                 .classify(request(vec![goal_question()]))
                 .await
                 .unwrap_err();
-            assert!(
-                matches!(error, ModelError::Provider(message) if message == "credential-bearing provider failure")
-            );
+            if status == 429 {
+                assert!(matches!(error, ModelError::RateLimited(_)));
+            } else {
+                assert!(matches!(
+                    error,
+                    ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded
+                    )
+                ));
+            }
         }
     }
     #[tokio::test]
@@ -2648,7 +2644,7 @@ mod tests {
         ] {
             let err = unreachable_jev().classify(request).await.unwrap_err();
             assert!(
-                matches!(err, ModelError::InvalidRequest(ref m) if m.contains(expected)),
+                matches!(err, ModelError::InvalidRequest(_)),
                 "{expected}: {err:?}"
             );
         }
@@ -2669,9 +2665,9 @@ mod tests {
                         secret_ref: "TYPESAFE_API_KEY".into()
                     }
                 );
-                self.0
-                    .clone()
-                    .ok_or_else(|| ModelError::Auth("missing".into()))
+                self.0.clone().ok_or_else(|| {
+                    ModelError::Auth(symbiotic_core::DiagnosticCode::AuthenticationRejected)
+                })
             }
         }
         let mode = ProviderAuthMode::ApiKey {
@@ -2984,7 +2980,9 @@ mod tests {
     impl ClassifierProvider for CountingClassifier {
         async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures {
-                return Err(ModelError::Unavailable("overloaded".into()));
+                return Err(ModelError::Unavailable(
+                    symbiotic_core::DiagnosticCode::HttpUnavailable,
+                ));
             }
             self.inner.classify(request).await
         }

@@ -78,7 +78,9 @@ Credential-process deployment routes compile into this same validated registry;
 they retain their existing permit protocol and single-attempt policy.
 
 Every supported HTTP adapter requires finite nonzero encoded request and response
-byte limits, including error responses and chunked bodies. Chat also requires a
+byte limits for success bodies, including chunked bodies. Non-success HTTP bodies
+are discarded without decoding or retaining their bytes; the status determines the
+error class, including for invalid UTF-8 bodies. Chat also requires a
 finite output-token bound; requests above a configured bound are refused. Gemini
 requires the exact configured dimension for every returned vector. Its adapter
 refuses task options and conflicting per-request dimensions before dispatch.
@@ -90,6 +92,15 @@ Without a registry, raw Foundation bindings require an explicit execution policy
 must configure accounts rather than infer limits from a model/operator name.
 Sensitivity remains a typed request/trace field pending protocol cleanup, but has
 no selection, cache or dispatch authority. Memory owns provider grants.
+
+## Errors and credential boundary
+
+`ModelError`, `QueueError` and `TraceError` carry closed `DiagnosticCode` values
+(or a typed unsupported capability), never free-form strings. Adapter validation,
+provider decoding, cache, storage and restored failures cannot attach provider or
+credential text to an error. Diagnostics and logs retain static codes only. The
+credential owner still checks successful raw and normalized outputs before results
+reach runtime bookkeeping, and discards raw provider JSON.
 
 ## Persistence
 
@@ -105,8 +116,8 @@ so the state directory and everything in it are owner-only:
 - A missing `state_dir` is created `0700`, with any missing parents.
 - An existing `state_dir` must be a directory owned by the current user,
   not a symlink, and closed to group and others. Otherwise `Runtime::open`
-  fails with a message naming the path, for example
-  `is open to group or others; make it owner-only (chmod 700)`.
+  fails with a static queue diagnostic. State paths and underlying filesystem
+  error text are never copied into runtime errors.
 - Inside it, the runtime creates directories `0700` and files `0600`: the
   database (SQLite gives its journal files the database's mode) and cache
   entries, written through a temporary file and a rename.
@@ -284,9 +295,9 @@ paths and remain implementation work.
   `min(retry_attempts, logical_retry_attempts)` attempts, so
   `logical_retry_attempts = 1` makes exactly one provider call. When the
   budget runs out, the error keeps the class of the last failure and says
-  `exhausted after n/m`. The class is stored on the queue item
-  (`last_error_class`), so a later call or a restarted runtime reports the
-  same class.
+  `attempt budget exhausted`. Queue items store only a typed diagnostic code
+  (`last_error`) and typed class (`last_error_class`), so a later call or a
+  restarted runtime rebuilds the same class without stored text.
 - A lease that expires on an item's last allowed attempt, for example
   because the process crashed mid-call, ends the item as dead. A restarted
   runtime does not make another paid attempt from that item. On a non-final
@@ -327,8 +338,8 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 These usage receipts support telemetry and cost reporting. They are not the
 canonical spend ledger or an enforceable monetary reservation. Accounting ownership
 and budget guarantees are specified in
-[boundary.md](boundary.md#spend-ledger-and-budgets). `QueueReceipt::redacted`
-replaces error text for logs that must not keep response bodies.
+[boundary.md](boundary.md#spend-ledger-and-budgets). Receipt errors carry only
+static diagnostic codes; they cannot contain provider response text.
 
 ## Current post-provider writes
 
@@ -393,8 +404,10 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-a queue file missing `last_error_class` is refused without migration. Terminal
-items without a recorded error class return a queue error, without inferring a
+queue files require schema version 2 and the current queue table layouts.
+Other layouts are refused without migration. Unknown stored failure codes/classes
+are refused with a static error. Terminal items without a recorded error class
+return a queue error, without inferring a
 class from provider text.
 
 ## Lower-level types

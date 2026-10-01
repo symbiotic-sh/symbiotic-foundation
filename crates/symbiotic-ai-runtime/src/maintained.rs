@@ -16,7 +16,7 @@ use symbiotic_queue_sqlite::SqliteQueue;
 /// Finished calls between two sweeps.
 const SWEEP_EVERY: u64 = 10_000;
 
-const ORPHANED: &str = "abandoned: no caller resumed this call within the runtime's retention";
+const ORPHANED: symbiotic_core::DiagnosticCode = symbiotic_core::DiagnosticCode::StaleQueueItem;
 
 /// How long and how much of the response cache the sweep keeps.
 pub(crate) struct ResponseRetention {
@@ -48,7 +48,7 @@ impl Sweep {
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
             .and_then(|_| self.queue.prune_terminal_before(cutoff))
-            .map_err(|err| ModelError::Queue(err.to_string()))?;
+            .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
         self.responses
             .cache
             .prune(self.responses.max_age, self.responses.max_bytes)?;
@@ -152,7 +152,7 @@ impl QueueBackend for MaintainedQueue {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         let result = self
