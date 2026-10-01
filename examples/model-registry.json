@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "models": [{
+    "id": "example-chat",
+    "aliases": ["example-chat-alias"],
+    "identity": {"operation": "chat", "operator": "example", "model": "example-model"},
+    "adapter": "open_ai_chat",
+    "operations": ["chat"],
+    "capabilities": {"context_window": 8192, "structured_output": true},
+    "pricing_provenance": null
+  }],
+  "bindings": [],
+  "accounts": []
+}

@@ -111,11 +111,9 @@ classifier, exact response cache, queue-bound chat/embedding/rerank/classifier
 wrappers, and retry classification. Codex CLI/session and optional `genai` adapters are still
 migration targets. The public contract remains ours.
 
-`ProviderCatalog::select` still filters by `SelectionRequest.sensitivity` and
-provider class, and `ChatClassifierProvider`'s Rust documentation still describes
-sensitivity routing. These are obsolete implementation/API documentation gaps
-pending removal; authorization follows
-[provider-principal data access](architecture/boundary.md#tenant-provider-bindings-and-data-access).
+`ModelRegistry` validates one JSON configuration of model entries, tenant/provider
+bindings and account policies. Provider classes confer no data authority;
+[Memory authorizes provider principals](architecture/boundary.md#tenant-provider-bindings-and-data-access).
 
 The queue-bound wrappers (`QueuedChatProvider`, `QueuedEmbeddingProvider`,
 `QueuedRerankProvider`, `QueuedClassifierProvider`) are the default `queue`
@@ -127,20 +125,11 @@ duplicate Foundation scheduling. Neither configuration links SQLite.
 Hosts get queued providers from `symbiotic-ai-runtime` (below). Using the
 `Queued*` types directly is unsupported outside Foundation.
 
-Known-model execution defaults live in `default_model_queue_config`. The current
-DeepSeek `deepseek-flash` name and retained `deepseek-v4-flash` name resolve the
-same existing 2,000-request queue policy. This is a configured limit, not a
-capacity measurement; execution bindings supply explicit overrides. DeepSeek's
-[published account limit](https://api-docs.deepseek.com/quick_start/rate_limit/)
-was 2,500 for Flash when checked on September 17, 2026. Request scheduling and
-enforcement belong to Foundation execution bindings.
-
-`classify:typesafe:jev-1.13.0` is catalogued with TypeSafe's account limits
-(1,200 requests/min, 250,000 tokens/s) and, in `default_model_capabilities`,
-an advisory `ModelPricing` of $0.042 per million input tokens with free output.
-`ModelCapabilities::pricing` is additive (serde default `None`); it supports
-estimates, and provider-reported cost stays in trace metadata. Canonical spend
-and monetary guarantees follow the [boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
+Model aliases resolve to one entry with its adapter, supported operation and advisory
+capabilities/pricing. Execution policy comes from configured accounts, never model
+or operator strings. Invalid or unsupported configuration is refused before serving.
+The [example registry](../examples/model-registry.json) configures no providers.
+See [registry configuration](architecture/ai-runtime.md#configured-registry).
 
 ### `symbiotic-ai-runtime`
 
@@ -149,8 +138,8 @@ returns a runtime that hands out ready `Arc<dyn …Provider>`s per binding. It
 currently implements queueing, retries, shared limits, cooldowns, attempt budgets,
 the response cache, traces, receipts and persistence: SQLite under
 `state_dir`, or in memory. Alongside the SQLite backend and credential-process implementation, it
-links SQLite; contract crates do not. Explicit tenant/account isolation and the
-canonical spend ledger remain boundary-alignment work. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+links SQLite; contract crates do not. Typed tenant/provider/revision/account identity scopes results; account sharing is
+explicit. The canonical spend ledger remains boundary-alignment work. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
 
 ### `symbiotic-egress` and `symbiotic-credential-process`
 

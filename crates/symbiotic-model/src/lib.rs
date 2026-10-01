@@ -24,10 +24,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use symbiotic_core::{
-    InvocationSource, ModelIdentity, ModelName, ModelTier, Operation, Operator, QueueId,
-    RoleBinding, Sensitivity, TraceId,
-};
+pub use symbiotic_core::{ModelIdentity, ProviderPrincipalId, TenantId};
+use symbiotic_core::{ModelName, Operation, Operator, QueueId, Sensitivity, TraceId};
 use symbiotic_trace::{
     CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
@@ -62,6 +60,8 @@ pub use queue_runtime::{
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
+mod registry;
+pub use registry::*;
 mod classify;
 pub mod wire;
 #[cfg(feature = "queue")]
@@ -126,10 +126,9 @@ pub enum ReasoningTier {
 /// on when planning a call. Distinct from [`ModelCapability`], which names the
 /// operation kinds a provider serves (chat/embedding/rerank/...).
 ///
-/// Additive-only: every field has a serde default so archived artifacts keep
-/// loading as fields are added.
+/// Advisory metadata supplied by the validated deployment registry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelCapabilities {
     /// Maximum context window in tokens, when known.
     pub context_window: Option<u32>,
@@ -145,7 +144,7 @@ pub struct ModelCapabilities {
 /// (USD 1 per million tokens = 1_000_000). Advisory, like [`CostClass`]:
 /// hosts use it for estimates; the provider's bill is authoritative.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelPricing {
     pub input_micro_usd_per_million_tokens: u64,
     pub output_micro_usd_per_million_tokens: u64,
@@ -195,14 +194,6 @@ pub struct ProviderDescriptor {
 impl ProviderDescriptor {
     pub fn queue_id(&self) -> QueueId {
         self.identity.queue_id()
-    }
-
-    /// Capability flags for this model, resolved from the catalog by identity.
-    /// Unknown models get the conservative [`ModelCapabilities::default`] —
-    /// deliberately budget-pessimistic (`cost_class: Standard`, never `Free`,
-    /// even for uncatalogued `:free` models), so budget routing stays safe.
-    pub fn model_capabilities(&self) -> ModelCapabilities {
-        default_model_capabilities(&self.identity).unwrap_or_default()
     }
 }
 
@@ -402,81 +393,7 @@ pub enum ResolvedAuth {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SelectionRequest {
-    pub capability: ModelCapability,
-    pub tier: Option<ModelTier>,
-    pub sensitivity: Sensitivity,
-    pub role_binding: Option<RoleBinding>,
-    pub source: Option<InvocationSource>,
-    pub preferred: Option<ModelIdentity>,
-    pub allowed_classes: Vec<ProviderClass>,
-}
-
-#[async_trait]
-pub trait ModelSelector: Send + Sync {
-    async fn select(&self, request: SelectionRequest) -> Result<Vec<ModelIdentity>, ModelError>;
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ProviderCatalog {
-    providers: Vec<ProviderDescriptor>,
-}
-
-impl ProviderCatalog {
-    pub fn new(providers: Vec<ProviderDescriptor>) -> Self {
-        Self { providers }
-    }
-
-    pub fn register(&mut self, descriptor: ProviderDescriptor) {
-        self.providers.push(descriptor);
-    }
-
-    pub fn providers(&self) -> &[ProviderDescriptor] {
-        &self.providers
-    }
-
-    pub fn select(&self, request: &SelectionRequest) -> Vec<ModelIdentity> {
-        let allowed = if request.allowed_classes.is_empty() {
-            vec![
-                ProviderClass::Local,
-                ProviderClass::Cloud,
-                ProviderClass::Aggregator,
-                ProviderClass::CliSession,
-            ]
-        } else {
-            request.allowed_classes.clone()
-        };
-        let mut candidates = self
-            .providers
-            .iter()
-            .filter(|provider| provider.capabilities.contains(&request.capability))
-            .filter(|provider| allowed.contains(&provider.provider_class))
-            .filter(|provider| {
-                !matches!(
-                    request.sensitivity,
-                    Sensitivity::Private | Sensitivity::Restricted
-                ) || matches!(
-                    provider.provider_class,
-                    ProviderClass::Local | ProviderClass::CliSession
-                )
-            })
-            .map(|provider| provider.identity.clone())
-            .collect::<Vec<_>>();
-        if let Some(preferred) = &request.preferred {
-            candidates.sort_by_key(|candidate| if candidate == preferred { 0 } else { 1 });
-        }
-        candidates
-    }
-}
-
-#[async_trait]
-impl ModelSelector for ProviderCatalog {
-    async fn select(&self, request: SelectionRequest) -> Result<Vec<ModelIdentity>, ModelError> {
-        Ok(self.select(&request))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelQueueConfig {
     pub max_in_flight: usize,
     pub lease_seconds: u64,
@@ -541,259 +458,6 @@ impl Default for ModelQueueConfig {
             request_debug_dir: None,
             budget_renewal_seconds: None,
         }
-    }
-}
-
-/// Production-oriented queue defaults for known model identities.
-///
-/// Unknown models deliberately return `None` so the host/product layer can apply
-/// its operation defaults. Direct use of `ModelQueueConfig::default()` remains a
-/// conservative local fallback; local Ollama-style models also get an explicit
-/// one-at-a-time catalog entry.
-pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueueConfig> {
-    match identity.queue_id().0.as_str() {
-        "chat:deepseek:deepseek-flash" | "chat:deepseek:deepseek-v4-flash" => {
-            Some(ModelQueueConfig {
-                max_in_flight: 2_000,
-                lease_seconds: 600,
-                logical_retry_attempts: 4,
-                retry_attempts: 4,
-                retry_jitter_seconds: 20,
-                request_timeout_seconds: Some(600),
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                response_cache_dir: None,
-                ..ModelQueueConfig::default()
-            })
-        }
-        "chat:deepseek:deepseek-v4-pro" => Some(ModelQueueConfig {
-            max_in_flight: 400,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(600),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "chat:gemini:gemini-3.5-flash" => Some(ModelQueueConfig {
-            max_in_flight: 100,
-            lease_seconds: 600,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(1_000),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "chat:gemini:gemini-3.1-pro-preview" => Some(ModelQueueConfig {
-            max_in_flight: 500,
-            lease_seconds: 600,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(100),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "embedding:gemini:gemini-embedding-2" => Some(ModelQueueConfig {
-            max_in_flight: 1_000,
-            lease_seconds: 300,
-            logical_retry_attempts: 6,
-            retry_attempts: 6,
-            retry_jitter_seconds: 10,
-            request_timeout_seconds: Some(300),
-            requests_per_minute: Some(4_500),
-            input_units_per_minute: Some(5_000_000),
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "embedding:openrouter:qwen/qwen3-embedding-8b"
-        | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelQueueConfig {
-            max_in_flight: 2_000,
-            lease_seconds: 300,
-            logical_retry_attempts: 6,
-            retry_attempts: 6,
-            retry_jitter_seconds: 10,
-            request_timeout_seconds: Some(300),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // Nemotron free reranker: keep the elevated openrouter concurrency but cap the per-request
-        // timeout at 60s (the free tier stalls rather than erroring) and let requests_per_minute fall
-        // through to the host's default rate bucket (None here).
-        "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelQueueConfig {
-            max_in_flight: 200,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(60),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // TypeSafe System One (Jev 1.13). Account limits checked 2026-09-28:
-        // 1,200 requests/min and 250,000 tokens/s (15M/min), adjusted
-        // dynamically by TypeSafe. One call answers every question in about
-        // 0.4 s, so 32 in flight stays under the request limit; short
-        // timeout and jitter because callers usually wait on the answer.
-        "classify:typesafe:jev-1.13.0" => Some(ModelQueueConfig {
-            max_in_flight: 32,
-            lease_seconds: 60,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 2,
-            request_timeout_seconds: Some(30),
-            requests_per_minute: Some(1_200),
-            input_units_per_minute: Some(15_000_000),
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // (openrouter qwen chat: removed the conservative 200/600rpm entry — falls through to the
-        // generic operator=openrouter fallback at 1000; throttle reactively only if it starts 429ing.)
-        _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
-            Some(ModelQueueConfig {
-                max_in_flight: 1,
-                lease_seconds: 600,
-                logical_retry_attempts: 2,
-                retry_attempts: 2,
-                retry_jitter_seconds: 0,
-                request_timeout_seconds: Some(600),
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                response_cache_dir: None,
-                ..ModelQueueConfig::default()
-            })
-        }
-        // Sane default for any not-individually-catalogued OpenRouter model (chat or embedding):
-        // OpenRouter fronts many providers and handles high concurrency, so without this an
-        // uncatalogued model would fall to max_in_flight=8 and serialize. Matches the catalogued
-        // OpenRouter embedding rate (1000); the queue's retry/backoff absorbs any 429 bursts.
-        _ if identity.operator.0 == "openrouter" => Some(ModelQueueConfig {
-            max_in_flight: 1_000,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        _ => None,
-    }
-}
-
-/// Capability flags for known model identities, mirroring the
-/// [`default_model_queue_config`] catalog convention: unknown models return
-/// `None` so the host can apply its own defaults (or fall back to
-/// `ModelCapabilities::default()` via [`ProviderDescriptor::model_capabilities`]).
-///
-/// Values are advisory seam metadata (context budgets, routing hints), not
-/// provider-enforced limits.
-pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapabilities> {
-    match identity.queue_id().0.as_str() {
-        "chat:deepseek:deepseek-v4-flash" => Some(ModelCapabilities {
-            context_window: Some(128_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Standard,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "chat:deepseek:deepseek-v4-pro" => Some(ModelCapabilities {
-            context_window: Some(128_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Extended,
-            cost_class: CostClass::Standard,
-            pricing: None,
-        }),
-        "chat:gemini:gemini-3.5-flash" => Some(ModelCapabilities {
-            context_window: Some(1_000_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Standard,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "chat:gemini:gemini-3.1-pro-preview" => Some(ModelCapabilities {
-            context_window: Some(1_000_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Extended,
-            cost_class: CostClass::Premium,
-            pricing: None,
-        }),
-        "embedding:gemini:gemini-embedding-2" => Some(ModelCapabilities {
-            context_window: Some(2_048),
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "embedding:openrouter:qwen/qwen3-embedding-8b"
-        | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelCapabilities {
-            context_window: Some(32_768),
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        // TypeSafe System One: typed answers, 64k tokens per request (32k for
-        // the state plus the longest question), $0.042 per million input
-        // tokens, output free. OpenRouter serves the same version through
-        // its `/systemone` route at the same listed token price; its credit
-        // purchase fee makes the direct key cheaper when you have one.
-        "classify:typesafe:jev-1.13.0" | "classify:openrouter:typesafe/jev-1.13" => {
-            Some(ModelCapabilities {
-                context_window: Some(64_000),
-                tool_use: false,
-                structured_output: true,
-                reasoning_tier: ReasoningTier::None,
-                cost_class: CostClass::Budget,
-                pricing: Some(ModelPricing {
-                    input_micro_usd_per_million_tokens: 42_000,
-                    output_micro_usd_per_million_tokens: 0,
-                }),
-            })
-        }
-        "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelCapabilities {
-            context_window: None,
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Free,
-            pricing: None,
-        }),
-        // Deliberately pessimistic floor for local models: local qwen-class chat
-        // models DO support tool use, but until per-model local entries exist we
-        // only guarantee cost (free). Catalogue a model explicitly if routing
-        // needs to rely on more.
-        _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
-            Some(ModelCapabilities {
-                context_window: None,
-                tool_use: false,
-                structured_output: false,
-                reasoning_tier: ReasoningTier::None,
-                cost_class: CostClass::Free,
-                pricing: None,
-            })
-        }
-        _ => None,
     }
 }
 
@@ -1449,7 +1113,7 @@ where
         cache_scope: Some(provider_identity),
         cache: runtime.cache(),
         trace_sink: runtime.trace_sink.clone(),
-        sensitivity: request_sensitivity(&request_value),
+        sensitivity: request.sensitivity(),
         request,
         request_hash,
         request_value,
@@ -2451,10 +2115,14 @@ pub struct ModelRateState {
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
     fn input_budget_units(&self) -> u64;
+    fn sensitivity(&self) -> Sensitivity;
 }
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for ChatRequest {
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(self.messages.iter().map(|message| message.content.as_str()))
     }
@@ -2462,6 +2130,9 @@ impl BudgetedModelRequest for ChatRequest {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for EmbeddingRequest {
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(self.inputs.iter().map(String::as_str))
     }
@@ -2469,6 +2140,9 @@ impl BudgetedModelRequest for EmbeddingRequest {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for RerankRequest {
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
     fn input_budget_units(&self) -> u64 {
         estimate_token_budget_units(
             std::iter::once(self.query.as_str()).chain(self.documents.iter().map(String::as_str)),
@@ -2709,15 +2383,6 @@ async fn note_model_cooldown(
     Ok(())
 }
 
-#[cfg(feature = "queue")]
-fn request_sensitivity(request: &Value) -> Sensitivity {
-    request
-        .get("sensitivity")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or(Sensitivity::Shareable)
-}
-
 /// Opaque revision of a serializable configuration. Never pass secret values.
 pub fn configuration_revision(
     settings: &impl Serialize,
@@ -2746,7 +2411,7 @@ impl HashEmbeddingProvider {
                 provider_class: ProviderClass::Local,
                 capabilities: vec![ModelCapability::Embedding],
                 auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({ "dimensions": dimensions }),
+                metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
             dimensions,
         }
@@ -2858,7 +2523,7 @@ pub struct OpenAiCompatibleChatProvider {
 }
 
 /// Provider extension supported by compatible APIs such as DeepSeek.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
     Enabled,
@@ -3158,7 +2823,7 @@ impl GeminiEmbeddingProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "dimensions": dimensions }),
+                metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
             client: reqwest::Client::new(),
             api_key: zeroize::Zeroizing::new(api_key.into()),
@@ -3326,6 +2991,17 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
     }
 }
 
+/// Client with explicit finite timeout for configured adapters.
+pub fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelError> {
+    let timeout = timeout_seconds
+        .filter(|n| *n > 0)
+        .ok_or_else(|| ModelError::InvalidRequest("finite timeout is required".into()))?;
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build()
+        .map_err(|_| ModelError::InvalidRequest("invalid HTTP client configuration".into()))
+}
+
 async fn bounded_response_bytes(
     mut response: reqwest::Response,
     max_bytes: Option<usize>,
@@ -3482,107 +3158,6 @@ mod tests {
     #[cfg(feature = "queue")]
     use symbiotic_trace::InMemoryTraceSink;
 
-    #[test]
-    fn current_deepseek_flash_name_preserves_shared_parallel_defaults() {
-        let current =
-            default_model_queue_config(&ModelIdentity::new("chat", "deepseek", "deepseek-flash"))
-                .expect("current Flash name must resolve shared queue settings");
-        let legacy = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        assert_eq!(current.max_in_flight, 2_000);
-        assert_eq!(
-            serde_json::to_value(current).unwrap(),
-            serde_json::to_value(legacy).unwrap()
-        );
-    }
-
-    #[test]
-    fn known_model_queue_defaults_live_in_catalog() {
-        let flash = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        let gemini = default_model_queue_config(&ModelIdentity::new(
-            "embedding",
-            "gemini",
-            "gemini-embedding-2",
-        ))
-        .unwrap();
-        let gemini_flash =
-            default_model_queue_config(&ModelIdentity::new("chat", "gemini", "gemini-3.5-flash"))
-                .unwrap();
-        let gemini_pro = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "gemini",
-            "gemini-3.1-pro-preview",
-        ))
-        .unwrap();
-
-        assert_eq!(flash.max_in_flight, 2_000);
-        assert_eq!(flash.request_timeout_seconds, Some(600));
-        assert_eq!(gemini.max_in_flight, 1_000);
-        assert_eq!(gemini.requests_per_minute, Some(4_500));
-        assert_eq!(gemini.input_units_per_minute, Some(5_000_000));
-        let qwen_embedding = default_model_queue_config(&ModelIdentity::new(
-            "embedding",
-            "openrouter",
-            "qwen/qwen3-embedding-8b",
-        ))
-        .unwrap();
-        assert_eq!(qwen_embedding.max_in_flight, 2_000);
-        assert_eq!(qwen_embedding.requests_per_minute, None);
-        assert_eq!(gemini_flash.max_in_flight, 100);
-        assert_eq!(gemini_flash.requests_per_minute, Some(1_000));
-        assert_eq!(gemini_pro.max_in_flight, 500);
-        assert_eq!(gemini_pro.requests_per_minute, Some(100));
-    }
-
-    #[test]
-    fn known_model_capabilities_live_in_catalog() {
-        let flash = default_model_capabilities(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        assert_eq!(flash.context_window, Some(128_000));
-        assert!(flash.tool_use);
-        assert!(flash.structured_output);
-        assert_eq!(flash.reasoning_tier, ReasoningTier::Standard);
-        assert_eq!(flash.cost_class, CostClass::Budget);
-
-        // Unknown models return None from the catalog; the descriptor method
-        // falls back to the conservative default profile.
-        let unknown = ModelIdentity::new("chat", "acme", "unknown-model");
-        assert!(default_model_capabilities(&unknown).is_none());
-        let descriptor = ProviderDescriptor {
-            identity: unknown,
-            provider_class: ProviderClass::Cloud,
-            capabilities: vec![ModelCapability::Chat],
-            auth_mode: ProviderAuthMode::None,
-            metadata: serde_json::json!({}),
-        };
-        assert_eq!(
-            descriptor.model_capabilities(),
-            ModelCapabilities::default()
-        );
-        assert_eq!(
-            ModelCapabilities::default().reasoning_tier,
-            ReasoningTier::None
-        );
-        assert_eq!(ModelCapabilities::default().cost_class, CostClass::Standard);
-
-        // Additive serde: a profile persisted before new fields existed still loads.
-        let sparse: ModelCapabilities = serde_json::from_str("{}").unwrap();
-        assert_eq!(sparse, ModelCapabilities::default());
-    }
-
     #[cfg(feature = "queue")]
     #[test]
     fn model_budget_units_are_token_estimates() {
@@ -3598,16 +3173,6 @@ mod tests {
 
         assert_eq!(request.input_budget_units(), 3);
         assert_eq!(estimate_token_budget_units([""]), 1);
-    }
-
-    #[test]
-    fn local_ollama_queue_defaults_are_conservative() {
-        let config =
-            default_model_queue_config(&ModelIdentity::new("chat", "ollama", "qwen-local"))
-                .unwrap();
-
-        assert_eq!(config.max_in_flight, 1);
-        assert_eq!(config.retry_attempts, 2);
     }
 
     #[cfg(feature = "queue")]
@@ -4559,43 +4124,6 @@ mod tests {
             check_model_budget(&state, &queue, &policy, &request).await,
             Err(ModelError::Queue(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn provider_catalog_filters_private_cloud_candidates() {
-        let catalog = ProviderCatalog::new(vec![
-            ProviderDescriptor {
-                identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-pro"),
-                provider_class: ProviderClass::Cloud,
-                capabilities: vec![ModelCapability::Chat],
-                auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({}),
-            },
-            ProviderDescriptor {
-                identity: ModelIdentity::new("chat", "ollama", "local-model"),
-                provider_class: ProviderClass::Local,
-                capabilities: vec![ModelCapability::Chat],
-                auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({}),
-            },
-        ]);
-        let selected = ModelSelector::select(
-            &catalog,
-            SelectionRequest {
-                capability: ModelCapability::Chat,
-                tier: Some(ModelTier::Deep),
-                sensitivity: Sensitivity::Private,
-                role_binding: Some(RoleBinding::new("agent.answer")),
-                source: Some(InvocationSource::new("unit-test")),
-                preferred: None,
-                allowed_classes: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].operator.0, "ollama");
     }
 
     #[cfg(feature = "queue")]

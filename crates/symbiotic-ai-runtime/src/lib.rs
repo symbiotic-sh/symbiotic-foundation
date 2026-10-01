@@ -11,7 +11,7 @@
 //!     state_dir: Some("/var/lib/host/ai-runtime".into()),
 //!     ..RuntimeConfig::default()
 //! })?;
-//! let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(symbiotic_ai_runtime::BindingIdentity::new("tenant", "provider", "1", "account")))?;
+//! let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(symbiotic_ai_runtime::BindingIdentity::new("tenant", "provider", "1", "account")).with_policy(symbiotic_ai_runtime::ModelQueueConfig::default()))?;
 //! # Ok(()) }
 //! ```
 //!
@@ -67,7 +67,7 @@ pub use symbiotic_model::{
     ClassifyRequest, ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest,
     EmbeddingResponse, InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig,
     ProviderDescriptor, QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus,
-    RerankProvider, RerankRequest, RerankResponse, ResponseCache, default_model_queue_config,
+    RerankProvider, RerankRequest, RerankResponse, ResponseCache,
 };
 
 /// File name of the persistent queue database inside `state_dir`.
@@ -78,6 +78,8 @@ pub const RESPONSES_DIR: &str = "responses";
 /// How the runtime is opened.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    /// Validated deployment registry; no provider is inferred when absent.
+    pub registry: Option<Arc<model::ModelRegistry>>,
     /// Private directory for persistent state. `None` keeps all state in
     /// memory. A missing directory is created owner-only.
     pub state_dir: Option<PathBuf>,
@@ -106,6 +108,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            registry: None,
             state_dir: None,
             worker_id: None,
             trace_sink: None,
@@ -140,8 +143,8 @@ pub struct ModelBinding<P> {
     /// Explicit quota pool. `None` isolates by tenant and concrete account.
     /// The same key pools limits across bindings, models and tenants.
     pub account_sharing_key: Option<AccountSharingKey>,
-    /// Queue policy. `None` uses the catalog default for the provider's
-    /// model ([`default_model_queue_config`]), else [`ModelQueueConfig::default`].
+    /// Explicit execution policy, or the configured registry account policy.
+    /// Without either, binding is refused.
     /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
     pub policy: Option<ModelQueueConfig>,
     pub response_cache: ResponseCacheMode,
@@ -219,12 +222,20 @@ struct Inner {
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
+    registry: Option<Arc<model::ModelRegistry>>,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
     response_max_age: Option<Duration>,
     worker_id: String,
     trace_sink: Option<Arc<dyn TraceSink>>,
     receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
+}
+
+/// Implemented configured operation. Unsupported operations are refused at registry validation.
+pub enum ConfiguredProvider {
+    Chat(Arc<dyn ChatProvider>),
+    Embedding(Arc<dyn EmbeddingProvider>),
+    Classifier(Arc<dyn ClassifierProvider>),
 }
 
 /// One stateful AI runtime. Clones share all state.
@@ -252,6 +263,7 @@ impl Runtime {
                 queue,
                 admission: ModelAdmission::new(),
                 rate_state: model::ModelRateState::default(),
+                registry: config.registry,
                 limits: Mutex::new(HashMap::new()),
                 state_dir: config.state_dir,
                 response_max_age: config.response_max_age,
@@ -288,6 +300,119 @@ impl Runtime {
             Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches),
             None => Ok(0),
         }
+    }
+
+    /// Build a configured adapter after resolving its optional credential inside Foundation.
+    pub async fn configured_provider(
+        &self,
+        tenant: &symbiotic_core::TenantId,
+        principal: &symbiotic_core::ProviderPrincipalId,
+        resolver: &dyn model::CredentialResolver,
+    ) -> Result<ConfiguredProvider, ModelError> {
+        let registry =
+            self.inner.registry.as_ref().ok_or_else(|| {
+                ModelError::InvalidRequest("model registry is not configured".into())
+            })?;
+        let resolved = registry.binding(tenant, principal)?;
+        let config = resolved.binding;
+        let auth_mode =
+            config
+                .secret_ref
+                .as_ref()
+                .map_or(model::ProviderAuthMode::None, |secret_ref| {
+                    model::ProviderAuthMode::ApiKey {
+                        secret_ref: secret_ref.clone(),
+                    }
+                });
+        let auth = if config.secret_ref.is_some() {
+            resolver.resolve_auth(&auth_mode).await?
+        } else {
+            model::ResolvedAuth::None
+        };
+        let key = match auth {
+            model::ResolvedAuth::None if config.secret_ref.is_none() => String::new(),
+            model::ResolvedAuth::Bearer(key) | model::ResolvedAuth::ApiKey(key)
+                if !key.is_empty() =>
+            {
+                key
+            }
+            _ => {
+                return Err(ModelError::Auth(
+                    "configured credential mode is unsupported or empty".into(),
+                ));
+            }
+        };
+        let client = model::http_client(resolved.account.policy.request_timeout_seconds)?;
+        let limits = &config.limits;
+        let settings = &config.settings;
+        match resolved.model.adapter {
+            model::ModelAdapter::OpenAiChat => {
+                let mut raw = model::OpenAiCompatibleChatProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    &config.endpoint,
+                    key,
+                )
+                .with_client(client)
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes)
+                .with_thinking(settings.thinking);
+                if let Some(effort) = &settings.reasoning_effort {
+                    raw = raw.with_reasoning_effort(effort);
+                }
+                Ok(ConfiguredProvider::Chat(
+                    self.chat(self.registry_binding(tenant, principal, raw)?)?,
+                ))
+            }
+            model::ModelAdapter::GeminiEmbedding => {
+                let raw = model::GeminiEmbeddingProvider::new(
+                    &resolved.model.identity.model.0,
+                    key,
+                    settings.dimensions.ok_or_else(|| {
+                        ModelError::InvalidRequest("embedding dimensions required".into())
+                    })?,
+                )
+                .with_client(client)
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes);
+                Ok(ConfiguredProvider::Embedding(self.embedding(
+                    self.registry_binding(tenant, principal, raw)?,
+                )?))
+            }
+            model::ModelAdapter::JevClassifier => {
+                let mut raw = model::JevClassifierProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    &config.endpoint,
+                    key,
+                )
+                .with_client(client);
+                if let Some(served) = &settings.served_model {
+                    raw = raw.with_served_model(served);
+                }
+                Ok(ConfiguredProvider::Classifier(self.classifier(
+                    self.registry_binding(tenant, principal, raw)?,
+                )?))
+            }
+        }
+    }
+
+    /// Resolve identity and account policy for a raw Foundation adapter. `bind` verifies its effective settings.
+    pub fn registry_binding<P>(
+        &self,
+        tenant: &symbiotic_core::TenantId,
+        principal: &symbiotic_core::ProviderPrincipalId,
+        provider: P,
+    ) -> Result<ModelBinding<P>, ModelError> {
+        let registry =
+            self.inner.registry.as_ref().ok_or_else(|| {
+                ModelError::InvalidRequest("model registry is not configured".into())
+            })?;
+        let resolved = registry.binding(tenant, principal)?;
+        let mut binding =
+            ModelBinding::new(provider).with_identity(resolved.binding.identity.clone());
+        binding.account_sharing_key = resolved.binding.account_sharing_key.clone();
+        Ok(binding)
     }
 
     /// A queued chat provider for `binding`.
@@ -381,12 +506,80 @@ impl Runtime {
             "account:{}",
             model::configuration_revision(&account_scope)?.0
         ));
-        let mut policy = binding
-            .policy
-            .clone()
-            .or_else(|| default_model_queue_config(&descriptor.identity))
-            .unwrap_or_default();
-        policy.max_in_flight = policy.max_in_flight.max(1);
+        let mut policy = if let Some(registry) = &self.inner.registry {
+            let resolved = registry.binding(&identity.tenant, &identity.provider)?;
+            if resolved.binding.identity != identity
+                || resolved.model.identity != descriptor.identity
+            {
+                return Err(ModelError::InvalidRequest(
+                    "binding differs from configured identity/model".into(),
+                ));
+            }
+            if descriptor.capabilities != resolved.model.operations {
+                return Err(ModelError::InvalidRequest(
+                    "adapter capabilities differ from configured model".into(),
+                ));
+            }
+            let settings = &resolved.binding.settings;
+            if descriptor
+                .metadata
+                .get("endpoint")
+                .and_then(serde_json::Value::as_str)
+                != Some(resolved.binding.endpoint.as_str())
+                || descriptor
+                    .metadata
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    != settings.thinking.map(|mode| match mode {
+                        model::ThinkingMode::Enabled => "enabled",
+                        model::ThinkingMode::Disabled => "disabled",
+                    })
+                || descriptor
+                    .metadata
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+                    != settings.reasoning_effort.as_deref()
+                || descriptor
+                    .metadata
+                    .get("dimensions")
+                    .and_then(serde_json::Value::as_u64)
+                    != settings.dimensions.map(|n| n as u64)
+                || (resolved.model.adapter == model::ModelAdapter::JevClassifier
+                    && descriptor
+                        .metadata
+                        .get("served_model")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(
+                            settings
+                                .served_model
+                                .as_deref()
+                                .unwrap_or(&resolved.model.identity.model.0),
+                        ))
+                || binding.account_sharing_key != resolved.binding.account_sharing_key
+            {
+                return Err(ModelError::InvalidRequest(
+                    "effective transport differs from configured binding".into(),
+                ));
+            }
+            if let Some(policy) = &binding.policy
+                && serde_json::to_value(policy)
+                    .map_err(|e| ModelError::InvalidRequest(e.to_string()))?
+                    != serde_json::to_value(&resolved.account.policy)
+                        .map_err(|e| ModelError::InvalidRequest(e.to_string()))?
+            {
+                return Err(ModelError::InvalidRequest(
+                    "binding overrides configured account policy".into(),
+                ));
+            }
+            resolved.account.policy.clone()
+        } else {
+            binding.policy.clone().ok_or_else(|| {
+                ModelError::InvalidRequest(
+                    "binding requires an explicit execution policy or configured registry".into(),
+                )
+            })?
+        };
+        policy.validate()?;
         policy.response_cache_dir = None;
         self.register_limits(&queue_id, &policy)?;
         let cache = match &binding.response_cache {

@@ -81,16 +81,9 @@ Exact ties go to the answer's `chosen` option, so without an abstain option
 through the same `run_queued` path as `QueuedChatProvider`,
 `QueuedEmbeddingProvider` and `QueuedRerankProvider`: idempotent enqueue,
 model cap, rate buckets, cooldowns, retry classification, exact response cache,
-and one trace per call. Its cache
-entries live under `{cache}/classify/{descriptor hash}/`, so classifiers with
-different identities or expected served models never share an entry. The
-other wrappers keep the historical `{cache}/{kind}/{request hash}` path, which
-does not include the model: two chat models sharing that lower-level cache
-directory can read each other's answers. Runtime-owned caches add descriptor
-scoping, but complete tenant/configuration result identity remains cleanup work
-required by [boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
-
-## Providers
+and one trace per call. Every wrapper scopes cache entries by binding identity,
+effective provider configuration and credential generation; classifier scope also
+includes its expected served model. There is no legacy shared cache reader.
 
 | Provider | Identity | Class | Transport |
 |---|---|---|---|
@@ -146,21 +139,13 @@ authorization follows [boundary.md](boundary.md#tenant-provider-bindings-and-dat
 Consumers obtain classifiers through `Runtime::classifier`; queue wrappers and
 chat-provider composition stay inside Foundation.
 
-## Defaults and pricing
+## Configuration and pricing
 
-`default_model_queue_config("classify:typesafe:jev-1.13.0")`: 32 in flight,
-1,200 requests/min and 15M input units/min (TypeSafe's account limits of
-1,200 requests/min and 250,000 tokens/s, checked 2026-09-28 and adjusted
-dynamically by TypeSafe), 30 s timeout, 3 attempts with 2 s jitter.
-
-`default_model_capabilities` catalogues the same identity with a 64k context,
-structured output, `CostClass::Budget`, and the new advisory
-`ModelCapabilities::pricing`: `ModelPricing { input_micro_usd_per_million_tokens:
-42_000, output_micro_usd_per_million_tokens: 0 }` ($0.042 per million input
-tokens, output free). `ModelPricing::cost_micro_usd(input, output)` estimates a
-call; a provider-reported cost, when present, stays in trace metadata as
-`reported_cost_usd`. Accounting and monetary guarantees follow the
-[spend contract](boundary.md#spend-ledger-and-budgets).
+Model capabilities, aliases, advisory tariffs with provenance and account execution
+policy come from the [validated registry](ai-runtime.md#configured-registry).
+There are no built-in queue/capability catalogues or sensitivity selectors.
+`ModelPricing::cost_micro_usd` estimates usage; measured provider cost and canonical
+accounting follow the [spend contract](boundary.md#spend-ledger-and-budgets).
 
 ## Gateways
 
@@ -175,11 +160,9 @@ JevClassifierProvider::new("openrouter", "typesafe/jev-1.13", "https://openroute
     .with_served_model("typesafe/jev-1.13-20260917")
 ```
 
-The catalogue lists `classify:openrouter:typesafe/jev-1.13` at the same token
-price, and its queue policy falls back to the generic OpenRouter entry.
-OpenRouter bills through purchased credits, which carry its purchase fee, so
-the direct TypeSafe key is cheaper when a deployment has it. Whether the
-OpenRouter snapshot answers exactly like `jev-1.13.0` has not been measured.
+Configure gateway model identity, expected served model, endpoint, optional secret
+reference and account policy explicitly in the registry. Provider authorization
+remains Memory's responsibility, regardless of provider class.
 
 ## Verification
 
@@ -192,4 +175,4 @@ inconsistent distributions, choices, scores and confidence, displayed ties,
 served-model checks, limit refusals before sending, status classification, the
 chat prompt and strict reply validation (including an out-of-vocabulary
 option), the queue wrapper's cache scoping, traces and retry, and the
-catalogue entries.
+registry validation.

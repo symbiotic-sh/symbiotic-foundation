@@ -138,6 +138,7 @@ impl CredentialProcess {
             }
         }
         let runtime = Runtime::open(RuntimeConfig {
+            registry: Some(Arc::new(provider::configured_registry(&config.routes)?)),
             state_dir: Some(config.state_dir.clone()),
             ..RuntimeConfig::default()
         })

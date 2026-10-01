@@ -490,6 +490,9 @@ impl TraceCarrier for ClassifyResponse {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for ClassifyRequest {
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
     fn input_budget_units(&self) -> u64 {
         let state = Value::Object(self.state.clone()).to_string();
         let questions = serde_json::to_string(&self.questions).unwrap_or_default();
@@ -1283,7 +1286,7 @@ impl Serialize for ChoiceCriteria<'_> {
 /// Score probabilities are normalised to sum to 1.
 ///
 /// The identity is `classify:<chat operator>:<chat model>` and the class is
-/// the chat provider's, so sensitivity routing treats it like its chat model.
+/// the chat provider's. Class is descriptive; Memory authorizes provider principals.
 /// To share the chat model's queue, pass a [`QueuedChatProvider`].
 #[derive(Clone)]
 pub struct ChatClassifierProvider {
@@ -1304,7 +1307,7 @@ impl ChatClassifierProvider {
             provider_class: inner.provider_class,
             capabilities: vec![ModelCapability::Classify],
             auth_mode: inner.auth_mode.clone(),
-            metadata: serde_json::json!({ "wire": "chat-json" }),
+            metadata: serde_json::json!({ "wire": "chat-json", "chat": inner }),
         };
         Self {
             descriptor,
@@ -1316,6 +1319,7 @@ impl ChatClassifierProvider {
     /// Cap the completion length. Reasoning models count thinking against the
     /// cap; a reply cut off by it fails to parse.
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.descriptor.metadata["max_output_tokens"] = serde_json::json!(max_output_tokens);
         self.max_output_tokens = Some(max_output_tokens);
         self
     }
@@ -1908,29 +1912,6 @@ mod tests {
             })
         );
         assert_eq!(response.decide_choice("goal", None, 0.1), None);
-    }
-
-    #[test]
-    fn catalog_has_jev_queue_defaults_capabilities_and_pricing() {
-        let identity = ModelIdentity::new("classify", "typesafe", JEV_DEFAULT_MODEL);
-        assert_eq!(identity.queue_id().0, "classify:typesafe:jev-1.13.0");
-        let queue = default_model_queue_config(&identity).unwrap();
-        assert_eq!(queue.max_in_flight, 32);
-        assert_eq!(queue.requests_per_minute, Some(1_200));
-        assert_eq!(queue.input_units_per_minute, Some(15_000_000));
-        let capabilities = default_model_capabilities(&identity).unwrap();
-        assert!(capabilities.structured_output);
-        assert_eq!(capabilities.context_window, Some(64_000));
-        let pricing = capabilities.pricing.unwrap();
-        // $0.042 per million input tokens, output free.
-        assert_eq!(pricing.cost_micro_usd(1_000_000, 0), 42_000);
-        assert_eq!(pricing.cost_micro_usd(600, 5_000), 26);
-        let gateway = ModelIdentity::new("classify", "openrouter", "typesafe/jev-1.13");
-        assert_eq!(
-            default_model_capabilities(&gateway).unwrap().pricing,
-            Some(pricing)
-        );
-        assert!(default_model_queue_config(&gateway).is_some());
     }
 
     // -- Jev -----------------------------------------------------------------

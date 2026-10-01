@@ -20,17 +20,18 @@ Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 ## Use
 
 ```rust
-use symbiotic_ai_runtime::{ModelBinding, Runtime, RuntimeConfig};
+use symbiotic_ai_runtime::{ModelBinding, ModelQueueConfig, Runtime, RuntimeConfig};
 
 let runtime = Runtime::open(RuntimeConfig {
     state_dir: Some(data_dir.join("ai-runtime")), // None: in memory
     ..RuntimeConfig::default()
 })?;
+let policy = ModelQueueConfig::default(); // explicit, conservative policy for this account
 let identity = symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "chat", "revision-1", "account-a");
-let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(identity.clone()))?;          // Arc<dyn ChatProvider>
-let embed = runtime.embedding(ModelBinding::new(raw_embedder).with_identity(identity.clone()))?; // Arc<dyn EmbeddingProvider>
-let rerank = runtime.rerank(ModelBinding::new(raw_reranker).with_identity(identity.clone()))?;   // Arc<dyn RerankProvider>
-let classify = runtime.classifier(ModelBinding::new(raw).with_identity(identity))?;      // Arc<dyn ClassifierProvider>
+let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(identity.clone()).with_policy(policy.clone()))?;          // Arc<dyn ChatProvider>
+let embed = runtime.embedding(ModelBinding::new(raw_embedder).with_identity(identity.clone()).with_policy(policy.clone()))?; // Arc<dyn EmbeddingProvider>
+let rerank = runtime.rerank(ModelBinding::new(raw_reranker).with_identity(identity.clone()).with_policy(policy.clone()))?;   // Arc<dyn RerankProvider>
+let classify = runtime.classifier(ModelBinding::new(raw).with_identity(identity).with_policy(policy))?;      // Arc<dyn ClassifierProvider>
 ```
 
 This example shows current runtime assembly, not complete authorized credential
@@ -49,9 +50,38 @@ the same state.
 |---|---|---|
 | `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
 | `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
-| `policy` | Catalog default for the model (`default_model_queue_config`), else `ModelQueueConfig::default()` | Concurrency, rate limits, retries, timeout |
+| `policy` | Required explicit policy, or the configured registry account | Concurrency, rate limits, retries, timeout |
 | `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
+
+## Configured registry
+
+`ModelRegistry::from_json` validates the entire current-version configuration before
+serving. Pass `Arc<ModelRegistry>` in `RuntimeConfig::registry`, then call
+`Runtime::configured_provider(tenant, principal, credential_resolver)`. It returns
+an installed chat, Gemini embedding or Jev classifier adapter. Keyless bindings do
+not call the credential resolver. Unknown tenants/principals and configuration,
+transport or policy overrides are refused.
+
+| Family | Required configuration |
+|---|---|
+| `models` | Unique ID and aliases, canonical model identity, installed adapter, supported operation, advisory capabilities; prices require provenance/date |
+| `bindings` | Typed tenant/provider/revision/account identity, model ID or alias, endpoint, optional secret reference, account policy, explicit sharing key or null, finite request/response bytes and output tokens, effective settings |
+| `accounts` | Named explicit execution policy: concurrency, timeout, attempts and optional pacing; no model-name fallback |
+
+The [example catalogue](../../examples/model-registry.json) contains one synthetic
+model with an alias and **no bindings or accounts**. It enables no provider.
+Aliases use the canonical model on the wire and resolve the same capabilities.
+Unsupported advertised operations/settings, ambiguous aliases, unusable limits,
+endpoint credentials and conflicting shared-account policies refuse startup.
+Credential-process deployment routes compile into this same validated registry;
+they retain their existing permit protocol and single-attempt policy.
+
+Without a registry, raw Foundation bindings require an explicit execution policy.
+`default_model_queue_config` and `default_model_capabilities` are removed; consumers
+must configure accounts rather than infer limits from a model/operator name.
+Sensitivity remains a typed request/trace field pending protocol cleanup, but has
+no selection, cache or dispatch authority. Memory owns provider grants.
 
 ## Persistence
 
@@ -231,8 +261,8 @@ paths and remain implementation work.
   and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
   failures. `ModelQueueConfig::default()`
-  allows three attempts; DeepSeek catalogue policies allow four, and other catalogue
-  entries also permit multiple attempts. These settings expose the error-class
+  allows three attempts when explicitly chosen; registry account policies specify
+  their own finite total attempts. These settings expose the error-class
   retry gaps listed above. Provider errors
   never start a cooldown.
 - `request_debug_dir`: write each serialized request to

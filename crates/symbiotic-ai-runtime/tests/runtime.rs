@@ -1260,3 +1260,95 @@ async fn explicit_account_sharing_enforces_one_rate_budget_across_tenants() {
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
+
+fn registry_runtime() -> Runtime {
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../examples/model-registry.json")).unwrap();
+    config["accounts"] = json!([{ "id": "policy", "policy": policy() }]);
+    config["bindings"] = json!([{
+        "identity": {"tenant": "tenant", "provider": "provider", "revision": "1", "account": "account"},
+        "model": "example-chat-alias", "endpoint": "http://127.0.0.1:9/v1", "secret_ref": null,
+        "account_policy": "policy", "account_sharing_key": null,
+        "limits": {"max_request_bytes": 65536, "max_response_bytes": 65536, "max_output_tokens": 1024},
+        "settings": {"thinking": null, "reasoning_effort": null, "dimensions": null, "served_model": null}
+    }]);
+    let registry = symbiotic_ai_runtime::model::ModelRegistry::from_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    Runtime::open(RuntimeConfig {
+        registry: Some(Arc::new(registry)),
+        ..RuntimeConfig::default()
+    })
+    .unwrap()
+}
+struct NoCredentials;
+#[async_trait]
+impl symbiotic_ai_runtime::model::CredentialResolver for NoCredentials {
+    async fn resolve_auth(
+        &self,
+        _: &ProviderAuthMode,
+    ) -> Result<symbiotic_ai_runtime::model::ResolvedAuth, ModelError> {
+        panic!("keyless binding must not resolve a secret")
+    }
+}
+#[tokio::test]
+async fn configured_registry_builds_keyless_adapter_and_refuses_unknown_tenants() {
+    use symbiotic_core::{ProviderPrincipalId, TenantId};
+    let runtime = registry_runtime();
+    let provider = runtime
+        .configured_provider(
+            &TenantId("tenant".into()),
+            &ProviderPrincipalId("provider".into()),
+            &NoCredentials,
+        )
+        .await
+        .unwrap();
+    let symbiotic_ai_runtime::ConfiguredProvider::Chat(provider) = provider else {
+        panic!("chat configured");
+    };
+    assert_eq!(provider.descriptor().identity.model.0, "example-model");
+    assert!(
+        runtime
+            .configured_provider(
+                &TenantId("other".into()),
+                &ProviderPrincipalId("provider".into()),
+                &NoCredentials
+            )
+            .await
+            .is_err()
+    );
+}
+#[test]
+fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
+    use symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider;
+    use symbiotic_core::{ProviderPrincipalId, TenantId};
+    let runtime = registry_runtime();
+    let tenant = TenantId("tenant".into());
+    let principal = ProviderPrincipalId("provider".into());
+    let raw = |endpoint| {
+        OpenAiCompatibleChatProvider::new("example", "example-model", endpoint, "")
+            .with_request_limit(65536)
+            .with_response_limit(65536)
+    };
+    let binding = runtime
+        .registry_binding(&tenant, &principal, raw("http://127.0.0.1:10/v1"))
+        .unwrap();
+    assert!(runtime.chat(binding).is_err());
+    let binding = runtime
+        .registry_binding(&tenant, &principal, raw("http://127.0.0.1:9/v1"))
+        .unwrap()
+        .with_policy(ModelQueueConfig {
+            max_in_flight: 7,
+            ..policy()
+        });
+    assert!(runtime.chat(binding).is_err());
+    assert!(
+        Runtime::in_memory()
+            .chat(binding_without_policy(Loopback::new(unique_identity())))
+            .is_err()
+    );
+}
+fn binding_without_policy<P>(provider: P) -> ModelBinding<P> {
+    binding(provider)
+}
