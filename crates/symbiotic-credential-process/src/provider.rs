@@ -65,6 +65,9 @@ impl ModelProvider for SafeChat {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
@@ -72,6 +75,9 @@ impl ModelProvider for SafeChat {
 impl ModelProvider for SafeEmbedding {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
+    }
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
     }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
@@ -193,7 +199,11 @@ pub(crate) fn configured_registry(
             limits: model::ProviderLimits {
                 max_request_bytes: route.max_input_bytes,
                 max_response_bytes: route.max_response_bytes,
-                max_output_tokens: route.max_output_tokens,
+                max_output_tokens: if adapter == model::ModelAdapter::OpenAiChat {
+                    Some(route.max_output_tokens)
+                } else {
+                    None
+                },
             },
             settings: model::TransportSettings {
                 dimensions,
@@ -239,7 +249,10 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
                         &route.model,
                         &route.destination,
                         "",
-                    ),
+                    )
+                    .with_request_limit(route.max_input_bytes)
+                    .with_response_limit(route.max_response_bytes)
+                    .with_output_limit(route.max_output_tokens),
                 )?
                 .with_response_cache(ResponseCacheMode::Off),
             )
@@ -249,7 +262,9 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
                 route_binding(
                     runtime,
                     route,
-                    GeminiEmbeddingProvider::new(&route.model, "", *dimensions),
+                    GeminiEmbeddingProvider::new("gemini", &route.model, "", *dimensions)
+                        .with_request_limit(route.max_input_bytes)
+                        .with_response_limit(route.max_response_bytes),
                 )?
                 .with_response_cache(ResponseCacheMode::Off),
             )
@@ -310,7 +325,8 @@ pub(crate) async fn execute(
                 )
                 .with_client(client)
                 .with_request_limit(route.max_input_bytes)
-                .with_response_limit(route.max_response_bytes),
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens),
                 secret,
                 started: started.clone(),
             };
@@ -343,10 +359,15 @@ pub(crate) async fn execute(
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
             let provider = SafeEmbedding {
-                inner: GeminiEmbeddingProvider::new(&route.model, secret.value(), *dimensions)
-                    .with_client(client)
-                    .with_request_limit(route.max_input_bytes)
-                    .with_response_limit(route.max_response_bytes),
+                inner: GeminiEmbeddingProvider::new(
+                    "gemini",
+                    &route.model,
+                    secret.value(),
+                    *dimensions,
+                )
+                .with_client(client)
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes),
                 secret,
                 started: started.clone(),
             };
@@ -467,7 +488,7 @@ mod tests {
 
     #[test]
     fn numeric_provider_values_cannot_echo_credential_bytes() {
-        let secret = Secret::from_bytes(zeroize::Zeroizing::new(b"123456789".to_vec())).unwrap();
+        let secret = Secret::from_bytes(model::SecretValue::new(b"123456789".to_vec())).unwrap();
         assert!(check_response(&serde_json::json!({"vectors": [[123456789]]}), &secret).is_err());
     }
 }

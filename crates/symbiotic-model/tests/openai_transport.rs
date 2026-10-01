@@ -70,6 +70,8 @@ async fn missing_cache_counters_remain_unknown() {
         "usage":{"prompt_tokens":10,"completion_tokens":2}
     }));
     let response = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(65536)
         .chat(request())
         .await
         .unwrap();
@@ -92,6 +94,8 @@ async fn low_thinking_and_metadata_without_reasoning_text() {
     }));
     let response =
         OpenAiCompatibleChatProvider::new("fixture", "requested-model", url, "synthetic-key")
+            .with_request_limit(65536)
+            .with_response_limit(65536)
             .with_thinking(Some(ThinkingMode::Enabled))
             .with_reasoning_effort("low")
             .chat(request())
@@ -137,6 +141,8 @@ async fn disabled_thinking_omits_effort_and_nullable_content_keeps_identity() {
         "choices":[{"message":{"content":null},"finish_reason":"length"}]
     }));
     let response = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(65536)
         .with_thinking(Some(ThinkingMode::Disabled))
         .with_reasoning_effort("low")
         .chat(request())
@@ -192,6 +198,8 @@ async fn provider_cost_usd_is_preserved_in_typed_usage() {
         }));
         let response =
             OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+                .with_request_limit(65536)
+                .with_response_limit(65536)
                 .chat(request())
                 .await
                 .unwrap();
@@ -218,6 +226,8 @@ async fn invalid_reported_costs_remain_unknown() {
         }));
         let response =
             OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+                .with_request_limit(65536)
+                .with_response_limit(65536)
                 .chat(request())
                 .await
                 .unwrap();
@@ -233,6 +243,8 @@ async fn configured_response_limit_refuses_oversized_body() {
         "choices": [{"message": {"content": "x".repeat(4096)}}]
     }));
     let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(65536)
         .with_response_limit(1024)
         .chat(request())
         .await;
@@ -248,6 +260,8 @@ async fn configured_request_limit_refuses_wire_body_before_connecting() {
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(65536)
         .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
         .with_request_limit(1)
         .chat(request())
@@ -274,10 +288,60 @@ async fn configured_request_limit_accepts_exact_encoded_body_size() {
     });
     let (url, server) = fixture(serde_json::json!({"choices":[{"message":{"content":"OK"}}]}));
     OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(65536)
         .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
         .with_request_limit(serde_json::to_vec(&expected).unwrap().len())
         .chat(request)
         .await
         .unwrap();
     assert_eq!(server.join().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn chunked_response_is_capped_without_content_length() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        let body = "x".repeat(4096);
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(wire.as_bytes());
+    });
+    let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_request_limit(65536)
+        .with_response_limit(1024)
+        .chat(request())
+        .await;
+    server.join().unwrap();
+    assert!(
+        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
+    );
+}
+#[tokio::test]
+async fn output_token_limits_refuse_oversized_or_unbounded_requests_before_connecting() {
+    let provider = OpenAiCompatibleChatProvider::new(
+        "fixture",
+        "fixture",
+        "http://127.0.0.1:9",
+        "synthetic-key",
+    )
+    .with_request_limit(65536)
+    .with_response_limit(65536);
+    let mut unbounded = request();
+    unbounded.max_output_tokens = None;
+    assert!(matches!(
+        provider.chat(unbounded).await,
+        Err(symbiotic_model::ModelError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        provider.with_output_limit(32).chat(request()).await,
+        Err(symbiotic_model::ModelError::InvalidRequest(_))
+    ));
 }

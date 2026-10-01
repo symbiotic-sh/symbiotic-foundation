@@ -50,7 +50,7 @@ fn request(text: &str) -> ChatRequest {
             role: "user".to_string(),
             content: text.to_string(),
         }],
-        max_output_tokens: None,
+        max_output_tokens: Some(32),
         temperature: Some(0.0),
         response_format: None,
         sensitivity: Sensitivity::Shareable,
@@ -809,7 +809,9 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
                 binding(
                     symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
                         "loopback", &model, &url, key,
-                    ),
+                    )
+                    .with_request_limit(65536)
+                    .with_response_limit(65536),
                 )
                 .with_policy(policy())
                 .with_response_cache(ResponseCacheMode::Off)
@@ -1115,18 +1117,24 @@ fn effective_transport_settings_change_result_identity() {
             "https://one.example",
             "synthetic-key",
         )
+        .with_request_limit(65536)
+        .with_response_limit(65536)
     };
     let descriptor =
         |p: OpenAiCompatibleChatProvider| serde_json::to_value(p.descriptor()).unwrap();
     let base = descriptor(provider());
     assert_ne!(
         base,
-        descriptor(OpenAiCompatibleChatProvider::new(
-            "operator",
-            "model",
-            "https://two.example",
-            "synthetic-key"
-        ))
+        descriptor(
+            OpenAiCompatibleChatProvider::new(
+                "operator",
+                "model",
+                "https://two.example",
+                "synthetic-key"
+            )
+            .with_request_limit(65536)
+            .with_response_limit(65536)
+        )
     );
     assert_ne!(
         base,
@@ -1261,7 +1269,7 @@ async fn explicit_account_sharing_enforces_one_rate_budget_across_tenants() {
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
 
-fn registry_runtime() -> Runtime {
+fn registry_config() -> serde_json::Value {
     let mut config: serde_json::Value =
         serde_json::from_str(include_str!("../../../examples/model-registry.json")).unwrap();
     config["accounts"] = json!([{ "id": "policy", "policy": policy() }]);
@@ -1272,6 +1280,10 @@ fn registry_runtime() -> Runtime {
         "limits": {"max_request_bytes": 65536, "max_response_bytes": 65536, "max_output_tokens": 1024},
         "settings": {"thinking": null, "reasoning_effort": null, "dimensions": null, "served_model": null}
     }]);
+    config
+}
+fn registry_runtime() -> Runtime {
+    let config = registry_config();
     let registry = symbiotic_ai_runtime::model::ModelRegistry::from_json(
         &serde_json::to_vec(&config).unwrap(),
     )
@@ -1290,6 +1302,55 @@ impl symbiotic_ai_runtime::model::CredentialResolver for NoCredentials {
         _: &ProviderAuthMode,
     ) -> Result<symbiotic_ai_runtime::model::ResolvedAuth, ModelError> {
         panic!("keyless binding must not resolve a secret")
+    }
+}
+#[tokio::test]
+async fn configured_embedding_and_classifier_apply_finite_transport_limits() {
+    use symbiotic_ai_runtime::{ConfiguredProvider, model::ModelRegistry};
+    use symbiotic_core::{ProviderPrincipalId, TenantId};
+    for (adapter, operation, endpoint) in [
+        (
+            "gemini_embedding",
+            "embedding",
+            "https://generativelanguage.googleapis.com/v1beta",
+        ),
+        ("jev_classifier", "classify", "http://127.0.0.1:9"),
+    ] {
+        let mut config = registry_config();
+        config["models"][0]["adapter"] = json!(adapter);
+        config["models"][0]["operations"] = json!([operation]);
+        config["models"][0]["identity"]["operation"] = json!(operation);
+        if adapter == "gemini_embedding" {
+            config["models"][0]["identity"]["operator"] = json!("google");
+            config["bindings"][0]["settings"]["dimensions"] = json!(3);
+        }
+        config["bindings"][0]["endpoint"] = json!(endpoint);
+        assert!(
+            ModelRegistry::from_json(&serde_json::to_vec(&config).unwrap()).is_err(),
+            "unsupported non-chat output option is refused"
+        );
+        config["bindings"][0]["limits"]["max_output_tokens"] = serde_json::Value::Null;
+        let registry = ModelRegistry::from_json(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let runtime = Runtime::open(RuntimeConfig {
+            registry: Some(Arc::new(registry)),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let installed = runtime
+            .configured_provider(
+                &TenantId("tenant".into()),
+                &ProviderPrincipalId("provider".into()),
+                &NoCredentials,
+            )
+            .await
+            .unwrap();
+        let descriptor = match &installed {
+            ConfiguredProvider::Embedding(provider) => provider.descriptor(),
+            ConfiguredProvider::Classifier(provider) => provider.descriptor(),
+            ConfiguredProvider::Chat(_) => panic!("wrong installed adapter"),
+        };
+        assert_eq!(descriptor.metadata["max_request_bytes"], 65536);
+        assert_eq!(descriptor.metadata["max_response_bytes"], 65536);
     }
 }
 #[tokio::test]
@@ -1330,11 +1391,15 @@ fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
         OpenAiCompatibleChatProvider::new("example", "example-model", endpoint, "")
             .with_request_limit(65536)
             .with_response_limit(65536)
+            .with_output_limit(1024)
     };
     let binding = runtime
         .registry_binding(&tenant, &principal, raw("http://127.0.0.1:10/v1"))
         .unwrap();
-    assert!(runtime.chat(binding).is_err());
+    assert!(
+        matches!(runtime.chat(binding), Err(ModelError::InvalidRequest(message))
+        if message == "effective transport differs from configured binding")
+    );
     let binding = runtime
         .registry_binding(&tenant, &principal, raw("http://127.0.0.1:9/v1"))
         .unwrap()
@@ -1351,4 +1416,75 @@ fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
 }
 fn binding_without_policy<P>(provider: P) -> ModelBinding<P> {
     binding(provider)
+}
+
+#[test]
+fn supported_http_bindings_require_finite_request_and_response_limits() {
+    use symbiotic_ai_runtime::model::{
+        GeminiEmbeddingProvider, JevClassifierProvider, OpenAiCompatibleChatProvider,
+    };
+    let runtime = Runtime::in_memory();
+    for request_limit in [None, Some(0), Some(1024)] {
+        for response_limit in [None, Some(0), Some(1024)] {
+            let valid = request_limit == Some(1024) && response_limit == Some(1024);
+            let mut chat = OpenAiCompatibleChatProvider::new(
+                "synthetic",
+                "synthetic",
+                "http://127.0.0.1:9",
+                "",
+            );
+            let mut embedding = GeminiEmbeddingProvider::new("gemini", "synthetic", "", 3);
+            let mut classifier =
+                JevClassifierProvider::new("synthetic", "synthetic", "http://127.0.0.1:9", "");
+            if let Some(limit) = request_limit {
+                chat = chat.with_request_limit(limit);
+                embedding = embedding.with_request_limit(limit);
+                classifier = classifier.with_request_limit(limit);
+            }
+            if let Some(limit) = response_limit {
+                chat = chat.with_response_limit(limit);
+                embedding = embedding.with_response_limit(limit);
+                classifier = classifier.with_response_limit(limit);
+            }
+            assert_eq!(
+                runtime.chat(binding(chat).with_policy(policy())).is_ok(),
+                valid
+            );
+            assert_eq!(
+                runtime
+                    .embedding(binding(embedding).with_policy(policy()))
+                    .is_ok(),
+                valid
+            );
+            assert_eq!(
+                runtime
+                    .classifier(binding(classifier).with_policy(policy()))
+                    .is_ok(),
+                valid
+            );
+        }
+    }
+    let zero_output =
+        OpenAiCompatibleChatProvider::new("synthetic", "synthetic", "http://127.0.0.1:9", "")
+            .with_request_limit(1024)
+            .with_response_limit(1024)
+            .with_output_limit(0);
+    assert!(
+        runtime
+            .chat(binding(zero_output).with_policy(policy()))
+            .is_err()
+    );
+}
+#[cfg(not(debug_assertions))]
+#[test]
+fn production_request_debug_dir_is_refused_at_bind_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dir.path().join("request-dumps");
+    let raw = Loopback::new(unique_identity());
+    let result = Runtime::in_memory().chat(binding(raw).with_policy(ModelQueueConfig {
+        request_debug_dir: Some(dumps.clone()),
+        ..policy()
+    }));
+    assert!(matches!(result, Err(ModelError::InvalidRequest(_))));
+    assert!(!dumps.exists());
 }

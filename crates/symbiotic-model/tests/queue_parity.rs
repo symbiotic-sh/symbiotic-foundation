@@ -487,6 +487,7 @@ async fn an_evicted_queue_item_is_queued_again_instead_of_failing() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn request_debug_capture_writes_the_serialized_request() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,12 +516,23 @@ async fn request_debug_capture_writes_the_serialized_request() {
     .map(|entry| entry.unwrap().path())
     .collect();
     assert_eq!(captured.len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&captured[0])
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     let body: Value = serde_json::from_slice(&std::fs::read(&captured[0]).unwrap()).unwrap();
     assert_eq!(body["messages"][0]["content"], "capture me");
 }
 
-/// A host cache keyed by the raw message text, standing in for a cache
-/// layout that predates the runtime.
+/// A host cache keyed by raw message text. The runtime still verifies binding scope.
 #[derive(Default)]
 struct TextKeyedCache {
     entries: Mutex<std::collections::HashMap<String, Value>>,
@@ -554,14 +566,9 @@ async fn a_host_response_cache_answers_before_the_queue() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
     let raw = Loopback::new(unique_identity());
     let cache = Arc::new(TextKeyedCache::default());
-    // A response already present under the host's own key.
-    let seeded = raw.chat(request("seeded")).await.unwrap();
-    cache
-        .entries
-        .lock()
-        .unwrap()
-        .insert("seeded".to_string(), serde_json::to_value(&seeded).unwrap());
     let provider = queued(raw.clone(), queue, config()).with_response_cache(cache.clone());
+    // A runtime-scoped response already present under the host's own key.
+    provider.chat(request("seeded")).await.unwrap();
 
     let hit = provider.chat(request("seeded")).await.unwrap();
     assert_eq!(hit.text, "seeded");
@@ -573,7 +580,7 @@ async fn a_host_response_cache_answers_before_the_queue() {
 
     provider.chat(request("fresh")).await.unwrap();
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(cache.stores.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.stores.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

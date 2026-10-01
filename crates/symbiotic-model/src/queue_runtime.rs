@@ -535,26 +535,24 @@ macro_rules! queue_runtime_builders {
             self
         }
 
-        /// Share in-process admission (the model cap) with every provider
-        /// built from the same [`ModelAdmission`](crate::ModelAdmission).
         /// Runtime-owned rate state, pooled by explicit account identity.
         pub fn with_rate_state(mut self, state: $crate::ModelRateState) -> Self {
             self.runtime.rate_state = state;
             self
         }
+        /// Share in-process admission with providers of the same runtime/account.
         pub fn with_admission(mut self, admission: $crate::ModelAdmission) -> Self {
             self.runtime.admission = Some(admission);
             self
         }
 
-        /// Run on `queue_id` instead of the model's own queue, so its limits
-        /// and cooldown are shared with (or isolated from) other providers by
-        /// that id.
+        /// Scope result reuse, queue items, traces and receipts to this binding.
         pub fn with_binding_identity(mut self, identity: symbiotic_core::BindingIdentity) -> Self {
             self.runtime.binding_identity = Some(identity);
             self
         }
 
+        /// Run on `queue_id` so limits and cooldown share the configured account.
         pub fn with_queue_id(mut self, queue_id: symbiotic_core::QueueId) -> Self {
             self.runtime.queue_id = Some(queue_id);
             self

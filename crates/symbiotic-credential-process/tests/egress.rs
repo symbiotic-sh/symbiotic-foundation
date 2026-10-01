@@ -1184,10 +1184,12 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
             _ => second.input_units_per_minute = Some(1000),
         }
         config.routes.push(second);
-        assert!(matches!(
-            CredentialProcess::open(config),
-            Err(EgressError::InvalidRequest)
-        ));
+        let opened = CredentialProcess::open(config);
+        assert!(
+            matches!(&opened, Err(EgressError::InvalidRequest)),
+            "{field}: unexpected startup result {:?}",
+            opened.err()
+        );
     }
     let mut config = fixture.config.clone();
     let mut second = config.routes[0].clone();

@@ -66,7 +66,7 @@ transport or policy overrides are refused.
 | Family | Required configuration |
 |---|---|
 | `models` | Unique ID and aliases, canonical model identity, installed adapter, supported operation, advisory capabilities; prices require provenance/date |
-| `bindings` | Typed tenant/provider/revision/account identity, model ID or alias, endpoint, optional secret reference, account policy, explicit sharing key or null, finite request/response bytes and output tokens, effective settings |
+| `bindings` | Typed tenant/provider/revision/account identity, model ID or alias, endpoint, optional secret reference, account policy, explicit sharing key or null, finite request/response bytes and chat output tokens, effective settings |
 | `accounts` | Named explicit execution policy: concurrency, timeout, attempts and optional pacing; no model-name fallback |
 
 The [example catalogue](../../examples/model-registry.json) contains one synthetic
@@ -76,6 +76,14 @@ Unsupported advertised operations/settings, ambiguous aliases, unusable limits,
 endpoint credentials and conflicting shared-account policies refuse startup.
 Credential-process deployment routes compile into this same validated registry;
 they retain their existing permit protocol and single-attempt policy.
+
+Every supported HTTP adapter requires finite nonzero encoded request and response
+byte limits, including error responses and chunked bodies. Chat also requires a
+finite output-token bound; requests above a configured bound are refused. Gemini
+requires the exact configured dimension for every returned vector. Its adapter
+refuses task options and conflicting per-request dimensions before dispatch.
+Provider credentials and derived secret buffers use the shared non-Debug,
+non-serializable `SecretValue` zeroizing container; `ResolvedAuth` is also non-Debug.
 
 Without a registry, raw Foundation bindings require an explicit execution policy.
 `default_model_queue_config` and `default_model_capabilities` are removed; consumers
@@ -233,10 +241,11 @@ admission and recovery follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
 a known implementation gap.
 
-Bindings of one account must agree on `max_in_flight`, `requests_per_minute`,
+Raw bindings without a registry must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
 fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
-per binding.
+per raw binding. Registry bindings of one account use an identical configured
+execution policy, including timeout and retries.
 
 ## Policy knobs
 
@@ -267,7 +276,8 @@ paths and remain implementation work.
   never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
-  debugging only: requests can contain sensitive text.
+  development builds only (`debug_assertions`): requests can contain sensitive
+  text. Production builds refuse a policy containing this setting at bind time.
 - `logical_retry_attempts` / `retry_attempts`: the request's total provider
   attempts across every retry layer, and the attempts per queue item. The
   logical budget is a cap: an item runs at most

@@ -57,7 +57,7 @@ pub struct PricingProvenance {
 pub struct ProviderLimits {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
-    pub max_output_tokens: u32,
+    pub max_output_tokens: Option<u32>,
 }
 /// Effective request settings; unsupported settings are refused at startup.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +137,9 @@ impl ModelQueueConfig {
                 "finite nonzero timeout, concurrency, attempts and pacing are required",
             ));
         }
+        if !cfg!(debug_assertions) && self.request_debug_dir.is_some() {
+            return Err(invalid("request_debug_dir requires a development build"));
+        }
         Ok(())
     }
 }
@@ -195,7 +198,7 @@ impl ModelRegistry {
             if !binding.identity.is_valid()
                 || binding.limits.max_request_bytes == 0
                 || binding.limits.max_response_bytes == 0
-                || binding.limits.max_output_tokens == 0
+                || binding.limits.max_output_tokens == Some(0)
                 || binding.secret_ref.as_deref().is_some_and(|s| !nonempty(s))
             {
                 return Err(invalid(
@@ -216,6 +219,15 @@ impl ModelRegistry {
                 ));
             }
             let model = registry.model(&binding.model)?;
+            if (model.adapter == ModelAdapter::OpenAiChat
+                && binding.limits.max_output_tokens.is_none())
+                || (model.adapter != ModelAdapter::OpenAiChat
+                    && binding.limits.max_output_tokens.is_some())
+            {
+                return Err(invalid(
+                    "output tokens are required for chat and unsupported for this adapter",
+                ));
+            }
             let settings = &binding.settings;
             if settings
                 .reasoning_effort
@@ -242,7 +254,7 @@ impl ModelRegistry {
                         || settings.thinking.is_some()
                         || settings.reasoning_effort.is_some()
                         || settings.served_model.is_some()
-                        || binding.endpoint.trim_end_matches('/')
+                        || binding.endpoint
                             != "https://generativelanguage.googleapis.com/v1beta" =>
                 {
                     return Err(invalid("unsupported Gemini endpoint or settings"));

@@ -60,6 +60,8 @@ pub use queue_runtime::{
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
+mod secrets;
+pub use secrets::SecretValue;
 mod registry;
 pub use registry::*;
 mod classify;
@@ -294,6 +296,10 @@ pub enum ModelError {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+    /// Refuse unsupported or unbounded transport configuration before execution.
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        Ok(())
+    }
 
     /// A stable, non-secret fingerprint of the credential this provider
     /// calls with, or `None` when it has none. The queue runtime keys
@@ -312,6 +318,10 @@ where
 {
     fn descriptor(&self) -> &ProviderDescriptor {
         (**self).descriptor()
+    }
+
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        (**self).validate_configuration()
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
@@ -383,12 +393,18 @@ pub trait CredentialResolver: Send + Sync {
     async fn resolve_auth(&self, mode: &ProviderAuthMode) -> Result<ResolvedAuth, ModelError>;
 }
 
-#[derive(Clone, Debug)]
+/// Resolved provider authentication; secret material has no diagnostic representation.
+/// ```compile_fail
+/// use symbiotic_model::{ResolvedAuth, SecretValue};
+/// let auth = ResolvedAuth::Bearer(SecretValue::from("synthetic"));
+/// println!("{auth:?}");
+/// ```
+#[derive(Clone)]
 pub enum ResolvedAuth {
     None,
-    Bearer(String),
-    ApiKey(String),
-    Headers(Vec<(String, String)>),
+    Bearer(SecretValue<String>),
+    ApiKey(SecretValue<String>),
+    Headers(Vec<(String, SecretValue<String>)>),
     LocalSession { tool: String, account: String },
 }
 
@@ -400,7 +416,7 @@ pub struct ModelQueueConfig {
     pub logical_retry_attempts: u32,
     pub retry_attempts: u32,
     pub retry_jitter_seconds: u64,
-    /// Longest provider call; `None` never times out. A caller that stops
+    /// Longest provider call; execution requires a finite nonzero value. A caller that stops
     /// waiting does not cancel a call in flight (the runtime owns it), so
     /// this is also what bounds a call nobody waits for.
     pub request_timeout_seconds: Option<u64>,
@@ -500,6 +516,10 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
@@ -517,7 +537,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Chat,
             "chat",
-            None,
             request,
             |inner: C, request| async move { inner.chat(request).await },
             self.inner.clone(),
@@ -562,6 +581,10 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
@@ -579,7 +602,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Embedding,
             "embedding",
-            None,
             request,
             |inner: E, request| async move { inner.embed(request).await },
             self.inner.clone(),
@@ -627,6 +649,10 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
@@ -644,7 +670,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Rerank,
             "rerank",
-            None,
             request,
             |inner: R, request| async move { inner.rerank(request).await },
             self.inner.clone(),
@@ -912,7 +937,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         let mut response = response;
         let mut trace = response.trace().clone();
         if !trace.metadata.is_object() {
-            trace.metadata = serde_json::json!({});
+            trace.metadata = serde_json::json!({ "value": trace.metadata });
         }
         trace.metadata["result_scope"] = serde_json::json!(self.cache_scope);
         trace.metadata["binding"] =
@@ -1058,11 +1083,6 @@ async fn run_queued<P, Req, Res, F, Fut>(
     mut descriptor: ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
-    // Response-cache subdirectory under `kind`. `None` keeps the historical
-    // `{cache}/{kind}/{request hash}` path, which is shared by every provider
-    // of that kind: two chat models sharing a cache directory can read each
-    // other's cached answers. Classification passes a descriptor hash.
-    _cache_scope: Option<String>,
     request: Req,
     call: F,
     provider: P,
@@ -1075,6 +1095,8 @@ where
     F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
 {
+    runtime.config.validate()?;
+    provider.validate_configuration()?;
     let queue_id = runtime
         .queue_id
         .clone()
@@ -2515,11 +2537,12 @@ pub struct OpenAiCompatibleChatProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
     base_url: String,
-    api_key: zeroize::Zeroizing<String>,
+    api_key: SecretValue<String>,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     thinking: Option<ThinkingMode>,
     reasoning_effort: Option<String>,
+    max_output_tokens: Option<u32>,
 }
 
 /// Provider extension supported by compatible APIs such as DeepSeek.
@@ -2535,7 +2558,7 @@ impl OpenAiCompatibleChatProvider {
         operator: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        api_key: impl Into<String>,
+        api_key: impl Into<SecretValue<String>>,
     ) -> Self {
         let operator = operator.into();
         let model = model.into();
@@ -2556,11 +2579,12 @@ impl OpenAiCompatibleChatProvider {
             },
             client: reqwest::Client::new(),
             base_url,
-            api_key: zeroize::Zeroizing::new(api_key.into()),
+            api_key: api_key.into(),
             max_response_bytes: None,
             max_request_bytes: None,
             thinking: None,
             reasoning_effort: None,
+            max_output_tokens: None,
         }
     }
 
@@ -2572,13 +2596,22 @@ impl OpenAiCompatibleChatProvider {
 
     /// Bound the complete encoded HTTP request body before transmission.
     pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_request_bytes"] = serde_json::json!(max_bytes);
         self.max_request_bytes = Some(max_bytes);
         self
     }
 
     /// Bound response bodies before buffering, including provider error bodies.
     pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_response_bytes"] = serde_json::json!(max_bytes);
         self.max_response_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Configured output-token ceiling; requests above it are refused.
+    pub fn with_output_limit(mut self, max_tokens: u32) -> Self {
+        self.descriptor.metadata["max_output_tokens"] = serde_json::json!(max_tokens);
+        self.max_output_tokens = Some(max_tokens);
         self
     }
 
@@ -2603,6 +2636,17 @@ impl OpenAiCompatibleChatProvider {
 impl ModelProvider for OpenAiCompatibleChatProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
+    }
+
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        required_byte_limit(self.max_request_bytes)?;
+        required_byte_limit(self.max_response_bytes)?;
+        if self.max_output_tokens == Some(0) {
+            return Err(ModelError::InvalidRequest(
+                "output token limit must be nonzero".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
@@ -2709,7 +2753,21 @@ fn reported_cost_usd(raw: &Value) -> Option<String> {
 
 #[async_trait]
 impl ChatProvider for OpenAiCompatibleChatProvider {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+    async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        self.validate_configuration()?;
+        let output = request
+            .max_output_tokens
+            .or(self.max_output_tokens)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                ModelError::InvalidRequest("finite output tokens are required".into())
+            })?;
+        if self.max_output_tokens.is_some_and(|limit| output > limit) {
+            return Err(ModelError::InvalidRequest(
+                "output token limit exceeded".into(),
+            ));
+        }
+        request.max_output_tokens = Some(output);
         let body = wire::openai_chat_body(
             &self.descriptor.identity.model.0,
             &request,
@@ -2717,15 +2775,20 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
             self.reasoning_effort.as_deref(),
             self.max_request_bytes,
         )?;
-        let resp = self
+        let builder = self
             .client
             .post(format!(
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
             ))
-            .bearer_auth(self.api_key.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
+            .body(body);
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.bearer_auth(self.api_key.as_str())
+        };
+        let resp = builder
             .send()
             .await
             .map_err(|err| ModelError::Unavailable(err.to_string()))?;
@@ -2806,18 +2869,23 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
 pub struct GeminiEmbeddingProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
-    api_key: zeroize::Zeroizing<String>,
+    api_key: SecretValue<String>,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     dimensions: usize,
 }
 
 impl GeminiEmbeddingProvider {
-    pub fn new(model: impl Into<String>, api_key: impl Into<String>, dimensions: usize) -> Self {
+    pub fn new(
+        operator: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<SecretValue<String>>,
+        dimensions: usize,
+    ) -> Self {
         let model = model.into();
         Self {
             descriptor: ProviderDescriptor {
-                identity: ModelIdentity::new("embedding", "gemini", model),
+                identity: ModelIdentity::new("embedding", operator, model),
                 provider_class: ProviderClass::Cloud,
                 capabilities: vec![ModelCapability::Embedding],
                 auth_mode: ProviderAuthMode::ApiKey {
@@ -2826,7 +2894,7 @@ impl GeminiEmbeddingProvider {
                 metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
             client: reqwest::Client::new(),
-            api_key: zeroize::Zeroizing::new(api_key.into()),
+            api_key: api_key.into(),
             max_response_bytes: None,
             max_request_bytes: None,
             dimensions,
@@ -2841,12 +2909,14 @@ impl GeminiEmbeddingProvider {
 
     /// Bound the complete encoded HTTP request body before transmission.
     pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_request_bytes"] = serde_json::json!(max_bytes);
         self.max_request_bytes = Some(max_bytes);
         self
     }
 
     /// Bound response bodies before buffering, including provider error bodies.
     pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_response_bytes"] = serde_json::json!(max_bytes);
         self.max_response_bytes = Some(max_bytes);
         self
     }
@@ -2856,6 +2926,17 @@ impl GeminiEmbeddingProvider {
 impl ModelProvider for GeminiEmbeddingProvider {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
+    }
+
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        required_byte_limit(self.max_request_bytes)?;
+        required_byte_limit(self.max_response_bytes)?;
+        if self.dimensions == 0 {
+            return Err(ModelError::InvalidRequest(
+                "embedding dimensions must be nonzero".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
@@ -2879,7 +2960,12 @@ struct GeminiEmbedding {
 }
 
 impl GeminiEmbedding {
-    fn into_values(self) -> Result<Vec<f32>, ModelError> {
+    fn into_values(self, dimensions: usize) -> Result<Vec<f32>, ModelError> {
+        if self.values.len() != dimensions {
+            return Err(ModelError::Provider(
+                "Gemini embedding dimension mismatch".into(),
+            ));
+        }
         if self.values.iter().any(|value| !value.is_finite()) {
             return Err(ModelError::Provider(
                 "Gemini embedding contains non-finite components".into(),
@@ -2892,6 +2978,8 @@ impl GeminiEmbedding {
 #[async_trait]
 impl EmbeddingProvider for GeminiEmbeddingProvider {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
+        self.validate_configuration()?;
+        wire::validate_gemini_options(self.dimensions, &request)?;
         if request.inputs.is_empty() {
             return Ok(EmbeddingResponse {
                 dimensions: self.dimensions,
@@ -2939,7 +3027,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                     .ok_or_else(|| {
                         ModelError::Provider("Gemini response missing embedding".to_string())
                     })?
-                    .into_values()?,
+                    .into_values(self.dimensions)?,
             ]
         } else {
             let resp = self
@@ -2972,7 +3060,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             }
             embeddings
                 .into_iter()
-                .map(GeminiEmbedding::into_values)
+                .map(|embedding| embedding.into_values(self.dimensions))
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(EmbeddingResponse {
@@ -3002,11 +3090,19 @@ pub fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, Mode
         .map_err(|_| ModelError::InvalidRequest("invalid HTTP client configuration".into()))
 }
 
+fn required_byte_limit(limit: Option<usize>) -> Result<usize, ModelError> {
+    limit.filter(|n| *n > 0).ok_or_else(|| {
+        ModelError::InvalidRequest(
+            "finite nonzero request/response byte limits are required".into(),
+        )
+    })
+}
+
 async fn bounded_response_bytes(
     mut response: reqwest::Response,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
-    let limit = max_bytes.unwrap_or(usize::MAX);
+    let limit = required_byte_limit(max_bytes)?;
     if response
         .content_length()
         .is_some_and(|len| len > limit as u64)
@@ -3107,17 +3203,87 @@ mod tests {
     use symbiotic_queue_sqlite::SqliteQueue;
 
     #[test]
+    fn gemini_single_vectors_require_exact_configured_dimensions() {
+        for length in [0, 1, 2, 4] {
+            let raw: GeminiEmbedWireResponse = serde_json::from_value(
+                serde_json::json!({"embedding": {"values": vec![0.5; length]}}),
+            )
+            .unwrap();
+            assert!(matches!(
+                raw.embedding.unwrap().into_values(3),
+                Err(ModelError::Provider(_))
+            ));
+        }
+        assert_eq!(
+            GeminiEmbedding {
+                values: vec![0.5; 3]
+            }
+            .into_values(3)
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+    #[test]
+    fn gemini_batch_checks_each_vectors_exact_length() {
+        for length in [0, 1, 2, 4] {
+            let raw: GeminiBatchEmbedWireResponse = serde_json::from_value(serde_json::json!({"embeddings": [{"values": [0.1, 0.2, 0.3]}, {"values": vec![0.5; length]}]})).unwrap();
+            let result: Result<Vec<_>, _> = raw
+                .embeddings
+                .unwrap()
+                .into_iter()
+                .map(|embedding| embedding.into_values(3))
+                .collect();
+            assert!(matches!(result, Err(ModelError::Provider(_))));
+        }
+    }
+    #[tokio::test]
+    async fn gemini_request_options_are_refused_even_for_empty_batches() {
+        let provider = GeminiEmbeddingProvider::new("gemini", "synthetic", "", 3)
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        let base = EmbeddingRequest {
+            inputs: vec![],
+            dimensions: None,
+            task: None,
+            sensitivity: Sensitivity::Shareable,
+            role_binding: None,
+            source: None,
+            metadata: Value::Null,
+        };
+        for dimensions in [Some(0), Some(2), Some(4)] {
+            let mut request = base.clone();
+            request.dimensions = dimensions;
+            assert!(matches!(
+                provider.embed(request).await,
+                Err(ModelError::InvalidRequest(_))
+            ));
+        }
+        let mut request = base.clone();
+        request.task = Some("retrieval_document".into());
+        assert!(matches!(
+            provider.embed(request).await,
+            Err(ModelError::InvalidRequest(_))
+        ));
+        let mut request = base;
+        request.dimensions = Some(3);
+        let result = provider.embed(request).await.unwrap();
+        assert_eq!(result.dimensions, 3);
+        assert!(result.vectors.is_empty());
+    }
+
+    #[test]
     fn gemini_single_embedding_rejects_non_finite_components() {
         for number in ["1e39", "-1e39"] {
             let raw: GeminiEmbedWireResponse =
                 serde_json::from_str(&format!(r#"{{"embedding":{{"values":[0.25,{number}]}}}}"#))
                     .unwrap();
-            assert!(matches!(raw.embedding.unwrap().into_values(),
+            assert!(matches!(raw.embedding.unwrap().into_values(2),
                 Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
         }
         let raw: GeminiEmbedWireResponse =
             serde_json::from_str(r#"{"embedding":{"values":[0.25,-0.5,3e38]}}"#).unwrap();
-        let values = raw.embedding.unwrap().into_values().unwrap();
+        let values = raw.embedding.unwrap().into_values(3).unwrap();
         assert_eq!(values.len(), 3);
         assert!(values.iter().all(|value| value.is_finite()));
     }
@@ -3133,7 +3299,7 @@ mod tests {
                 .embeddings
                 .unwrap()
                 .into_iter()
-                .map(GeminiEmbedding::into_values)
+                .map(|embedding| embedding.into_values(2))
                 .collect();
             assert!(matches!(result,
                 Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
@@ -3146,7 +3312,7 @@ mod tests {
             .embeddings
             .unwrap()
             .into_iter()
-            .map(GeminiEmbedding::into_values)
+            .map(|embedding| embedding.into_values(2))
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(vectors.len(), 2);

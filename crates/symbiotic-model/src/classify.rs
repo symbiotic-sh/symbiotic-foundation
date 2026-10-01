@@ -562,6 +562,10 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
@@ -577,13 +581,11 @@ where
         // A malformed request never takes a queue slot or a provider call.
         request.validate()?;
         let descriptor = self.inner.descriptor().clone();
-        let cache_scope = hash_json(&descriptor)?;
         run_queued(
             &self.runtime,
             descriptor,
             ModelCapability::Classify,
             "classify",
-            Some(cache_scope),
             request,
             |inner: P, request| async move { inner.classify(request).await },
             self.inner.clone(),
@@ -856,7 +858,9 @@ pub struct JevClassifierProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: SecretValue<String>,
+    max_request_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
     served_model: String,
 }
 
@@ -867,7 +871,7 @@ impl JevClassifierProvider {
         operator: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        api_key: impl Into<String>,
+        api_key: impl Into<SecretValue<String>>,
     ) -> Self {
         let model = model.into();
         let base_url = base_url.into();
@@ -884,12 +888,27 @@ impl JevClassifierProvider {
             client: reqwest::Client::new(),
             base_url,
             api_key: api_key.into(),
+            max_request_bytes: None,
+            max_response_bytes: None,
             served_model: model,
         }
     }
 
+    /// Bound the complete encoded System One request before sending.
+    pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_request_bytes"] = serde_json::json!(max_bytes);
+        self.max_request_bytes = Some(max_bytes);
+        self
+    }
+    /// Bound success and error HTTP response bodies with the shared capped reader.
+    pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_response_bytes"] = serde_json::json!(max_bytes);
+        self.max_response_bytes = Some(max_bytes);
+        self
+    }
+
     /// TypeSafe's own endpoint with [`JEV_DEFAULT_MODEL`].
-    pub fn typesafe(api_key: impl Into<String>) -> Self {
+    pub fn typesafe(api_key: impl Into<SecretValue<String>>) -> Self {
         Self::new("typesafe", JEV_DEFAULT_MODEL, TYPESAFE_BASE_URL, api_key)
     }
 
@@ -1092,6 +1111,12 @@ impl ModelProvider for JevClassifierProvider {
         &self.descriptor
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        required_byte_limit(self.max_request_bytes)?;
+        required_byte_limit(self.max_response_bytes)?;
+        Ok(())
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         api_key_fingerprint(&self.api_key)
     }
@@ -1100,6 +1125,7 @@ impl ModelProvider for JevClassifierProvider {
 #[async_trait]
 impl ClassifierProvider for JevClassifierProvider {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        self.validate_configuration()?;
         request.validate()?;
         Self::check_limits(&request)?;
         let wire = JevWireRequest {
@@ -1107,24 +1133,28 @@ impl ClassifierProvider for JevClassifierProvider {
             state: &request.state,
             questions: &request.questions,
         };
+        let body = wire::encode(&wire, self.max_request_bytes)?;
         let started = Instant::now();
-        let resp = self
+        let builder = self
             .client
             .post(format!("{}/systemone", self.base_url.trim_end_matches('/')))
-            .bearer_auth(&self.api_key)
-            .json(&wire)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.bearer_auth(self.api_key.as_str())
+        };
+        let resp = builder
             .send()
             .await
             .map_err(|err| ModelError::Unavailable(err.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = bounded_response_text(resp, self.max_response_bytes).await?;
             return Err(status_error(status.as_u16(), body));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+        let text = bounded_response_text(resp, self.max_response_bytes).await?;
         let raw: Value =
             serde_json::from_str(&text).map_err(|err| ModelError::Provider(err.to_string()))?;
         let unexpected = |detail: &str| {
@@ -1518,6 +1548,10 @@ impl ModelProvider for ChatClassifierProvider {
         &self.descriptor
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.chat.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.chat.credential_fingerprint()
     }
@@ -1776,11 +1810,15 @@ mod tests {
 
     fn jev_at(server: &MockHttp) -> JevClassifierProvider {
         JevClassifierProvider::new("typesafe", JEV_DEFAULT_MODEL, &server.base_url, "test-key")
+            .with_request_limit(65536)
+            .with_response_limit(65536)
     }
 
     fn unreachable_jev() -> JevClassifierProvider {
         // Nothing listens on the loopback discard port.
         JevClassifierProvider::new("typesafe", JEV_DEFAULT_MODEL, "http://127.0.0.1:9/v1", "k")
+            .with_request_limit(65536)
+            .with_response_limit(65536)
     }
 
     // -- Types ---------------------------------------------------------------
@@ -2052,7 +2090,9 @@ mod tests {
             "typesafe/jev-1.13",
             &server.base_url,
             "or-key",
-        );
+        )
+        .with_request_limit(65536)
+        .with_response_limit(65536);
 
         let err = gateway
             .clone()
@@ -2459,6 +2499,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jev_success_and_error_bodies_use_the_shared_response_cap() {
+        for status in [200, 429] {
+            let server = mock_http(vec![(status, vec![], "x".repeat(4096))]);
+            let provider = jev_at(&server).with_response_limit(1024);
+            let error = provider
+                .classify(request(vec![goal_question()]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ModelError::Provider(message) if message == "provider response limit exceeded")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn jev_encoded_request_limit_refuses_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = JevClassifierProvider::new(
+            "typesafe",
+            JEV_DEFAULT_MODEL,
+            format!("http://{}", listener.local_addr().unwrap()),
+            "synthetic",
+        )
+        .with_request_limit(1)
+        .with_response_limit(1024);
+        assert!(matches!(
+            provider.classify(request(vec![goal_question()])).await,
+            Err(ModelError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
     async fn jev_http_statuses_use_the_shared_retry_classification() {
         let cases: [(u16, &str, bool); 10] = [
             (408, "timeout", true),
@@ -2574,7 +2650,9 @@ mod tests {
             &server.base_url,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_request_limit(65536)
+        .with_response_limit(65536);
         assert_eq!(provider.descriptor().auth_mode, mode);
         provider
             .classify(request(vec![route_question(), goal_question()]))

@@ -65,6 +65,7 @@ fn invalid_configuration_is_refused_as_a_whole() {
         ("/bindings/0/limits/max_response_bytes", json!(0)),
         ("/bindings/0/limits/max_request_bytes", json!(0)),
         ("/bindings/0/limits/max_output_tokens", json!(0)),
+        ("/bindings/0/limits/max_output_tokens", Value::Null),
         (
             "/bindings/0/endpoint",
             json!("https://user:password@example.com"),

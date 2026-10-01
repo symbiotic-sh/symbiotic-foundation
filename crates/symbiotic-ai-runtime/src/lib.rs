@@ -124,13 +124,13 @@ impl Default for RuntimeConfig {
 #[derive(Clone, Default)]
 pub enum ResponseCacheMode {
     /// The runtime's own cache when it is persistent, scoped to the
-    /// provider's descriptor; no cache when it is in memory.
+    /// binding identity and effective transport; no cache when it is in memory.
     #[default]
     Default,
     /// No response cache: every call reaches the provider.
     Off,
-    /// A host cache, for example one that reads a layout that predates the
-    /// runtime. See [`ResponseCache`].
+    /// A host cache. Its hits must carry the runtime's matching result scope.
+    /// See [`ResponseCache`].
     Custom(Arc<dyn ResponseCache>),
 }
 
@@ -198,7 +198,7 @@ impl<P> ModelBinding<P> {
     }
 }
 
-/// The limits every binding of one model shares.
+/// The limits every binding of one concrete account shares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SharedLimits {
     max_in_flight: usize,
@@ -330,7 +330,9 @@ impl Runtime {
             model::ResolvedAuth::None
         };
         let key = match auth {
-            model::ResolvedAuth::None if config.secret_ref.is_none() => String::new(),
+            model::ResolvedAuth::None if config.secret_ref.is_none() => {
+                model::SecretValue::new(String::new())
+            }
             model::ResolvedAuth::Bearer(key) | model::ResolvedAuth::ApiKey(key)
                 if !key.is_empty() =>
             {
@@ -356,6 +358,9 @@ impl Runtime {
                 .with_client(client)
                 .with_request_limit(limits.max_request_bytes)
                 .with_response_limit(limits.max_response_bytes)
+                .with_output_limit(limits.max_output_tokens.ok_or_else(|| {
+                    ModelError::InvalidRequest("chat output limit required".into())
+                })?)
                 .with_thinking(settings.thinking);
                 if let Some(effort) = &settings.reasoning_effort {
                     raw = raw.with_reasoning_effort(effort);
@@ -366,6 +371,7 @@ impl Runtime {
             }
             model::ModelAdapter::GeminiEmbedding => {
                 let raw = model::GeminiEmbeddingProvider::new(
+                    &resolved.model.identity.operator.0,
                     &resolved.model.identity.model.0,
                     key,
                     settings.dimensions.ok_or_else(|| {
@@ -386,7 +392,9 @@ impl Runtime {
                     &config.endpoint,
                     key,
                 )
-                .with_client(client);
+                .with_client(client)
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes);
                 if let Some(served) = &settings.served_model {
                     raw = raw.with_served_model(served);
                 }
@@ -420,6 +428,7 @@ impl Runtime {
     where
         C: ChatProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedChatProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
@@ -436,6 +445,7 @@ impl Runtime {
     where
         E: EmbeddingProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider = QueuedEmbeddingProvider::new(
             binding.provider,
@@ -453,6 +463,7 @@ impl Runtime {
     where
         R: RerankProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedRerankProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
@@ -469,6 +480,7 @@ impl Runtime {
     where
         P: ClassifierProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider = QueuedClassifierProvider::new(
             binding.provider,
@@ -518,6 +530,27 @@ impl Runtime {
             if descriptor.capabilities != resolved.model.operations {
                 return Err(ModelError::InvalidRequest(
                     "adapter capabilities differ from configured model".into(),
+                ));
+            }
+            if descriptor
+                .metadata
+                .get("max_request_bytes")
+                .and_then(serde_json::Value::as_u64)
+                != Some(resolved.binding.limits.max_request_bytes as u64)
+                || descriptor
+                    .metadata
+                    .get("max_response_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(resolved.binding.limits.max_response_bytes as u64)
+                || (resolved.model.adapter == model::ModelAdapter::OpenAiChat
+                    && descriptor
+                        .metadata
+                        .get("max_output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        != resolved.binding.limits.max_output_tokens.map(u64::from))
+            {
+                return Err(ModelError::InvalidRequest(
+                    "adapter bounds differ from configured binding".into(),
                 ));
             }
             let settings = &resolved.binding.settings;

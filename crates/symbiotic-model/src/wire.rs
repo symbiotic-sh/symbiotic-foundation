@@ -23,7 +23,10 @@ impl Write for CappedBody {
     }
 }
 
-fn encode(value: &impl Serialize, max_bytes: Option<usize>) -> Result<Vec<u8>, ModelError> {
+pub(crate) fn encode(
+    value: &impl Serialize,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ModelError> {
     let mut body = CappedBody {
         bytes: Vec::new(),
         max_bytes: max_bytes.unwrap_or(usize::MAX),
@@ -103,6 +106,28 @@ struct GeminiPart<'a> {
     text: &'a str,
 }
 
+/// Refuse request options the installed Gemini adapter does not implement.
+pub fn validate_gemini_options(
+    dimensions: usize,
+    request: &EmbeddingRequest,
+) -> Result<(), ModelError> {
+    if dimensions == 0
+        || request
+            .dimensions
+            .is_some_and(|requested| requested != dimensions)
+    {
+        return Err(ModelError::InvalidRequest(
+            "Gemini request dimensions differ from configured binding".into(),
+        ));
+    }
+    if request.task.is_some() {
+        return Err(ModelError::InvalidRequest(
+            "Gemini task option is unsupported".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Encode the complete Gemini single/batch HTTP body, refusing to buffer more
 /// than `max_bytes` when set, including repeated model names and JSON escaping.
 pub fn gemini_embedding_body(
@@ -111,6 +136,7 @@ pub fn gemini_embedding_body(
     request: &EmbeddingRequest,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
+    validate_gemini_options(dimensions, request)?;
     let model = format!("models/{}", model.trim_start_matches("models/"));
     let wire_request = |input| GeminiEmbedWireRequest {
         model: &model,
@@ -140,6 +166,24 @@ mod tests {
     use super::*;
     use symbiotic_core::Sensitivity;
 
+    #[test]
+    fn gemini_wire_refuses_unsupported_task_and_conflicting_dimensions() {
+        let mut request = EmbeddingRequest {
+            inputs: vec!["synthetic".into()],
+            dimensions: Some(3),
+            task: None,
+            sensitivity: Sensitivity::Shareable,
+            role_binding: None,
+            source: None,
+            metadata: Value::Null,
+        };
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_ok());
+        request.task = Some("retrieval_query".into());
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_err());
+        request.task = None;
+        request.dimensions = Some(4);
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_err());
+    }
     #[test]
     fn gemini_wire_limit_covers_single_and_batch_expansion_at_exact_boundary() {
         for count in [1, 128] {
