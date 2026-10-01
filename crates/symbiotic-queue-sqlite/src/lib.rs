@@ -52,8 +52,8 @@ impl SqliteQueue {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(storage_error)?;
         }
-        let conn = Connection::open(path).map_err(storage_error)?;
-        configure(&conn)?;
+        let mut conn = Connection::open(path).map_err(storage_error)?;
+        configure(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             event_sink: None,
@@ -61,8 +61,8 @@ impl SqliteQueue {
     }
 
     pub fn in_memory() -> Result<Self, QueueError> {
-        let conn = Connection::open_in_memory().map_err(storage_error)?;
-        configure(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(storage_error)?;
+        configure(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             event_sink: None,
@@ -791,32 +791,33 @@ impl QueueBackend for SqliteQueue {
 
 const QUEUE_SCHEMA_VERSION: u32 = 2;
 
-fn configure(conn: &Connection) -> Result<(), QueueError> {
+fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
         .map_err(storage_error)?;
-    // Refuse a previous development schema rather than modifying stored data.
-    let existing_queue = conn
-        .prepare("select 1 from sqlite_master where type = 'table' and name = 'queue_items'")
-        .and_then(|mut stmt| stmt.exists([]))
+    conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(storage_error)?;
-    let schema_version: u32 = conn
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    let schema_version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage_error)?;
-    if existing_queue && schema_version != QUEUE_SCHEMA_VERSION
-        || !existing_queue && schema_version != 0
-    {
+    if schema_version == i64::from(QUEUE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    // Before release, only an empty, unversioned queue can be initialized.
+    let existing_queue = tx
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns')")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(storage_error)?;
+    if schema_version != 0 || existing_queue {
         return Err(QueueError::Storage(
             symbiotic_core::DiagnosticCode::UnsupportedQueueSchema,
         ));
     }
-    if existing_queue {
-        validate_layout(conn)?;
-    }
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(storage_error)?;
-    conn.execute_batch(
+    tx.execute_batch(
         "
-        create table if not exists queue_items (
+        create table queue_items (
             item_id text primary key,
             queue_id text not null,
             kind text not null,
@@ -833,15 +834,15 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
             created_at text not null,
             updated_at text not null
         );
-        create index if not exists idx_queue_claim
+        create index idx_queue_claim
             on queue_items(queue_id, status, run_after, created_at);
-        create index if not exists idx_queue_idempotency
+        create index idx_queue_idempotency
             on queue_items(queue_id, idempotency_key);
-        create unique index if not exists idx_queue_active_idempotency
+        create unique index idx_queue_active_idempotency
             on queue_items(queue_id, idempotency_key)
             where idempotency_key is not null
               and status in ('pending', 'running', 'failed');
-        create table if not exists queue_events (
+        create table queue_events (
             event_id integer primary key autoincrement,
             item_id text not null,
             queue_id text not null,
@@ -851,7 +852,7 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
             timestamp text not null,
             error text
         );
-        create table if not exists queue_cooldowns (
+        create table queue_cooldowns (
             queue_id text primary key,
             cooldown_until text not null,
             updated_at text not null
@@ -859,77 +860,9 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
         ",
     )
     .map_err(storage_error)?;
-    conn.pragma_update(None, "user_version", QUEUE_SCHEMA_VERSION)
+    tx.pragma_update(None, "user_version", QUEUE_SCHEMA_VERSION)
         .map_err(storage_error)?;
-    Ok(())
-}
-
-/// Version and exact queue table layouts are required; opening never repairs a layout.
-fn validate_layout(conn: &Connection) -> Result<(), QueueError> {
-    for (table, expected) in [
-        (
-            "queue_items",
-            &[
-                ("item_id", "TEXT"),
-                ("queue_id", "TEXT"),
-                ("kind", "TEXT"),
-                ("payload_json", "TEXT"),
-                ("status", "TEXT"),
-                ("attempt", "INTEGER"),
-                ("max_attempts", "INTEGER"),
-                ("run_after", "TEXT"),
-                ("lease_owner", "TEXT"),
-                ("lease_until", "TEXT"),
-                ("idempotency_key", "TEXT"),
-                ("last_error", "TEXT"),
-                ("last_error_class", "TEXT"),
-                ("created_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ][..],
-        ),
-        (
-            "queue_events",
-            &[
-                ("event_id", "INTEGER"),
-                ("item_id", "TEXT"),
-                ("queue_id", "TEXT"),
-                ("kind", "TEXT"),
-                ("status", "TEXT"),
-                ("attempt", "INTEGER"),
-                ("timestamp", "TEXT"),
-                ("error", "TEXT"),
-            ][..],
-        ),
-        (
-            "queue_cooldowns",
-            &[
-                ("queue_id", "TEXT"),
-                ("cooldown_until", "TEXT"),
-                ("updated_at", "TEXT"),
-            ][..],
-        ),
-    ] {
-        let mut stmt = conn
-            .prepare("select name, type from pragma_table_info(?1) order by cid")
-            .map_err(storage_error)?;
-        let actual = stmt
-            .query_map([table], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(storage_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(storage_error)?;
-        if actual
-            .iter()
-            .map(|(name, ty)| (name.as_str(), ty.as_str()))
-            .ne(expected.iter().copied())
-        {
-            return Err(QueueError::Storage(
-                symbiotic_core::DiagnosticCode::UnsupportedQueueSchema,
-            ));
-        }
-    }
-    Ok(())
+    tx.commit().map_err(storage_error)
 }
 
 fn invalid_stored_code() -> rusqlite::Error {
@@ -1226,74 +1159,107 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn previous_queue_schema_is_refused_without_migration() {
+    fn queue_schema_initializes_and_reopens_at_the_current_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.sqlite");
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("create table queue_items (item_id text primary key, queue_id text, kind text, payload_json text, status text, attempt integer, max_attempts integer, run_after text, lease_owner text, lease_until text, idempotency_key text, last_error text, created_at text, updated_at text)").unwrap();
-        assert!(
-            matches!(SqliteQueue::open(&path), Err(QueueError::Storage(message)) if message.contains("unsupported queue schema"))
+        drop(SqliteQueue::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            QUEUE_SCHEMA_VERSION
         );
-        assert!(
-            !conn
-                .prepare(
-                    "select 1 from pragma_table_info('queue_items') where name = 'last_error_class'"
-                )
-                .unwrap()
-                .exists([])
-                .unwrap()
-        );
-        assert!(
-            !conn
-                .prepare("select 1 from sqlite_master where name = 'queue_events'")
-                .unwrap()
-                .exists([])
-                .unwrap()
-        );
+        assert!(SqliteQueue::open(&path).is_ok());
     }
 
     #[test]
-    fn schemas_with_old_text_errors_or_wrong_version_are_refused_without_migration() {
-        for version in [0, QUEUE_SCHEMA_VERSION + 1] {
+    fn partial_queue_schema_is_refused_without_schema_writes() {
+        for table in [
+            "queue_items",
+            "queue_events",
+            "queue_cooldowns",
+            "QUEUE_EVENTS",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("queue.sqlite");
-            drop(SqliteQueue::open(&path).unwrap());
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch(&format!("create table {table} (foreign_column text)"))
+                .unwrap();
+            let error = match SqliteQueue::open(&path) {
+                Ok(_) => panic!("accepted partial schema with {table}"),
+                Err(error) => error,
+            };
             assert!(matches!(
-                SqliteQueue::open(&path),
-                Err(QueueError::Storage(
-                    symbiotic_core::DiagnosticCode::UnsupportedQueueSchema
-                ))
+                error,
+                QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
             ));
+            assert!(error.to_string().contains("rebuild the queue database"));
             assert_eq!(
                 conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                version
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "select count(*) from sqlite_master where type = 'table'",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+                1
             );
         }
     }
 
     #[test]
-    fn current_version_with_a_different_layout_is_refused_without_repair() {
+    fn queue_schema_creation_and_version_stamp_roll_back_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.sqlite");
-        drop(SqliteQueue::open(&path).unwrap());
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("drop table queue_events").unwrap();
-        assert!(matches!(
-            SqliteQueue::open(&path),
-            Err(QueueError::Storage(
-                symbiotic_core::DiagnosticCode::UnsupportedQueueSchema
-            ))
-        ));
-        assert!(
-            !conn
-                .prepare("select 1 from sqlite_master where name = 'queue_events'")
-                .unwrap()
-                .exists([])
-                .unwrap()
+        // Fail late in initialization, after queue_items and queue_events are created.
+        conn.execute_batch("create view queue_cooldowns as select 1")
+            .unwrap();
+        assert!(SqliteQueue::open(&path).is_err());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
         );
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        conn.execute_batch("drop view queue_cooldowns").unwrap();
+        assert!(SqliteQueue::open(&path).is_ok());
+    }
+
+    #[test]
+    fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
+        for version in [-1, 0, 1, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+            for existing in [false, true] {
+                if version == 0 && !existing {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("queue.sqlite");
+                if existing {
+                    drop(SqliteQueue::open(&path).unwrap());
+                }
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "user_version", version).unwrap();
+                let error = match SqliteQueue::open(&path) {
+                    Ok(_) => panic!("accepted schema version {version}"),
+                    Err(error) => error,
+                };
+                assert!(matches!(
+                    error,
+                    QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
+                ));
+                assert!(error.to_string().contains("rebuild the queue database"));
+                assert_eq!(
+                    conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    version
+                );
+            }
+        }
     }
 
     use super::*;

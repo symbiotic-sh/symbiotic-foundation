@@ -606,13 +606,11 @@ where
 // Answer validation shared by the providers
 // ---------------------------------------------------------------------------
 
-fn check_probability(_question: &str, _key: &str, value: f64) -> Result<f64, ModelError> {
+fn check_probability(value: f64) -> Result<f64, ModelError> {
     if value.is_finite() && (-PROBABILITY_EPSILON..=1.0 + PROBABILITY_EPSILON).contains(&value) {
         Ok(value.clamp(0.0, 1.0))
     } else {
-        Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ))
+        Err(ModelError::Provider(DiagnosticCode::ProviderFailure))
     }
 }
 
@@ -621,34 +619,30 @@ fn check_probability(_question: &str, _key: &str, value: f64) -> Result<f64, Mod
 /// further from 1 (a provider that promises a distribution); `None` accepts
 /// any positive sum (a text model's stated numbers rarely add up).
 fn choice_probabilities(
-    question: &str,
     options: &[ChoiceOption],
     mut reported: HashMap<String, f64>,
     max_sum_error: Option<f64>,
 ) -> Result<Vec<OptionProbability>, ModelError> {
     let mut probabilities = Vec::with_capacity(options.len());
     for option in options {
-        let value = reported.remove(&option.id).ok_or(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ))?;
+        let value = reported
+            .remove(&option.id)
+            .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
         probabilities.push(OptionProbability {
             id: option.id.clone(),
-            probability: check_probability(question, &option.id, value)?,
+            probability: check_probability(value)?,
         });
     }
     if let Some(_extra) = reported.keys().next() {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     }
     let values: Vec<f64> = probabilities
         .iter()
         .map(|entry| entry.probability)
         .collect();
-    for (entry, value) in
-        probabilities
-            .iter_mut()
-            .zip(normalise_distribution(question, &values, max_sum_error)?)
+    for (entry, value) in probabilities
+        .iter_mut()
+        .zip(normalise_distribution(&values, max_sum_error)?)
     {
         entry.probability = value;
     }
@@ -658,7 +652,6 @@ fn choice_probabilities(
 /// Every level `"0"`, `"1"`, … exactly once, lowest first, rescaled to sum
 /// to 1; `max_sum_error` as in [`choice_probabilities`].
 fn score_probabilities(
-    question: &str,
     level_count: usize,
     mut reported: HashMap<String, f64>,
     max_sum_error: Option<f64>,
@@ -666,36 +659,29 @@ fn score_probabilities(
     let mut probabilities = Vec::with_capacity(level_count);
     for level in 0..level_count {
         let key = level.to_string();
-        let value = reported.remove(&key).ok_or(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ))?;
-        probabilities.push(check_probability(question, &key, value)?);
+        let value = reported
+            .remove(&key)
+            .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
+        probabilities.push(check_probability(value)?);
     }
     if let Some(_extra) = reported.keys().next() {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     }
-    normalise_distribution(question, &probabilities, max_sum_error)
+    normalise_distribution(&probabilities, max_sum_error)
 }
 
 fn normalise_distribution(
-    _question: &str,
     values: &[f64],
     max_sum_error: Option<f64>,
 ) -> Result<Vec<f64>, ModelError> {
     let total: f64 = values.iter().sum();
     if total <= PROBABILITY_EPSILON {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     }
     if let Some(max_error) = max_sum_error
         && (total - 1.0).abs() > max_error
     {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     }
     Ok(values.iter().map(|value| value / total).collect())
 }
@@ -710,27 +696,21 @@ fn validate_answers(
     request: &ClassifyRequest,
     answers: &[ClassifierAnswer],
 ) -> Result<(), ModelError> {
-    let invalid = |_question: &str, _detail: &str| {
-        ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
-    };
     if answers.len() != request.questions.len() {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderFailure,
-        ));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     }
     let sums_to_one = |values: &mut dyn Iterator<Item = f64>| {
         (values.sum::<f64>() - 1.0).abs() <= PROBABILITY_EPSILON
     };
     for (question, answer) in request.questions.iter().zip(answers) {
-        let id = question.id.as_str();
         if answer.question_id != question.id {
-            return Err(invalid(id, "answers are out of order"));
+            return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
         }
         let in_range = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
         match (&question.kind, &answer.value) {
             (QuestionKind::Noul { .. }, AnswerValue::Noul { probability }) => {
                 if !in_range(*probability) {
-                    return Err(invalid(id, "probability outside [0, 1]"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
             }
             (
@@ -747,14 +727,14 @@ fn validate_answers(
                         .zip(options)
                         .any(|(entry, option)| entry.id != option.id)
                 {
-                    return Err(invalid(id, "options differ from the requested ones"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 if !probabilities
                     .iter()
                     .all(|entry| in_range(entry.probability))
                     || !sums_to_one(&mut probabilities.iter().map(|entry| entry.probability))
                 {
-                    return Err(invalid(id, "not a probability distribution"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 let max = probabilities
                     .iter()
@@ -764,10 +744,10 @@ fn validate_answers(
                     .iter()
                     .any(|entry| &entry.id == chosen && entry.probability >= max - TIE_EPSILON)
                 {
-                    return Err(invalid(id, "the chosen option is not the most probable"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 if confidence.is_some_and(|value| !in_range(value)) {
-                    return Err(invalid(id, "confidence outside [0, 1]"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
             }
             (
@@ -782,19 +762,19 @@ fn validate_answers(
                     || !probabilities.iter().all(|p| in_range(*p))
                     || !sums_to_one(&mut probabilities.iter().copied())
                 {
-                    return Err(invalid(id, "not a distribution over the levels"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 if !value.is_finite()
                     || (value - expected_level(probabilities)).abs() > PROBABILITY_EPSILON
                 {
-                    return Err(invalid(id, "value is not the weighted level"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 if confidence.is_some_and(|value| !in_range(value)) {
-                    return Err(invalid(id, "confidence outside [0, 1]"));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
             }
-            (kind, _) => {
-                return Err(invalid(id, &format!("expected a {} answer", kind.label())));
+            (_, _) => {
+                return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
             }
         }
     }
@@ -1018,55 +998,46 @@ impl JevClassifierProvider {
         let mut parsed = Vec::with_capacity(request.questions.len());
         for question in &request.questions {
             let id = question.id.as_str();
-            let malformed = |_detail: &str| {
-                ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
-            };
             let answer = answers
                 .get(id)
                 .and_then(Value::as_object)
-                .ok_or_else(|| malformed("missing or not an object"))?;
+                .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
             let kind = answer.get("type").and_then(Value::as_str).unwrap_or("");
             if kind != question.kind.label() {
-                return Err(malformed(&format!(
-                    "a {} question answered as `{kind}`",
-                    question.kind.label()
-                )));
+                return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
             }
             let number = |field: &str| {
                 answer
                     .get(field)
                     .and_then(Value::as_f64)
-                    .ok_or_else(|| malformed(&format!("`{field}` is not a number")))
+                    .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))
             };
             let confidence = match answer.get("confidence") {
                 None | Some(Value::Null) => None,
-                Some(_) => Some(check_probability(id, "confidence", number("confidence")?)?),
+                Some(_) => Some(check_probability(number("confidence")?)?),
             };
             let distribution = || {
                 answer
                     .get("probabilities")
                     .cloned()
-                    .ok_or_else(|| malformed("no probabilities"))
-                    .and_then(|raw| number_map(id, raw).map_err(|detail| malformed(&detail)))
+                    .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))
+                    .and_then(number_map)
             };
             let value = match &question.kind {
                 QuestionKind::Noul { .. } => AnswerValue::Noul {
-                    probability: check_probability(id, "of yes", number("noul")?)?,
+                    probability: check_probability(number("noul")?)?,
                 },
                 QuestionKind::Choice { options } => {
                     let chosen = answer
                         .get("choice")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| malformed("`choice` is not a string"))?;
+                        .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
                     if !options.iter().any(|option| option.id == chosen) {
-                        return Err(malformed(&format!(
-                            "chose `{chosen}`, not a requested option"
-                        )));
+                        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                     }
                     AnswerValue::Choice {
                         chosen: chosen.to_string(),
                         probabilities: choice_probabilities(
-                            id,
                             options,
                             distribution()?,
                             Some(REPORTED_SUM_TOLERANCE),
@@ -1076,7 +1047,6 @@ impl JevClassifierProvider {
                 }
                 QuestionKind::Score { levels } => {
                     let probabilities = score_probabilities(
-                        id,
                         levels.len(),
                         distribution()?,
                         Some(REPORTED_SUM_TOLERANCE),
@@ -1087,9 +1057,7 @@ impl JevClassifierProvider {
                     if !(0.0..=top).contains(&reported)
                         || (reported - value).abs() > SCORE_TOLERANCE_LEVELS
                     {
-                        return Err(malformed(&format!(
-                            "score {reported} does not match its probabilities ({value:.3})"
-                        )));
+                        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                     }
                     AnswerValue::Score {
                         value,
@@ -1107,9 +1075,7 @@ impl JevClassifierProvider {
             .keys()
             .find(|key| !request.questions.iter().any(|q| &q.id == *key))
         {
-            return Err(ModelError::Provider(
-                symbiotic_core::DiagnosticCode::ProviderFailure,
-            ));
+            return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
         }
         validate_answers(request, &parsed)?;
         Ok(parsed)
@@ -1167,23 +1133,18 @@ impl ClassifierProvider for JevClassifierProvider {
                 let (raw, text) =
                     provider_response_json(builder, self.max_response_bytes, ModelError::Provider)
                         .await?;
-                let unexpected = |_detail: &str| {
-                    ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
-                };
                 let served_model = raw
                     .get("model")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| unexpected("no model"))?
+                    .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?
                     .to_string();
                 if served_model != self.served_model {
-                    return Err(ModelError::Provider(
-                        symbiotic_core::DiagnosticCode::ProviderFailure,
-                    ));
+                    return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
                 let answers = raw
                     .get("answers")
                     .and_then(Value::as_object)
-                    .ok_or_else(|| unexpected("no answers"))?;
+                    .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
                 let answers = Self::parse_answers(&request, answers)?;
                 let mut trace = classify_trace(&self.descriptor, &request, &text, started)?;
                 let usage = |field: &str| {
@@ -1405,34 +1366,27 @@ impl ChatClassifierProvider {
         request: &ClassifyRequest,
         reply: &str,
     ) -> Result<Vec<ClassifierAnswer>, ModelError> {
-        let malformed =
-            |_detail: String| ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure);
         let value: Value = serde_json::from_str(reply.trim())
-            .map_err(|err| malformed(format!("not JSON ({err})")))?;
+            .map_err(|_| ModelError::Provider(DiagnosticCode::ProviderFailure))?;
         let Value::Object(mut object) = value else {
-            return Err(malformed("not a JSON object".to_string()));
+            return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
         };
         let mut answers = Vec::with_capacity(request.questions.len());
         for question in &request.questions {
             let raw = object
                 .remove(&question.id)
-                .ok_or_else(|| malformed(format!("no answer for question `{}`", question.id)))?;
+                .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
             let value = match &question.kind {
                 QuestionKind::Noul { .. } => {
-                    let probability = raw.as_f64().ok_or_else(|| {
-                        malformed(format!("question `{}` needs a number", question.id))
-                    })?;
+                    let probability = raw
+                        .as_f64()
+                        .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))?;
                     AnswerValue::Noul {
-                        probability: check_probability(&question.id, "of yes", probability)?,
+                        probability: check_probability(probability)?,
                     }
                 }
                 QuestionKind::Choice { options } => {
-                    let probabilities = choice_probabilities(
-                        &question.id,
-                        options,
-                        number_map(&question.id, raw).map_err(malformed)?,
-                        None,
-                    )?;
+                    let probabilities = choice_probabilities(options, number_map(raw)?, None)?;
                     AnswerValue::Choice {
                         chosen: most_probable(&probabilities),
                         probabilities,
@@ -1440,12 +1394,7 @@ impl ChatClassifierProvider {
                     }
                 }
                 QuestionKind::Score { levels } => {
-                    let probabilities = score_probabilities(
-                        &question.id,
-                        levels.len(),
-                        number_map(&question.id, raw).map_err(malformed)?,
-                        None,
-                    )?;
+                    let probabilities = score_probabilities(levels.len(), number_map(raw)?, None)?;
                     AnswerValue::Score {
                         value: expected_level(&probabilities),
                         probabilities,
@@ -1458,25 +1407,25 @@ impl ChatClassifierProvider {
                 value,
             });
         }
-        if let Some(extra) = object.keys().next() {
-            return Err(malformed(format!("unrequested key `{extra}`")));
+        if !object.is_empty() {
+            return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
         }
         validate_answers(request, &answers)?;
         Ok(answers)
     }
 }
 
-fn number_map(question: &str, raw: Value) -> Result<HashMap<String, f64>, String> {
+fn number_map(raw: Value) -> Result<HashMap<String, f64>, ModelError> {
     let Value::Object(object) = raw else {
-        return Err(format!("question `{question}` needs an object of numbers"));
+        return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
     };
     object
         .into_iter()
         .map(|(key, value)| {
             value
                 .as_f64()
-                .map(|number| (key.clone(), number))
-                .ok_or_else(|| format!("question `{question}`: `{key}` is not a number"))
+                .map(|number| (key, number))
+                .ok_or(ModelError::Provider(DiagnosticCode::ProviderFailure))
         })
         .collect()
 }
@@ -3066,6 +3015,35 @@ mod tests {
             .unwrap();
         assert_eq!(response.noul("goal"), Some(0.7));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn queued_classifier_traces_a_terminal_failure_with_its_typed_class() {
+        let trace_sink = Arc::new(InMemoryTraceSink::default());
+        let provider = QueuedClassifierProvider::new(
+            CountingClassifier {
+                inner: StaticClassifierProvider::new([ClassifierAnswer::noul("goal", 0.7)]),
+                calls: Arc::new(AtomicUsize::new(0)),
+                failures: 1,
+            },
+            Arc::new(SqliteQueue::in_memory().unwrap()),
+            "worker",
+            ModelQueueConfig {
+                logical_retry_attempts: 1,
+                retry_attempts: 1,
+                ..queue_config(None)
+            },
+        )
+        .with_trace_sink(trace_sink.clone());
+        assert!(matches!(
+            provider.classify(request(vec![goal_question()])).await,
+            Err(ModelError::Unavailable(_))
+        ));
+        let traces = trace_sink.records();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].outcome, InvocationOutcome::Failed);
+        assert_eq!(traces[0].error_class, Some(FailureClass::Unavailable));
     }
 
     #[cfg(feature = "queue")]

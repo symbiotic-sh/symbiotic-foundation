@@ -101,7 +101,7 @@ closed_codes! {
         StaleQueueItem => ("stale_queue_item", "stale queue item"),
         StorageFailure => ("storage_failure", "storage failure"),
         SystemOneNeedsABearerApiKey => ("system_one_needs_a_bearer_api_key", "System One needs a bearer API key"),
-        UnsupportedQueueSchema => ("unsupported_queue_schema", "unsupported queue schema"),
+        UnsupportedQueueSchema => ("unsupported_queue_schema", "unsupported queue schema; rebuild the queue database"),
         WorkerIdMustNotBeEmpty => ("worker_id_must_not_be_empty", "worker_id must not be empty"),
     }
 }

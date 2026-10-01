@@ -1088,7 +1088,7 @@ impl<Req> QueuedCall<Req> {
                 usage: UsageTrace::default(),
                 timing: TimingTrace::default(),
                 outcome: InvocationOutcome::Failed,
-                error_class: Some(err.to_string()),
+                error_class: Some(error_class(err)),
                 audit_refs: Vec::new(),
                 metadata: serde_json::json!({"binding": self.binding_identity}),
                 timestamp: Utc::now(),
