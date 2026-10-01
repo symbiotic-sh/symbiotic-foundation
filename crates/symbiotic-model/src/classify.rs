@@ -865,7 +865,7 @@ fn classify_trace(
 #[derive(Clone)]
 pub struct JevClassifierProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
     api_key: CredentialBoundary,
     max_request_bytes: Option<usize>,
@@ -894,7 +894,7 @@ impl JevClassifierProvider {
                 },
                 metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": base_url }),
             },
-            client: default_http_client(),
+            client: HttpClient::default(),
             base_url,
             api_key: CredentialBoundary::new(api_key.into()),
             max_request_bytes: None,
@@ -951,7 +951,7 @@ impl JevClassifierProvider {
     /// ```
     /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
     pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
-        self.client = http_client(Some(timeout_seconds))?;
+        self.client = HttpClient(Ok(http_client(Some(timeout_seconds))?));
         Ok(self)
     }
 
@@ -1127,6 +1127,7 @@ impl ModelProvider for JevClassifierProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;
         Ok(())
@@ -1158,6 +1159,7 @@ impl ClassifierProvider for JevClassifierProvider {
                 let started = Instant::now();
                 let builder = self
                     .client
+                    .get()?
                     .post(format!("{}/systemone", self.base_url.trim_end_matches('/')))
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body);
@@ -1166,7 +1168,7 @@ impl ClassifierProvider for JevClassifierProvider {
                 } else {
                     builder.bearer_auth(self.api_key.secret())
                 };
-                let (raw, bytes) =
+                let (raw, text) =
                     provider_response_json(builder, self.max_response_bytes, ModelError::Provider)
                         .await?;
                 let unexpected = |detail: &str| {
@@ -1188,10 +1190,7 @@ impl ClassifierProvider for JevClassifierProvider {
                     .and_then(Value::as_object)
                     .ok_or_else(|| unexpected("no answers"))?;
                 let answers = Self::parse_answers(&request, answers)?;
-                let body = String::from_utf8(bytes).map_err(|_| {
-                    ModelError::Provider("invalid System One UTF-8 response".into())
-                })?;
-                let mut trace = classify_trace(&self.descriptor, &request, &body, started)?;
+                let mut trace = classify_trace(&self.descriptor, &request, &text, started)?;
                 let usage = |field: &str| {
                     raw.pointer(&format!("/usage/{field}"))
                         .and_then(Value::as_u64)
@@ -1846,6 +1845,16 @@ mod tests {
         JevClassifierProvider::new("typesafe", JEV_DEFAULT_MODEL, "http://127.0.0.1:9/v1", "")
             .with_request_limit(65536)
             .with_response_limit(65536)
+    }
+
+    #[test]
+    fn failed_http_client_construction_refuses_classifier_configuration() {
+        let mut provider = unreachable_jev();
+        provider.client = HttpClient(Err(()));
+        assert!(matches!(
+            provider.validate_configuration(),
+            Err(ModelError::InvalidRequest(message)) if message == "invalid HTTP client configuration"
+        ));
     }
 
     // -- Types ---------------------------------------------------------------

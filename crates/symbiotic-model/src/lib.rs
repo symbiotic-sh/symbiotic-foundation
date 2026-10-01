@@ -2561,7 +2561,7 @@ impl ChatProvider for StaticChatProvider {
 #[derive(Clone)]
 pub struct OpenAiCompatibleChatProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
     api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
@@ -2622,7 +2622,7 @@ impl OpenAiCompatibleChatProvider {
                 },
                 metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": base_url }),
             },
-            client: default_http_client(),
+            client: HttpClient::default(),
             base_url,
             api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
@@ -2641,7 +2641,7 @@ impl OpenAiCompatibleChatProvider {
     /// ```
     /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
     pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
-        self.client = http_client(Some(timeout_seconds))?;
+        self.client = HttpClient(Ok(http_client(Some(timeout_seconds))?));
         Ok(self)
     }
 
@@ -2690,6 +2690,7 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;
         if self.max_output_tokens == Some(0) {
@@ -2834,6 +2835,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 )?;
                 let builder = self
                     .client
+                    .get()?
                     .post(format!(
                         "{}/chat/completions",
                         self.base_url.trim_end_matches('/')
@@ -2925,7 +2927,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
 #[derive(Clone)]
 pub struct GeminiEmbeddingProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
+    client: HttpClient,
     api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
@@ -2966,7 +2968,7 @@ impl GeminiEmbeddingProvider {
                 },
                 metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
-            client: default_http_client(),
+            client: HttpClient::default(),
             api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
@@ -2984,7 +2986,7 @@ impl GeminiEmbeddingProvider {
     /// ```
     /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
     pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
-        self.client = http_client(Some(timeout_seconds))?;
+        self.client = HttpClient(Ok(http_client(Some(timeout_seconds))?));
         Ok(self)
     }
 
@@ -3010,6 +3012,7 @@ impl ModelProvider for GeminiEmbeddingProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;
         if self.dimensions == 0 {
@@ -3098,6 +3101,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                 let vectors = if request.inputs.len() == 1 {
                     let builder = self
                         .client
+                        .get()?
                         .post(format!("{}/models/{model}:embedContent", self.endpoint()))
                         .header("x-goog-api-key", self.api_key.secret())
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -3123,6 +3127,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                 } else {
                     let builder = self
                         .client
+                        .get()?
                         .post(format!(
                             "{}/models/{model}:batchEmbedContents",
                             self.endpoint()
@@ -3174,18 +3179,32 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
     }
 }
 
+// Keep infallible adapter constructors while surfacing client construction errors
+// during configuration validation, before a binding can dispatch.
+#[derive(Clone)]
+struct HttpClient(Result<reqwest::Client, ()>);
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self(http_client_builder().build().map_err(|_| ()))
+    }
+}
+
+impl HttpClient {
+    fn get(&self) -> Result<&reqwest::Client, ModelError> {
+        self.0.as_ref().map_err(|_| invalid_http_client())
+    }
+}
+
+fn invalid_http_client() -> ModelError {
+    ModelError::InvalidRequest("invalid HTTP client configuration".into())
+}
+
 fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .retry(reqwest::retry::never())
-}
-
-fn default_http_client() -> reqwest::Client {
-    // Every construction path uses the same redirect/proxy/retry policy.
-    http_client_builder()
-        .build()
-        .expect("default provider HTTP client could not be built")
 }
 
 /// Boundary-owned HTTP client construction; no public client injection.
@@ -3196,7 +3215,7 @@ fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelErr
     http_client_builder()
         .timeout(std::time::Duration::from_secs(timeout))
         .build()
-        .map_err(|_| ModelError::InvalidRequest("invalid HTTP client configuration".into()))
+        .map_err(|_| invalid_http_client())
 }
 
 fn required_byte_limit(limit: Option<usize>) -> Result<usize, ModelError> {
@@ -3242,7 +3261,7 @@ async fn provider_response_json(
     builder: reqwest::RequestBuilder,
     max_bytes: Option<usize>,
     invalid_json: fn(String) -> ModelError,
-) -> Result<(Value, Vec<u8>), ModelError> {
+) -> Result<(Value, String), ModelError> {
     let response = builder
         .send()
         .await
@@ -3252,14 +3271,13 @@ async fn provider_response_json(
         return Err(ModelError::Provider("provider redirect refused".into()));
     }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| ModelError::Provider("provider response is not valid UTF-8".into()))?;
     if !status.is_success() {
-        return Err(status_error(
-            status.as_u16(),
-            String::from_utf8_lossy(&bytes).into_owned(),
-        ));
+        return Err(status_error(status.as_u16(), text));
     }
-    let raw: Value = serde_json::from_slice(&bytes).map_err(|err| invalid_json(err.to_string()))?;
-    Ok((raw, bytes))
+    let raw: Value = serde_json::from_str(&text).map_err(|err| invalid_json(err.to_string()))?;
+    Ok((raw, text))
 }
 
 fn status_error(status: u16, body: String) -> ModelError {
@@ -3320,6 +3338,24 @@ mod tests {
     use std::time::Duration;
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
+
+    #[test]
+    fn failed_http_client_construction_refuses_chat_and_embedding_configuration() {
+        let mut chat = OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "")
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        let mut embedding = GeminiEmbeddingProvider::new("op", "model", "", 2)
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        chat.client = HttpClient(Err(()));
+        embedding.client = HttpClient(Err(()));
+        for provider in [&chat as &dyn ModelProvider, &embedding] {
+            assert!(matches!(
+                provider.validate_configuration(),
+                Err(ModelError::InvalidRequest(message)) if message == "invalid HTTP client configuration"
+            ));
+        }
+    }
 
     #[test]
     fn gemini_single_vectors_require_exact_configured_dimensions() {
