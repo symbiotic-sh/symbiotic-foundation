@@ -83,20 +83,26 @@ Query text sent for search embedding or reranking has no per-query access check:
 it goes to the tenant's configured search providers. Configure local search
 providers when queries must stay local. This exemption covers query text only.
 Candidate record text in a reranking payload requires the requesting principal's
-and reranker principal's read access. An unauthorized candidate must not be sent
-to that provider; query exemption does not authorize the complete payload.
+and reranker principal's read access. A candidate the caller may read but the
+reranker may not read stays in the results at its first-stage position, is not
+reranked, and is flagged `rerank: skipped`. Nothing about that candidate is sent
+to the reranker provider; query exemption does not authorize the complete payload.
 
 For example, tenant A searches for `renewal date`. That text may go to its configured
 search provider without a query grant. If candidate revision R is readable by the
-caller but not by the reranker, Memory cannot include R in the reranking request.
+caller but not by the reranker, Memory returns R at its first-stage position with
+`rerank: skipped` and sends nothing about R in the reranking request.
 If both have access, Foundation executes the admitted payload, and Memory stores
 any resulting derivation with a receipt reference and checked input provenance.
 
-Derived output is readable by at most the intersection of its inputs' readers by
-default. Widening requires an explicit Memory release grant: a principal with
-release authority grants a specified reader set for the derived record, and Memory
-updates that record's reader set and the effective grant revision. Without that
-grant, the input intersection carries provider restrictions into derived data.
+Without an explicit release, derived output is readable by at most the intersection
+of its inputs' readers. Widening requires an explicit Memory release grant: a
+principal with release authority grants a specified reader set for the derived
+record, which may include a provider principal. Memory updates that record's reader
+set and the effective grant revision. The explicit release stands until changed by
+another explicit release; later input-grant changes do not recompute its reader set.
+The automatic input-intersection rule applies only to outputs without an explicit
+release and carries provider restrictions into those outputs.
 Once data is returned to an agent, Memory cannot control which model that agent
 subsequently uses.
 
@@ -144,8 +150,18 @@ the grant revision changes even when the provider's grants remain unchanged.
 C is refused before handoff; a later commit check cannot undo disclosure to
 the provider.
 
-Grant changes apply going forward. Stored outputs remain; the provider loses read
-access through the input intersection rule. The audit trail stays global. Changing
+Grant changes apply going forward. Stored outputs remain. Outputs without an
+explicit release follow the input-intersection rule, so a provider that loses read
+access to an input loses read access to those outputs. An explicitly released
+output retains its specified readers, including provider principals, until another
+explicit release changes them.
+
+For example, provider P is an explicit reader of derived record D under a release
+grant. Removing P's access to an input of D does not remove P's access to D; another
+explicit release must change D's readers to do that. An output with the same inputs
+but no explicit release loses P through the input-intersection rule.
+
+The audit trail stays global. Changing
 the embedding provider triggers re-embedding. Products that want to regenerate
 old outputs page `derivations.list` by producer and explicitly request new runs.
 
@@ -179,8 +195,8 @@ The current runtime retries `ModelError::Timeout`, `ModelError::Unavailable`
 (5xx, including 529) and `ModelError::RateLimited` (429) by error class without
 checking charge certainty. Enabling `retry_provider_errors` also retries
 `ModelError::Provider` on that basis. These are known violations across the shared
-queued chat, embedding, rerank and classification paths; correcting retry admission
-and same-attempt recovery is assigned to audit PRs 5/6. The current credential-process
+queued chat, embedding, rerank and classification paths; retry admission and
+same-attempt recovery remain implementation work. The current credential-process
 backend disables these retries with one runtime attempt per permit.
 
 For example, a request-bound invocation allows at most two provider requests. One

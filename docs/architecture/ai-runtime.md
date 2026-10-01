@@ -12,7 +12,7 @@ records current runtime behavior. Complete tenant/provider/configuration binding
 explicit account isolation, canonical spend accounting and admission/maintenance
 bounds remain implementation work; this API alone supplies none of Memory's data
 authorization checks. The error-class retry gaps listed under
-[policy knobs](#policy-knobs) remain assigned to audit PRs 5/6 under the
+[policy knobs](#policy-knobs) remain implementation work under the
 [spend contract](boundary.md#spend-ledger-and-budgets).
 
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
@@ -82,7 +82,7 @@ Queue records hold the request hash, never the request. A crash therefore
 cannot resume an in-flight call from the queue. Recovery requirements follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). The current credential backend
 provides [same-attempt recovery](model-egress.md#same-attempt-recovery-v2); the general
-runtime still requires that recovery integration in audit PRs 5/6. The cache and
+runtime still requires that recovery integration. The cache and
 attempt budget are execution primitives, not spend reconciliation. For example,
 a request that exhausted its attempts before a restart fails again
 afterwards without another provider call.
@@ -201,7 +201,7 @@ budgets are keyed as before. This fresh queue budget does not establish charge
 certainty for an earlier attempt or authorize resubmitting an unknown charge;
 admission and recovery follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
-a known gap assigned to audit PRs 5/6.
+a known implementation gap.
 
 Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
@@ -216,7 +216,7 @@ policy retries `ModelError::Timeout`, `ModelError::Unavailable` (5xx, including 
 and `ModelError::RateLimited` (429) without checking charge certainty. Opt-in
 `retry_provider_errors` adds `ModelError::Provider` to that policy. All four classes
 are known gaps across the shared queued chat, embedding, rerank and classification
-paths, assigned to audit PRs 5/6.
+paths and remain implementation work.
 
 `ModelQueueConfig` fields:
 
@@ -252,7 +252,7 @@ paths, assigned to audit PRs 5/6.
   runtime does not make another paid attempt from that item. On a non-final
   attempt, both queue backends instead mark the item failed and allow another
   claim without checking the earlier attempt's charge certainty. This is another
-  recovery gap assigned to audit PRs 5/6 under the
+  recovery gap under the
   [spend contract](boundary.md#spend-ledger-and-budgets).
 
 - `budget_renewal_seconds` (default `None`): once a request has exhausted
@@ -262,8 +262,8 @@ paths, assigned to audit PRs 5/6.
   `Some(0)` gives every call its own budget. These are current queue mechanics;
   renewal does not prove zero charge or authorize resending an uncertain attempt.
   Retry admission and recovery must follow
-  [boundary.md](boundary.md#spend-ledger-and-budgets); that alignment remains a gap
-  assigned to audit PRs 5/6.
+  [boundary.md](boundary.md#spend-ledger-and-budgets); that alignment remains an
+  implementation gap.
   Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a

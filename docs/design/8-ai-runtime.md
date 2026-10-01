@@ -20,8 +20,8 @@ Queued provider calls were implemented three times across Foundation's
 consumers: Foundation's `Queued*` providers, a consumer-local provider-queue
 stack, and a consumer-local durable journal. Fixes reached one copy at a time.
 Consumers forked because Foundation offered only a SQLite backend and lacked
-behaviour one of them depended on. The Stage-4 gate asks for zero duplicate
-rate-limiter/rerank/queue implementations.
+behaviour one of them depended on. The shared runtime facade removes duplicate
+rate-limiter, rerank and queue implementations from consumers.
 
 ## Decisions
 
@@ -75,7 +75,7 @@ rate-limiter/rerank/queue implementations.
    [spend contract](../architecture/boundary.md#spend-ledger-and-budgets).
    Current error-class retries for timeout, unavailable and rate-limited calls,
    plus `ModelError::Provider` when `retry_provider_errors` is enabled, remain
-   known gaps assigned to audit PRs 5/6.
+   known implementation gaps.
 8. **Repeating a finished request without a cached answer runs it again.**
    Before, this returned a cache error. Queue records coordinate calls; they do
    not hold answers.

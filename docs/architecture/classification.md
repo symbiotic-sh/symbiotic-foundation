@@ -115,8 +115,8 @@ response must name the expected served model (by default the requested one;
 tuned on one version. HTTP statuses use the crate's classification: 408/504
 time out, 429 is rate limited, 5xx (including TypeSafe's 529 Overloaded) is
 unavailable. The current queue policy treats all three as retryable without proving
-zero charge; this is the [runtime retry gap](ai-runtime.md#policy-knobs)
-assigned to audit PRs 5/6. Opt-in `retry_provider_errors` also retries
+zero charge; this is the [runtime retry gap](ai-runtime.md#policy-knobs).
+Opt-in `retry_provider_errors` also retries
 `ModelError::Provider` without checking charge certainty under the same gap.
 Retry admission follows the [spend contract](boundary.md#spend-ledger-and-budgets).
 Answers that do not match the questions
