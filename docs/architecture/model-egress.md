@@ -1,11 +1,20 @@
 # Credential-owned model egress (WP14)
 
-Memory depends on **`symbiotic-egress` 0.2.0** (Rust path `symbiotic_egress`).
+The [Foundation boundary contract](boundary.md) is authoritative for provider
+principals, grant-revision dispatch ordering, spend ownership and supported modes.
+This page describes the current local credential backend and version-2 API;
+it does not claim those APIs already satisfy the replacement contract.
+
+Memory consumes **`symbiotic-egress` 0.2.0** (Rust path `symbiotic_egress`).
 The executable and implementation crate are **`symbiotic-credential-process` 0.2.0**
-(`symbiotic_credential_process`). This is Foundation's implementation for
-[symbiotic-sh/symbiotic-memory#208](https://github.com/symbiotic-sh/symbiotic-memory/issues/208),
-following design 137 revision 8 §§7.2 and 12. Memory implements admission and durable
-reservations; it does not import the process implementation or own another provider queue.
+(`symbiotic_credential_process`). The implementation reuses the Foundation runtime
+and its operational database; it has no second provider scheduler.
+
+**Implementation gaps:** the current schema still carries obsolete policy fields
+and a caller-supplied reservation, uses route-sequence revocation rather than
+current provider grant revisions, and lacks complete tenant/provider/configuration
+identity and the canonical Foundation spend ledger. Replacement protocol and
+accounting work must follow [boundary.md](boundary.md), not preserve these semantics.
 
 ## Shared schema and Memory integration
 
@@ -13,7 +22,7 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 `PROTOCOL_VERSION = 2`. The credential operation also requires
 `InjectProviderCredential.operation_version = 2`.
 
-| Type / API | Contract |
+| Current type / API | Meaning |
 | --- | --- |
 | `EgressClient::exchange(Request) -> Result<Response, EgressError>` | Async, object-safe seam for Memory and its test doubles |
 | `socket::UnixEgressClient` | Local socket implementation, configured path, frame bound and timeout |
@@ -29,51 +38,30 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 | `DispatchReceipt` | `attempt_digest`, `DispatchStatus`, provider-reported `UsageTrace`, `ChargeReport` |
 | `ProviderOutput` | Chat text or embedding vectors/dimensions; no raw provider response, raw error, credentials or trace metadata |
 
-`DurableAttempt` fields are exactly:
+`DurableAttempt` and related wire types are defined in
+[`crates/symbiotic-egress/src/lib.rs`](../../crates/symbiotic-egress/src/lib.rs).
+Use those definitions for current version-2 serialization; this page does not
+provide a replacement wire schema. `input_digest` hashes the exact typed
+`ProviderPayload` JSON via its `digest()` helper. `input_manifest_digest` binds
+Memory's manifest bytes; Foundation verifies the binding, not the manifest's
+policy contents. Secret references are tenant scoped, not file paths.
 
-- `tenant`, `incarnation`, `invocation_id`, `attempt_ordinal`, `record_sequence`;
-- `recorded_at`, `expires_at`, `recovery_expires_at`, `caller_binding`;
-- `route`, `destination`, `model`, `method`, `secret_ref`;
-- `manifest_ref`, `input_manifest_digest`, `input_digest`, `markings`;
-- `max_attempts`, `reserved_budget: ReservedBudget { unit, amount, invocation_limit }`.
+The replacement integration order is specified once in
+[boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The admission MAC
+key is distinct from provider credentials and authenticates trusted admission;
+it is not end-user authentication. Memory retains input authorization and guarded
+output commits. Foundation owns execution reservations, settlement and recovery;
+Memory retains receipt references.
 
-Times are Unix seconds, expiry is exclusive, ordinals are one-based, digests are
-lowercase SHA-256 hex. `input_digest` hashes the exact typed `ProviderPayload` JSON.
-`input_manifest_digest` hashes Memory's manifest bytes; Foundation verifies its binding,
-not Memory's manifest contents. `method` is `POST`. Secret references are tenant scoped
-and must match a configured route; they are not file paths. Empty markings are permitted
-when the marking layer is unconfigured. `unclassified` refuses dispatch.
-
-Memory's ordered integration:
-
-1. Under K serialization, check current authority, D1/D2, route and processing admission,
-   input guards, trusted expiry and remaining spend. Record the exact attempt and reserve
-   its upper charge bound together. Failed durability means **never sign**.
-2. After a successful barrier, call `AdmissionKey::sign_attempt` and send `IssuePermit`.
-   The MAC key is separately provisioned to the trusted Memory admission component and
-   Foundation; it is never a provider credential. Foundation trusts Memory's signed
-   durability/policy attestation and cannot independently verify Memory's disk barrier.
-3. Send `InjectProviderCredential` with that signed record, returned permit and exact
-   payload. Foundation authenticates/binds them, durably consumes the permit, resolves
-   the configured credential, and hands one attempt to the existing Foundation runtime.
-4. Record the returned receipt/usage in Memory's canonical EffectRecord accounting.
-   Accept output under Memory's WP09/WP11 rules. Foundation atomically retains the safe
-   typed result with its receipt until `recovery_expires_at`; this is attempt recovery,
-   never a response cache for other invocations.
-5. A retry requires a new K record, next ordinal, later K sequence and a fresh permit.
-   It cannot change invocation input, destination, model, manifest, caller, markings,
-   expiry or limits. A successful invocation is terminal. An uncertain attempt stops
-   with `ReconciliationRequired`; it is never automatically resubmitted.
-
-Memory's test double implements `EgressClient`, including an unknown-charge result.
-The crate re-exports `ChatMessage`, `ChatRequest`, `EmbeddingRequest` and `Sensitivity`
-for constructing the payload without importing the credential process.
+The current `EgressClient` test seam supports unknown-charge results. It re-exports
+the payload construction types; consumers do not import the credential-process
+implementation.
 
 ## Same-attempt recovery (v2)
 
 V2 replaces v1 without aliases or fallback. Both request and credential-operation
 versions, configuration version, and HMAC domains are 2. Opening a v1 egress registry
-fails with `Version`; no migration or reset is performed. The lead must reconcile any
+fails with `Version`; no migration or reset is performed. Operators must reconcile any
 old live attempts before provisioning fresh v2 state; never delete active replay history.
 The crate package version remains 0.2.0 on this unreleased branch.
 
@@ -127,7 +115,8 @@ Embedded users must periodically call `CredentialProcess::purge_expired_results(
 returns `StateUnavailable`; the daemon fails visibly. SQLite secure-delete is enabled;
 this is logical retention, not a forensic erasure guarantee for WAL files, backups, or
 filesystem snapshots. These recovery records are protected by filesystem permissions,
-not encrypted at rest. Deployments must keep the state directory owner-only.
+not encrypted at rest. Users of this local backend must keep the state directory
+owner-only; these requirements do not prescribe a universal deployment topology.
 
 ## Wire format
 
@@ -159,17 +148,12 @@ The `AdmissionKey` helpers define serialization and constant-time verification.
 
 ## Revocation, replay and unknown charges
 
-The authoritative §7.2 **record order** applies, not wall-clock permit delivery order.
-Attempt@10 may receive its permit after route-removal@11 if its barrier succeeds;
-attempt@12 is refused. `RouteRevocation { tenant, incarnation, route, record_sequence }`
-is signed and sent with `RevokeRoute`. Publication must be coordinated with Memory's
-K writer: Foundation does not discover a route removal that Memory has not sent.
-Memory never signs an attempt serialized after its authority is revoked.
-Restrictions are monotonic; re-admission uses a new route identity/incarnation.
-Foundation checks revocation order at both permit issuance and consumption. A revocation
-received between these operations refuses an unconsumed permit whose record sequence is
-at or after the revocation, leaving it `Permitted`; reattachment returns the same token.
-Later expiry/revocation never withdraws an already consumed handoff.
+The required grant-revision ordering is in
+[boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The current v2
+`RouteRevocation`/`RevokeRoute` API and registry compare serialized route sequences;
+this is an implementation gap, not the authorization contract for new adoption.
+Permit issuance does not grant a right to dispatch after a provider grant change.
+Already accepted handoffs and their accounting remain recoverable.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_revocations` replay-protection tables. They store hashes, ordinal/sequence,
@@ -178,8 +162,10 @@ safe typed results until the signed recovery deadline, never prompts or provider
 The owner-only database and same-UID authenticated IPC protect these recovery values.
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede
 handoff. A process lock prevents two credential processes using one state directory.
-These tables do not schedule jobs or replace Memory's canonical EffectRecord/spend
-ledger. The existing runtime remains the only model queue/scheduler.
+These tables do not schedule jobs. The existing runtime remains the only model
+queue/scheduler. They supply replay and charge-recovery primitives; the canonical
+Foundation spend ledger remains implementation work under
+[boundary.md](boundary.md#spend-ledger-and-budgets).
 
 Before handoff the consumed permit has a durable `ChargeReport::Unknown` carrying the
 full reservation. Timeout, uncertain provider failure or crash leaves it reserved.
@@ -208,7 +194,9 @@ it must be a measured zero-charge failure in the reserved unit. Success is termi
 and other charges require reconciliation, so earlier history needs no aggregate scan.
 If the atomic final result/receipt write fails, the paid output still returns with
 `receipt_persisted = false`; restart retains the earlier unknown reservation and
-`Dispatched` state. Memory must record the received receipt itself.
+`Dispatched` state. Received receipts must be reconciled in Foundation accounting;
+Memory retains a reference alongside its derivation effects. A paid output is not
+evidence that canonical settlement was durably recorded.
 Runtime queue-completion, trace-write and response-cache-write failures return the
 static `queue_complete_failed`, `trace_write_failed` and `response_cache_write_failed`
 diagnostics alongside the paid output and measured charge, even when the separate
@@ -217,10 +205,16 @@ registry write succeeds. Raw runtime diagnostic strings are never forwarded.
 V2 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
 invocation limit and `max_attempts`. The adapters enforce one HTTP request per permit:
 HTTP protocol retries, redirects and ambient proxies are disabled; runtime retry budgets are one.
-Strict monetary budgets are refused (`BudgetRefused`) because these transports cannot
-enforce a monetary upper bound. Token counts are measurements, never substituted money.
+Monetary units are refused with `BudgetRefused`. Budget guarantees and the
+distinction between request bounds and money are specified in
+[boundary.md](boundary.md#spend-ledger-and-budgets).
 
 ## Deployment and credentials
+
+This section applies to the supported Unix same-UID local backend. It is one
+option within the [mode contract](boundary.md#supported-modes-and-trusted-channels).
+The current backend requires secret sources even for loopback bindings; keyless
+binding support remains implementation work.
 
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
 must be an owner-only regular file. Before reading configuration or secrets, the executable
@@ -235,7 +229,9 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 `ProcessConfig` version 2 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
 Each route requires all `RouteConfig` fields documented in the Rust type, including
-finite field/input/response/token/concurrency/timeout limits. Startup registers every
+finite field/input/response/token/concurrency/timeout settings. These are configured
+limits, not measured capacity; their labels and qualification follow
+[boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every
 route with the runtime and refuses conflicting concurrency or pacing limits for a
 shared model queue, including routes in different tenants. Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
@@ -278,7 +274,7 @@ The shared Gemini adapter rejects non-finite embedding components in single and
 batch responses with a static provider failure; dispatch retains an unknown charge.
 Other transformations are outside that finite guarantee. Persistent response caching,
 request debug capture and raw trace metadata forwarding are disabled. Provider-side
-cache isolation remains a route/deployment admission requirement; the broker does not
+cache isolation remains a provider-configuration/deployment responsibility; the broker does not
 claim control over a remote provider's private prefix-cache implementation.
 
 The process refuses an existing socket path instead of unlinking another listener.
@@ -288,11 +284,12 @@ socket. Preserve the state directory to preserve single-use and accounting histo
 ## Evidence boundary
 
 Targeted synthetic loopback tests exercise credential injection, all declared encodings,
-response/error/log isolation, durable replay, K-ordered revocation, unknown charges,
+response/error/log isolation, durable replay, current route-sequence revocation, unknown charges,
 cancellation, same-attempt attachment after lost permit/completion IPC replies, restart
 recovery, digest mismatch refusal, exclusive result expiry, no cache, new-attempt retry,
 pinned destinations, redirects, response/frame
 limits, file protection and real executable IPC. The macOS keychain API is compiled;
 no real user credential or keychain item is read or created by tests. These fixtures
-are not a live-provider qualification or physical power-loss certification. Memory's
-barrier, admission and encrypted recovery tests belong to memory#208 and its WP13/WP14 work.
+are not a live-provider qualification or physical power-loss certification. They
+do not establish the grant-revision ordering or Foundation spend-ledger contract.
+Memory input-authorization and guarded-commit verification belongs to Memory.

@@ -1,24 +1,19 @@
 # Symbiotic Foundation Architecture
 
-Status: implemented local foundation, with runtime/memory migration still in progress.
+Status: execution infrastructure implemented; boundary alignment and consumer adoption
+remain in progress.
 
 This workspace contains reusable AI execution contracts. It is intentionally
 not the Symbiotic product runtime and not the memory engine.
 
-## Why A Separate Repository
+The [Foundation boundary contract](architecture/boundary.md) is authoritative for
+ownership, provider-principal authorization, grant-revision ordering, spend,
+storage scope and supported modes. This document maps the current crates; existing
+APIs still require changes to meet that contract.
 
-The current runtime already has crates named `symbiotic-core`,
-`symbiotic-queue`, and `symbiotic-providers`, but those crates were created
-inside urgent product and benchmark work. They are valuable evidence, not the
-final generic boundary.
-
-This repository rebuilds the foundation directly:
-
-- no dependency on Archive, Distillery, Recall Gateway, Matrix, Gatekeeper, or
-  agent role evolution;
-- no benchmark-specific or product-specific code;
-- small crates with clear ownership;
-- host-owned policy and storage through traits.
+Foundation remains reusable: no product business logic, memory fact model or
+benchmark-specific behavior. Products configure policy; Foundation owns execution
+and its operational persistence.
 
 ## Crate Boundaries
 
@@ -40,12 +35,10 @@ flowchart TB
     Queue --> Sqlite
     Sqlite --> AiRuntime
 
-    Runtime["Symbiotic runtime\npolicy, Gatekeeper, Vault, schedulers"] --> Queue
-    Runtime --> Model
-    Runtime --> Trace
-
-    Memory["symbiotic-memory\nArchive, Distillery, Recall"] --> Model
-    Memory --> Trace
+    Egress["symbiotic-egress\nversioned client and schema"] --> Model
+    Credential["symbiotic-credential-process\nsecrets, permits, recovery"] --> Egress
+    Credential --> AiRuntime
+    Memory["Memory\ndata authorization and derivations"] --> Egress
 ```
 
 ### `symbiotic-core`
@@ -59,9 +52,9 @@ Owns only tiny stable vocabulary:
 - `RoleBinding`
 - `InvocationSource`
 - `ModelTier`
-- `Sensitivity`
 
-It must not accumulate product behavior.
+It must not accumulate product behavior. Existing policy vocabulary outside the
+[boundary contract](architecture/boundary.md) is pending cleanup.
 
 ### `symbiotic-queue`
 
@@ -110,7 +103,7 @@ Owns provider-neutral model contracts:
 - classification (typed Noul / Choice / Score questions answered with
   probabilities; see [classification](architecture/classification.md));
 - future vision/media/agent-task capabilities;
-- provider identity and class;
+- provider identity and capability descriptions;
 - auth mode descriptions;
 - credential resolution trait;
 - provider-neutral errors.
@@ -125,8 +118,8 @@ migration targets. The public contract remains ours.
 The queue-bound wrappers (`QueuedChatProvider`, `QueuedEmbeddingProvider`,
 `QueuedRerankProvider`, `QueuedClassifierProvider`) are the default `queue`
 feature. With `default-features = false` the crate is the provider contracts
-and HTTP providers alone, so a host that schedules calls its own way can use
-them without the queue runtime. Neither configuration links SQLite.
+and HTTP providers alone. This build boundary does not authorize consumers to
+duplicate Foundation scheduling. Neither configuration links SQLite.
 `crates/symbiotic-model/tests/feature_graph.rs` checks the dependency graphs.
 
 Hosts get queued providers from `symbiotic-ai-runtime` (below). Using the
@@ -135,25 +128,27 @@ Hosts get queued providers from `symbiotic-ai-runtime` (below). Using the
 Known-model execution defaults live in `default_model_queue_config`. The current
 DeepSeek `deepseek-flash` name and retained `deepseek-v4-flash` name resolve the
 same existing 2,000-request queue policy. This is a configured limit, not a
-capacity measurement; consumers still apply their shared safety ceiling and
-explicit overrides. DeepSeek's [published account limit](https://api-docs.deepseek.com/quick_start/rate_limit/)
+capacity measurement; execution bindings supply explicit overrides. DeepSeek's
+[published account limit](https://api-docs.deepseek.com/quick_start/rate_limit/)
 was 2,500 for Flash when checked on September 17, 2026. Request scheduling and
-enforcement remain with the consuming execution adapter.
+enforcement belong to Foundation execution bindings.
 
 `classify:typesafe:jev-1.13.0` is catalogued with TypeSafe's account limits
 (1,200 requests/min, 250,000 tokens/s) and, in `default_model_capabilities`,
 an advisory `ModelPricing` of $0.042 per million input tokens with free output.
-`ModelCapabilities::pricing` is additive (serde default `None`); hosts use it
-for estimates, and provider-reported cost stays in trace metadata.
+`ModelCapabilities::pricing` is additive (serde default `None`); it supports
+estimates, and provider-reported cost stays in trace metadata. Canonical spend
+and monetary guarantees follow the [boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
 
 ### `symbiotic-ai-runtime`
 
 The one way hosts run model calls. `Runtime::open(RuntimeConfig { state_dir, .. })`
 returns a runtime that hands out ready `Arc<dyn …Provider>`s per binding. It
-owns queueing, retries, per-model shared limits, cooldowns, attempt budgets,
+currently implements queueing, retries, shared limits, cooldowns, attempt budgets,
 the response cache, traces, receipts and persistence: SQLite under
 `state_dir`, or in memory. Alongside the SQLite backend and credential-process implementation, it
-links SQLite; contract crates do not. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+links SQLite; contract crates do not. Explicit tenant/account isolation and the
+canonical spend ledger remain boundary-alignment work. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
 
 ### `symbiotic-egress` and `symbiotic-credential-process`
 
@@ -172,7 +167,6 @@ Owns normalized invocation traces:
 - queue item reference;
 - role binding;
 - source;
-- sensitivity;
 - request/response hashes;
 - cache status;
 - token/media/cost usage;
@@ -182,8 +176,9 @@ Owns normalized invocation traces:
 - pluggable sinks.
 
 This is the central learning tap. The provider/queue layer emits traces, and
-the host decides where they go: usage meter, audit log, Archive capture,
-Evolution engine, external telemetry, or benchmark artifacts.
+the host decides which optional telemetry sinks receive them. Optional usage
+telemetry is distinct from Foundation's canonical spend ledger; see the
+[boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
 
 Current sinks include JSONL, in-memory, fail-fast fanout, and best-effort
 wrapping for model invocation traces. Queue event traces have separate JSONL and
@@ -203,44 +198,25 @@ Auth is modeled as provider modes, not as one global OAuth abstraction:
 | `oauth_mints_api_key` | OAuth flow returns a provider API key, e.g. OpenRouter |
 | `cli_session` | local tool session, e.g. Codex ChatGPT sign-in |
 
-The foundation describes these modes. For WP14, Foundation’s credential process
-resolves configured file/keychain provider credentials after admitted single-use
-permit consumption. Other product integrations supply their own resolution.
+These describe provider authentication, distinct from gateway authentication of
+callers. Foundation resolves provider credentials through its credential boundary;
+current file/keychain support is described in [model egress](architecture/model-egress.md).
+The full mode and ownership contract is in
+[boundary.md](architecture/boundary.md#supported-modes-and-trusted-channels).
 
-## Product-Owned Policy
+## Policy and integration
 
-Foundation crates do not decide:
-
-- whether a model may see private content;
-- which provider is preferred;
-- when budget fallback happens;
-- whether a trace is persisted to Archive;
-- which traces become training data;
-- whether a local CLI session is allowed;
-- which credentials can be used by an agent.
-
-Those decisions belong to the host runtime.
-
-## Current Evidence From Symbiotic
-
-The existing runtime crates are useful references:
-
-| existing crate | use as evidence for |
-| --- | --- |
-| `symbiotic-queue` | idempotency, leases, retry/DLQ vocabulary |
-| `symbiotic-providers` | provider traits, Codex/Claude Code local sessions, metering, budgets |
-| `symbiotic-agents` | monitor records, Process Engineer learning tools |
-| daemon `llm_audit.rs` | LLM audit and Archive trace capture |
-| memory benchmark repo | queue/model pressure under high parallel spend |
-
-Do not copy these shapes blindly. Prefer the contracts in this repository and
-port only proven behavior.
+See [boundary.md](architecture/boundary.md#ownership) for the ownership contract.
+Products supply prompts, meaning and explicit task requests. Memory supplies checked
+data authority. Hosts configure providers and account policies; Foundation enforces
+execution settings. The gateway supplies authenticated callers. Existing provider
+class metadata grants no data authority.
 
 ## Non-Goals
 
 - No Archive or memory fact model.
-- No Gatekeeper or general credential Vault platform. WP14 has only local provider
-  credential injection.
+- No end-user authentication gateway or general credential platform. The current
+  credential backend handles local provider credential injection and recovery.
 - No Matrix/app event protocol.
 - No product-specific agent role evolution.
 - No benchmark-specific selectors or scoring logic.

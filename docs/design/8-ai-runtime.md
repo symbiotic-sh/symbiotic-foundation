@@ -9,6 +9,11 @@ Shipped behaviour: [architecture/ai-runtime.md](../architecture/ai-runtime.md).
 The operator approved this design on 2026-09-28 (issue #8). This page keeps the
 decisions and the alternatives they replaced.
 
+The current [Foundation boundary contract](../architecture/boundary.md) supersedes
+this record's model-only limit grouping, legacy-cache retention and host tariff
+ownership. The decisions below preserve the original facade rationale; current
+provider/account isolation, spend and bounds follow the boundary contract.
+
 ## Problem
 
 Queued provider calls were implemented three times across Foundation's

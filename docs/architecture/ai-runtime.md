@@ -6,6 +6,13 @@ provider stays inside the runtime: queueing, retries and backoff, rate and
 concurrency limits, cooldowns, attempt budgets, the response cache, traces,
 usage receipts and persistence.
 
+The [Foundation boundary contract](boundary.md) is authoritative for ownership,
+provider-principal authorization, spend, storage and supported modes. This page
+records current runtime behavior. Complete tenant/provider/configuration binding,
+explicit account isolation, canonical spend accounting and admission/maintenance
+bounds remain implementation work; this API alone supplies none of Memory's data
+authorization checks.
+
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 (issue #8).
 
@@ -23,6 +30,10 @@ let embed = runtime.embedding(ModelBinding::new(raw_embedder))?; // Arc<dyn Embe
 let rerank = runtime.rerank(ModelBinding::new(raw_reranker))?;   // Arc<dyn RerankProvider>
 let classify = runtime.classifier(ModelBinding::new(raw))?;      // Arc<dyn ClassifierProvider>
 ```
+
+This example shows current runtime assembly, not complete authorized credential
+dispatch. Credential-bearing transports stay inside Foundation; consumer adoption
+follows [boundary.md](boundary.md#ownership).
 
 A binding's `provider` is the raw transport: one of `symbiotic_model`'s HTTP
 providers, or a host type implementing the provider trait
@@ -60,16 +71,20 @@ so the state directory and everything in it are owner-only:
   entries, written through a temporary file and a rename.
 - A symlink, or a component owned by another user, anywhere under
   `responses/` or at the database files, is refused. It is never followed.
-  At open, components that an earlier version wrote with wider permissions
-  are tightened to `0700`/`0600`, so existing state keeps working.
+  The current implementation also tightens existing component permissions at open.
+  This does not establish a legacy-format compatibility requirement; state format
+  and unresolved-attempt handling follow
+  [boundary.md](boundary.md#storage-and-credentials).
 
 Queue records hold the request hash, never the request. A crash therefore
-cannot resume an in-flight call from the queue: the host re-issues its work,
-and the cache and attempt budget make the re-issue cheap and bounded. For
+cannot resume an in-flight call from the queue. For credential-bound execution,
+recover the same attempt through [model egress](model-egress.md#same-attempt-recovery-v2);
+never blindly re-issue an uncertain paid attempt. The cache and attempt budget
+are execution primitives, not spend reconciliation. For
 example, a request that exhausted its attempts before a restart fails again
 afterwards without another provider call.
 
-**Retention.** At open, and after every 10,000 finished calls, a persistent
+**Current retention settings.** At open, and after every 10,000 finished calls, a persistent
 runtime retires state older than `RuntimeConfig::retention` (seven days by
 default):
 
@@ -80,6 +95,9 @@ default):
   `response_max_bytes` (1 GiB by default). `None` disables either limit.
 
 An expired response also misses on read, before any sweep removes it.
+These are sweep-based soft cache limits, not hard byte admission bounds. Pending
+count/bytes and per-batch/idle work remain unbounded by these settings; see
+[boundary.md](boundary.md#bounds-as-labelled-settings).
 Periodic sweeps run on the blocking pool. A failed sweep is logged as a
 `tracing` warning and retried at the next interval; it never fails a call.
 A sweep or purge checks the whole cache tree before it deletes anything.
@@ -136,7 +154,11 @@ There is no cancellation API. A provider that panics propagates the panic to
 the waiting caller; its lease is not renewed and expires after
 `lease_seconds`, as after a crash.
 
-## Shared limits
+## Current shared limits
+
+This describes current model/queue grouping, not the required tenant/account
+isolation. Explicit sharing and result identity follow
+[boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
 
 Every provider handed out for one queue shares the limits below. By default a
 queue is one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`); a
@@ -237,11 +259,17 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 - `CacheHit`, which repeats the original usage and receipt and makes no
   provider call.
 
-Cost estimation stays with the host's tariff: the receipt carries the token
-counts it needs. `QueueReceipt::redacted` replaces error text for logs that
-must not keep response bodies.
+These usage receipts support telemetry and cost reporting. They are not the
+canonical spend ledger or an enforceable monetary reservation. Accounting ownership
+and budget guarantees are specified in
+[boundary.md](boundary.md#spend-ledger-and-budgets). `QueueReceipt::redacted`
+replaces error text for logs that must not keep response bodies.
 
-## Side effects never change an outcome
+## Current post-provider writes
+
+The behavior below describes runtime cache/trace/queue writes. Foundation ledger
+reservation, settlement and unknown-charge recovery are durable obligations under
+[boundary.md](boundary.md#spend-ledger-and-budgets), not optional telemetry.
 
 Once the provider has answered, the call has been paid for, and the runtime
 returns the answer. The writes that follow are best-effort: the response
@@ -263,18 +291,15 @@ returned, with the diagnostic. A failed call keeps its own error when its
 failure trace or its cooldown cannot be written; those failures are logged,
 and the retry proceeds as scheduled.
 
-## Response-cache compatibility
+## Custom response caches
 
-`ResponseCache` is the seam for a cache the runtime did not write. `load`
-receives the request kind, scope, request hash and the serialized request, so
-a host can compute its historical key, for example a hash of the raw prompt
-text, and return the stored response converted to the provider's response
-type. Returning `Ok(None)` falls through to a provider call. A host keeps an
-existing cache readable this way, and no re-run is needed.
-
-The runtime does not migrate foreign caches. A layout keyed by a one-way hash
-of inputs cannot be re-keyed without those inputs, so a host that must not pay
-twice keeps its reader as a `Custom` cache.
+`ResponseCache` is the seam for an alternate cache. `load` receives request kind,
+scope, request hash and the serialized request; `Ok(None)` falls through to a
+provider call. Custom caches must respect the result-identity and data-lifecycle
+contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
+There is no pre-release requirement to retain historical cache readers or migrate
+old layouts. Rebuildable caches are distinct from unresolved paid-attempt state;
+see [storage and credentials](boundary.md#storage-and-credentials).
 
 ## Backends and conformance
 
