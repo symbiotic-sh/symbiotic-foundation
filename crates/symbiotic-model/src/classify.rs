@@ -867,6 +867,7 @@ impl JevClassifierProvider {
         api_key: impl Into<String>,
     ) -> Self {
         let model = model.into();
+        let base_url = base_url.into();
         Self {
             descriptor: ProviderDescriptor {
                 identity: ModelIdentity::new("classify", operator, model.clone()),
@@ -875,10 +876,10 @@ impl JevClassifierProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "systemone", "served_model": model }),
+                metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": base_url }),
             },
             client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            base_url,
             api_key: api_key.into(),
             served_model: model,
         }

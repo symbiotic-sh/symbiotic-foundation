@@ -126,6 +126,52 @@ impl ModelIdentity {
     }
 }
 
+/// Tenant namespace of a configured provider.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TenantId(pub String);
+/// Provider principal whose data grants are owned by Memory.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderPrincipalId(pub String);
+/// Opaque configuration generation; changing it invalidates result reuse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConfigurationRevision(pub String);
+/// Concrete provider account, distinct from the model name or secret value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccountId(pub String);
+/// Required identity of a runtime binding. Contains references, never secrets.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BindingIdentity {
+    pub tenant: TenantId,
+    pub provider: ProviderPrincipalId,
+    pub revision: ConfigurationRevision,
+    pub account: AccountId,
+}
+impl BindingIdentity {
+    pub fn new(
+        tenant: impl Into<String>,
+        provider: impl Into<String>,
+        revision: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant: TenantId(tenant.into()),
+            provider: ProviderPrincipalId(provider.into()),
+            revision: ConfigurationRevision(revision.into()),
+            account: AccountId(account.into()),
+        }
+    }
+    pub fn is_valid(&self) -> bool {
+        [
+            &self.tenant.0,
+            &self.provider.0,
+            &self.revision.0,
+            &self.account.0,
+        ]
+        .iter()
+        .all(|s| !s.trim().is_empty())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensitivity {

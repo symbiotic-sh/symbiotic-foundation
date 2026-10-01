@@ -117,6 +117,17 @@ impl From<EgressError> for ExecuteError {
     }
 }
 
+fn route_binding<P>(route: &RouteConfig, provider: P) -> ModelBinding<P> {
+    ModelBinding::new(provider).with_identity(BindingIdentity::new(
+        &route.tenant,
+        &route.route,
+        model::configuration_revision(route)
+            .expect("route serializes")
+            .0,
+        &route.secret_ref,
+    ))
+}
+
 fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
     // No hidden retry layer may spend a permit twice. Every retry must come back
     // through Memory's admission/barrier with its next ordinal.
@@ -139,21 +150,27 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
     match &route.provider {
         RouteProvider::OpenAiChat { operator } => runtime
             .chat(
-                ModelBinding::new(OpenAiCompatibleChatProvider::new(
-                    operator,
-                    &route.model,
-                    &route.destination,
-                    "",
-                ))
+                route_binding(
+                    route,
+                    OpenAiCompatibleChatProvider::new(
+                        operator,
+                        &route.model,
+                        &route.destination,
+                        "",
+                    ),
+                )
                 .with_policy(policy)
                 .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
         RouteProvider::GeminiEmbedding { dimensions } => runtime
             .embedding(
-                ModelBinding::new(GeminiEmbeddingProvider::new(&route.model, "", *dimensions))
-                    .with_policy(policy)
-                    .with_response_cache(ResponseCacheMode::Off),
+                route_binding(
+                    route,
+                    GeminiEmbeddingProvider::new(&route.model, "", *dimensions),
+                )
+                .with_policy(policy)
+                .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
     }
@@ -219,7 +236,7 @@ pub(crate) async fn execute(
             };
             let provider = runtime
                 .chat(
-                    ModelBinding::new(provider)
+                    route_binding(route, provider)
                         .with_policy(policy)
                         .with_response_cache(ResponseCacheMode::Off),
                 )
@@ -256,7 +273,7 @@ pub(crate) async fn execute(
             };
             let provider = runtime
                 .embedding(
-                    ModelBinding::new(provider)
+                    route_binding(route, provider)
                         .with_policy(policy)
                         .with_response_cache(ResponseCacheMode::Off),
                 )
@@ -309,7 +326,10 @@ mod tests {
         })
         .unwrap();
         let provider = runtime
-            .embedding(ModelBinding::new(model::HashEmbeddingProvider::new(2)))
+            .embedding(
+                ModelBinding::new(model::HashEmbeddingProvider::new(2))
+                    .with_identity(BindingIdentity::new("test", "provider", "1", "account")),
+            )
             .unwrap();
         let mut response = provider
             .embed(EmbeddingRequest {

@@ -11,7 +11,7 @@
 //!     state_dir: Some("/var/lib/host/ai-runtime".into()),
 //!     ..RuntimeConfig::default()
 //! })?;
-//! let chat = runtime.chat(ModelBinding::new(raw_chat))?;
+//! let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(symbiotic_ai_runtime::BindingIdentity::new("tenant", "provider", "1", "account")))?;
 //! # Ok(()) }
 //! ```
 //!
@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+pub use symbiotic_core::BindingIdentity;
 use symbiotic_core::{QueueId, QueueItemId};
 use symbiotic_model::private_fs;
 use symbiotic_model::{
@@ -135,6 +136,8 @@ pub enum ResponseCacheMode {
 #[derive(Clone)]
 pub struct ModelBinding<P> {
     pub provider: P,
+    /// Required tenant, provider, revision and concrete account.
+    pub identity: Option<BindingIdentity>,
     /// Queue whose limits and cooldown this binding shares. `None` uses the
     /// model's own queue (`operation:operator:model`); set it to isolate a
     /// role from its model's other callers, or to pool several models.
@@ -154,12 +157,18 @@ impl<P> ModelBinding<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
+            identity: None,
             queue_id: None,
             policy: None,
             response_cache: ResponseCacheMode::Default,
             receipt_sink: None,
             trace_sink: None,
         }
+    }
+
+    pub fn with_identity(mut self, identity: BindingIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     pub fn with_queue_id(mut self, queue_id: QueueId) -> Self {
@@ -350,10 +359,16 @@ impl Runtime {
         descriptor: &ProviderDescriptor,
         binding: &ModelBinding<P>,
     ) -> Result<Bound, ModelError> {
+        let identity = binding
+            .identity
+            .clone()
+            .filter(BindingIdentity::is_valid)
+            .ok_or_else(|| ModelError::InvalidRequest("binding identity is required".into()))?;
+        let scope = descriptor_scope(descriptor, &identity)?;
         let queue_id = binding
             .queue_id
             .clone()
-            .unwrap_or_else(|| descriptor.queue_id());
+            .unwrap_or_else(|| QueueId::new(format!("binding:{scope}")));
         let mut policy = binding
             .policy
             .clone()
@@ -367,10 +382,8 @@ impl Runtime {
             ResponseCacheMode::Custom(cache) => Some(cache.clone()),
             ResponseCacheMode::Default => self.inner.state_dir.as_ref().map(|dir| {
                 Arc::new(
-                    DirResponseCache::new(
-                        dir.join(RESPONSES_DIR).join(descriptor_scope(descriptor)),
-                    )
-                    .with_max_age(self.inner.response_max_age),
+                    DirResponseCache::new(dir.join(RESPONSES_DIR))
+                        .with_max_age(self.inner.response_max_age),
                 ) as Arc<dyn ResponseCache>
             }),
         };
@@ -380,6 +393,7 @@ impl Runtime {
             policy,
             sinks: Sinks {
                 queue_id,
+                identity,
                 trace: binding
                     .trace_sink
                     .clone()
@@ -430,6 +444,7 @@ struct Bound {
 
 struct Sinks {
     queue_id: QueueId,
+    identity: BindingIdentity,
     trace: Option<Arc<dyn TraceSink>>,
     receipt: Option<Arc<dyn QueueReceiptSink>>,
     cache: Option<Arc<dyn ResponseCache>>,
@@ -438,7 +453,9 @@ struct Sinks {
 macro_rules! apply_sinks {
     ($name:ident, $ty:ident) => {
         fn $name<P>(self, mut provider: $ty<P>) -> $ty<P> {
-            provider = provider.with_queue_id(self.queue_id);
+            provider = provider
+                .with_queue_id(self.queue_id)
+                .with_binding_identity(self.identity);
             if let Some(sink) = self.trace {
                 provider = provider.with_trace_sink(sink);
             }
@@ -463,9 +480,13 @@ impl Sinks {
 /// Cache subdirectory of one provider: a hash of its descriptor (identity,
 /// class, auth mode, metadata), so two models never read each other's
 /// responses.
-fn descriptor_scope(descriptor: &ProviderDescriptor) -> String {
-    let bytes = serde_json::to_vec(descriptor).unwrap_or_default();
-    hex::encode(Sha256::digest(bytes))
+fn descriptor_scope(
+    descriptor: &ProviderDescriptor,
+    identity: &BindingIdentity,
+) -> Result<String, ModelError> {
+    let bytes = serde_json::to_vec(&(descriptor, identity))
+        .map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn open_persistent_queue(

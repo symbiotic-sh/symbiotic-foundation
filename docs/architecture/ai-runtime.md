@@ -8,9 +8,8 @@ usage receipts and persistence.
 
 The [Foundation boundary contract](boundary.md) is authoritative for ownership,
 provider-principal authorization, spend, storage and supported modes. This page
-records current runtime behavior. Complete tenant/provider/configuration binding,
-explicit account isolation, canonical spend accounting and admission/maintenance
-bounds remain implementation work; this API alone supplies none of Memory's data
+records current runtime behavior. Typed tenant/provider/configuration binding scopes execution and result reuse.
+Canonical spend accounting and admission/maintenance bounds remain implementation work; this API alone supplies none of Memory's data
 authorization checks. The error-class retry gaps listed under
 [policy knobs](#policy-knobs) remain implementation work under the
 [spend contract](boundary.md#spend-ledger-and-budgets).
@@ -27,10 +26,11 @@ let runtime = Runtime::open(RuntimeConfig {
     state_dir: Some(data_dir.join("ai-runtime")), // None: in memory
     ..RuntimeConfig::default()
 })?;
-let chat = runtime.chat(ModelBinding::new(raw_chat))?;          // Arc<dyn ChatProvider>
-let embed = runtime.embedding(ModelBinding::new(raw_embedder))?; // Arc<dyn EmbeddingProvider>
-let rerank = runtime.rerank(ModelBinding::new(raw_reranker))?;   // Arc<dyn RerankProvider>
-let classify = runtime.classifier(ModelBinding::new(raw))?;      // Arc<dyn ClassifierProvider>
+let identity = symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "chat", "revision-1", "account-a");
+let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(identity.clone()))?;          // Arc<dyn ChatProvider>
+let embed = runtime.embedding(ModelBinding::new(raw_embedder).with_identity(identity.clone()))?; // Arc<dyn EmbeddingProvider>
+let rerank = runtime.rerank(ModelBinding::new(raw_reranker).with_identity(identity.clone()))?;   // Arc<dyn RerankProvider>
+let classify = runtime.classifier(ModelBinding::new(raw).with_identity(identity))?;      // Arc<dyn ClassifierProvider>
 ```
 
 This example shows current runtime assembly, not complete authorized credential
@@ -47,7 +47,8 @@ the same state.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `queue_id` | The model's own queue (`operation:operator:model`) | Queue whose limits and cooldown the binding shares: isolate a role, or pool models |
+| `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
+| `queue_id` | Hash of binding and effective descriptor | Queue whose limits and cooldown the binding shares: isolate a role, or pool models |
 | `policy` | Catalog default for the model (`default_model_queue_config`), else `ModelQueueConfig::default()` | Concurrency, rate limits, retries, timeout |
 | `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
@@ -58,7 +59,7 @@ the same state.
 |---|---|---|
 | Queue backend | `MemoryQueue` (in-process, bounded terminal history) | `SqliteQueue` at `dir/queue.sqlite` |
 | Cooldowns, attempt budgets, deduplication | End with the process | Survive restarts |
-| Response cache (`Default` mode) | None | `dir/responses/<descriptor hash>/<kind>[/<scope>]/<request hash>.json` |
+| Response cache (`Default` mode) | None | `dir/responses/<kind>/<binding and transport hash>/<request hash>.json` |
 
 **Private state.** Cached responses and queue state can hold private text,
 so the state directory and everything in it are owner-only:
@@ -114,9 +115,8 @@ it refuses and removes nothing, so it can never reach outside the cache.
 responses whose recorded owner matches. It is the hook for erasure: when a
 source or tenant is erased, the host purges its responses. Each entry is
 matched by what its response's trace records: the request's `source` and
-`role_binding`, and the model (`CachedResponse`). A host that needs erasure
-by tenant or source puts that identity in the request's `source` or
-`role_binding`. The purge reads every entry once, so it suits erasure, not a
+`role_binding`, model, and typed binding identity (`CachedResponse::binding`).
+Tenant erasure matches `binding.tenant`, independently of free-text source labels. The purge reads every entry once, so it suits erasure, not a
 hot path.
 
 ## Calls in flight
@@ -186,8 +186,9 @@ at most 250 ms. Between slices it looks at its item and the cache, so a
 duplicate whose answer has arrived returns at once and spends nothing.
 
 Pooling shares limits only. Deduplication, attempt budgets and results stay
-per provider: the idempotency key is the queue, the provider descriptor and
-the request hash.
+per provider: the idempotency key is the queue, the tenant/provider/revision/account identity, effective provider descriptor,
+credential generation and request hash. Endpoint, thinking and effort settings enter
+the descriptor; custom providers must describe their effective configuration.
 
 The key also includes the provider's credential generation,
 `ModelProvider::credential_fingerprint`. The HTTP providers derive it from

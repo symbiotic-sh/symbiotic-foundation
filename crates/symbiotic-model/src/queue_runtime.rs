@@ -117,6 +117,7 @@ pub enum ReceiptStatus {
 /// wait split. A cache hit repeats the original usage and costs nothing new.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueueReceipt {
+    pub binding: Option<symbiotic_core::BindingIdentity>,
     pub queue_id: QueueId,
     /// `chat`, `embedding`, `rerank` or `classify`.
     pub kind: String,
@@ -228,6 +229,7 @@ pub struct DirResponseCache {
 /// for, as recorded on its trace.
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
+    pub binding: Option<symbiotic_core::BindingIdentity>,
     /// The request's `source`.
     pub source: Option<String>,
     /// The request's `role_binding`.
@@ -310,6 +312,9 @@ impl DirResponseCache {
                     .map(str::to_string)
             };
             let response = CachedResponse {
+                binding: trace
+                    .and_then(|trace| trace.pointer("/metadata/binding"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
                 source: text("source"),
                 role_binding: text("role_binding"),
                 model: trace
@@ -478,6 +483,7 @@ pub(crate) struct QueueRuntime {
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
     /// Queue identity override; `None` uses the descriptor's `queue_id`.
     pub(crate) queue_id: Option<QueueId>,
+    pub(crate) binding_identity: Option<symbiotic_core::BindingIdentity>,
     pub(crate) worker_id: String,
     pub(crate) config: crate::ModelQueueConfig,
 }
@@ -495,6 +501,7 @@ impl QueueRuntime {
             admission: None,
             response_cache: None,
             queue_id: None,
+            binding_identity: None,
             worker_id,
             config,
         }
@@ -536,6 +543,11 @@ macro_rules! queue_runtime_builders {
         /// Run on `queue_id` instead of the model's own queue, so its limits
         /// and cooldown are shared with (or isolated from) other providers by
         /// that id.
+        pub fn with_binding_identity(mut self, identity: symbiotic_core::BindingIdentity) -> Self {
+            self.runtime.binding_identity = Some(identity);
+            self
+        }
+
         pub fn with_queue_id(mut self, queue_id: symbiotic_core::QueueId) -> Self {
             self.runtime.queue_id = Some(queue_id);
             self
@@ -720,6 +732,7 @@ mod tests {
     #[test]
     fn redacted_receipt_drops_error_text() {
         let receipt = QueueReceipt {
+            binding: None,
             queue_id: QueueId::new("chat:test:model"),
             kind: "chat".into(),
             item_id: None,

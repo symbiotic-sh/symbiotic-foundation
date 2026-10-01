@@ -503,10 +503,17 @@ async fn request_debug_capture_writes_the_serialized_request() {
     .chat(request("capture me"))
     .await
     .unwrap();
-    let captured: Vec<_> = std::fs::read_dir(dir.path().join("chat"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
+    let captured: Vec<_> = std::fs::read_dir(
+        std::fs::read_dir(dir.path().join("chat"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .collect();
     assert_eq!(captured.len(), 1);
     let body: Value = serde_json::from_slice(&std::fs::read(&captured[0]).unwrap()).unwrap();
     assert_eq!(body["messages"][0]["content"], "capture me");

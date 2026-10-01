@@ -993,6 +993,7 @@ where
 #[cfg(feature = "queue")]
 struct CallReceipts {
     sink: Option<Arc<dyn QueueReceiptSink>>,
+    binding: Option<symbiotic_core::BindingIdentity>,
     queue_id: QueueId,
     kind: String,
     request_hash: String,
@@ -1029,6 +1030,7 @@ impl CallReceipts {
             return;
         };
         sink.record_receipt(QueueReceipt {
+            binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
             item_id: item.map(|item| item.item_id.clone()),
@@ -1055,12 +1057,19 @@ fn load_cached<Res: for<'de> Deserialize<'de>>(
     cache: &dyn ResponseCache,
     entry: &CacheEntry<'_>,
 ) -> Result<Option<Res>, ModelError> {
-    cache
-        .load(entry)?
-        .map(|value| {
-            serde_json::from_value(value).map_err(|err| ModelError::Cache(err.to_string()))
-        })
-        .transpose()
+    let Some(value) = cache.load(entry)? else {
+        return Ok(None);
+    };
+    if value
+        .pointer("/trace/metadata/result_scope")
+        .and_then(Value::as_str)
+        != entry.scope
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|err| ModelError::Cache(err.to_string()))
 }
 
 /// Run `work` on tokio's blocking pool and wait for it. A `ResponseCache`
@@ -1101,6 +1110,7 @@ struct QueuedCall<Req> {
     descriptor: ProviderDescriptor,
     capability: ModelCapability,
     kind: String,
+    binding_identity: Option<symbiotic_core::BindingIdentity>,
     // Response-cache subdirectory under `kind`; see `run_queued`.
     cache_scope: Option<String>,
     cache: Option<Arc<dyn ResponseCache>>,
@@ -1236,6 +1246,14 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
         let mut response = response;
+        let mut trace = response.trace().clone();
+        if !trace.metadata.is_object() {
+            trace.metadata = serde_json::json!({});
+        }
+        trace.metadata["result_scope"] = serde_json::json!(self.cache_scope);
+        trace.metadata["binding"] =
+            serde_json::to_value(&self.binding_identity).expect("binding identity serializes");
+        response.set_trace(trace);
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
             let shared = Arc::new(response);
@@ -1319,7 +1337,7 @@ impl<Req> QueuedCall<Req> {
                 outcome: InvocationOutcome::Failed,
                 error_class: Some(err.to_string()),
                 audit_refs: Vec::new(),
-                metadata: serde_json::json!({}),
+                metadata: serde_json::json!({"binding": self.binding_identity}),
                 timestamp: Utc::now(),
             })
             .await;
@@ -1373,14 +1391,14 @@ fn note_side_effect<Res: TraceCarrier>(
 #[allow(clippy::too_many_arguments)]
 async fn run_queued<P, Req, Res, F, Fut>(
     runtime: &QueueRuntime,
-    descriptor: ProviderDescriptor,
+    mut descriptor: ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
     // Response-cache subdirectory under `kind`. `None` keeps the historical
     // `{cache}/{kind}/{request hash}` path, which is shared by every provider
     // of that kind: two chat models sharing a cache directory can read each
     // other's cached answers. Classification passes a descriptor hash.
-    cache_scope: Option<String>,
+    _cache_scope: Option<String>,
     request: Req,
     call: F,
     provider: P,
@@ -1404,10 +1422,12 @@ where
     // limits, never each other's attempt budgets or results. So is its
     // credential's fingerprint, when it has one: a rotated credential gets
     // a fresh budget. Only a hash of the fingerprint is stored.
-    let provider_identity = match provider.credential_fingerprint() {
-        Some(fingerprint) => hash_json(&(&descriptor, fingerprint))?,
-        None => hash_json(&descriptor)?,
-    };
+    descriptor.metadata = serde_json::json!({"configuration": descriptor.metadata, "binding": runtime.binding_identity});
+    let provider_identity = hash_json(&(
+        &descriptor,
+        &runtime.binding_identity,
+        provider.credential_fingerprint(),
+    ))?;
     let idempotency_key = Some(format!("{}:{provider_identity}:{request_hash}", queue_id.0));
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
@@ -1415,6 +1435,7 @@ where
         config: runtime.config.clone(),
         receipts: CallReceipts {
             sink: runtime.receipt_sink.clone(),
+            binding: runtime.binding_identity.clone(),
             queue_id: queue_id.clone(),
             kind: kind.to_string(),
             request_hash: request_hash.clone(),
@@ -1424,7 +1445,8 @@ where
         descriptor,
         capability,
         kind: kind.to_string(),
-        cache_scope,
+        binding_identity: runtime.binding_identity.clone(),
+        cache_scope: Some(provider_identity),
         cache: runtime.cache(),
         trace_sink: runtime.trace_sink.clone(),
         sensitivity: request_sensitivity(&request_value),
@@ -2244,6 +2266,7 @@ fn model_queue_payload(
         "capability": capability,
         "request_hash": request_hash,
         "model": descriptor.identity,
+        "binding": descriptor.metadata.get("binding"),
         "logical_retry": {
             "attempts_used": retry_state.attempts_used,
             "max_attempts": retry_state.max_attempts,
@@ -2716,6 +2739,13 @@ fn request_sensitivity(request: &Value) -> Sensitivity {
         .unwrap_or(Sensitivity::Shareable)
 }
 
+/// Opaque revision of a serializable configuration. Never pass secret values.
+pub fn configuration_revision(
+    settings: &impl Serialize,
+) -> Result<symbiotic_core::ConfigurationRevision, ModelError> {
+    hash_json(settings).map(symbiotic_core::ConfigurationRevision)
+}
+
 fn hash_json<T: Serialize>(value: &T) -> Result<String, ModelError> {
     let bytes = serde_json::to_vec(value).map_err(|err| ModelError::Provider(err.to_string()))?;
     let mut hasher = Sha256::new();
@@ -2865,6 +2895,7 @@ impl OpenAiCompatibleChatProvider {
     ) -> Self {
         let operator = operator.into();
         let model = model.into();
+        let base_url = base_url.into();
         Self {
             descriptor: ProviderDescriptor {
                 identity: ModelIdentity {
@@ -2877,10 +2908,10 @@ impl OpenAiCompatibleChatProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "openai-compatible" }),
+                metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": base_url }),
             },
             client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            base_url,
             api_key: zeroize::Zeroizing::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
@@ -2908,6 +2939,8 @@ impl OpenAiCompatibleChatProvider {
     }
 
     pub fn with_thinking(mut self, thinking: Option<ThinkingMode>) -> Self {
+        self.descriptor.metadata["thinking"] =
+            serde_json::to_value(thinking).expect("thinking serializes");
         self.thinking = thinking;
         self
     }
@@ -2915,6 +2948,7 @@ impl OpenAiCompatibleChatProvider {
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         let effort = effort.into();
         if !effort.trim().is_empty() {
+            self.descriptor.metadata["reasoning_effort"] = Value::String(effort.clone());
             self.reasoning_effort = Some(effort);
         }
         self
@@ -4176,13 +4210,13 @@ mod tests {
 
         assert_eq!(response.text, "same request");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            dir.path()
-                .join("cache")
-                .join("chat")
-                .join(format!("{request_hash}.json"))
-                .is_file()
-        );
+        let scope = std::fs::read_dir(dir.path().join("cache/chat"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(scope.join(format!("{request_hash}.json")).is_file());
     }
 
     #[cfg(feature = "queue")]

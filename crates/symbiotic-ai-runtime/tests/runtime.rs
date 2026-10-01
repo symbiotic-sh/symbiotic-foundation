@@ -15,6 +15,12 @@ use symbiotic_ai_runtime::{
 use symbiotic_core::{ModelIdentity, Sensitivity, TraceId};
 use symbiotic_trace::{InvocationOutcome, ModelInvocationTrace};
 
+fn binding<P>(provider: P) -> ModelBinding<P> {
+    ModelBinding::new(provider).with_identity(symbiotic_ai_runtime::BindingIdentity::new(
+        "tenant", "provider", "1", "account",
+    ))
+}
+
 static MODEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn unique_identity() -> ModelIdentity {
@@ -171,10 +177,10 @@ async fn bindings_of_one_model_share_its_cap() {
     let runtime = Runtime::in_memory();
     let raw = Loopback::new(unique_identity());
     let answer = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(policy()))
+        .chat(binding(raw.clone()).with_policy(policy()))
         .unwrap();
     let judge = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(policy()))
+        .chat(binding(raw.clone()).with_policy(policy()))
         .unwrap();
     let calls: Vec<_> = (0..10)
         .map(|idx| {
@@ -198,20 +204,20 @@ async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_inde
     let runtime = Runtime::in_memory();
     let identity = unique_identity();
     runtime
-        .chat(ModelBinding::new(Loopback::new(identity.clone())).with_policy(policy()))
+        .chat(binding(Loopback::new(identity.clone())).with_policy(policy()))
         .unwrap();
     let conflicting = ModelQueueConfig {
         requests_per_minute: Some(60),
         ..policy()
     };
     let err = runtime
-        .chat(ModelBinding::new(Loopback::new(identity)).with_policy(conflicting.clone()))
+        .chat(binding(Loopback::new(identity)).with_policy(conflicting.clone()))
         .err()
         .expect("a second policy for one model is rejected");
     assert!(matches!(err, ModelError::InvalidRequest(_)), "{err:?}");
     // Retry settings may differ per binding; only shared limits must agree.
     runtime
-        .chat(ModelBinding::new(Loopback::new(unique_identity())).with_policy(conflicting))
+        .chat(binding(Loopback::new(unique_identity())).with_policy(conflicting))
         .unwrap();
 }
 
@@ -219,9 +225,7 @@ async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_inde
 async fn host_provider_objects_can_be_bound() {
     let runtime = Runtime::in_memory();
     let raw: Arc<dyn ChatProvider> = Arc::new(Loopback::new(unique_identity()));
-    let chat = runtime
-        .chat(ModelBinding::new(raw).with_policy(policy()))
-        .unwrap();
+    let chat = runtime.chat(binding(raw).with_policy(policy())).unwrap();
     assert!(
         chat.chat(request("hi"))
             .await
@@ -259,14 +263,14 @@ async fn cached_responses_survive_a_restart_and_stay_scoped_to_their_model() {
 
     let runtime = persistent(dir.path());
     let chat = runtime
-        .chat(ModelBinding::new(first_model.clone()).with_policy(policy()))
+        .chat(binding(first_model.clone()).with_policy(policy()))
         .unwrap();
     let original = chat.chat(request("same question")).await.unwrap();
     drop((chat, runtime));
 
     let reopened = persistent(dir.path());
     let chat = reopened
-        .chat(ModelBinding::new(first_model.clone()).with_policy(policy()))
+        .chat(binding(first_model.clone()).with_policy(policy()))
         .unwrap();
     let replay = chat.chat(request("same question")).await.unwrap();
     assert_eq!(replay.text, original.text);
@@ -274,7 +278,7 @@ async fn cached_responses_survive_a_restart_and_stay_scoped_to_their_model() {
 
     // Another model asked the same question gets its own answer.
     let other = reopened
-        .chat(ModelBinding::new(second_model.clone()).with_policy(policy()))
+        .chat(binding(second_model.clone()).with_policy(policy()))
         .unwrap();
     let answer = other.chat(request("same question")).await.unwrap();
     assert_ne!(answer.text, original.text);
@@ -286,7 +290,7 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
     let dir = private_tempdir();
     let down = Loopback::new(unique_identity()).unavailable();
     let binding = || {
-        ModelBinding::new(down.clone())
+        binding(down.clone())
             .with_policy(policy())
             .with_response_cache(ResponseCacheMode::Off)
     };
@@ -328,7 +332,7 @@ async fn an_in_memory_runtime_caches_nothing_by_default_and_binding_sinks_apply(
     let receipts = Arc::new(InMemoryReceiptSink::default());
     let chat = runtime
         .chat(
-            ModelBinding::new(raw.clone())
+            binding(raw.clone())
                 .with_policy(policy())
                 .with_receipt_sink(receipts.clone()),
         )
@@ -357,11 +361,11 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
     // The same model on its own queue and on an isolated role queue: the two
     // queues do not share the one slot.
     let shared = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(one_slot.clone()))
+        .chat(binding(raw.clone()).with_policy(one_slot.clone()))
         .unwrap();
     let isolated = runtime
         .chat(
-            ModelBinding::new(raw.clone())
+            binding(raw.clone())
                 .with_policy(one_slot.clone())
                 .with_queue_id(symbiotic_core::QueueId::new("answer:isolated")),
         )
@@ -380,14 +384,14 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
     let pool = symbiotic_core::QueueId::new("chat:pool:shared");
     let first_chat = runtime
         .chat(
-            ModelBinding::new(first.clone())
+            binding(first.clone())
                 .with_policy(one_slot.clone())
                 .with_queue_id(pool.clone()),
         )
         .unwrap();
     let second_chat = runtime
         .chat(
-            ModelBinding::new(second.clone())
+            binding(second.clone())
                 .with_policy(one_slot)
                 .with_queue_id(pool),
         )
@@ -416,7 +420,7 @@ async fn pooled_models_keep_separate_budgets_for_the_same_request() {
     let bind = |raw: Loopback| {
         runtime
             .chat(
-                ModelBinding::new(raw)
+                binding(raw)
                     .with_policy(policy())
                     .with_queue_id(pool.clone()),
             )
@@ -439,7 +443,7 @@ async fn an_exhausted_error_keeps_its_class_after_a_restart() {
     let broken =
         Loopback::new(unique_identity()).failing(ModelError::Provider("bad json".to_string()));
     let binding = || {
-        ModelBinding::new(broken.clone())
+        binding(broken.clone())
             .with_policy(ModelQueueConfig {
                 retry_provider_errors: true,
                 ..policy()
@@ -478,7 +482,7 @@ fn leased() -> ModelQueueConfig {
 async fn an_abandoned_call_does_not_block_the_identical_request_behind_it(runtime: Runtime) {
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_500));
     let chat = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(leased()))
+        .chat(binding(raw.clone()).with_policy(leased()))
         .unwrap();
 
     let first = tokio::time::timeout(Duration::from_millis(500), chat.chat(request("same"))).await;
@@ -500,7 +504,7 @@ async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
     let chat = runtime
         .chat(
-            ModelBinding::new(raw.clone())
+            binding(raw.clone())
                 .with_policy(leased())
                 .with_response_cache(cache),
         )
@@ -674,7 +678,7 @@ async fn runtime_state_and_cached_responses_are_owner_only() {
     let runtime = persistent(&state);
     let raw = Loopback::new(unique_identity());
     runtime
-        .chat(ModelBinding::new(raw).with_policy(policy()))
+        .chat(binding(raw).with_policy(policy()))
         .unwrap()
         .chat(request("private answer"))
         .await
@@ -791,7 +795,7 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
     let bind = |key: &str| {
         runtime
             .chat(
-                ModelBinding::new(
+                binding(
                     symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
                         "loopback", &model, &url, key,
                     ),
@@ -851,7 +855,7 @@ async fn logical_attempts_cap_provider_calls(runtime: Runtime) {
         let down = Loopback::new(unique_identity()).unavailable();
         let err = runtime
             .chat(
-                ModelBinding::new(down.clone())
+                binding(down.clone())
                     .with_policy(ModelQueueConfig {
                         logical_retry_attempts: logical,
                         retry_attempts: per_item,
@@ -951,7 +955,7 @@ async fn an_expired_cached_response_misses_and_the_sweep_removes_it() {
     let raw = Loopback::new(unique_identity());
     let ask = |runtime: &Runtime| {
         let chat = runtime
-            .chat(ModelBinding::new(raw.clone()).with_policy(policy()))
+            .chat(binding(raw.clone()).with_policy(policy()))
             .unwrap();
         async move { chat.chat(request("aging")).await.unwrap() }
     };
@@ -987,7 +991,7 @@ async fn the_sweep_keeps_the_newest_responses_within_the_size_limit() {
     let raw = Loopback::new(unique_identity());
     let runtime = persistent(dir.path());
     let chat = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(policy()))
+        .chat(binding(raw.clone()).with_policy(policy()))
         .unwrap();
     for text in ["oldest", "middle", "newest"] {
         chat.chat(request(text)).await.unwrap();
@@ -1031,7 +1035,7 @@ async fn purging_a_source_removes_only_its_responses() {
     let raw = Loopback::new(unique_identity());
     let runtime = persistent(dir.path());
     let chat = runtime
-        .chat(ModelBinding::new(raw.clone()).with_policy(policy()))
+        .chat(binding(raw.clone()).with_policy(policy()))
         .unwrap();
     let from = |source: &str, text: &str| ChatRequest {
         source: Some(source.to_string()),
@@ -1055,4 +1059,120 @@ async fn purging_a_source_removes_only_its_responses() {
     chat.chat(from("tenant-b/doc-2", "two")).await.unwrap();
     assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
     assert_eq!(Runtime::in_memory().purge_responses(|_| true).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn binding_identity_partitions_results_and_purge_by_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().join("state")),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let raw = Loopback::new(unique_identity());
+    for (tenant, principal, revision, account) in [
+        ("a", "p", "1", "acct"),
+        ("b", "p", "1", "acct"),
+        ("a", "other", "1", "acct"),
+        ("a", "p", "2", "acct"),
+        ("a", "p", "1", "other"),
+    ] {
+        let provider = runtime
+            .chat(binding(raw.clone()).with_policy(policy()).with_identity(
+                symbiotic_ai_runtime::BindingIdentity::new(tenant, principal, revision, account),
+            ))
+            .unwrap();
+        provider.chat(request("same")).await.unwrap();
+        provider.chat(request("same")).await.unwrap();
+    }
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        runtime
+            .purge_responses(|entry| entry.binding.as_ref().is_some_and(|b| b.tenant.0 == "b"))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn effective_transport_settings_change_result_identity() {
+    use symbiotic_ai_runtime::model::{OpenAiCompatibleChatProvider, ThinkingMode};
+    let provider = || {
+        OpenAiCompatibleChatProvider::new(
+            "operator",
+            "model",
+            "https://one.example",
+            "synthetic-key",
+        )
+    };
+    let descriptor =
+        |p: OpenAiCompatibleChatProvider| serde_json::to_value(p.descriptor()).unwrap();
+    let base = descriptor(provider());
+    assert_ne!(
+        base,
+        descriptor(OpenAiCompatibleChatProvider::new(
+            "operator",
+            "model",
+            "https://two.example",
+            "synthetic-key"
+        ))
+    );
+    assert_ne!(
+        base,
+        descriptor(provider().with_thinking(Some(ThinkingMode::Enabled)))
+    );
+    assert_ne!(base, descriptor(provider().with_reasoning_effort("high")));
+}
+
+#[test]
+fn runtime_refuses_missing_binding_identity() {
+    let raw = Loopback::new(unique_identity());
+    assert!(
+        Runtime::in_memory()
+            .chat(ModelBinding::new(raw).with_policy(policy()))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores_scope() {
+    struct OneEntry(std::sync::Mutex<Option<serde_json::Value>>);
+    impl symbiotic_ai_runtime::ResponseCache for OneEntry {
+        fn load(
+            &self,
+            _: &symbiotic_ai_runtime::CacheEntry<'_>,
+        ) -> Result<Option<serde_json::Value>, ModelError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn store(
+            &self,
+            _: &symbiotic_ai_runtime::CacheEntry<'_>,
+            value: &serde_json::Value,
+        ) -> Result<(), ModelError> {
+            *self.0.lock().unwrap() = Some(value.clone());
+            Ok(())
+        }
+    }
+    let runtime = Runtime::in_memory();
+    let raw = Loopback::new(unique_identity());
+    let cache = Arc::new(OneEntry(std::sync::Mutex::new(None)));
+    for settings in [
+        json!({"endpoint": "one"}),
+        json!({"endpoint": "two"}),
+        json!({"endpoint": "two", "thinking": "enabled"}),
+        json!({"endpoint": "two", "effort": "high"}),
+    ] {
+        let mut configured = raw.clone();
+        configured.descriptor.metadata = settings;
+        let provider = runtime
+            .chat(
+                binding(configured)
+                    .with_policy(policy())
+                    .with_response_cache(ResponseCacheMode::Custom(cache.clone())),
+            )
+            .unwrap();
+        provider.chat(request("same")).await.unwrap();
+        provider.chat(request("same")).await.unwrap();
+    }
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 4);
 }
