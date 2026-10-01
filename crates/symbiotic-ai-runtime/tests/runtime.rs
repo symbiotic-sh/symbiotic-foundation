@@ -217,7 +217,16 @@ async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_inde
     assert!(matches!(err, ModelError::InvalidRequest(_)), "{err:?}");
     // Retry settings may differ per binding; only shared limits must agree.
     runtime
-        .chat(binding(Loopback::new(unique_identity())).with_policy(conflicting))
+        .chat(
+            binding(Loopback::new(unique_identity()))
+                .with_policy(conflicting)
+                .with_identity(symbiotic_ai_runtime::BindingIdentity::new(
+                    "tenant",
+                    "provider",
+                    "1",
+                    "other-account",
+                )),
+        )
         .unwrap();
 }
 
@@ -367,7 +376,9 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
         .chat(
             binding(raw.clone())
                 .with_policy(one_slot.clone())
-                .with_queue_id(symbiotic_core::QueueId::new("answer:isolated")),
+                .with_account_sharing(symbiotic_ai_runtime::AccountSharingKey::new(
+                    "answer:isolated",
+                )),
         )
         .unwrap();
     let (a, b) = tokio::join!(shared.chat(request("a")), isolated.chat(request("b")));
@@ -381,19 +392,19 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
     let mut second = Loopback::new(unique_identity());
     second.active = first.active.clone();
     second.peak = first.peak.clone();
-    let pool = symbiotic_core::QueueId::new("chat:pool:shared");
+    let pool = symbiotic_ai_runtime::AccountSharingKey::new("chat:pool:shared");
     let first_chat = runtime
         .chat(
             binding(first.clone())
                 .with_policy(one_slot.clone())
-                .with_queue_id(pool.clone()),
+                .with_account_sharing(pool.clone()),
         )
         .unwrap();
     let second_chat = runtime
         .chat(
             binding(second.clone())
                 .with_policy(one_slot)
-                .with_queue_id(pool),
+                .with_account_sharing(pool),
         )
         .unwrap();
     let (a, b) = tokio::join!(
@@ -414,7 +425,7 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
 #[tokio::test]
 async fn pooled_models_keep_separate_budgets_for_the_same_request() {
     let runtime = Runtime::in_memory();
-    let pool = symbiotic_core::QueueId::new("chat:pool:budgets");
+    let pool = symbiotic_ai_runtime::AccountSharingKey::new("chat:pool:budgets");
     let down = Loopback::new(unique_identity()).unavailable();
     let up = Loopback::new(unique_identity());
     let bind = |raw: Loopback| {
@@ -422,7 +433,7 @@ async fn pooled_models_keep_separate_budgets_for_the_same_request() {
             .chat(
                 binding(raw)
                     .with_policy(policy())
-                    .with_queue_id(pool.clone()),
+                    .with_account_sharing(pool.clone()),
             )
             .unwrap()
     };
@@ -1175,4 +1186,77 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
         provider.chat(request("same")).await.unwrap();
     }
     assert_eq!(raw.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn independent_accounts_and_runtimes_do_not_share_rate_budget() {
+    let runtime = Runtime::in_memory();
+    let other_runtime = Runtime::in_memory();
+    let raw = Loopback::new(unique_identity());
+    let policy = ModelQueueConfig {
+        requests_per_minute: Some(1),
+        ..policy()
+    };
+    let first = runtime
+        .chat(binding(raw.clone()).with_policy(policy.clone()))
+        .unwrap();
+    first.chat(request("first")).await.unwrap();
+    for (owner, tenant, account) in [
+        (&runtime, "tenant", "other-account"),
+        (&runtime, "other-tenant", "account"),
+        (&other_runtime, "tenant", "account"),
+    ] {
+        let provider = owner
+            .chat(
+                binding(raw.clone())
+                    .with_policy(policy.clone())
+                    .with_identity(symbiotic_ai_runtime::BindingIdentity::new(
+                        tenant, "provider", "1", account,
+                    )),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), provider.chat(request("next")))
+            .await
+            .expect("independent account has its own initial budget")
+            .unwrap();
+    }
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn explicit_account_sharing_enforces_one_rate_budget_across_tenants() {
+    let runtime = Runtime::in_memory();
+    let raw = Loopback::new(unique_identity());
+    let policy = ModelQueueConfig {
+        requests_per_minute: Some(1),
+        ..policy()
+    };
+    let shared = symbiotic_ai_runtime::AccountSharingKey::new("shared-account");
+    let first = runtime
+        .chat(
+            binding(raw.clone())
+                .with_policy(policy.clone())
+                .with_account_sharing(shared.clone()),
+        )
+        .unwrap();
+    let second = runtime
+        .chat(
+            binding(raw.clone())
+                .with_policy(policy)
+                .with_account_sharing(shared)
+                .with_identity(symbiotic_ai_runtime::BindingIdentity::new(
+                    "other-tenant",
+                    "provider",
+                    "1",
+                    "account",
+                )),
+        )
+        .unwrap();
+    first.chat(request("first")).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), second.chat(request("second")))
+            .await
+            .is_err()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }

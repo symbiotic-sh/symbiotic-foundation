@@ -921,7 +921,7 @@ on_both_backends!(
     a_slow_cache_write_keeps_the_lease_until_the_item_completes,
     a_waiters_slow_cache_read_does_not_stall_lease_renewal,
     a_failed_trace_write_still_completes_the_item,
-    a_failed_cooldown_write_still_records_the_failure,
+    a_failed_cooldown_write_refuses_retry_and_records_the_failure,
     a_failed_trace_write_keeps_the_providers_error,
     a_failed_completion_still_returns_the_paid_answer,
     an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage,
@@ -1516,7 +1516,7 @@ async fn a_failed_trace_write_still_completes_the_item(backend: &str, queue: Arc
     );
 }
 
-async fn a_failed_cooldown_write_still_records_the_failure(
+async fn a_failed_cooldown_write_refuses_retry_and_records_the_failure(
     backend: &str,
     queue: Arc<CountsRenewals>,
 ) {
@@ -1531,20 +1531,14 @@ async fn a_failed_cooldown_write_still_records_the_failure(
         .await
         .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
         .unwrap_err();
-    // The provider's failure, not the cooldown store's.
-    assert!(
-        matches!(err, ModelError::Unavailable(_)),
-        "{backend}: {err:?}"
-    );
-    assert!(
-        err.to_string().contains("provider down"),
-        "{backend}: {err}"
-    );
+    // A failed limiter refuses further execution visibly.
+    assert!(matches!(err, ModelError::Queue(_)), "{backend}: {err:?}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
     let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
     assert_eq!(item.status, QueueStatus::Dead, "{backend}: {item:?}");
     assert_eq!(
         item.last_error_class.as_deref(),
-        Some("unavailable"),
+        Some("queue"),
         "{backend}: {item:?}"
     );
     assert!(item.lease_owner.is_none(), "{backend}: {item:?}");

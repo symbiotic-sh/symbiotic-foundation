@@ -31,19 +31,18 @@
 //! cancel it: the call finishes, records its outcome, fills the cache and
 //! releases its queue item, and identical requests get its result.
 //!
-//! Every provider handed out for one model (`queue_id`) shares one
+//! Every provider bound to one configured account shares one
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
-//! or caller uses it. Two bindings of one model must agree on those limits.
+//! or caller uses it. Account bindings must agree on those limits.
 //!
 //! SQLite stays behind runtime/credential-process implementations; provider
 //! and egress contracts do not link it.
 
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-pub use symbiotic_core::BindingIdentity;
+pub use symbiotic_core::{AccountSharingKey, BindingIdentity};
 use symbiotic_core::{QueueId, QueueItemId};
 use symbiotic_model::private_fs;
 use symbiotic_model::{
@@ -138,10 +137,9 @@ pub struct ModelBinding<P> {
     pub provider: P,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
-    /// Queue whose limits and cooldown this binding shares. `None` uses the
-    /// model's own queue (`operation:operator:model`); set it to isolate a
-    /// role from its model's other callers, or to pool several models.
-    pub queue_id: Option<QueueId>,
+    /// Explicit quota pool. `None` isolates by tenant and concrete account.
+    /// The same key pools limits across bindings, models and tenants.
+    pub account_sharing_key: Option<AccountSharingKey>,
     /// Queue policy. `None` uses the catalog default for the provider's
     /// model ([`default_model_queue_config`]), else [`ModelQueueConfig::default`].
     /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
@@ -158,7 +156,7 @@ impl<P> ModelBinding<P> {
         Self {
             provider,
             identity: None,
-            queue_id: None,
+            account_sharing_key: None,
             policy: None,
             response_cache: ResponseCacheMode::Default,
             receipt_sink: None,
@@ -171,8 +169,8 @@ impl<P> ModelBinding<P> {
         self
     }
 
-    pub fn with_queue_id(mut self, queue_id: QueueId) -> Self {
-        self.queue_id = Some(queue_id);
+    pub fn with_account_sharing(mut self, key: AccountSharingKey) -> Self {
+        self.account_sharing_key = Some(key);
         self
     }
 
@@ -220,6 +218,7 @@ impl SharedLimits {
 struct Inner {
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
+    rate_state: model::ModelRateState,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
     response_max_age: Option<Duration>,
@@ -252,6 +251,7 @@ impl Runtime {
             inner: Arc::new(Inner {
                 queue,
                 admission: ModelAdmission::new(),
+                rate_state: model::ModelRateState::default(),
                 limits: Mutex::new(HashMap::new()),
                 state_dir: config.state_dir,
                 response_max_age: config.response_max_age,
@@ -298,7 +298,8 @@ impl Runtime {
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedChatProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
-                .with_admission(self.inner.admission.clone());
+                .with_admission(self.inner.admission.clone())
+                .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_chat(provider)))
     }
 
@@ -317,7 +318,8 @@ impl Runtime {
             bound.worker_id,
             bound.policy,
         )
-        .with_admission(self.inner.admission.clone());
+        .with_admission(self.inner.admission.clone())
+        .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_embedding(provider)))
     }
 
@@ -329,7 +331,8 @@ impl Runtime {
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedRerankProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
-                .with_admission(self.inner.admission.clone());
+                .with_admission(self.inner.admission.clone())
+                .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_rerank(provider)))
     }
 
@@ -348,7 +351,8 @@ impl Runtime {
             bound.worker_id,
             bound.policy,
         )
-        .with_admission(self.inner.admission.clone());
+        .with_admission(self.inner.admission.clone())
+        .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_classifier(provider)))
     }
 
@@ -364,11 +368,19 @@ impl Runtime {
             .clone()
             .filter(BindingIdentity::is_valid)
             .ok_or_else(|| ModelError::InvalidRequest("binding identity is required".into()))?;
-        let scope = descriptor_scope(descriptor, &identity)?;
-        let queue_id = binding
-            .queue_id
-            .clone()
-            .unwrap_or_else(|| QueueId::new(format!("binding:{scope}")));
+        let account_scope = match &binding.account_sharing_key {
+            Some(key) if !key.0.trim().is_empty() => serde_json::json!({"shared": key}),
+            Some(_) => {
+                return Err(ModelError::InvalidRequest(
+                    "account sharing key is empty".into(),
+                ));
+            }
+            None => serde_json::json!({"tenant": identity.tenant, "account": identity.account}),
+        };
+        let queue_id = QueueId::new(format!(
+            "account:{}",
+            model::configuration_revision(&account_scope)?.0
+        ));
         let mut policy = binding
             .policy
             .clone()
@@ -475,18 +487,6 @@ impl Sinks {
     apply_sinks!(apply_embedding, QueuedEmbeddingProvider);
     apply_sinks!(apply_rerank, QueuedRerankProvider);
     apply_sinks!(apply_classifier, QueuedClassifierProvider);
-}
-
-/// Cache subdirectory of one provider: a hash of its descriptor (identity,
-/// class, auth mode, metadata), so two models never read each other's
-/// responses.
-fn descriptor_scope(
-    descriptor: &ProviderDescriptor,
-    identity: &BindingIdentity,
-) -> Result<String, ModelError> {
-    let bytes = serde_json::to_vec(&(descriptor, identity))
-        .map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn open_persistent_queue(

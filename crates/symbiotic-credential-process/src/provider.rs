@@ -118,14 +118,18 @@ impl From<EgressError> for ExecuteError {
 }
 
 fn route_binding<P>(route: &RouteConfig, provider: P) -> ModelBinding<P> {
-    ModelBinding::new(provider).with_identity(BindingIdentity::new(
+    let binding = ModelBinding::new(provider).with_identity(BindingIdentity::new(
         &route.tenant,
         &route.route,
         model::configuration_revision(route)
             .expect("route serializes")
             .0,
-        &route.secret_ref,
-    ))
+        &route.account,
+    ));
+    match &route.account_sharing_key {
+        Some(key) => binding.with_account_sharing(key.clone()),
+        None => binding,
+    }
 }
 
 fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {

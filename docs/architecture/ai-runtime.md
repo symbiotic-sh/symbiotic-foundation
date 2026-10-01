@@ -48,7 +48,7 @@ the same state.
 | Field | Default | Meaning |
 |---|---|---|
 | `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
-| `queue_id` | Hash of binding and effective descriptor | Queue whose limits and cooldown the binding shares: isolate a role, or pool models |
+| `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
 | `policy` | Catalog default for the model (`default_model_queue_config`), else `ModelQueueConfig::default()` | Concurrency, rate limits, retries, timeout |
 | `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
@@ -158,14 +158,13 @@ the waiting caller; its lease is not renewed and expires after
 
 ## Current shared limits
 
-This describes current model/queue grouping, not the required tenant/account
-isolation. Explicit sharing and result identity follow
-[boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
-
-Every provider handed out for one queue shares the limits below. By default a
-queue is one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`); a
-binding's `queue_id` moves it to another queue. The providers of a queue
-share:
+Execution state belongs to the runtime. By default queues and rate state are
+keyed by typed tenant and concrete account; all models on that account share its
+policy. An explicit `AccountSharingKey` pools execution across bindings or tenants.
+Independent runtimes have separate in-process rate state. Persistent cooldowns
+belong to their queue backend, so deliberately sharing a state directory shares
+that durable account state. Poisoned rate/admission locks and closed gates return
+visible `ModelError::Queue` errors; they never bypass pacing. Accounts share:
 
 - one concurrency cap. Callers wait FIFO for a slot (`ModelAdmission`), and the
   backend enforces the same cap;
@@ -204,7 +203,7 @@ admission and recovery follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
 a known implementation gap.
 
-Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
+Bindings of one account must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
 fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
 per binding.
@@ -313,9 +312,9 @@ these writes fails:
 - it is logged as a `tracing` warning.
 
 The same holds elsewhere. A cache hit whose trace write fails is still
-returned, with the diagnostic. A failed call keeps its own error when its
-failure trace or its cooldown cannot be written; those failures are logged,
-and any retry currently proceeds as scheduled. This does not establish safe retry
+returned, with the diagnostic. A failed failure-trace write is logged. A failed cooldown write returns a
+queue error and refuses retry, because execution without its account limiter
+is not allowed. This does not establish safe retry
 admission; the current policy's charge-certainty gap is described above.
 
 ## Custom response caches

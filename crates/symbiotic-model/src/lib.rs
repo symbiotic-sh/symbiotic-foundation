@@ -37,7 +37,7 @@ use thiserror::Error;
 #[cfg(feature = "queue")]
 use chrono::Duration as ChronoDuration;
 #[cfg(feature = "queue")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 #[cfg(feature = "queue")]
 use std::time::Duration;
 #[cfg(feature = "queue")]
@@ -1533,26 +1533,27 @@ where
         };
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
-        let rate = match check_model_budget(queue_id, config, &this.request).await? {
-            RateCheck::Cleared(rate) => rate,
-            RateCheck::Wait(wait) => {
-                // Wait for budget in short slices without holding a model
-                // slot, and look at the item and the cache in between: a
-                // duplicate whose answer arrives returns without spending.
-                drop(permit);
-                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
-                let slice = throttle_started.elapsed();
-                throttle_wait += slice;
-                waiting_attempt = Some((attempt_started, attempt_throttle + slice));
-                if let Followed::Answer(answer) = this
-                    .waiting_on_item(&call_state, &mut enqueue, config)
-                    .await?
-                {
-                    return Ok(answer);
+        let rate =
+            match check_model_budget(&runtime.rate_state, queue_id, config, &this.request).await? {
+                RateCheck::Cleared(rate) => rate,
+                RateCheck::Wait(wait) => {
+                    // Wait for budget in short slices without holding a model
+                    // slot, and look at the item and the cache in between: a
+                    // duplicate whose answer arrives returns without spending.
+                    drop(permit);
+                    tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                    let slice = throttle_started.elapsed();
+                    throttle_wait += slice;
+                    waiting_attempt = Some((attempt_started, attempt_throttle + slice));
+                    if let Followed::Answer(answer) = this
+                        .waiting_on_item(&call_state, &mut enqueue, config)
+                        .await?
+                    {
+                        return Ok(answer);
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         let throttled = throttle_started.elapsed();
         attempt_throttle += throttled;
         throttle_wait += throttled;
@@ -1750,8 +1751,14 @@ where
         Err(err) => return Err(queue_error(err)),
     };
     // Only an attempt that reaches the provider spends rate budget.
-    if let Some(rate) = rate {
-        rate.charge();
+    if let Some(rate) = rate
+        && let Err(err) = rate.charge()
+    {
+        queue
+            .fail(&item.item_id, worker_id, &err.to_string(), None)
+            .await
+            .map_err(queue_error)?;
+        return Err(err);
     }
 
     let settled = holding_lease(
@@ -1931,13 +1938,26 @@ where
                 &this.request_hash,
                 &err,
             );
-            // The cooldown protects the provider; failing to record it does
-            // not change this attempt's outcome or its retry.
+            // Failed limiter state refuses visibly and cannot admit a retry.
             if is_transient(&err)
                 && let Err(cooldown_err) =
                     note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
             {
-                warn_side_effect(&this.queue_id, "cooldown_write_failed", &cooldown_err);
+                let failed = queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: cooldown_err.to_string(),
+                            error_class: Some("queue".into()),
+                            run_after: None,
+                        },
+                    )
+                    .await;
+                return Settled::Failed {
+                    err: cooldown_err,
+                    failed,
+                };
             }
             // One exact deadline, kept by the backend: this caller and any
             // duplicate waiting on the item retry no earlier than it.
@@ -2418,13 +2438,15 @@ fn exhausted_request_error(
 }
 
 #[cfg(feature = "queue")]
-static MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+type RateGates = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
+
+/// Rate state owned by a runtime and shared only through its account keys.
 #[cfg(feature = "queue")]
-static MODEL_RATE_BUCKETS: OnceLock<Mutex<HashMap<String, RateBucket>>> = OnceLock::new();
-/// Per queue: held from an attempt's rate-budget check through its claim.
-#[cfg(feature = "queue")]
-static MODEL_RATE_GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+#[derive(Clone, Default)]
+pub struct ModelRateState {
+    buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
+    gates: Arc<Mutex<RateGates>>,
+}
 
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
@@ -2539,22 +2561,26 @@ struct RateCharge {
 /// duplicate holds it, or its retry time has not come), spends nothing.
 #[cfg(feature = "queue")]
 struct RateGrant {
+    state: ModelRateState,
     _gate: tokio::sync::OwnedMutexGuard<()>,
     charges: Vec<RateCharge>,
 }
 
 #[cfg(feature = "queue")]
 impl RateGrant {
-    fn charge(self) {
-        let map = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut buckets) = map.lock() else {
-            return;
-        };
+    fn charge(self) -> Result<(), ModelError> {
+        let mut buckets = self
+            .state
+            .buckets
+            .lock()
+            .map_err(|_| ModelError::Queue("rate bucket lock poisoned".into()))?;
         for charge in &self.charges {
-            if let Some(bucket) = buckets.get_mut(&charge.key) {
-                bucket.charge(charge.amount);
-            }
+            buckets
+                .get_mut(&charge.key)
+                .ok_or_else(|| ModelError::Queue("rate bucket disappeared".into()))?
+                .charge(charge.amount);
         }
+        Ok(())
     }
 }
 
@@ -2573,6 +2599,7 @@ enum RateCheck {
 /// claim.
 #[cfg(feature = "queue")]
 async fn check_model_budget<R>(
+    state: &ModelRateState,
     queue_id: &QueueId,
     config: &ModelQueueConfig,
     request: &R,
@@ -2605,18 +2632,18 @@ where
         return Ok(RateCheck::Cleared(None));
     }
     let gate = {
-        let gates = MODEL_RATE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut gates) = gates.lock() else {
-            return Ok(RateCheck::Cleared(None));
-        };
+        let mut gates = state
+            .gates
+            .lock()
+            .map_err(|_| ModelError::Queue("rate gate lock poisoned".into()))?;
         gates.entry(queue_id.0.clone()).or_default().clone()
     };
     let held = gate.lock_owned().await;
     let wait = {
-        let buckets = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut buckets) = buckets.lock() else {
-            return Ok(RateCheck::Cleared(None));
-        };
+        let mut buckets = state
+            .buckets
+            .lock()
+            .map_err(|_| ModelError::Queue("rate bucket lock poisoned".into()))?;
         charges
             .iter()
             .filter_map(|charge| {
@@ -2631,6 +2658,7 @@ where
     };
     Ok(match wait {
         None => RateCheck::Cleared(Some(RateGrant {
+            state: state.clone(),
             _gate: held,
             charges,
         })),
@@ -2652,37 +2680,7 @@ async fn wait_for_model_cooldown(
         .cooldown_until(queue_id)
         .await
         .map_err(|err| ModelError::Queue(err.to_string()))?;
-    let local_sleep_for = {
-        let map = MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut guard) = map.lock() else {
-            return Ok(());
-        };
-        if let Some(until) = guard.get(&queue_id.0).copied() {
-            let now = Instant::now();
-            if until <= now {
-                guard.remove(&queue_id.0);
-                None
-            } else {
-                Some(until.saturating_duration_since(now))
-            }
-        } else {
-            None
-        }
-    };
-    let durable_sleep_for = durable_until.and_then(|until| {
-        let now = Utc::now();
-        if until <= now {
-            None
-        } else {
-            (until - now).to_std().ok()
-        }
-    });
-    let sleep_for = match (local_sleep_for, durable_sleep_for) {
-        (Some(local), Some(durable)) => Some(local.max(durable)),
-        (Some(local), None) => Some(local),
-        (None, Some(durable)) => Some(durable),
-        (None, None) => None,
-    };
+    let sleep_for = durable_until.and_then(|until| (until - Utc::now()).to_std().ok());
     if let Some(sleep_for) = sleep_for {
         tokio::time::sleep(sleep_for).await;
     }
@@ -2703,26 +2701,7 @@ async fn note_model_cooldown(
         _ => 1,
     };
     let millis = retry_delay_ms.saturating_mul(multiplier).clamp(1, 60_000);
-    let until_instant = Instant::now() + Duration::from_millis(millis);
     let until_utc = Utc::now() + ChronoDuration::milliseconds(millis as i64);
-    {
-        let map = MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut guard) = map.lock() else {
-            queue
-                .note_cooldown(queue_id, until_utc)
-                .await
-                .map_err(|err| ModelError::Queue(err.to_string()))?;
-            return Ok(());
-        };
-        guard
-            .entry(queue_id.0.clone())
-            .and_modify(|current| {
-                if *current < until_instant {
-                    *current = until_instant;
-                }
-            })
-            .or_insert(until_instant);
-    }
     queue
         .note_cooldown(queue_id, until_utc)
         .await
@@ -4513,6 +4492,7 @@ mod tests {
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
 
+        let state = ModelRateState::default();
         let cleared = |check: RateCheck| match check {
             RateCheck::Cleared(grant) => grant.expect("a rate-limited policy returns a grant"),
             RateCheck::Wait(wait) => panic!("budget is available, but asked to wait {wait:?}"),
@@ -4520,24 +4500,65 @@ mod tests {
         // Cleared without a claim: nothing is spent, and the next caller is
         // cleared at once.
         drop(cleared(
-            check_model_budget(&queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
                 .await
                 .unwrap(),
         ));
         cleared(
-            check_model_budget(&queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
                 .await
                 .unwrap(),
         )
-        .charge();
+        .charge()
+        .unwrap();
         // Spent: the next caller waits about a second for the refill.
-        match check_model_budget(&queue_id, &config, &chat_request("second"))
+        match check_model_budget(&state, &queue_id, &config, &chat_request("second"))
             .await
             .unwrap()
         {
             RateCheck::Wait(wait) => assert!(wait >= Duration::from_millis(900), "{wait:?}"),
             RateCheck::Cleared(_) => panic!("the budget was spent"),
         }
+    }
+
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn poisoned_rate_state_refuses_checks_and_charging() {
+        let policy = ModelQueueConfig {
+            requests_per_minute: Some(60),
+            ..ModelQueueConfig::default()
+        };
+        let request = chat_request("x");
+        let queue = QueueId::new("account");
+        let state = ModelRateState::default();
+        let RateCheck::Cleared(Some(grant)) = check_model_budget(&state, &queue, &policy, &request)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh budget");
+        };
+        let buckets = state.buckets.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = buckets.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(matches!(grant.charge(), Err(ModelError::Queue(_))));
+        assert!(matches!(
+            check_model_budget(&state, &queue, &policy, &request).await,
+            Err(ModelError::Queue(_))
+        ));
+        let state = ModelRateState::default();
+        let gates = state.gates.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = gates.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(matches!(
+            check_model_budget(&state, &queue, &policy, &request).await,
+            Err(ModelError::Queue(_))
+        ));
     }
 
     #[tokio::test]

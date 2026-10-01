@@ -115,6 +115,8 @@ impl Fixture {
             io_timeout_seconds: 2,
             routes: vec![RouteConfig {
                 tenant: "tenant".into(),
+                account: "account".into(),
+                account_sharing_key: None,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -1171,6 +1173,8 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     for field in ["concurrency", "requests", "input"] {
         let mut config = fixture.config.clone();
+        config.routes[0].account_sharing_key =
+            Some(symbiotic_ai_runtime::AccountSharingKey::new("shared"));
         let mut second = config.routes[0].clone();
         second.route = "second-route".into();
         second.tenant = "other-tenant".into();
@@ -1551,4 +1555,17 @@ async fn recovery_disconnected_peer_does_not_stop_socket_server() {
     );
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn independent_tenant_routes_accept_different_account_policies() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let mut config = fixture.config.clone();
+    let mut second = config.routes[0].clone();
+    second.tenant = "other-tenant".into();
+    second.max_in_flight = 1;
+    second.requests_per_minute = Some(60);
+    config.routes.push(second);
+    assert!(CredentialProcess::open(config).is_ok());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }

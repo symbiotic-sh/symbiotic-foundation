@@ -43,11 +43,11 @@ impl ModelAdmission {
     }
 
     /// The cap fixed for `queue_id`, if a provider was admitted for it.
-    pub fn cap(&self, queue_id: &QueueId) -> Option<usize> {
+    pub fn cap(&self, queue_id: &QueueId) -> Result<Option<usize>, ModelError> {
         self.gates
             .lock()
-            .ok()
-            .and_then(|gates| gates.get(&queue_id.0).map(|(cap, _)| *cap))
+            .map(|gates| gates.get(&queue_id.0).map(|(cap, _)| *cap))
+            .map_err(|_| ModelError::Queue("model admission lock poisoned".into()))
     }
 
     /// Fix the cap for `queue_id`, or check it matches the fixed one.
@@ -480,6 +480,7 @@ pub(crate) struct QueueRuntime {
     pub(crate) trace_sink: Option<Arc<dyn TraceSink>>,
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
+    pub(crate) rate_state: crate::ModelRateState,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
     /// Queue identity override; `None` uses the descriptor's `queue_id`.
     pub(crate) queue_id: Option<QueueId>,
@@ -499,6 +500,7 @@ impl QueueRuntime {
             trace_sink: None,
             receipt_sink: None,
             admission: None,
+            rate_state: crate::ModelRateState::default(),
             response_cache: None,
             queue_id: None,
             binding_identity: None,
@@ -535,6 +537,11 @@ macro_rules! queue_runtime_builders {
 
         /// Share in-process admission (the model cap) with every provider
         /// built from the same [`ModelAdmission`](crate::ModelAdmission).
+        /// Runtime-owned rate state, pooled by explicit account identity.
+        pub fn with_rate_state(mut self, state: $crate::ModelRateState) -> Self {
+            self.runtime.rate_state = state;
+            self
+        }
         pub fn with_admission(mut self, admission: $crate::ModelAdmission) -> Self {
             self.runtime.admission = Some(admission);
             self
@@ -564,6 +571,23 @@ pub(crate) use queue_runtime_builders;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_admission_state_refuses_visibly() {
+        let admission = super::ModelAdmission::new();
+        let id = symbiotic_core::QueueId::new("account");
+        let gate = admission.gate(&id, 1).unwrap();
+        gate.close();
+        assert!(admission.acquire(&id, 1).await.is_err());
+        let gates = admission.gates.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = gates.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(admission.cap(&id).is_err());
+        assert!(admission.register(&id, 1).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -572,7 +596,7 @@ mod tests {
         let queue_id = QueueId::new("chat:test:model");
         admission.register(&queue_id, 4).unwrap();
         admission.register(&queue_id, 4).unwrap();
-        assert_eq!(admission.cap(&queue_id), Some(4));
+        assert_eq!(admission.cap(&queue_id).unwrap(), Some(4));
         let err = admission.register(&queue_id, 2).unwrap_err();
         assert!(matches!(err, ModelError::InvalidRequest(_)), "{err:?}");
         // Other models are independent.

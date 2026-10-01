@@ -228,7 +228,9 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 
 `ProcessConfig` version 2 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
-Each route requires all `RouteConfig` fields documented in the Rust type, including
+Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
+isolation, or explicitly pools execution across routes or tenants. Shared bindings
+must agree on account limits. Each route requires all `RouteConfig` fields documented in the Rust type, including
 finite field/input/response/token/concurrency/timeout settings. These are configured
 limits, not measured capacity; their labels and qualification follow
 [boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every

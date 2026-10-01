@@ -34,6 +34,10 @@ pub enum RouteProvider {
 pub struct RouteConfig {
     /// Tenant namespace.
     pub tenant: String,
+    /// Concrete account identity, scoped to this tenant unless explicitly shared.
+    pub account: String,
+    /// Explicit account quota sharing across routes or tenants.
+    pub account_sharing_key: Option<symbiotic_ai_runtime::AccountSharingKey>,
     /// Route identifier.
     pub route: String,
     /// Opaque reference scoped to this tenant.
@@ -411,7 +415,8 @@ fn is_digest(value: &str) -> bool {
 }
 
 fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError> {
-    if route.tenant.is_empty()
+    if route.account.trim().is_empty()
+        || route.tenant.is_empty()
         || route.route.is_empty()
         || route.secret_ref.is_empty()
         || route.model.is_empty()

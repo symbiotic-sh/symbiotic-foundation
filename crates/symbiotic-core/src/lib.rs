@@ -138,6 +138,14 @@ pub struct ConfigurationRevision(pub String);
 /// Concrete provider account, distinct from the model name or secret value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccountId(pub String);
+/// Explicit key for pooling account execution limits, including across tenants.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccountSharingKey(pub String);
+impl AccountSharingKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+}
 /// Required identity of a runtime binding. Contains references, never secrets.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindingIdentity {
