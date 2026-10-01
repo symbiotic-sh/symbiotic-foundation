@@ -823,9 +823,9 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
 
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
     assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
-    // The bad key's budget is spent: it does not call again.
+    // The bad key's terminal refusal is retained: it does not call again.
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
-    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // A new key is a new credential, with its own budget.
@@ -1190,10 +1190,24 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
                     .with_response_cache(ResponseCacheMode::Custom(cache.clone())),
             )
             .unwrap();
-        provider.chat(request("same")).await.unwrap();
-        provider.chat(request("same")).await.unwrap();
+        let mut variants = vec![request("same"), request("different")];
+        let mut limited = request("same");
+        limited.max_output_tokens = Some(16);
+        variants.push(limited);
+        let mut warmer = request("same");
+        warmer.temperature = Some(0.5);
+        variants.push(warmer);
+        for request in variants {
+            let first = provider.chat(request.clone()).await.unwrap();
+            let hit = provider.chat(request).await.unwrap();
+            assert_eq!(first.trace.request_hash, hit.trace.request_hash);
+            assert_eq!(
+                hit.trace.cache.response_cache,
+                symbiotic_trace::CacheStatus::Hit
+            );
+        }
     }
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 16);
 }
 
 #[tokio::test]
@@ -1487,4 +1501,33 @@ fn production_request_debug_dir_is_refused_at_bind_time() {
     }));
     assert!(matches!(result, Err(ModelError::InvalidRequest(_))));
     assert!(!dumps.exists());
+}
+
+#[test]
+fn raw_and_registry_bindings_refuse_the_same_invalid_chat_settings() {
+    use symbiotic_ai_runtime::model::{ModelRegistry, OpenAiCompatibleChatProvider, ThinkingMode};
+    for (thinking, effort) in [(Some(ThinkingMode::Disabled), "low"), (None, "")] {
+        let mut config = registry_config();
+        config["bindings"][0]["settings"]["thinking"] = json!(thinking);
+        config["bindings"][0]["settings"]["reasoning_effort"] = json!(effort);
+        let configured_error =
+            ModelRegistry::from_json(&serde_json::to_vec(&config).unwrap()).unwrap_err();
+        let raw = OpenAiCompatibleChatProvider::new(
+            "example",
+            "example-model",
+            "http://127.0.0.1:9/v1",
+            "",
+        )
+        .with_request_limit(65536)
+        .with_response_limit(65536)
+        .with_output_limit(1024)
+        .with_thinking(thinking)
+        .with_reasoning_effort(effort);
+        let raw_error = match Runtime::in_memory().chat(binding(raw).with_policy(policy())) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid raw binding was accepted"),
+        };
+        assert!(matches!(raw_error, ModelError::InvalidRequest(_)));
+        assert_eq!(raw_error.to_string(), configured_error.to_string());
+    }
 }

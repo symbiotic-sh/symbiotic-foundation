@@ -231,7 +231,10 @@ impl State {
                 .or_default()
                 .insert(item_id.to_string());
         }
-        if matches!(status, QueueStatus::Succeeded | QueueStatus::Dead) {
+        if matches!(
+            status,
+            QueueStatus::Succeeded | QueueStatus::Dead | QueueStatus::Stopped
+        ) {
             self.terminal.push_back(item_id.to_string());
             self.evict_terminal();
         }
@@ -525,7 +528,10 @@ impl QueueBackend for MemoryQueue {
             item.last_error = Some(failure.error.clone());
             item.last_error_class = failure.error_class.clone();
             item.updated_at = now;
-            let status = if exhausted {
+            let status = if failure.run_after.is_none() {
+                outcome = FailOutcome::Stopped;
+                QueueStatus::Stopped
+            } else if exhausted {
                 outcome = FailOutcome::MovedToDead;
                 QueueStatus::Dead
             } else {

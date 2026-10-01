@@ -135,7 +135,7 @@ async fn low_thinking_and_metadata_without_reasoning_text() {
 }
 
 #[tokio::test]
-async fn disabled_thinking_omits_effort_and_nullable_content_keeps_identity() {
+async fn disabled_thinking_and_nullable_content_keep_identity() {
     let (url, server) = fixture(serde_json::json!({
         "id":"no-usage", "model":"served-model",
         "choices":[{"message":{"content":null},"finish_reason":"length"}]
@@ -144,7 +144,6 @@ async fn disabled_thinking_omits_effort_and_nullable_content_keeps_identity() {
         .with_request_limit(65536)
         .with_response_limit(65536)
         .with_thinking(Some(ThinkingMode::Disabled))
-        .with_reasoning_effort("low")
         .chat(request())
         .await
         .unwrap();
@@ -344,4 +343,41 @@ async fn output_token_limits_refuse_oversized_or_unbounded_requests_before_conne
         provider.with_output_limit(32).chat(request()).await,
         Err(symbiotic_model::ModelError::InvalidRequest(_))
     ));
+}
+
+#[tokio::test]
+async fn disabled_thinking_with_effort_is_refused_before_transport() {
+    use symbiotic_model::{ModelError, ModelProvider};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let provider = OpenAiCompatibleChatProvider::new(
+        "fixture",
+        "fixture",
+        format!("http://{}", listener.local_addr().unwrap()),
+        "synthetic-key",
+    )
+    .with_request_limit(65536)
+    .with_response_limit(65536)
+    .with_thinking(Some(ThinkingMode::Disabled))
+    .with_reasoning_effort("low");
+    assert!(matches!(
+        provider.validate_configuration(),
+        Err(ModelError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        provider.chat(request()).await,
+        Err(ModelError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn local_hash_embeddings_have_no_http_destination() {
+    use symbiotic_model::{HashEmbeddingProvider, ModelProvider, ProviderClass};
+    let provider = HashEmbeddingProvider::new(3);
+    assert_eq!(provider.descriptor().provider_class, ProviderClass::Local);
+    assert!(provider.descriptor().metadata.get("endpoint").is_none());
 }

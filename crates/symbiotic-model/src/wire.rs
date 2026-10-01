@@ -62,6 +62,7 @@ pub fn openai_chat_body(
     reasoning_effort: Option<&str>,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
+    super::validate_chat_settings(thinking, reasoning_effort)?;
     encode(
         &OpenAiChatWireRequest {
             model,
@@ -73,11 +74,7 @@ pub fn openai_chat_body(
                 .as_deref()
                 .map(|format| serde_json::json!({ "type": format })),
             thinking: thinking.map(|mode| serde_json::json!({ "type": mode })),
-            reasoning_effort: if thinking == Some(ThinkingMode::Disabled) {
-                None
-            } else {
-                reasoning_effort
-            },
+            reasoning_effort,
             stream: false,
         },
         max_bytes,

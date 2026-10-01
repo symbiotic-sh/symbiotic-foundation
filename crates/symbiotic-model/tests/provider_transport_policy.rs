@@ -38,6 +38,15 @@ fn classify_request() -> ClassifyRequest {
 
 // A bounded loopback fixture also accepts arbitrary bytes for malformed UTF-8 tests.
 fn serve(body: Vec<u8>, stop: Arc<AtomicBool>) -> (String, std::thread::JoinHandle<usize>) {
+    serve_response(200, None, body, stop)
+}
+
+fn serve_response(
+    status: u16,
+    location: Option<String>,
+    body: Vec<u8>,
+    stop: Arc<AtomicBool>,
+) -> (String, std::thread::JoinHandle<usize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -52,6 +61,8 @@ fn serve(body: Vec<u8>, stop: Arc<AtomicBool>) -> (String, std::thread::JoinHand
                 }
                 Err(error) => panic!("{error}"),
             };
+            // Accepted sockets inherit the nonblocking listener mode on macOS.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                 .unwrap();
@@ -83,7 +94,8 @@ fn serve(body: Vec<u8>, stop: Arc<AtomicBool>) -> (String, std::thread::JoinHand
             requests += 1;
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} Fixture\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                location.as_ref().map(|url| format!("Location: {url}\r\n")).unwrap_or_default(),
                 body.len()
             )
             .unwrap();
@@ -196,4 +208,63 @@ async fn jev_refuses_invalid_utf8_in_a_success_body() {
     assert_eq!(server.join().unwrap(), 1);
     let error = result.expect_err("invalid UTF-8 must not become a successful classification");
     assert!(matches!(error, ModelError::Provider(message) if message.contains("UTF-8")));
+}
+
+#[tokio::test]
+async fn built_in_clients_refuse_redirects_without_contacting_the_target() {
+    for configured in [false, true] {
+        for classifier in [false, true] {
+            for status in [307, 308] {
+                let target = TcpListener::bind("127.0.0.1:0").unwrap();
+                target.set_nonblocking(true).unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (endpoint, server) = serve_response(
+                    status,
+                    Some(format!("http://{}/other", target.local_addr().unwrap())),
+                    Vec::new(),
+                    stop.clone(),
+                );
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    if classifier {
+                        let mut provider = JevClassifierProvider::new(
+                            "fixture",
+                            "fixture",
+                            endpoint,
+                            "synthetic-key",
+                        )
+                        .with_request_limit(65536)
+                        .with_response_limit(65536);
+                        if configured {
+                            provider = provider.with_client(http_client(Some(3)).unwrap());
+                        }
+                        provider.classify(classify_request()).await.map(|_| ())
+                    } else {
+                        let mut provider = OpenAiCompatibleChatProvider::new(
+                            "fixture",
+                            "fixture",
+                            endpoint,
+                            "synthetic-key",
+                        )
+                        .with_request_limit(65536)
+                        .with_response_limit(65536);
+                        if configured {
+                            provider = provider.with_client(http_client(Some(3)).unwrap());
+                        }
+                        provider.chat(chat_request()).await.map(|_| ())
+                    }
+                })
+                .await;
+                stop.store(true, Ordering::Release);
+                assert_eq!(server.join().unwrap(), 1);
+                let result = result.expect("provider redirect refusal must finish promptly");
+                assert!(
+                    matches!(result, Err(ModelError::Provider(message)) if message.contains("redirect"))
+                );
+                assert_eq!(
+                    target.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
 }

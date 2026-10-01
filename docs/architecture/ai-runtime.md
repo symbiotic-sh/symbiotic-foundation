@@ -353,8 +353,12 @@ these writes fails:
 
 The same holds elsewhere. A cache hit whose trace write fails is still
 returned, with the diagnostic. A failed failure-trace write is logged. A failed cooldown write returns a
-queue error and refuses retry, because execution without its account limiter
-is not allowed. This does not establish safe retry
+queue error and persists a stopped item, because execution without its account
+limiter is not allowed. Stopped items cannot be claimed, continued as logical retry
+chains or renewed by `budget_renewal_seconds`; identical waiters and later calls
+return the recorded refusal while the queue retains the item. Failures without a
+retry deadline also stop the item. Retryable failures with a deadline become failed
+or dead according to their attempt budget. This does not establish safe retry
 admission; the current policy's charge-certainty gap is described above.
 
 ## Custom response caches

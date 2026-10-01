@@ -10,11 +10,15 @@ use symbiotic_core::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelAdapter {
+    /// Compatible chat completions over HTTP.
     OpenAiChat,
+    /// Gemini single and batch embedding requests.
     GeminiEmbedding,
+    /// System One probability classification requests.
     JevClassifier,
 }
 impl ModelAdapter {
+    /// Operation implemented by this adapter.
     pub fn capability(self) -> ModelCapability {
         match self {
             Self::OpenAiChat => ModelCapability::Chat,
@@ -35,11 +39,17 @@ impl ModelAdapter {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
+    /// Canonical lookup name for this model.
     pub id: String,
+    /// Additional lookup names resolving to this exact entry.
     pub aliases: Vec<String>,
+    /// Effective operation, operator and model name.
     pub identity: ModelIdentity,
+    /// Installed transport implementation.
     pub adapter: ModelAdapter,
+    /// Supported operations; must match the installed adapter.
     pub operations: Vec<ModelCapability>,
+    /// Declared features and advisory pricing; grants no execution authority.
     pub capabilities: ModelCapabilities,
     /// Required when advisory prices are supplied, e.g. source URL and date.
     pub pricing_provenance: Option<PricingProvenance>,
@@ -48,53 +58,76 @@ pub struct ModelEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PricingProvenance {
+    /// Reference identifying the tariff source.
     pub source: String,
+    /// Date of the tariff observation in YYYY-MM-DD format.
     pub date: String,
 }
 /// Hard encoded request and HTTP response limits, in bytes, per binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderLimits {
+    /// Maximum encoded HTTP request body bytes; required and nonzero.
     pub max_request_bytes: usize,
+    /// Maximum buffered HTTP response body bytes, including errors.
     pub max_response_bytes: usize,
+    /// Required nonzero output ceiling for chat; unsupported for other adapters.
     pub max_output_tokens: Option<u32>,
 }
 /// Effective request settings; unsupported settings are refused at startup.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportSettings {
+    /// Optional compatible chat thinking mode.
     pub thinking: Option<ThinkingMode>,
+    /// Optional nonempty chat effort; refused when thinking is disabled.
     pub reasoning_effort: Option<String>,
+    /// Required nonzero Gemini embedding dimension count.
     pub dimensions: Option<usize>,
+    /// Optional expected System One served model name.
     pub served_model: Option<String>,
 }
 /// A tenant's provider principal with a concrete account and config revision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantProviderBinding {
+    /// Tenant, provider principal, revision and concrete account.
     pub identity: BindingIdentity,
+    /// Canonical model lookup name or alias.
     pub model: String,
+    /// Effective HTTP(S) API base without credentials, query or fragment.
     pub endpoint: String,
+    /// Opaque credential reference; None selects keyless execution.
     pub secret_ref: Option<String>,
+    /// Lookup name of the account execution policy.
     pub account_policy: String,
+    /// Explicit quota pool; None isolates by tenant and concrete account.
     pub account_sharing_key: Option<AccountSharingKey>,
+    /// Hard transport limits enforced by the adapter.
     pub limits: ProviderLimits,
+    /// Effective adapter-specific request settings.
     pub settings: TransportSettings,
 }
 /// Explicit account execution policy. No operator/model defaults are inferred.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountExecutionPolicy {
+    /// Unique account policy lookup name.
     pub id: String,
+    /// Explicit concurrency, pacing, timeout and retry policy.
     pub policy: ModelQueueConfig,
 }
 /// Current format only; examples configure no implicit provider.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
+    /// Current configuration format version; must be 1.
     pub version: u16,
+    /// Model catalogue entries; duplicates and ambiguous aliases are refused.
     pub models: Vec<ModelEntry>,
+    /// Explicit tenant/provider bindings; no implicit bindings are inferred.
     pub bindings: Vec<TenantProviderBinding>,
+    /// Named account execution policies used by bindings.
     pub accounts: Vec<AccountExecutionPolicy>,
 }
 /// Immutable validated configuration with keyed model and tenant lookups.
@@ -107,8 +140,11 @@ pub struct ModelRegistry {
 }
 /// References to one fully resolved configuration, never credentials.
 pub struct RegistryBinding<'a> {
+    /// Resolved tenant/provider configuration.
     pub binding: &'a TenantProviderBinding,
+    /// Canonical model entry, including alias resolution.
     pub model: &'a ModelEntry,
+    /// Resolved account execution policy.
     pub account: &'a AccountExecutionPolicy,
 }
 fn invalid(message: &str) -> ModelError {
@@ -148,6 +184,7 @@ impl ModelRegistry {
     pub fn from_json(bytes: &[u8]) -> Result<Self, ModelError> {
         Self::new(serde_json::from_slice(bytes).map_err(|_| invalid("invalid configuration JSON"))?)
     }
+    /// Validate all entries, bindings and account policies atomically.
     pub fn new(config: RegistryConfig) -> Result<Self, ModelError> {
         if config.version != 1 {
             return Err(invalid("unsupported configuration version"));
@@ -230,22 +267,21 @@ impl ModelRegistry {
             }
             let settings = &binding.settings;
             if settings
-                .reasoning_effort
+                .served_model
                 .as_deref()
                 .is_some_and(|s| !nonempty(s))
-                || settings
-                    .served_model
-                    .as_deref()
-                    .is_some_and(|s| !nonempty(s))
             {
                 return Err(invalid("empty transport setting"));
             }
+            if model.adapter == ModelAdapter::OpenAiChat {
+                crate::validate_chat_settings(
+                    settings.thinking,
+                    settings.reasoning_effort.as_deref(),
+                )?;
+            }
             match model.adapter {
                 ModelAdapter::OpenAiChat
-                    if settings.dimensions.is_some()
-                        || settings.served_model.is_some()
-                        || (settings.thinking == Some(ThinkingMode::Disabled)
-                            && settings.reasoning_effort.is_some()) =>
+                    if settings.dimensions.is_some() || settings.served_model.is_some() =>
                 {
                     return Err(invalid("unsupported chat settings"));
                 }
@@ -307,12 +343,14 @@ impl ModelRegistry {
         }
         Ok(registry)
     }
+    /// Resolve a canonical model name or alias; unknown names are refused.
     pub fn model(&self, id: &str) -> Result<&ModelEntry, ModelError> {
         self.models
             .get(id)
             .map(|i| &self.config.models[*i])
             .ok_or_else(|| invalid("unknown model or alias"))
     }
+    /// Resolve a configured tenant/provider pair without accessing credentials.
     pub fn binding(
         &self,
         tenant: &TenantId,
@@ -329,6 +367,7 @@ impl ModelRegistry {
             binding,
         })
     }
+    /// Inspect the immutable validated configuration.
     pub fn config(&self) -> &RegistryConfig {
         &self.config
     }

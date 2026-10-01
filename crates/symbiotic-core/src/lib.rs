@@ -99,6 +99,7 @@ impl ModelName {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelIdentity {
     pub operation: Operation,
     pub operator: Operator,
@@ -142,19 +143,26 @@ pub struct AccountId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccountSharingKey(pub String);
 impl AccountSharingKey {
+    /// Name an explicit quota pool, including across tenants when configured.
     pub fn new(key: impl Into<String>) -> Self {
         Self(key.into())
     }
 }
 /// Required identity of a runtime binding. Contains references, never secrets.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingIdentity {
+    /// Tenant owning this binding.
     pub tenant: TenantId,
+    /// Provider principal whose input grants Memory checks.
     pub provider: ProviderPrincipalId,
+    /// Configuration generation used for result reuse.
     pub revision: ConfigurationRevision,
+    /// Concrete provider account within the tenant.
     pub account: AccountId,
 }
 impl BindingIdentity {
+    /// Construct a binding identity; runtime validation refuses empty components.
     pub fn new(
         tenant: impl Into<String>,
         provider: impl Into<String>,
@@ -168,6 +176,7 @@ impl BindingIdentity {
             account: AccountId(account.into()),
         }
     }
+    /// Whether every required identity component is nonempty.
     pub fn is_valid(&self) -> bool {
         [
             &self.tenant.0,
