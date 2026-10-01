@@ -234,12 +234,11 @@ must agree on account limits. Each route requires all `RouteConfig` fields docum
 finite field/input/response/token/concurrency/timeout settings. These are configured
 limits, not measured capacity; their labels and qualification follow
 [boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every
-route with the runtime and refuses conflicting concurrency or pacing limits for a
-shared model queue, including routes in different tenants. When those limits agree,
-the current backend pools those tenants' rate buckets and cooldowns. This is the
-accidental sharing forbidden by the
-[boundary contract](boundary.md#tenant-provider-bindings-and-data-access), not the
-target configuration; explicit tenant/account isolation remains implementation work.
+route with the runtime. Concurrency, rate buckets and cooldowns are grouped by
+`(tenant, account)` when `account_sharing_key` is null; matching model routes in
+independent tenant accounts remain isolated. The same non-null sharing key
+explicitly pools execution limits across routes, models and tenants. Bindings
+in one group must agree on concurrency and pacing limits or startup is refused.
 Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.

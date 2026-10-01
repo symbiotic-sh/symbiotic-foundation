@@ -42,6 +42,7 @@ macro_rules! queue_backend_conformance {
             expired_lease_cannot_complete_and_is_reclaimed,
             an_expired_final_attempt_is_dead_not_claimable,
             fail_with_records_the_class_and_the_exact_deadline,
+            failure_without_retry_deadline_stops_with_attempts_remaining,
             enqueue_replacing_supersedes_only_the_current_item,
             cooldown_only_moves_forward,
             unknown_item_is_absent,
@@ -596,4 +597,47 @@ pub async fn enqueue_replacing_supersedes_only_the_current_item(queue: Arc<dyn Q
     }
     assert_eq!(inserted, 1);
     assert_eq!(ids.len(), 1, "both callers end on the same replacement");
+}
+
+/// A terminal refusal must never reenter the claimable work set.
+pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
+    queue: Arc<dyn QueueBackend>,
+) {
+    let item = queue.enqueue(request("stopped")).await.unwrap().item;
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    let outcome = queue
+        .fail_with(
+            &item.item_id,
+            "worker",
+            Failure {
+                error: "limiter unavailable".into(),
+                error_class: Some("queue".into()),
+                run_after: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, FailOutcome::Stopped);
+    let stopped = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(stopped.status, QueueStatus::Stopped);
+    assert!(stopped.attempt < stopped.max_attempts);
+    assert!(
+        queue
+            .claim_item(&item.item_id, "other", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queue
+            .claim(claim("other", 1, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(queue.reclaim_expired_leases(&queue_id()).await.unwrap(), 0);
+    let duplicate = queue.enqueue(request("stopped")).await.unwrap();
+    assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
+    assert_eq!(duplicate.item.item_id, item.item_id);
+    assert_eq!(duplicate.item.last_error_class.as_deref(), Some("queue"));
 }

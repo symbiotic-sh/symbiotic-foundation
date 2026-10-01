@@ -126,3 +126,15 @@ fn unsupported_settings_and_unattributed_prices_are_refused() {
         json!({"source": "synthetic tariff", "date": "2026-10-02"});
     assert!(load(&config).is_ok());
 }
+
+#[test]
+fn nested_identity_unknown_fields_are_refused() {
+    for (identity, field) in [
+        ("/bindings/0/identity", "account_sharing_key"),
+        ("/models/0/identity", "misspelled_model"),
+    ] {
+        let mut config = config();
+        config.pointer_mut(identity).unwrap()[field] = json!("unexpected");
+        assert!(load(&config).is_err(), "{identity}/{field}");
+    }
+}

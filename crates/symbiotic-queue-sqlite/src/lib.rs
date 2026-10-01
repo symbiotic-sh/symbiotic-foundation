@@ -23,6 +23,7 @@ fn status_str(status: QueueStatus) -> &'static str {
         QueueStatus::Succeeded => "succeeded",
         QueueStatus::Failed => "failed",
         QueueStatus::Dead => "dead",
+        QueueStatus::Stopped => "stopped",
     }
 }
 
@@ -33,6 +34,7 @@ fn parse_status(value: &str) -> Result<QueueStatus, QueueError> {
         "succeeded" => Ok(QueueStatus::Succeeded),
         "failed" => Ok(QueueStatus::Failed),
         "dead" => Ok(QueueStatus::Dead),
+        "stopped" => Ok(QueueStatus::Stopped),
         other => Err(QueueError::Storage(format!("unknown queue status {other}"))),
     }
 }
@@ -243,7 +245,7 @@ impl SqliteQueue {
         Ok(updated)
     }
 
-    /// Delete terminal items (succeeded or dead) last updated before
+    /// Delete terminal items (succeeded, dead or stopped) last updated before
     /// `before`, and queue events older than it. Active items are kept
     /// whatever their age. Returns the number of items deleted.
     ///
@@ -255,7 +257,7 @@ impl SqliteQueue {
         let deleted = tx
             .execute(
                 "delete from queue_items
-                 where status in ('succeeded', 'dead') and updated_at < ?1",
+                 where status in ('succeeded', 'dead', 'stopped') and updated_at < ?1",
                 params![ts(before)],
             )
             .map_err(storage_error)?;
@@ -301,8 +303,10 @@ impl SqliteQueue {
                         existing.status,
                         QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed
                     );
-                    let terminal =
-                        matches!(existing.status, QueueStatus::Succeeded | QueueStatus::Dead);
+                    let terminal = matches!(
+                        existing.status,
+                        QueueStatus::Succeeded | QueueStatus::Dead | QueueStatus::Stopped
+                    );
                     let superseded = replacing.is_some_and(|current| existing.item_id != *current);
                     if active || (terminal && !request.force) || superseded {
                         tx.commit().map_err(storage_error)?;
@@ -656,7 +660,9 @@ impl QueueBackend for SqliteQueue {
         let (item, outcome) = update_running_item(&self.conn, item_id, worker_id, |conn| {
             let item = get_required(conn, item_id)?;
             let exhausted = item.attempt >= item.max_attempts;
-            let status = if exhausted {
+            let status = if failure.run_after.is_none() {
+                QueueStatus::Stopped
+            } else if exhausted {
                 QueueStatus::Dead
             } else {
                 QueueStatus::Failed
@@ -682,7 +688,9 @@ impl QueueBackend for SqliteQueue {
             )
             .map_err(storage_error)?;
             let updated = get_required(conn, item_id)?;
-            let outcome = if exhausted {
+            let outcome = if failure.run_after.is_none() {
+                FailOutcome::Stopped
+            } else if exhausted {
                 FailOutcome::MovedToDead
             } else {
                 FailOutcome::RetryScheduled
@@ -1423,6 +1431,48 @@ mod tests {
         assert_eq!(
             reopened.get(&claimed[0].item_id).unwrap().unwrap().status,
             QueueStatus::Dead
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_failure_survives_reopen_with_attempts_remaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = SqliteQueue::open(&path).unwrap();
+        let item = queue.enqueue(request("stopped")).await.unwrap().item;
+        queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queue
+                .fail_with(
+                    &item.item_id,
+                    "worker",
+                    Failure {
+                        error: "limiter unavailable".into(),
+                        error_class: Some("queue".into()),
+                        run_after: None,
+                    }
+                )
+                .await
+                .unwrap(),
+            FailOutcome::Stopped
+        );
+        drop(queue);
+        let reopened = SqliteQueue::open(&path).unwrap();
+        let duplicate = reopened.enqueue(request("stopped")).await.unwrap();
+        assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
+        assert_eq!(duplicate.item.status, QueueStatus::Stopped);
+        assert_eq!(duplicate.item.last_error_class.as_deref(), Some("queue"));
+        assert!(duplicate.item.attempt < duplicate.item.max_attempts);
+        assert!(
+            reopened
+                .claim_item(&item.item_id, "later", 60, None)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

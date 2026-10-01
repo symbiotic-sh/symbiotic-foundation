@@ -1,5 +1,4 @@
 //! Local secret resolution. No secret type implements Debug or Serialize.
-use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use std::{fs::OpenOptions, io::Read, path::PathBuf};
 use symbiotic_ai_runtime::model::SecretValue;
@@ -15,23 +14,14 @@ pub enum SecretSource {
     MacosKeychain { service: String, account: String },
 }
 
-/// Secret with the finite v1 encoding set precomputed for output rejection.
+/// Owned credential; the shared model HTTP boundary rejects output echoes.
 pub(crate) struct Secret {
     value: SecretValue<String>,
-    encodings: SecretValue<Vec<String>>,
 }
 
 impl Secret {
     pub(crate) fn value(&self) -> &str {
         &self.value
-    }
-
-    pub(crate) fn contains(&self, bytes: &[u8]) -> bool {
-        self.encodings.iter().any(|value| {
-            bytes
-                .windows(value.len())
-                .any(|window| window == value.as_bytes())
-        })
     }
 
     pub(crate) fn from_bytes(bytes: SecretValue<Vec<u8>>) -> Result<Self, EgressError> {
@@ -43,36 +33,7 @@ impl Secret {
         if value.is_empty() {
             return Err(EgressError::CredentialUnavailable);
         }
-        let mut encodings = SecretValue::new(vec![value.to_string()]);
-        let escaped = SecretValue::new(
-            serde_json::to_string(value.as_str())
-                .map_err(|_| EgressError::CredentialUnavailable)?,
-        );
-        encodings.push(escaped[1..escaped.len() - 1].to_owned());
-        for all in [false, true] {
-            for upper in [false, true] {
-                let mut encoded = String::new();
-                for byte in value.bytes() {
-                    if !all && (byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)) {
-                        encoded.push(char::from(byte));
-                    } else if upper {
-                        encoded.push_str(&format!("%{byte:02X}"));
-                    } else {
-                        encoded.push_str(&format!("%{byte:02x}"));
-                    }
-                }
-                encodings.push(encoded);
-            }
-        }
-        for engine in [
-            general_purpose::STANDARD,
-            general_purpose::STANDARD_NO_PAD,
-            general_purpose::URL_SAFE,
-            general_purpose::URL_SAFE_NO_PAD,
-        ] {
-            encodings.push(engine.encode(value.as_bytes()));
-        }
-        Ok(Self { value, encodings })
+        Ok(Self { value })
     }
 }
 
@@ -147,16 +108,6 @@ fn keychain(_: &str, _: &str) -> Result<SecretValue<Vec<u8>>, EgressError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn rejects_every_declared_credential_encoding() {
-        let secret =
-            Secret::from_bytes(SecretValue::new(b"key-\"/\n+?=\xc3\xa9".to_vec())).unwrap();
-        assert!(secret.encodings.len() >= 10);
-        for encoded in secret.encodings.iter() {
-            assert!(secret.contains(format!("prefix {encoded} suffix").as_bytes()));
-        }
-        assert!(!secret.contains(b"ordinary provider answer"));
-    }
     #[cfg(unix)]
     #[test]
     fn file_backend_refuses_public_files_symlinks_and_oversize() {

@@ -158,7 +158,12 @@ configuration only:
 ```rust
 JevClassifierProvider::new("openrouter", "typesafe/jev-1.13", "https://openrouter.ai/api/v1", key)
     .with_served_model("typesafe/jev-1.13-20260917")
+    .with_request_limit(65_536)
+    .with_response_limit(65_536)
 ```
+
+The example's 65,536-byte request and response ceilings are illustrative settings;
+choose finite nonzero limits for the deployment before binding or executing.
 
 Configure gateway model identity, expected served model, endpoint, optional secret
 reference and account policy explicitly in the registry. Provider authorization

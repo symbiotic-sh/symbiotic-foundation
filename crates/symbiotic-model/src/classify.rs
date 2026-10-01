@@ -885,7 +885,7 @@ impl JevClassifierProvider {
                 },
                 metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": base_url }),
             },
-            client: reqwest::Client::new(),
+            client: default_http_client(),
             base_url,
             api_key: api_key.into(),
             max_request_bytes: None,
@@ -1145,18 +1145,13 @@ impl ClassifierProvider for JevClassifierProvider {
         } else {
             builder.bearer_auth(self.api_key.as_str())
         };
-        let resp = builder
-            .send()
-            .await
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = bounded_response_text(resp, self.max_response_bytes).await?;
-            return Err(status_error(status.as_u16(), body));
-        }
-        let text = bounded_response_text(resp, self.max_response_bytes).await?;
-        let raw: Value =
-            serde_json::from_str(&text).map_err(|err| ModelError::Provider(err.to_string()))?;
+        let (raw, bytes) = provider_response_json(
+            builder,
+            self.max_response_bytes,
+            &self.api_key,
+            ModelError::Provider,
+        )
+        .await?;
         let unexpected = |detail: &str| {
             ModelError::Provider(format!("unexpected System One response: {detail}"))
         };
@@ -1176,7 +1171,12 @@ impl ClassifierProvider for JevClassifierProvider {
             .and_then(Value::as_object)
             .ok_or_else(|| unexpected("no answers"))?;
         let answers = Self::parse_answers(&request, answers)?;
-        let mut trace = classify_trace(&self.descriptor, &request, &text, started)?;
+        let mut trace = classify_trace(
+            &self.descriptor,
+            &request,
+            &String::from_utf8_lossy(&bytes),
+            started,
+        )?;
         let usage = |field: &str| {
             raw.pointer(&format!("/usage/{field}"))
                 .and_then(Value::as_u64)
@@ -1191,12 +1191,15 @@ impl ClassifierProvider for JevClassifierProvider {
                 "reported_cost_usd": trace.usage.reported_cost_usd,
             },
         });
-        Ok(ClassifyResponse {
-            answers,
-            served_model,
-            trace,
-            raw_provider_response: Some(raw),
-        })
+        secrets::checked_response(
+            ClassifyResponse {
+                answers,
+                served_model,
+                trace,
+                raw_provider_response: Some(raw),
+            },
+            &self.api_key,
+        )
     }
 }
 

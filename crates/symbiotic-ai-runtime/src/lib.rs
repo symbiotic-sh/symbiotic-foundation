@@ -137,6 +137,7 @@ pub enum ResponseCacheMode {
 /// A raw provider (the transport) plus how the runtime should run it.
 #[derive(Clone)]
 pub struct ModelBinding<P> {
+    /// Raw transport whose effective configuration is checked at binding.
     pub provider: P,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
@@ -147,6 +148,7 @@ pub struct ModelBinding<P> {
     /// Without either, binding is refused.
     /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
     pub policy: Option<ModelQueueConfig>,
+    /// Select the runtime cache, disable caching or supply a custom cache.
     pub response_cache: ResponseCacheMode,
     /// Overrides the runtime's receipt sink for this binding.
     pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
@@ -155,6 +157,7 @@ pub struct ModelBinding<P> {
 }
 
 impl<P> ModelBinding<P> {
+    /// Create an unconfigured binding; supply identity and policy before installation.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -167,31 +170,37 @@ impl<P> ModelBinding<P> {
         }
     }
 
+    /// Set the tenant, provider principal, configuration revision and account.
     pub fn with_identity(mut self, identity: BindingIdentity) -> Self {
         self.identity = Some(identity);
         self
     }
 
+    /// Explicitly pool account limits with bindings using this same key.
     pub fn with_account_sharing(mut self, key: AccountSharingKey) -> Self {
         self.account_sharing_key = Some(key);
         self
     }
 
+    /// Set the account execution policy; registry bindings must match their configured policy.
     pub fn with_policy(mut self, policy: ModelQueueConfig) -> Self {
         self.policy = Some(policy);
         self
     }
 
+    /// Choose this binding's response cache behavior.
     pub fn with_response_cache(mut self, mode: ResponseCacheMode) -> Self {
         self.response_cache = mode;
         self
     }
 
+    /// Override the runtime receipt sink for this binding.
     pub fn with_receipt_sink(mut self, sink: Arc<dyn QueueReceiptSink>) -> Self {
         self.receipt_sink = Some(sink);
         self
     }
 
+    /// Override the runtime trace sink for this binding.
     pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
         self.trace_sink = Some(sink);
         self
@@ -233,8 +242,11 @@ struct Inner {
 
 /// Implemented configured operation. Unsupported operations are refused at registry validation.
 pub enum ConfiguredProvider {
+    /// A configured queued chat adapter.
     Chat(Arc<dyn ChatProvider>),
+    /// A configured queued embedding adapter.
     Embedding(Arc<dyn EmbeddingProvider>),
+    /// A configured queued probability classifier.
     Classifier(Arc<dyn ClassifierProvider>),
 }
 

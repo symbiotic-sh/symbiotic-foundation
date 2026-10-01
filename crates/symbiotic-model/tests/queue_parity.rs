@@ -456,6 +456,14 @@ impl QueueBackend for EvictsOnce {
             .fail(item_id, worker_id, error, retry_after_seconds)
             .await
     }
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner.fail_with(item_id, worker_id, failure).await
+    }
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
         self.inner.reclaim_expired_leases(queue_id).await
     }
@@ -929,6 +937,7 @@ on_both_backends!(
     a_waiters_slow_cache_read_does_not_stall_lease_renewal,
     a_failed_trace_write_still_completes_the_item,
     a_failed_cooldown_write_refuses_retry_and_records_the_failure,
+    a_failed_cooldown_write_stops_logical_chain_continuation,
     a_failed_trace_write_keeps_the_providers_error,
     a_failed_completion_still_returns_the_paid_answer,
     an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage,
@@ -1527,29 +1536,84 @@ async fn a_failed_cooldown_write_refuses_retry_and_records_the_failure(
     backend: &str,
     queue: Arc<CountsRenewals>,
 ) {
+    failed_cooldown_is_terminal(backend, queue, 3).await;
+}
+
+async fn a_failed_cooldown_write_stops_logical_chain_continuation(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    failed_cooldown_is_terminal(backend, queue, 1).await;
+}
+
+async fn failed_cooldown_is_terminal(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+    retry_attempts: u32,
+) {
     queue.fail_cooldown_writes.store(true, Ordering::SeqCst);
     let raw = Loopback::new(unique_identity())
-        .slow(Duration::from_millis(1_200))
+        .slow(Duration::from_millis(100))
         .failing_first(vec![ModelError::Unavailable("provider down".to_string())]);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
-
-    let err = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("cooling")))
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            retry_attempts,
+            logical_retry_attempts: 3,
+            budget_renewal_seconds: Some(0),
+            ..config()
+        },
+    )
+    .with_receipt_sink(receipts.clone());
+    let (first, waiter) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            provider.chat(request("cooling")),
+            provider.chat(request("cooling"))
+        )
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{backend}: callers finish"));
+    for result in [first, waiter] {
+        assert!(
+            matches!(result, Err(ModelError::Queue(_))),
+            "{backend}: {result:?}"
+        );
+    }
+    let item = queue
+        .get_item(&queued_item(&receipts))
         .await
-        .unwrap_or_else(|_| panic!("{backend}: the call finishes"))
-        .unwrap_err();
-    // A failed limiter refuses further execution visibly.
-    assert!(matches!(err, ModelError::Queue(_)), "{backend}: {err:?}");
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
-    let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(1)).await;
-    assert_eq!(item.status, QueueStatus::Dead, "{backend}: {item:?}");
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(item.status).unwrap(),
+        json!("stopped"),
+        "{backend}: {item:?}"
+    );
     assert_eq!(
         item.last_error_class.as_deref(),
         Some("queue"),
         "{backend}: {item:?}"
     );
-    assert!(item.lease_owner.is_none(), "{backend}: {item:?}");
-    assert_no_more_renewals(&queue, backend).await;
+    assert!(
+        item.lease_owner.is_none() && item.lease_until.is_none(),
+        "{backend}: {item:?}"
+    );
+    assert!(
+        queue
+            .claim_item(&item.item_id, "later-worker", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Recovering the limiter does not clear a durable refusal, even with immediate budget renewal.
+    queue.fail_cooldown_writes.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        provider.chat(request("cooling")).await,
+        Err(ModelError::Queue(_))
+    ));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
 }
 
 /// The directory cache, whose first store blocks its thread for `delay`, as

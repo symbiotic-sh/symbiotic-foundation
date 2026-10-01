@@ -753,6 +753,7 @@ fn load_cached<Res: for<'de> Deserialize<'de>>(
         .pointer("/trace/metadata/result_scope")
         .and_then(Value::as_str)
         != entry.scope
+        || value.pointer("/trace/request_hash").and_then(Value::as_str) != Some(entry.request_hash)
     {
         return Ok(None);
     }
@@ -990,7 +991,6 @@ impl<Req> QueuedCall<Req> {
         trace.trace_id = TraceId::new();
         trace.queue_item_id = queue_item_id;
         trace.model = self.descriptor.identity.clone();
-        trace.request_hash = self.request_hash.clone();
         trace.cache.response_cache = CacheStatus::Hit;
         trace.outcome = InvocationOutcome::Succeeded;
         trace.error_class = None;
@@ -1173,6 +1173,7 @@ where
         .await;
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
+            QueueStatus::Stopped => return Err(dead_item_retry_error(&enqueue.item)),
             QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
@@ -1325,6 +1326,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             return Ok(Followed::Moved);
         };
         match current.status {
+            QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
             QueueStatus::Dead if budget_renewed(&current, config) => {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
@@ -2017,7 +2019,7 @@ async fn reenqueue_dead_item(
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
     let state = logical_retry_state(&item.payload, logical_max_attempts(config));
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
-    if attempts_used >= state.max_attempts {
+    if item.status == QueueStatus::Stopped || attempts_used >= state.max_attempts {
         return Ok(None);
     }
     let remaining_attempts = state.max_attempts - attempts_used;
@@ -2433,7 +2435,7 @@ impl HashEmbeddingProvider {
                 provider_class: ProviderClass::Local,
                 capabilities: vec![ModelCapability::Embedding],
                 auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
+                metadata: serde_json::json!({ "dimensions": dimensions }),
             },
             dimensions,
         }
@@ -2549,11 +2551,30 @@ pub struct OpenAiCompatibleChatProvider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
+    /// Enable provider thinking.
     Enabled,
+    /// Disable provider thinking; reasoning effort is refused.
     Disabled,
 }
 
+/// Refuse settings that would otherwise be silently omitted from the wire.
+fn validate_chat_settings(
+    thinking: Option<ThinkingMode>,
+    effort: Option<&str>,
+) -> Result<(), ModelError> {
+    if effort.is_some_and(|s| s.trim().is_empty())
+        || (thinking == Some(ThinkingMode::Disabled) && effort.is_some())
+    {
+        return Err(ModelError::InvalidRequest(
+            "unsupported chat settings: reasoning effort requires thinking and must be nonempty"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl OpenAiCompatibleChatProvider {
+    /// Construct a compatible chat transport; finite byte and output limits are required to execute.
     pub fn new(
         operator: impl Into<String>,
         model: impl Into<String>,
@@ -2577,7 +2598,7 @@ impl OpenAiCompatibleChatProvider {
                 },
                 metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": base_url }),
             },
-            client: reqwest::Client::new(),
+            client: default_http_client(),
             base_url,
             api_key: api_key.into(),
             max_response_bytes: None,
@@ -2615,6 +2636,7 @@ impl OpenAiCompatibleChatProvider {
         self
     }
 
+    /// Configure thinking; combining disabled thinking with effort is refused.
     pub fn with_thinking(mut self, thinking: Option<ThinkingMode>) -> Self {
         self.descriptor.metadata["thinking"] =
             serde_json::to_value(thinking).expect("thinking serializes");
@@ -2622,12 +2644,11 @@ impl OpenAiCompatibleChatProvider {
         self
     }
 
+    /// Configure a nonempty reasoning effort; invalid settings are refused on binding or execution.
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         let effort = effort.into();
-        if !effort.trim().is_empty() {
-            self.descriptor.metadata["reasoning_effort"] = Value::String(effort.clone());
-            self.reasoning_effort = Some(effort);
-        }
+        self.descriptor.metadata["reasoning_effort"] = Value::String(effort.clone());
+        self.reasoning_effort = Some(effort);
         self
     }
 }
@@ -2646,7 +2667,7 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
                 "output token limit must be nonzero".into(),
             ));
         }
-        Ok(())
+        validate_chat_settings(self.thinking, self.reasoning_effort.as_deref())
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
@@ -2788,16 +2809,13 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         } else {
             builder.bearer_auth(self.api_key.as_str())
         };
-        let resp = builder
-            .send()
-            .await
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = bounded_response_text(resp, self.max_response_bytes).await?;
-            return Err(status_error(status.as_u16(), body));
-        }
-        let raw: Value = bounded_response_json(resp, self.max_response_bytes).await?;
+        let (raw, _) = provider_response_json(
+            builder,
+            self.max_response_bytes,
+            &self.api_key,
+            ModelError::Unavailable,
+        )
+        .await?;
         let parsed: OpenAiChatWireResponse = serde_json::from_value(raw.clone())
             .map_err(|err| ModelError::Provider(err.to_string()))?;
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
@@ -2856,12 +2874,15 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
             prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
             cached_input_tokens: hit,
         };
-        Ok(ChatResponse {
-            text: content.to_string(),
-            finish_reason: choice.finish_reason,
-            trace,
-            raw_provider_response: Some(raw),
-        })
+        secrets::checked_response(
+            ChatResponse {
+                text: content.to_string(),
+                finish_reason: choice.finish_reason,
+                trace,
+                raw_provider_response: Some(raw),
+            },
+            &self.api_key,
+        )
     }
 }
 
@@ -2876,6 +2897,7 @@ pub struct GeminiEmbeddingProvider {
 }
 
 impl GeminiEmbeddingProvider {
+    /// Construct a Gemini transport with an owned key and explicit dimensions.
     pub fn new(
         operator: impl Into<String>,
         model: impl Into<String>,
@@ -2893,7 +2915,7 @@ impl GeminiEmbeddingProvider {
                 },
                 metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
-            client: reqwest::Client::new(),
+            client: default_http_client(),
             api_key: api_key.into(),
             max_response_bytes: None,
             max_request_bytes: None,
@@ -2981,19 +3003,22 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
         self.validate_configuration()?;
         wire::validate_gemini_options(self.dimensions, &request)?;
         if request.inputs.is_empty() {
-            return Ok(EmbeddingResponse {
-                dimensions: self.dimensions,
-                vectors: Vec::new(),
-                trace: success_trace(
-                    &self.descriptor,
-                    request.sensitivity,
-                    request.role_binding.clone(),
-                    request.source.clone(),
-                    hash_json(&request)?,
-                    None,
-                ),
-                raw_provider_response: None,
-            });
+            return secrets::checked_response(
+                EmbeddingResponse {
+                    dimensions: self.dimensions,
+                    vectors: Vec::new(),
+                    trace: success_trace(
+                        &self.descriptor,
+                        request.sensitivity,
+                        request.role_binding.clone(),
+                        request.source.clone(),
+                        hash_json(&request)?,
+                        None,
+                    ),
+                    raw_provider_response: None,
+                },
+                &self.api_key,
+            );
         }
         let model = self
             .descriptor
@@ -3004,24 +3029,25 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
         let body =
             wire::gemini_embedding_body(model, self.dimensions, &request, self.max_request_bytes)?;
         let vectors = if request.inputs.len() == 1 {
-            let resp = self
+            let builder = self
                 .client
                 .post(format!(
                     "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
                 ))
                 .header("x-goog-api-key", self.api_key.as_str())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = bounded_response_text(resp, self.max_response_bytes).await?;
-                return Err(status_error(status.as_u16(), body));
-            }
-            let raw: GeminiEmbedWireResponse =
-                bounded_response_json(resp, self.max_response_bytes).await?;
+                .body(body);
+            let raw: GeminiEmbedWireResponse = serde_json::from_value(
+                provider_response_json(
+                    builder,
+                    self.max_response_bytes,
+                    &self.api_key,
+                    ModelError::Unavailable,
+                )
+                .await?
+                .0,
+            )
+            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
             vec![
                 raw.embedding
                     .ok_or_else(|| {
@@ -3030,24 +3056,25 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                     .into_values(self.dimensions)?,
             ]
         } else {
-            let resp = self
-                .client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
-                ))
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = bounded_response_text(resp, self.max_response_bytes).await?;
-                return Err(status_error(status.as_u16(), body));
-            }
-            let raw: GeminiBatchEmbedWireResponse =
-                bounded_response_json(resp, self.max_response_bytes).await?;
+            let builder = self
+                    .client
+                    .post(format!(
+                        "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+                    ))
+                    .header("x-goog-api-key", self.api_key.as_str())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+            let raw: GeminiBatchEmbedWireResponse = serde_json::from_value(
+                provider_response_json(
+                    builder,
+                    self.max_response_bytes,
+                    &self.api_key,
+                    ModelError::Unavailable,
+                )
+                .await?
+                .0,
+            )
+            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
             let embeddings = raw.embeddings.ok_or_else(|| {
                 ModelError::Provider("Gemini batch response missing embeddings".to_string())
             })?;
@@ -3063,28 +3090,42 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                 .map(|embedding| embedding.into_values(self.dimensions))
                 .collect::<Result<Vec<_>, _>>()?
         };
-        Ok(EmbeddingResponse {
-            dimensions: self.dimensions,
-            vectors,
-            trace: success_trace(
-                &self.descriptor,
-                request.sensitivity,
-                request.role_binding.clone(),
-                request.source.clone(),
-                hash_json(&request)?,
-                None,
-            ),
-            raw_provider_response: None,
-        })
+        secrets::checked_response(
+            EmbeddingResponse {
+                dimensions: self.dimensions,
+                vectors,
+                trace: success_trace(
+                    &self.descriptor,
+                    request.sensitivity,
+                    request.role_binding.clone(),
+                    request.source.clone(),
+                    hash_json(&request)?,
+                    None,
+                ),
+                raw_provider_response: None,
+            },
+            &self.api_key,
+        )
     }
 }
 
-/// Client with explicit finite timeout for configured adapters.
+fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+}
+
+fn default_http_client() -> reqwest::Client {
+    // Match Client::new's construction failure behavior, with redirects disabled.
+    http_client_builder()
+        .build()
+        .expect("default provider HTTP client could not be built")
+}
+
+/// Client with an explicit finite timeout and redirects disabled for configured adapters.
 pub fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelError> {
     let timeout = timeout_seconds
         .filter(|n| *n > 0)
         .ok_or_else(|| ModelError::InvalidRequest("finite timeout is required".into()))?;
-    reqwest::Client::builder()
+    http_client_builder()
         .timeout(std::time::Duration::from_secs(timeout))
         .build()
         .map_err(|_| ModelError::InvalidRequest("invalid HTTP client configuration".into()))
@@ -3115,7 +3156,7 @@ async fn bounded_response_bytes(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|err| ModelError::Unavailable(err.to_string()))?
+        .map_err(|_| ModelError::Unavailable("provider response read failed".into()))?
     {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(ModelError::Provider(
@@ -3127,20 +3168,40 @@ async fn bounded_response_bytes(
     Ok(bytes)
 }
 
-async fn bounded_response_text(
-    response: reqwest::Response,
+/// The shared HTTP boundary: refuse redirects and sanitize credentials before
+/// any adapter can return a result to runtime bookkeeping.
+async fn provider_response_json(
+    builder: reqwest::RequestBuilder,
     max_bytes: Option<usize>,
-) -> Result<String, ModelError> {
+    secret: &str,
+    invalid_json: fn(String) -> ModelError,
+) -> Result<(Value, Vec<u8>), ModelError> {
+    let sanitize = |error| {
+        if secret.is_empty() {
+            error
+        } else {
+            secrets::safe_error(error)
+        }
+    };
+    let response = builder
+        .send()
+        .await
+        .map_err(|err| sanitize(ModelError::Unavailable(err.to_string())))?;
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(ModelError::Provider("provider redirect refused".into()));
+    }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-async fn bounded_response_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-    max_bytes: Option<usize>,
-) -> Result<T, ModelError> {
-    let bytes = bounded_response_bytes(response, max_bytes).await?;
-    serde_json::from_slice(&bytes).map_err(|err| ModelError::Unavailable(err.to_string()))
+    if !status.is_success() {
+        return Err(sanitize(status_error(
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )));
+    }
+    let raw: Value =
+        serde_json::from_slice(&bytes).map_err(|err| sanitize(invalid_json(err.to_string())))?;
+    secrets::check_response(&raw, secret)?;
+    Ok((raw, bytes))
 }
 
 fn status_error(status: u16, body: String) -> ModelError {

@@ -1,4 +1,4 @@
-//! Sanitize inside the raw provider, before runtime receipts/logging see any result.
+//! Track dispatch and project sanitized model output into credential-process replies.
 use crate::{RouteConfig, RouteProvider, secrets::Secret};
 use async_trait::async_trait;
 use std::sync::{
@@ -15,50 +15,12 @@ use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 #[derive(Clone)]
 struct SafeChat {
     inner: OpenAiCompatibleChatProvider,
-    secret: Arc<Secret>,
     started: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 struct SafeEmbedding {
     inner: GeminiEmbeddingProvider,
-    secret: Arc<Secret>,
     started: Arc<AtomicBool>,
-}
-
-fn safe_error(error: ModelError) -> ModelError {
-    // Preserve useful error classes without retaining any provider-controlled bytes.
-    let safe = "credential-process provider failure".to_owned();
-    match error {
-        ModelError::Auth(_) => ModelError::Auth(safe),
-        ModelError::RateLimited(_) => ModelError::RateLimited(safe),
-        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(safe),
-        ModelError::Timeout(_) => ModelError::Timeout(safe),
-        ModelError::Unavailable(_) => ModelError::Unavailable(safe),
-        _ => ModelError::Provider(safe),
-    }
-}
-
-fn check_response(value: &impl serde::Serialize, secret: &Secret) -> Result<(), ModelError> {
-    fn contains(value: &serde_json::Value, secret: &Secret) -> bool {
-        match value {
-            serde_json::Value::String(text) => secret.contains(text.as_bytes()),
-            serde_json::Value::Array(values) => values.iter().any(|value| contains(value, secret)),
-            serde_json::Value::Object(values) => values
-                .iter()
-                .any(|(key, value)| secret.contains(key.as_bytes()) || contains(value, secret)),
-            _ => false,
-        }
-    }
-    let value = serde_json::to_value(value)
-        .map_err(|_| ModelError::Provider("invalid provider response".into()))?;
-    let wire = serde_json::to_vec(&value)
-        .map_err(|_| ModelError::Provider("invalid provider response".into()))?;
-    if contains(&value, secret) || secret.contains(&wire) {
-        return Err(ModelError::Provider(
-            "credential-bearing provider response refused".into(),
-        ));
-    }
-    Ok(())
 }
 
 impl ModelProvider for SafeChat {
@@ -87,8 +49,7 @@ impl ModelProvider for SafeEmbedding {
 impl ChatProvider for SafeChat {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.chat(request).await.map_err(safe_error)?;
-        check_response(&response, &self.secret)?;
+        let mut response = self.inner.chat(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -98,8 +59,7 @@ impl ChatProvider for SafeChat {
 impl EmbeddingProvider for SafeEmbedding {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.embed(request).await.map_err(safe_error)?;
-        check_response(&response, &self.secret)?;
+        let mut response = self.inner.embed(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -327,7 +287,6 @@ pub(crate) async fn execute(
                 .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes)
                 .with_output_limit(route.max_output_tokens),
-                secret,
                 started: started.clone(),
             };
             let provider = runtime
@@ -368,7 +327,6 @@ pub(crate) async fn execute(
                 .with_client(client)
                 .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes),
-                secret,
                 started: started.clone(),
             };
             let provider = runtime
@@ -475,20 +433,5 @@ mod tests {
             r#"["trace_write_failed"]"#
         );
         assert!(serde_json::from_str::<DispatchDiagnostic>(r#""private unknown kind""#).is_err());
-    }
-
-    #[test]
-    fn invalid_embedding_error_is_sanitized_as_provider_failure() {
-        let error = safe_error(ModelError::Provider(
-            "Gemini embedding contains non-finite components".into(),
-        ));
-        assert!(matches!(error, ModelError::Provider(message)
-            if message == "credential-process provider failure"));
-    }
-
-    #[test]
-    fn numeric_provider_values_cannot_echo_credential_bytes() {
-        let secret = Secret::from_bytes(model::SecretValue::new(b"123456789".to_vec())).unwrap();
-        assert!(check_response(&serde_json::json!({"vectors": [[123456789]]}), &secret).is_err());
     }
 }

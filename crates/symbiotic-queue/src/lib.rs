@@ -31,6 +31,8 @@ pub enum QueueStatus {
     Succeeded,
     Failed,
     Dead,
+    /// Explicit terminal refusal; automatic retries and budget renewal are forbidden.
+    Stopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,7 +119,7 @@ pub struct Failure {
     pub error: String,
     /// Stable class of the error, kept on the item as `last_error_class`.
     pub error_class: Option<String>,
-    /// Earliest time of the next attempt. `None` means one second from now.
+    /// Earliest time of the next attempt. `None` stops the item permanently.
     pub run_after: Option<DateTime<Utc>>,
 }
 
@@ -126,6 +128,8 @@ pub struct Failure {
 pub enum FailOutcome {
     RetryScheduled,
     MovedToDead,
+    /// The failure has no retry deadline and the item is permanently stopped.
+    Stopped,
 }
 
 #[derive(Debug, Error)]
@@ -191,23 +195,15 @@ pub trait QueueBackend: Send + Sync {
         error: &str,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError>;
-    /// Like [`fail`](Self::fail), with the error's class and an exact retry
-    /// deadline. The default keeps neither: it rounds the deadline up to
-    /// whole seconds and drops the class. Both Foundation backends record
-    /// them exactly.
+    /// Record the error class and exact retry deadline. A failure without a
+    /// deadline must become [`QueueStatus::Stopped`], regardless of attempts
+    /// remaining. Backends must preserve this refusal for duplicate callers.
     async fn fail_with(
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
         failure: Failure,
-    ) -> Result<FailOutcome, QueueError> {
-        let retry_after_seconds = failure.run_after.map(|until| {
-            let millis = (until - Utc::now()).num_milliseconds().max(0) as u64;
-            millis.div_ceil(1_000)
-        });
-        self.fail(item_id, worker_id, &failure.error, retry_after_seconds)
-            .await
-    }
+    ) -> Result<FailOutcome, QueueError>;
     /// Return items whose lease expired to `Failed`, or to `Dead` when that
     /// lease was their last allowed attempt.
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError>;
