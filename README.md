@@ -2,6 +2,11 @@
 
 Reusable Rust contracts for durable AI work:
 
+- `symbiotic-egress` — versioned durable-attempt/permit schema and `EgressClient`
+  for Memory, including the bounded local-socket client.
+- `symbiotic-credential-process` — credential-owning daemon with owner-only-file
+  and macOS keychain backends, single-use permits and typed usage. It reuses the
+  model runtime with caching off. See [model egress](docs/architecture/model-egress.md).
 - `symbiotic-ai-runtime` — **the entry point for model calls.** Open one
   `Runtime` (persistent with a state directory, in memory without) and get
   ready chat, embedding, rerank and classifier providers. Queueing, retries,

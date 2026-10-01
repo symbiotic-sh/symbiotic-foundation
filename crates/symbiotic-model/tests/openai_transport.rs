@@ -117,6 +117,10 @@ async fn low_thinking_and_metadata_without_reasoning_text() {
     );
     assert_eq!(response.trace.usage.reasoning_tokens, Some(3));
     assert_eq!(response.trace.usage.cost_micro_usd, None);
+    assert_eq!(
+        response.trace.usage.reported_cost_usd.as_deref(),
+        Some("0.00001234")
+    );
     assert_eq!(response.trace.cache.prompt_cache, CacheStatus::PartialHit);
     assert_eq!(response.trace.metadata["cache_miss_tokens"], 6);
     assert!(
@@ -148,6 +152,7 @@ async fn disabled_thinking_omits_effort_and_nullable_content_keeps_identity() {
         "no-usage"
     );
     assert_eq!(response.trace.usage.input_tokens, None);
+    assert_eq!(response.trace.usage.reported_cost_usd, None);
 }
 
 #[test]
@@ -179,6 +184,27 @@ fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
 }
 
 #[tokio::test]
+async fn provider_cost_usd_is_preserved_in_typed_usage() {
+    for cost in ["0.01", "0.0000001234567890123456789"] {
+        let (url, server) = fixture(serde_json::json!({
+            "choices":[{"message":{"content":"OK"}}],
+            "usage":{"cost_usd":cost}
+        }));
+        let response =
+            OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+                .chat(request())
+                .await
+                .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            response.trace.usage.reported_cost_usd.as_deref(),
+            Some(cost)
+        );
+        assert_eq!(response.trace.usage.cost_micro_usd, None);
+    }
+}
+
+#[tokio::test]
 async fn invalid_reported_costs_remain_unknown() {
     for cost in [
         serde_json::json!(-0.1),
@@ -197,5 +223,61 @@ async fn invalid_reported_costs_remain_unknown() {
                 .unwrap();
         server.join().unwrap();
         assert!(response.trace.metadata["provider"]["reported_cost_usd"].is_null());
+        assert_eq!(response.trace.usage.reported_cost_usd, None);
     }
+}
+
+#[tokio::test]
+async fn configured_response_limit_refuses_oversized_body() {
+    let (url, server) = fixture(serde_json::json!({
+        "choices": [{"message": {"content": "x".repeat(4096)}}]
+    }));
+    let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_response_limit(1024)
+        .chat(request())
+        .await;
+    server.join().unwrap();
+    assert!(
+        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
+    );
+}
+
+#[tokio::test]
+async fn configured_request_limit_refuses_wire_body_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_request_limit(1)
+        .chat(request())
+        .await;
+    assert!(
+        matches!(result, Err(symbiotic_model::ModelError::InvalidRequest(message)) if message == "provider request limit exceeded")
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn configured_request_limit_accepts_exact_encoded_body_size() {
+    let mut request = request();
+    request.messages[0].content = "quotes: \" newline: \n unicode: é".into();
+    let expected = serde_json::json!({
+        "model": "fixture",
+        "messages": [{"role": "user", "content": request.messages[0].content}],
+        "max_tokens": 128,
+        "temperature": 0.0,
+        "stream": false
+    });
+    let (url, server) = fixture(serde_json::json!({"choices":[{"message":{"content":"OK"}}]}));
+    OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_request_limit(serde_json::to_vec(&expected).unwrap().len())
+        .chat(request)
+        .await
+        .unwrap();
+    assert_eq!(server.join().unwrap(), expected);
 }

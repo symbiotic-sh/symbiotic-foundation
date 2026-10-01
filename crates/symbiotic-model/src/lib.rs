@@ -61,6 +61,7 @@ pub use queue_runtime::{
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
 mod classify;
+pub mod wire;
 #[cfg(feature = "queue")]
 pub use classify::QueuedClassifierProvider;
 pub use classify::{
@@ -2837,7 +2838,9 @@ pub struct OpenAiCompatibleChatProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: zeroize::Zeroizing<String>,
+    max_response_bytes: Option<usize>,
+    max_request_bytes: Option<usize>,
     thinking: Option<ThinkingMode>,
     reasoning_effort: Option<String>,
 }
@@ -2875,7 +2878,9 @@ impl OpenAiCompatibleChatProvider {
             },
             client: reqwest::Client::new(),
             base_url: base_url.into(),
-            api_key: api_key.into(),
+            api_key: zeroize::Zeroizing::new(api_key.into()),
+            max_response_bytes: None,
+            max_request_bytes: None,
             thinking: None,
             reasoning_effort: None,
         }
@@ -2884,6 +2889,18 @@ impl OpenAiCompatibleChatProvider {
     /// Reuse the consumer's connection pool and timeout policy.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Bound the complete encoded HTTP request body before transmission.
+    pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.max_request_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Bound response bodies before buffering, including provider error bodies.
+    pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = Some(max_bytes);
         self
     }
 
@@ -2910,23 +2927,6 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
     fn credential_fingerprint(&self) -> Option<String> {
         api_key_fingerprint(&self.api_key)
     }
-}
-
-#[derive(Serialize)]
-struct OpenAiChatWireRequest<'a> {
-    model: &'a str,
-    messages: &'a [ChatMessage],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-    stream: bool,
 }
 
 #[derive(Deserialize)]
@@ -3029,45 +3029,31 @@ fn reported_cost_usd(raw: &Value) -> Option<String> {
 #[async_trait]
 impl ChatProvider for OpenAiCompatibleChatProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        let wire = OpenAiChatWireRequest {
-            model: &self.descriptor.identity.model.0,
-            messages: &request.messages,
-            max_tokens: request.max_output_tokens,
-            temperature: request.temperature,
-            response_format: request
-                .response_format
-                .as_deref()
-                .map(|format| serde_json::json!({ "type": format })),
-            thinking: self
-                .thinking
-                .map(|mode| serde_json::json!({ "type": mode })),
-            reasoning_effort: if self.thinking == Some(ThinkingMode::Disabled) {
-                None
-            } else {
-                self.reasoning_effort.as_deref()
-            },
-            stream: false,
-        };
+        let body = wire::openai_chat_body(
+            &self.descriptor.identity.model.0,
+            &request,
+            self.thinking,
+            self.reasoning_effort.as_deref(),
+            self.max_request_bytes,
+        )?;
         let resp = self
             .client
             .post(format!(
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
             ))
-            .bearer_auth(&self.api_key)
-            .json(&wire)
+            .bearer_auth(self.api_key.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
             .map_err(|err| ModelError::Unavailable(err.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = bounded_response_text(resp, self.max_response_bytes).await?;
             return Err(status_error(status.as_u16(), body));
         }
-        let raw: Value = resp
-            .json()
-            .await
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+        let raw: Value = bounded_response_json(resp, self.max_response_bytes).await?;
         let parsed: OpenAiChatWireResponse = serde_json::from_value(raw.clone())
             .map_err(|err| ModelError::Provider(err.to_string()))?;
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
@@ -3095,6 +3081,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 .and_then(|details| details.reasoning_tokens),
             media_units: None,
             cost_micro_usd: None,
+            reported_cost_usd: reported_cost_usd(&raw),
         };
         let nested_hit = usage
             .prompt_tokens_details
@@ -3111,7 +3098,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 "served_model": raw.get("model").and_then(Value::as_str),
                 "created": raw.get("created").and_then(Value::as_i64),
                 "reasoning_tokens": trace.usage.reasoning_tokens,
-                "reported_cost_usd": reported_cost_usd(&raw),
+                "reported_cost_usd": trace.usage.reported_cost_usd,
             },
             "cache_miss_tokens": miss,
             "observed_cache_tokens": {
@@ -3138,7 +3125,9 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
 pub struct GeminiEmbeddingProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
-    api_key: String,
+    api_key: zeroize::Zeroizing<String>,
+    max_response_bytes: Option<usize>,
+    max_request_bytes: Option<usize>,
     dimensions: usize,
 }
 
@@ -3156,9 +3145,29 @@ impl GeminiEmbeddingProvider {
                 metadata: serde_json::json!({ "dimensions": dimensions }),
             },
             client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key: zeroize::Zeroizing::new(api_key.into()),
+            max_response_bytes: None,
+            max_request_bytes: None,
             dimensions,
         }
+    }
+
+    /// Reuse a client with the deployment's timeout and redirect policy.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Bound the complete encoded HTTP request body before transmission.
+    pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.max_request_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Bound response bodies before buffering, including provider error bodies.
+    pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = Some(max_bytes);
+        self
     }
 }
 
@@ -3171,28 +3180,6 @@ impl ModelProvider for GeminiEmbeddingProvider {
     fn credential_fingerprint(&self) -> Option<String> {
         api_key_fingerprint(&self.api_key)
     }
-}
-
-#[derive(Serialize)]
-struct GeminiEmbedWireRequest<'a> {
-    model: String,
-    content: GeminiContent<'a>,
-    output_dimensionality: usize,
-}
-
-#[derive(Serialize)]
-struct GeminiBatchEmbedWireRequest<'a> {
-    requests: Vec<GeminiEmbedWireRequest<'a>>,
-}
-
-#[derive(Serialize)]
-struct GeminiContent<'a> {
-    parts: Vec<GeminiPart<'a>>,
-}
-
-#[derive(Serialize)]
-struct GeminiPart<'a> {
-    text: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -3208,6 +3195,17 @@ struct GeminiBatchEmbedWireResponse {
 #[derive(Deserialize)]
 struct GeminiEmbedding {
     values: Vec<f32>,
+}
+
+impl GeminiEmbedding {
+    fn into_values(self) -> Result<Vec<f32>, ModelError> {
+        if self.values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Provider(
+                "Gemini embedding contains non-finite components".into(),
+            ));
+        }
+        Ok(self.values)
+    }
 }
 
 #[async_trait]
@@ -3234,76 +3232,53 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             .model
             .0
             .trim_start_matches("models/");
+        let body =
+            wire::gemini_embedding_body(model, self.dimensions, &request, self.max_request_bytes)?;
         let vectors = if request.inputs.len() == 1 {
-            let wire = GeminiEmbedWireRequest {
-                model: format!("models/{model}"),
-                content: GeminiContent {
-                    parts: vec![GeminiPart {
-                        text: &request.inputs[0],
-                    }],
-                },
-                output_dimensionality: self.dimensions,
-            };
             let resp = self
                 .client
                 .post(format!(
                     "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
                 ))
-                .header("x-goog-api-key", &self.api_key)
-                .json(&wire)
+                .header("x-goog-api-key", self.api_key.as_str())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
                 .send()
                 .await
                 .map_err(|err| ModelError::Unavailable(err.to_string()))?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = bounded_response_text(resp, self.max_response_bytes).await?;
                 return Err(status_error(status.as_u16(), body));
             }
-            let raw: GeminiEmbedWireResponse = resp
-                .json()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+            let raw: GeminiEmbedWireResponse =
+                bounded_response_json(resp, self.max_response_bytes).await?;
             vec![
                 raw.embedding
                     .ok_or_else(|| {
                         ModelError::Provider("Gemini response missing embedding".to_string())
                     })?
-                    .values,
+                    .into_values()?,
             ]
         } else {
-            let model_name = format!("models/{model}");
-            let wire = GeminiBatchEmbedWireRequest {
-                requests: request
-                    .inputs
-                    .iter()
-                    .map(|input| GeminiEmbedWireRequest {
-                        model: model_name.clone(),
-                        content: GeminiContent {
-                            parts: vec![GeminiPart { text: input }],
-                        },
-                        output_dimensionality: self.dimensions,
-                    })
-                    .collect(),
-            };
             let resp = self
                 .client
                 .post(format!(
                     "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
                 ))
-                .header("x-goog-api-key", &self.api_key)
-                .json(&wire)
+                .header("x-goog-api-key", self.api_key.as_str())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
                 .send()
                 .await
                 .map_err(|err| ModelError::Unavailable(err.to_string()))?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = bounded_response_text(resp, self.max_response_bytes).await?;
                 return Err(status_error(status.as_u16(), body));
             }
-            let raw: GeminiBatchEmbedWireResponse = resp
-                .json()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+            let raw: GeminiBatchEmbedWireResponse =
+                bounded_response_json(resp, self.max_response_bytes).await?;
             let embeddings = raw.embeddings.ok_or_else(|| {
                 ModelError::Provider("Gemini batch response missing embeddings".to_string())
             })?;
@@ -3316,8 +3291,8 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             }
             embeddings
                 .into_iter()
-                .map(|embedding| embedding.values)
-                .collect()
+                .map(GeminiEmbedding::into_values)
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(EmbeddingResponse {
             dimensions: self.dimensions,
@@ -3333,6 +3308,51 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             raw_provider_response: None,
         })
     }
+}
+
+async fn bounded_response_bytes(
+    mut response: reqwest::Response,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ModelError> {
+    let limit = max_bytes.unwrap_or(usize::MAX);
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(ModelError::Provider(
+            "provider response limit exceeded".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| ModelError::Unavailable(err.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ModelError::Provider(
+                "provider response limit exceeded".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn bounded_response_text(
+    response: reqwest::Response,
+    max_bytes: Option<usize>,
+) -> Result<String, ModelError> {
+    let bytes = bounded_response_bytes(response, max_bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn bounded_response_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    max_bytes: Option<usize>,
+) -> Result<T, ModelError> {
+    let bytes = bounded_response_bytes(response, max_bytes).await?;
+    serde_json::from_slice(&bytes).map_err(|err| ModelError::Unavailable(err.to_string()))
 }
 
 fn status_error(status: u16, body: String) -> ModelError {
@@ -3393,6 +3413,53 @@ mod tests {
     use std::time::Duration;
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
+
+    #[test]
+    fn gemini_single_embedding_rejects_non_finite_components() {
+        for number in ["1e39", "-1e39"] {
+            let raw: GeminiEmbedWireResponse =
+                serde_json::from_str(&format!(r#"{{"embedding":{{"values":[0.25,{number}]}}}}"#))
+                    .unwrap();
+            assert!(matches!(raw.embedding.unwrap().into_values(),
+                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+        }
+        let raw: GeminiEmbedWireResponse =
+            serde_json::from_str(r#"{"embedding":{"values":[0.25,-0.5,3e38]}}"#).unwrap();
+        let values = raw.embedding.unwrap().into_values().unwrap();
+        assert_eq!(values.len(), 3);
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn gemini_batch_embedding_rejects_non_finite_components() {
+        for number in ["1e39", "-1e39"] {
+            let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(&format!(
+                r#"{{"embeddings":[{{"values":[0.25,0.5]}},{{"values":[-0.5,{number}]}}]}}"#
+            ))
+            .unwrap();
+            let result: Result<Vec<_>, _> = raw
+                .embeddings
+                .unwrap()
+                .into_iter()
+                .map(GeminiEmbedding::into_values)
+                .collect();
+            assert!(matches!(result,
+                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+        }
+        let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(
+            r#"{"embeddings":[{"values":[0.25,0.5]},{"values":[-0.5,3e38]}]}"#,
+        )
+        .unwrap();
+        let vectors: Vec<_> = raw
+            .embeddings
+            .unwrap()
+            .into_iter()
+            .map(GeminiEmbedding::into_values)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().flatten().all(|value| value.is_finite()));
+    }
 
     #[cfg(feature = "queue")]
     static TEST_QUEUE_COUNTER: AtomicUsize = AtomicUsize::new(0);

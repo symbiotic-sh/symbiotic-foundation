@@ -35,7 +35,8 @@
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
 //! or caller uses it. Two bindings of one model must agree on those limits.
 //!
-//! This is the only Foundation crate that links SQLite.
+//! SQLite stays behind runtime/credential-process implementations; provider
+//! and egress contracts do not link it.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

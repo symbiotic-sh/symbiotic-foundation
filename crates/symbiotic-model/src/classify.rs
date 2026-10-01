@@ -1149,11 +1149,12 @@ impl ClassifierProvider for JevClassifierProvider {
         };
         trace.usage.input_tokens = usage("input_tokens");
         trace.usage.output_tokens = usage("output_tokens");
+        trace.usage.reported_cost_usd = reported_cost_usd(&raw);
         trace.metadata = serde_json::json!({
             "provider": {
                 "response_id": raw.get("id").and_then(Value::as_str),
                 "served_model": served_model,
-                "reported_cost_usd": reported_cost_usd(&raw),
+                "reported_cost_usd": trace.usage.reported_cost_usd,
             },
         });
         Ok(ClassifyResponse {
@@ -2099,6 +2100,10 @@ mod tests {
                 .metadata
                 .pointer("/provider/reported_cost_usd"),
             Some(&serde_json::json!("0.00002"))
+        );
+        assert_eq!(
+            response.trace.usage.reported_cost_usd.as_deref(),
+            Some("0.00002")
         );
         assert_eq!(
             response.trace.metadata.pointer("/provider/response_id"),

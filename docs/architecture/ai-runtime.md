@@ -310,7 +310,10 @@ admission, cache scoping and retention is only guaranteed through the runtime.
 `symbiotic_ai_runtime::model` re-exports the provider contracts and HTTP
 providers for building raw transports.
 
-Only `symbiotic-ai-runtime` and `symbiotic-queue-sqlite` link SQLite.
+Only `symbiotic-ai-runtime`, `symbiotic-queue-sqlite` and the WP14
+`symbiotic-credential-process` implementation link SQLite. The credential process
+extends the runtime database with permit replay protection and uses the same runtime
+with response caching disabled; see [model egress](model-egress.md).
 `crates/symbiotic-model/tests/feature_graph.rs` checks that `symbiotic-core`,
 `symbiotic-queue`, `symbiotic-trace`, `symbiotic-model` and
 `symbiotic-portability` do not.
