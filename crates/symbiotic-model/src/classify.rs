@@ -493,10 +493,15 @@ impl BudgetedModelRequest for ClassifyRequest {
     fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
     }
-    fn input_budget_units(&self) -> u64 {
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
         let state = Value::Object(self.state.clone()).to_string();
-        let questions = serde_json::to_string(&self.questions).unwrap_or_default();
-        estimate_token_budget_units([state.as_str(), questions.as_str()])
+        let questions = serde_json::to_string(&self.questions).map_err(|_| {
+            ModelError::InvalidRequest("classification questions cannot be encoded".into())
+        })?;
+        Ok(estimate_token_budget_units([
+            state.as_str(),
+            questions.as_str(),
+        ]))
     }
 }
 
@@ -568,6 +573,10 @@ where
 
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -858,7 +867,7 @@ pub struct JevClassifierProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
     base_url: String,
-    api_key: SecretValue<String>,
+    api_key: CredentialBoundary,
     max_request_bytes: Option<usize>,
     max_response_bytes: Option<usize>,
     served_model: String,
@@ -887,7 +896,7 @@ impl JevClassifierProvider {
             },
             client: default_http_client(),
             base_url,
-            api_key: api_key.into(),
+            api_key: CredentialBoundary::new(api_key.into()),
             max_request_bytes: None,
             max_response_bytes: None,
             served_model: model,
@@ -934,10 +943,16 @@ impl JevClassifierProvider {
         Ok(provider)
     }
 
-    /// Reuse the consumer's connection pool and timeout policy.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// Clients cannot be injected through the public API.
+    /// ```compile_fail
+    /// use symbiotic_model::JevClassifierProvider;
+    /// JevClassifierProvider::new("op", "model", "http://localhost", "key")
+    ///     .with_client(reqwest::Client::new());
+    /// ```
+    /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
+        self.client = http_client(Some(timeout_seconds))?;
+        Ok(self)
     }
 
     /// Accept `served_model` as the model the endpoint reports, e.g. the
@@ -1118,86 +1133,87 @@ impl ModelProvider for JevClassifierProvider {
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
-        api_key_fingerprint(&self.api_key)
+        api_key_fingerprint(self.api_key.secret())
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        Some(&self.api_key)
     }
 }
 
 #[async_trait]
 impl ClassifierProvider for JevClassifierProvider {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
-        self.validate_configuration()?;
-        request.validate()?;
-        Self::check_limits(&request)?;
-        let wire = JevWireRequest {
-            model: &self.descriptor.identity.model.0,
-            state: &request.state,
-            questions: &request.questions,
-        };
-        let body = wire::encode(&wire, self.max_request_bytes)?;
-        let started = Instant::now();
-        let builder = self
-            .client
-            .post(format!("{}/systemone", self.base_url.trim_end_matches('/')))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        let builder = if self.api_key.is_empty() {
-            builder
-        } else {
-            builder.bearer_auth(self.api_key.as_str())
-        };
-        let (raw, bytes) = provider_response_json(
-            builder,
-            self.max_response_bytes,
-            &self.api_key,
-            ModelError::Provider,
-        )
-        .await?;
-        let unexpected = |detail: &str| {
-            ModelError::Provider(format!("unexpected System One response: {detail}"))
-        };
-        let served_model = raw
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| unexpected("no model"))?
-            .to_string();
-        if served_model != self.served_model {
-            return Err(ModelError::Provider(format!(
-                "served model `{served_model}` is not the expected `{}`",
-                self.served_model
-            )));
-        }
-        let answers = raw
-            .get("answers")
-            .and_then(Value::as_object)
-            .ok_or_else(|| unexpected("no answers"))?;
-        let answers = Self::parse_answers(&request, answers)?;
-        let mut trace = classify_trace(
-            &self.descriptor,
-            &request,
-            &String::from_utf8_lossy(&bytes),
-            started,
-        )?;
-        let usage = |field: &str| {
-            raw.pointer(&format!("/usage/{field}"))
-                .and_then(Value::as_u64)
-        };
-        trace.usage.input_tokens = usage("input_tokens");
-        trace.usage.output_tokens = usage("output_tokens");
-        trace.usage.reported_cost_usd = reported_cost_usd(&raw);
-        trace.metadata = serde_json::json!({
-            "provider": {
-                "response_id": raw.get("id").and_then(Value::as_str),
-                "served_model": served_model,
-                "reported_cost_usd": trace.usage.reported_cost_usd,
-            },
-        });
-        secrets::checked_response(
-            ClassifyResponse {
-                answers,
-                served_model,
-                trace,
-                raw_provider_response: Some(raw),
-            },
+        secrets::credential_boundary(
+            (async {
+                self.validate_configuration()?;
+                request.validate()?;
+                Self::check_limits(&request)?;
+                let wire = JevWireRequest {
+                    model: &self.descriptor.identity.model.0,
+                    state: &request.state,
+                    questions: &request.questions,
+                };
+                let body = wire::encode(&wire, self.max_request_bytes)?;
+                let started = Instant::now();
+                let builder = self
+                    .client
+                    .post(format!("{}/systemone", self.base_url.trim_end_matches('/')))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+                let builder = if self.api_key.secret().is_empty() {
+                    builder
+                } else {
+                    builder.bearer_auth(self.api_key.secret())
+                };
+                let (raw, bytes) =
+                    provider_response_json(builder, self.max_response_bytes, ModelError::Provider)
+                        .await?;
+                let unexpected = |detail: &str| {
+                    ModelError::Provider(format!("unexpected System One response: {detail}"))
+                };
+                let served_model = raw
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unexpected("no model"))?
+                    .to_string();
+                if served_model != self.served_model {
+                    return Err(ModelError::Provider(format!(
+                        "served model `{served_model}` is not the expected `{}`",
+                        self.served_model
+                    )));
+                }
+                let answers = raw
+                    .get("answers")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| unexpected("no answers"))?;
+                let answers = Self::parse_answers(&request, answers)?;
+                let body = String::from_utf8(bytes).map_err(|_| {
+                    ModelError::Provider("invalid System One UTF-8 response".into())
+                })?;
+                let mut trace = classify_trace(&self.descriptor, &request, &body, started)?;
+                let usage = |field: &str| {
+                    raw.pointer(&format!("/usage/{field}"))
+                        .and_then(Value::as_u64)
+                };
+                trace.usage.input_tokens = usage("input_tokens");
+                trace.usage.output_tokens = usage("output_tokens");
+                trace.usage.reported_cost_usd = reported_cost_usd(&raw);
+                trace.metadata = serde_json::json!({
+                    "provider": {
+                        "response_id": raw.get("id").and_then(Value::as_str),
+                        "served_model": served_model,
+                        "reported_cost_usd": trace.usage.reported_cost_usd,
+                    },
+                });
+                Ok(ClassifyResponse {
+                    answers,
+                    served_model,
+                    trace,
+                    raw_provider_response: Some(raw),
+                })
+            })
+            .await,
             &self.api_key,
         )
     }
@@ -1558,58 +1574,66 @@ impl ModelProvider for ChatClassifierProvider {
     fn credential_fingerprint(&self) -> Option<String> {
         self.chat.credential_fingerprint()
     }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.chat.credential_boundary()
+    }
 }
 
 #[async_trait]
 impl ClassifierProvider for ChatClassifierProvider {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
-        request.validate()?;
-        let started = Instant::now();
-        let response = self
-            .chat
-            .chat(ChatRequest {
-                messages: vec![
-                    ChatMessage {
-                        role: "system".to_string(),
-                        content: Self::render_system_prompt(&request),
-                    },
-                    ChatMessage {
-                        role: "user".to_string(),
-                        content: Self::render_user_message(&request),
-                    },
-                ],
-                max_output_tokens: self.max_output_tokens,
-                temperature: Some(0.0),
-                response_format: Some("json_object".to_string()),
-                sensitivity: request.sensitivity,
-                role_binding: request.role_binding.clone(),
-                source: request.source.clone(),
-                metadata: request.metadata.clone(),
+        let result = (async {
+            request.validate()?;
+            let started = Instant::now();
+            let response = self
+                .chat
+                .chat(ChatRequest {
+                    messages: vec![
+                        ChatMessage {
+                            role: "system".to_string(),
+                            content: Self::render_system_prompt(&request),
+                        },
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: Self::render_user_message(&request),
+                        },
+                    ],
+                    max_output_tokens: self.max_output_tokens,
+                    temperature: Some(0.0),
+                    response_format: Some("json_object".to_string()),
+                    sensitivity: request.sensitivity,
+                    role_binding: request.role_binding.clone(),
+                    source: request.source.clone(),
+                    metadata: request.metadata.clone(),
+                })
+                .await?;
+            let answers = Self::parse_reply(&request, &response.text)?;
+            let served_model = response
+                .trace
+                .metadata
+                .pointer("/provider/served_model")
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || self.descriptor.identity.model.0.clone(),
+                    ToString::to_string,
+                );
+            let mut trace = response.trace;
+            trace.model = self.descriptor.identity.clone();
+            trace.request_hash = hash_json(&request)?;
+            trace
+                .timing
+                .provider_ms
+                .get_or_insert(started.elapsed().as_millis() as u64);
+            Ok(ClassifyResponse {
+                answers,
+                served_model,
+                trace,
+                raw_provider_response: response.raw_provider_response,
             })
-            .await?;
-        let answers = Self::parse_reply(&request, &response.text)?;
-        let served_model = response
-            .trace
-            .metadata
-            .pointer("/provider/served_model")
-            .and_then(Value::as_str)
-            .map_or_else(
-                || self.descriptor.identity.model.0.clone(),
-                ToString::to_string,
-            );
-        let mut trace = response.trace;
-        trace.model = self.descriptor.identity.clone();
-        trace.request_hash = hash_json(&request)?;
-        trace
-            .timing
-            .provider_ms
-            .get_or_insert(started.elapsed().as_millis() as u64);
-        Ok(ClassifyResponse {
-            answers,
-            served_model,
-            trace,
-            raw_provider_response: response.raw_provider_response,
         })
+        .await;
+        secrets::composed_result(self, result)
     }
 }
 
@@ -1819,7 +1843,7 @@ mod tests {
 
     fn unreachable_jev() -> JevClassifierProvider {
         // Nothing listens on the loopback discard port.
-        JevClassifierProvider::new("typesafe", JEV_DEFAULT_MODEL, "http://127.0.0.1:9/v1", "k")
+        JevClassifierProvider::new("typesafe", JEV_DEFAULT_MODEL, "http://127.0.0.1:9/v1", "")
             .with_request_limit(65536)
             .with_response_limit(65536)
     }
@@ -2103,7 +2127,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ModelError::Provider(ref m) if m.contains("served model")),
+            matches!(err, ModelError::Provider(ref m) if m == "credential-bearing provider failure"),
             "{err:?}"
         );
         #[cfg(feature = "queue")]
@@ -2511,7 +2535,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(error, ModelError::Provider(message) if message == "provider response limit exceeded")
+                matches!(error, ModelError::Provider(message) if message == "credential-bearing provider failure")
             );
         }
     }
@@ -3040,12 +3064,12 @@ mod tests {
     #[cfg(feature = "queue")]
     #[test]
     fn classify_requests_carry_an_input_budget() {
-        let small = request(vec![goal_question()]).input_budget_units();
+        let small = request(vec![goal_question()]).input_budget_units().unwrap();
         let mut large = request(vec![goal_question()]);
         large
             .state
             .insert("message".to_string(), serde_json::json!("y".repeat(4_000)));
         // About one unit per four characters of state and questions.
-        assert!(small > 0 && large.input_budget_units() >= small + 990);
+        assert!(small > 0 && large.input_budget_units().unwrap() >= small + 990);
     }
 }

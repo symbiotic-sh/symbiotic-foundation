@@ -272,10 +272,21 @@ provider encoder runs before permit consumption/secret loading and at transmissi
 the adapters send its resulting bytes without re-serializing them. Oversized admission
 returns `LimitExceeded` without consuming the permit.
 
-The safe provider wrapper rejects a response containing the injected credential in
-any declared representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8
-(upper/lower hex), standard Base64 and URL-safe Base64 (padded/unpadded). It scans string
-values before forwarding and discards raw errors before the runtime can log them.
+The shared adapter-result boundary (`secrets::credential_boundary` in
+`symbiotic-model`) wraps every credential-bearing HTTP adapter's complete result,
+including typed decoding and answer validation, before runtime bookkeeping.
+Queued calls also require the credential owner's opaque guard before any result
+writes; raw adapters and chat-backed classification use that same boundary.
+Injected credential-bearing adapters without a Foundation-owned guard are refused.
+On
+success it refuses credential echoes in raw JSON and typed output: exact bytes,
+JSON-escaped UTF-8, numeric re-spellings (including `arbitrary_precision` numbers),
+percent-encoded UTF-8 (upper/lower hex), standard Base64 and URL-safe Base64
+(padded/unpadded). It discards raw provider JSON after checking it. On failure it
+preserves typed error classes with static messages, so provider text never reaches
+receipts, traces, queue storage or the response cache. All adapter clients are
+Foundation-owned, disable redirects and HTTP retries, and ignore ambient proxies;
+public client injection is unavailable.
 The shared Gemini adapter rejects non-finite embedding components in single and
 batch responses with a static provider failure; dispatch retains an unknown charge.
 Other transformations are outside that finite guarantee. Persistent response caching,

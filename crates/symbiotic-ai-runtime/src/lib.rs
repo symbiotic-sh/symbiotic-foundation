@@ -356,7 +356,11 @@ impl Runtime {
                 ));
             }
         };
-        let client = model::http_client(resolved.account.policy.request_timeout_seconds)?;
+        let timeout_seconds = resolved
+            .account
+            .policy
+            .request_timeout_seconds
+            .ok_or_else(|| ModelError::InvalidRequest("finite timeout is required".into()))?;
         let limits = &config.limits;
         let settings = &config.settings;
         match resolved.model.adapter {
@@ -367,7 +371,7 @@ impl Runtime {
                     &config.endpoint,
                     key,
                 )
-                .with_client(client)
+                .with_timeout(timeout_seconds)?
                 .with_request_limit(limits.max_request_bytes)
                 .with_response_limit(limits.max_response_bytes)
                 .with_output_limit(limits.max_output_tokens.ok_or_else(|| {
@@ -390,7 +394,7 @@ impl Runtime {
                         ModelError::InvalidRequest("embedding dimensions required".into())
                     })?,
                 )
-                .with_client(client)
+                .with_timeout(timeout_seconds)?
                 .with_request_limit(limits.max_request_bytes)
                 .with_response_limit(limits.max_response_bytes);
                 Ok(ConfiguredProvider::Embedding(self.embedding(
@@ -404,7 +408,7 @@ impl Runtime {
                     &config.endpoint,
                     key,
                 )
-                .with_client(client)
+                .with_timeout(timeout_seconds)?
                 .with_request_limit(limits.max_request_bytes)
                 .with_response_limit(limits.max_response_bytes);
                 if let Some(served) = &settings.served_model {

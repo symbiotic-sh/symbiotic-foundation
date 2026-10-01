@@ -77,3 +77,29 @@ fn the_queued_classifier_keeps_its_credential_fingerprint() {
     assert_eq!(queued.credential_fingerprint(), api_key_fingerprint(key));
     assert!(queued.credential_fingerprint().is_some());
 }
+
+#[test]
+fn purge_reports_malformed_binding_and_model_instead_of_silently_keeping_entries() {
+    for trace in [
+        json!({"metadata":{"binding":{"tenant":42}}}),
+        json!({"model":{"operation":42}}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DirResponseCache::new(dir.path().join("cache"));
+        let request = json!({});
+        cache
+            .store(
+                &CacheEntry {
+                    kind: "chat",
+                    scope: None,
+                    request_hash: "invalid",
+                    request: &request,
+                },
+                &json!({"trace": trace}),
+            )
+            .unwrap();
+        let result = cache.purge(|_| false);
+        assert!(matches!(result, Err(symbiotic_model::ModelError::Cache(_))));
+        assert!(dir.path().join("cache/chat/invalid.json").exists());
+    }
+}

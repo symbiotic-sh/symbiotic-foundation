@@ -200,9 +200,8 @@ pub struct CacheEntry<'a> {
 /// Exact response cache consulted before a queued call and filled after a
 /// successful one. Values are serialized responses of the provider kind.
 ///
-/// Implement it to keep reading a cache whose layout or keys predate the
-/// runtime: return `Ok(None)` for requests it cannot answer and skip stores
-/// it does not keep.
+/// Store only the current response format and complete binding/request identity.
+/// Return `Ok(None)` for requests outside the cache's scope; legacy layouts are refused.
 pub trait ResponseCache: Send + Sync {
     fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError>;
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError>;
@@ -311,15 +310,26 @@ impl DirResponseCache {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             };
+            let decode = |value: &Value| {
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    ModelError::Cache(format!("{}: invalid cache binding", path.display()))
+                })
+            };
             let response = CachedResponse {
                 binding: trace
                     .and_then(|trace| trace.pointer("/metadata/binding"))
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    .map(decode)
+                    .transpose()?,
                 source: text("source"),
                 role_binding: text("role_binding"),
                 model: trace
                     .and_then(|trace| trace.get("model"))
-                    .and_then(|model| serde_json::from_value(model.clone()).ok()),
+                    .map(|model| {
+                        serde_json::from_value(model.clone()).map_err(|_| {
+                            ModelError::Cache(format!("{}: invalid cached model", path.display()))
+                        })
+                    })
+                    .transpose()?,
                 modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
                 bytes: meta.len(),
             };

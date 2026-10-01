@@ -1531,3 +1531,99 @@ fn raw_and_registry_bindings_refuse_the_same_invalid_chat_settings() {
         assert_eq!(raw_error.to_string(), configured_error.to_string());
     }
 }
+
+#[tokio::test]
+async fn injected_credential_results_without_a_boundary_are_refused_before_bookkeeping() {
+    const KEY: &str = "synthetic-unprotected-credential-741";
+    #[derive(Clone)]
+    struct Unprotected {
+        inner: Loopback,
+        fail: bool,
+    }
+    impl ModelProvider for Unprotected {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            self.inner.descriptor()
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for Unprotected {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            if self.fail {
+                return Err(ModelError::Auth(format!("invalid key {KEY}")));
+            }
+            let mut response = self.inner.chat(request).await?;
+            response.text = KEY.into();
+            response.raw_provider_response = Some(json!({"ignored": KEY}));
+            Ok(response)
+        }
+    }
+    for registry_path in [false, true] {
+        for fail in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let traces = Arc::new(symbiotic_trace::InMemoryTraceSink::default());
+            let runtime = Runtime::open(RuntimeConfig {
+                state_dir: Some(state.path().join("state")),
+                registry: Some(Arc::new(
+                    symbiotic_ai_runtime::model::ModelRegistry::from_json(
+                        &serde_json::to_vec(&registry_config()).unwrap(),
+                    )
+                    .unwrap(),
+                )),
+                receipt_sink: Some(receipts.clone()),
+                trace_sink: Some(traces.clone()),
+                ..RuntimeConfig::default()
+            })
+            .unwrap();
+            let descriptor = symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
+                "example",
+                "example-model",
+                "http://127.0.0.1:9/v1",
+                KEY,
+            )
+            .with_request_limit(65536)
+            .with_response_limit(65536)
+            .with_output_limit(1024)
+            .descriptor()
+            .clone();
+            let mut inner = Loopback::new(descriptor.identity.clone());
+            inner.descriptor = descriptor;
+            let raw = Unprotected { inner, fail };
+            let binding = if registry_path {
+                runtime
+                    .registry_binding(
+                        &symbiotic_core::TenantId("tenant".into()),
+                        &symbiotic_core::ProviderPrincipalId("provider".into()),
+                        raw,
+                    )
+                    .unwrap()
+            } else {
+                binding(raw).with_policy(policy())
+            };
+            let provider = runtime.chat(binding).unwrap();
+            let error = provider.chat(request("ordinary prompt")).await.unwrap_err();
+            assert!(
+                matches!(error, ModelError::Provider(ref text) if text == "credential result boundary is unavailable")
+            );
+            for text in [
+                error.to_string(),
+                serde_json::to_string(&receipts.receipts()).unwrap(),
+                serde_json::to_string(&traces.records()).unwrap(),
+            ] {
+                assert!(!text.contains(KEY));
+            }
+            let mut dirs = vec![state.path().to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    } else {
+                        let bytes = std::fs::read(path).unwrap();
+                        assert!(!bytes.windows(KEY.len()).any(|part| part == KEY.as_bytes()));
+                    }
+                }
+            }
+        }
+    }
+}

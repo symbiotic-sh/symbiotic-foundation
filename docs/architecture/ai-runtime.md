@@ -372,7 +372,7 @@ contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access) 
 ## Backends and conformance
 
 `symbiotic-queue` ships `MemoryQueue`, the in-process backend with no storage
-dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 21
+dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 22
 checks of the `QueueBackend` contract. Both `MemoryQueue` and `SqliteQueue` run
 them in CI:
 
@@ -392,7 +392,10 @@ them in CI:
 - cooldown monotonicity;
 - unknown items.
 
-A new backend passes the same macro.
+A new backend passes the same macro. SQLite creates only the current schema;
+a queue file missing `last_error_class` is refused without migration. Terminal
+items without a recorded error class return a queue error, without inferring a
+class from provider text.
 
 ## Lower-level types
 

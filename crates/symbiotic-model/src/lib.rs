@@ -61,7 +61,7 @@ pub use queue_runtime::{
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
 mod secrets;
-pub use secrets::SecretValue;
+pub use secrets::{CredentialBoundary, SecretValue};
 mod registry;
 pub use registry::*;
 mod classify;
@@ -310,6 +310,14 @@ pub trait ModelProvider: Send + Sync {
     fn credential_fingerprint(&self) -> Option<String> {
         None
     }
+
+    /// Forward the opaque credential owner for composed adapter results.
+    /// Foundation creates this guard; adapters cannot replace its result policy
+    /// or read its secret. Credential-bearing adapters without a guard are refused.
+    #[doc(hidden)]
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        None
+    }
 }
 
 impl<T> ModelProvider for Arc<T>
@@ -326,6 +334,10 @@ where
 
     fn credential_fingerprint(&self) -> Option<String> {
         (**self).credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        (**self).credential_boundary()
     }
 }
 
@@ -523,6 +535,10 @@ where
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -587,6 +603,10 @@ where
 
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -655,6 +675,10 @@ where
 
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -798,6 +822,7 @@ struct QueuedCall<Req> {
     config: ModelQueueConfig,
     queue_id: QueueId,
     descriptor: ProviderDescriptor,
+    result_owner: Arc<dyn ModelProvider>,
     capability: ModelCapability,
     kind: String,
     binding_identity: Option<symbiotic_core::BindingIdentity>,
@@ -897,14 +922,15 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         item: Option<&QueueItem>,
     ) -> Result<Option<Res>, ModelError>
     where
-        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+        Res: Serialize + TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
     {
         let Some(cache) = self.cache.clone() else {
             return Ok(None);
         };
         let call = self.clone();
         let loaded =
-            run_blocking(move || load_cached::<Res>(cache.as_ref(), &call.cache_entry())).await?;
+            run_blocking(move || load_cached::<Res>(cache.as_ref(), &call.cache_entry())).await;
+        let loaded = secrets::composed_result(self.result_owner.as_ref(), loaded)?;
         let Some(cached) = loaded else {
             return Ok(None);
         };
@@ -1125,10 +1151,11 @@ where
             queue_id: queue_id.clone(),
             kind: kind.to_string(),
             request_hash: request_hash.clone(),
-            input_units: request.input_budget_units(),
+            input_units: request.input_budget_units()?,
         },
         queue_id,
         descriptor,
+        result_owner: Arc::new(provider.clone()),
         capability,
         kind: kind.to_string(),
         binding_identity: runtime.binding_identity.clone(),
@@ -1314,7 +1341,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         config: &ModelQueueConfig,
     ) -> Result<Followed<Res>, ModelError>
     where
-        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+        Res: Serialize + TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
     {
         let current = self
             .queue
@@ -1415,8 +1442,9 @@ async fn run_attempt<P, Req, Res, F, Fut>(
     clock: AttemptClock,
 ) -> Result<AttemptEnd<Res>, ModelError>
 where
+    P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1549,8 +1577,9 @@ async fn settle<P, Req, Res, F, Fut>(
     clock: &AttemptClock,
 ) -> Settled<Res>
 where
+    P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1578,9 +1607,10 @@ where
     let result = within_timeout(
         &this.queue_id,
         config.request_timeout_seconds,
-        call(provider, this.request.clone()),
+        call(provider.clone(), this.request.clone()),
     )
     .await;
+    let result = secrets::composed_result(&provider, result);
     let provider_ms = elapsed_ms(provider_started);
     let failed_timing = || AttemptTiming {
         queue_wait_ms: None,
@@ -1920,8 +1950,7 @@ fn error_class(err: &ModelError) -> String {
     }
 }
 
-/// The error a dead item stands for, from its recorded class. Items failed
-/// before classes were recorded fall back to reading the message.
+/// Recover a terminal error from its recorded class; never infer a missing class from text.
 #[cfg(feature = "queue")]
 fn dead_item_retry_error(item: &QueueItem) -> ModelError {
     let error = item
@@ -1943,16 +1972,7 @@ fn dead_item_retry_error(item: &QueueItem) -> ModelError {
                 serde_json::from_value(Value::String(capability.to_string())).ok()
             })
             .map_or(ModelError::Provider(error), ModelError::Unsupported),
-        None => {
-            let lower = error.to_ascii_lowercase();
-            if lower.contains("rate") || lower.contains("429") {
-                ModelError::RateLimited(error)
-            } else if lower.contains("timeout") || lower.contains("timed out") {
-                ModelError::Timeout(error)
-            } else {
-                ModelError::Unavailable(error)
-            }
-        }
+        None => ModelError::Queue("terminal queue item is missing its error class".into()),
     }
 }
 
@@ -2138,7 +2158,7 @@ pub struct ModelRateState {
 
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
-    fn input_budget_units(&self) -> u64;
+    fn input_budget_units(&self) -> Result<u64, ModelError>;
     fn sensitivity(&self) -> Sensitivity;
 }
 
@@ -2147,8 +2167,10 @@ impl BudgetedModelRequest for ChatRequest {
     fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
     }
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(self.messages.iter().map(|message| message.content.as_str()))
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
+            self.messages.iter().map(|message| message.content.as_str()),
+        ))
     }
 }
 
@@ -2157,8 +2179,10 @@ impl BudgetedModelRequest for EmbeddingRequest {
     fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
     }
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(self.inputs.iter().map(String::as_str))
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
+            self.inputs.iter().map(String::as_str),
+        ))
     }
 }
 
@@ -2167,10 +2191,10 @@ impl BudgetedModelRequest for RerankRequest {
     fn sensitivity(&self) -> Sensitivity {
         self.sensitivity
     }
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
             std::iter::once(self.query.as_str()).chain(self.documents.iter().map(String::as_str)),
-        )
+        ))
     }
 }
 
@@ -2323,7 +2347,7 @@ where
                 queue_id.0, config.rate_burst_seconds
             ),
             per_minute: input_units_per_minute as f64,
-            amount: request.input_budget_units() as f64,
+            amount: request.input_budget_units()? as f64,
         });
     }
     if charges.is_empty() {
@@ -2539,7 +2563,7 @@ pub struct OpenAiCompatibleChatProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
     base_url: String,
-    api_key: SecretValue<String>,
+    api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     thinking: Option<ThinkingMode>,
@@ -2600,7 +2624,7 @@ impl OpenAiCompatibleChatProvider {
             },
             client: default_http_client(),
             base_url,
-            api_key: api_key.into(),
+            api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
             thinking: None,
@@ -2609,10 +2633,16 @@ impl OpenAiCompatibleChatProvider {
         }
     }
 
-    /// Reuse the consumer's connection pool and timeout policy.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// Clients cannot be injected through the public API.
+    /// ```compile_fail
+    /// use symbiotic_model::OpenAiCompatibleChatProvider;
+    /// OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "key")
+    ///     .with_client(reqwest::Client::new());
+    /// ```
+    /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
+        self.client = http_client(Some(timeout_seconds))?;
+        Ok(self)
     }
 
     /// Bound the complete encoded HTTP request body before transmission.
@@ -2671,7 +2701,11 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
-        api_key_fingerprint(&self.api_key)
+        api_key_fingerprint(self.api_key.secret())
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        Some(&self.api_key)
     }
 }
 
@@ -2775,112 +2809,114 @@ fn reported_cost_usd(raw: &Value) -> Option<String> {
 #[async_trait]
 impl ChatProvider for OpenAiCompatibleChatProvider {
     async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        self.validate_configuration()?;
-        let output = request
-            .max_output_tokens
-            .or(self.max_output_tokens)
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                ModelError::InvalidRequest("finite output tokens are required".into())
-            })?;
-        if self.max_output_tokens.is_some_and(|limit| output > limit) {
-            return Err(ModelError::InvalidRequest(
-                "output token limit exceeded".into(),
-            ));
-        }
-        request.max_output_tokens = Some(output);
-        let body = wire::openai_chat_body(
-            &self.descriptor.identity.model.0,
-            &request,
-            self.thinking,
-            self.reasoning_effort.as_deref(),
-            self.max_request_bytes,
-        )?;
-        let builder = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.base_url.trim_end_matches('/')
-            ))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        let builder = if self.api_key.is_empty() {
-            builder
-        } else {
-            builder.bearer_auth(self.api_key.as_str())
-        };
-        let (raw, _) = provider_response_json(
-            builder,
-            self.max_response_bytes,
-            &self.api_key,
-            ModelError::Unavailable,
-        )
-        .await?;
-        let parsed: OpenAiChatWireResponse = serde_json::from_value(raw.clone())
-            .map_err(|err| ModelError::Provider(err.to_string()))?;
-        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
-            ModelError::Provider("OpenAI-compatible response had no choices".to_string())
-        })?;
-        let usage = parsed.usage.unwrap_or_default();
-        let content = choice
-            .message
-            .as_ref()
-            .and_then(|message| message.content.as_deref())
-            .unwrap_or_default();
-        let mut trace = success_trace(
-            &self.descriptor,
-            request.sensitivity,
-            request.role_binding.clone(),
-            request.source.clone(),
-            hash_json(&request)?,
-            Some(content),
-        );
-        trace.usage = UsageTrace {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            media_units: None,
-            cost_micro_usd: None,
-            reported_cost_usd: reported_cost_usd(&raw),
-        };
-        let nested_hit = usage
-            .prompt_tokens_details
-            .and_then(|details| details.cached_tokens);
-        let (hit, miss) = prompt_cache_counts(
-            usage.prompt_tokens,
-            usage.prompt_cache_hit_tokens,
-            usage.prompt_cache_miss_tokens,
-            nested_hit,
-        );
-        trace.metadata = serde_json::json!({
-            "provider": {
-                "response_id": raw.get("id").and_then(Value::as_str),
-                "served_model": raw.get("model").and_then(Value::as_str),
-                "created": raw.get("created").and_then(Value::as_i64),
-                "reasoning_tokens": trace.usage.reasoning_tokens,
-                "reported_cost_usd": trace.usage.reported_cost_usd,
-            },
-            "cache_miss_tokens": miss,
-            "observed_cache_tokens": {
-                "hit": usage.prompt_cache_hit_tokens,
-                "miss": usage.prompt_cache_miss_tokens,
-                "nested_hit": nested_hit,
-            },
-        });
-        trace.cache = CacheTrace {
-            response_cache: CacheStatus::Miss,
-            prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
-            cached_input_tokens: hit,
-        };
-        secrets::checked_response(
-            ChatResponse {
-                text: content.to_string(),
-                finish_reason: choice.finish_reason,
-                trace,
-                raw_provider_response: Some(raw),
-            },
+        secrets::credential_boundary(
+            (async {
+                self.validate_configuration()?;
+                let output = request
+                    .max_output_tokens
+                    .or(self.max_output_tokens)
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        ModelError::InvalidRequest("finite output tokens are required".into())
+                    })?;
+                if self.max_output_tokens.is_some_and(|limit| output > limit) {
+                    return Err(ModelError::InvalidRequest(
+                        "output token limit exceeded".into(),
+                    ));
+                }
+                request.max_output_tokens = Some(output);
+                let body = wire::openai_chat_body(
+                    &self.descriptor.identity.model.0,
+                    &request,
+                    self.thinking,
+                    self.reasoning_effort.as_deref(),
+                    self.max_request_bytes,
+                )?;
+                let builder = self
+                    .client
+                    .post(format!(
+                        "{}/chat/completions",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+                let builder = if self.api_key.secret().is_empty() {
+                    builder
+                } else {
+                    builder.bearer_auth(self.api_key.secret())
+                };
+                let (raw, _) = provider_response_json(
+                    builder,
+                    self.max_response_bytes,
+                    ModelError::Unavailable,
+                )
+                .await?;
+                let parsed: OpenAiChatWireResponse = serde_json::from_value(raw.clone())
+                    .map_err(|err| ModelError::Provider(err.to_string()))?;
+                let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+                    ModelError::Provider("OpenAI-compatible response had no choices".to_string())
+                })?;
+                let usage = parsed.usage.unwrap_or_default();
+                let content = choice
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.content.as_deref())
+                    .unwrap_or_default();
+                let mut trace = success_trace(
+                    &self.descriptor,
+                    request.sensitivity,
+                    request.role_binding.clone(),
+                    request.source.clone(),
+                    hash_json(&request)?,
+                    Some(content),
+                );
+                trace.usage = UsageTrace {
+                    input_tokens: usage.prompt_tokens,
+                    output_tokens: usage.completion_tokens,
+                    reasoning_tokens: usage
+                        .completion_tokens_details
+                        .and_then(|details| details.reasoning_tokens),
+                    media_units: None,
+                    cost_micro_usd: None,
+                    reported_cost_usd: reported_cost_usd(&raw),
+                };
+                let nested_hit = usage
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens);
+                let (hit, miss) = prompt_cache_counts(
+                    usage.prompt_tokens,
+                    usage.prompt_cache_hit_tokens,
+                    usage.prompt_cache_miss_tokens,
+                    nested_hit,
+                );
+                trace.metadata = serde_json::json!({
+                    "provider": {
+                        "response_id": raw.get("id").and_then(Value::as_str),
+                        "served_model": raw.get("model").and_then(Value::as_str),
+                        "created": raw.get("created").and_then(Value::as_i64),
+                        "reasoning_tokens": trace.usage.reasoning_tokens,
+                        "reported_cost_usd": trace.usage.reported_cost_usd,
+                    },
+                    "cache_miss_tokens": miss,
+                    "observed_cache_tokens": {
+                        "hit": usage.prompt_cache_hit_tokens,
+                        "miss": usage.prompt_cache_miss_tokens,
+                        "nested_hit": nested_hit,
+                    },
+                });
+                trace.cache = CacheTrace {
+                    response_cache: CacheStatus::Miss,
+                    prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
+                    cached_input_tokens: hit,
+                };
+                Ok(ChatResponse {
+                    text: content.to_string(),
+                    finish_reason: choice.finish_reason,
+                    trace,
+                    raw_provider_response: Some(raw),
+                })
+            })
+            .await,
             &self.api_key,
         )
     }
@@ -2890,13 +2926,28 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
 pub struct GeminiEmbeddingProvider {
     descriptor: ProviderDescriptor,
     client: reqwest::Client,
-    api_key: SecretValue<String>,
+    api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     dimensions: usize,
+    #[cfg(test)]
+    test_endpoint: Option<String>,
 }
 
 impl GeminiEmbeddingProvider {
+    #[cfg(test)]
+    fn at_test_endpoint(mut self, endpoint: String) -> Self {
+        self.test_endpoint = Some(endpoint);
+        self
+    }
+
+    fn endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.test_endpoint {
+            return endpoint;
+        }
+        "https://generativelanguage.googleapis.com/v1beta"
+    }
     /// Construct a Gemini transport with an owned key and explicit dimensions.
     pub fn new(
         operator: impl Into<String>,
@@ -2916,17 +2967,25 @@ impl GeminiEmbeddingProvider {
                 metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
             client: default_http_client(),
-            api_key: api_key.into(),
+            api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
             dimensions,
+            #[cfg(test)]
+            test_endpoint: None,
         }
     }
 
-    /// Reuse a client with the deployment's timeout and redirect policy.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// Clients cannot be injected through the public API.
+    /// ```compile_fail
+    /// use symbiotic_model::GeminiEmbeddingProvider;
+    /// GeminiEmbeddingProvider::new("op", "model", "key", 2)
+    ///     .with_client(reqwest::Client::new());
+    /// ```
+    /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
+        self.client = http_client(Some(timeout_seconds))?;
+        Ok(self)
     }
 
     /// Bound the complete encoded HTTP request body before transmission.
@@ -2962,7 +3021,11 @@ impl ModelProvider for GeminiEmbeddingProvider {
     }
 
     fn credential_fingerprint(&self) -> Option<String> {
-        api_key_fingerprint(&self.api_key)
+        api_key_fingerprint(self.api_key.secret())
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        Some(&self.api_key)
     }
 }
 
@@ -3000,13 +3063,100 @@ impl GeminiEmbedding {
 #[async_trait]
 impl EmbeddingProvider for GeminiEmbeddingProvider {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
-        self.validate_configuration()?;
-        wire::validate_gemini_options(self.dimensions, &request)?;
-        if request.inputs.is_empty() {
-            return secrets::checked_response(
-                EmbeddingResponse {
+        secrets::credential_boundary(
+            (async {
+                self.validate_configuration()?;
+                wire::validate_gemini_options(self.dimensions, &request)?;
+                if request.inputs.is_empty() {
+                    return Ok(EmbeddingResponse {
+                        dimensions: self.dimensions,
+                        vectors: Vec::new(),
+                        trace: success_trace(
+                            &self.descriptor,
+                            request.sensitivity,
+                            request.role_binding.clone(),
+                            request.source.clone(),
+                            hash_json(&request)?,
+                            None,
+                        ),
+                        raw_provider_response: None,
+                    });
+                }
+                let model = self
+                    .descriptor
+                    .identity
+                    .model
+                    .0
+                    .trim_start_matches("models/");
+                let body = wire::gemini_embedding_body(
+                    model,
+                    self.dimensions,
+                    &request,
+                    self.max_request_bytes,
+                )?;
+                let raw_provider_response;
+                let vectors = if request.inputs.len() == 1 {
+                    let builder = self
+                        .client
+                        .post(format!("{}/models/{model}:embedContent", self.endpoint()))
+                        .header("x-goog-api-key", self.api_key.secret())
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body);
+                    let (raw, _) = provider_response_json(
+                        builder,
+                        self.max_response_bytes,
+                        ModelError::Unavailable,
+                    )
+                    .await?;
+                    raw_provider_response = Some(raw.clone());
+                    let raw: GeminiEmbedWireResponse = serde_json::from_value(raw)
+                        .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+                    vec![
+                        raw.embedding
+                            .ok_or_else(|| {
+                                ModelError::Provider(
+                                    "Gemini response missing embedding".to_string(),
+                                )
+                            })?
+                            .into_values(self.dimensions)?,
+                    ]
+                } else {
+                    let builder = self
+                        .client
+                        .post(format!(
+                            "{}/models/{model}:batchEmbedContents",
+                            self.endpoint()
+                        ))
+                        .header("x-goog-api-key", self.api_key.secret())
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body);
+                    let (raw, _) = provider_response_json(
+                        builder,
+                        self.max_response_bytes,
+                        ModelError::Unavailable,
+                    )
+                    .await?;
+                    raw_provider_response = Some(raw.clone());
+                    let raw: GeminiBatchEmbedWireResponse = serde_json::from_value(raw)
+                        .map_err(|err| ModelError::Unavailable(err.to_string()))?;
+                    let embeddings = raw.embeddings.ok_or_else(|| {
+                        ModelError::Provider("Gemini batch response missing embeddings".to_string())
+                    })?;
+                    if embeddings.len() != request.inputs.len() {
+                        return Err(ModelError::Provider(format!(
+                            "Gemini batch returned {} embeddings for {} inputs",
+                            embeddings.len(),
+                            request.inputs.len()
+                        )));
+                    }
+                    embeddings
+                        .into_iter()
+                        .map(|embedding| embedding.into_values(self.dimensions))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(EmbeddingResponse {
                     dimensions: self.dimensions,
-                    vectors: Vec::new(),
+                    vectors,
                     trace: success_trace(
                         &self.descriptor,
                         request.sensitivity,
@@ -3015,113 +3165,31 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                         hash_json(&request)?,
                         None,
                     ),
-                    raw_provider_response: None,
-                },
-                &self.api_key,
-            );
-        }
-        let model = self
-            .descriptor
-            .identity
-            .model
-            .0
-            .trim_start_matches("models/");
-        let body =
-            wire::gemini_embedding_body(model, self.dimensions, &request, self.max_request_bytes)?;
-        let vectors = if request.inputs.len() == 1 {
-            let builder = self
-                .client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
-                ))
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
-            let raw: GeminiEmbedWireResponse = serde_json::from_value(
-                provider_response_json(
-                    builder,
-                    self.max_response_bytes,
-                    &self.api_key,
-                    ModelError::Unavailable,
-                )
-                .await?
-                .0,
-            )
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            vec![
-                raw.embedding
-                    .ok_or_else(|| {
-                        ModelError::Provider("Gemini response missing embedding".to_string())
-                    })?
-                    .into_values(self.dimensions)?,
-            ]
-        } else {
-            let builder = self
-                    .client
-                    .post(format!(
-                        "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
-                    ))
-                    .header("x-goog-api-key", self.api_key.as_str())
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body);
-            let raw: GeminiBatchEmbedWireResponse = serde_json::from_value(
-                provider_response_json(
-                    builder,
-                    self.max_response_bytes,
-                    &self.api_key,
-                    ModelError::Unavailable,
-                )
-                .await?
-                .0,
-            )
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            let embeddings = raw.embeddings.ok_or_else(|| {
-                ModelError::Provider("Gemini batch response missing embeddings".to_string())
-            })?;
-            if embeddings.len() != request.inputs.len() {
-                return Err(ModelError::Provider(format!(
-                    "Gemini batch returned {} embeddings for {} inputs",
-                    embeddings.len(),
-                    request.inputs.len()
-                )));
-            }
-            embeddings
-                .into_iter()
-                .map(|embedding| embedding.into_values(self.dimensions))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        secrets::checked_response(
-            EmbeddingResponse {
-                dimensions: self.dimensions,
-                vectors,
-                trace: success_trace(
-                    &self.descriptor,
-                    request.sensitivity,
-                    request.role_binding.clone(),
-                    request.source.clone(),
-                    hash_json(&request)?,
-                    None,
-                ),
-                raw_provider_response: None,
-            },
+                    raw_provider_response,
+                })
+            })
+            .await,
             &self.api_key,
         )
     }
 }
 
 fn http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
 }
 
 fn default_http_client() -> reqwest::Client {
-    // Match Client::new's construction failure behavior, with redirects disabled.
+    // Every construction path uses the same redirect/proxy/retry policy.
     http_client_builder()
         .build()
         .expect("default provider HTTP client could not be built")
 }
 
-/// Client with an explicit finite timeout and redirects disabled for configured adapters.
-pub fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelError> {
+/// Boundary-owned HTTP client construction; no public client injection.
+fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelError> {
     let timeout = timeout_seconds
         .filter(|n| *n > 0)
         .ok_or_else(|| ModelError::InvalidRequest("finite timeout is required".into()))?;
@@ -3168,39 +3236,29 @@ async fn bounded_response_bytes(
     Ok(bytes)
 }
 
-/// The shared HTTP boundary: refuse redirects and sanitize credentials before
-/// any adapter can return a result to runtime bookkeeping.
+/// Bounded HTTP decoding. Credential policy belongs exclusively to the final
+/// adapter-result boundary, including errors raised after this helper returns.
 async fn provider_response_json(
     builder: reqwest::RequestBuilder,
     max_bytes: Option<usize>,
-    secret: &str,
     invalid_json: fn(String) -> ModelError,
 ) -> Result<(Value, Vec<u8>), ModelError> {
-    let sanitize = |error| {
-        if secret.is_empty() {
-            error
-        } else {
-            secrets::safe_error(error)
-        }
-    };
     let response = builder
         .send()
         .await
-        .map_err(|err| sanitize(ModelError::Unavailable(err.to_string())))?;
+        .map_err(|err| ModelError::Unavailable(err.to_string()))?;
     let status = response.status();
     if status.is_redirection() {
         return Err(ModelError::Provider("provider redirect refused".into()));
     }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
     if !status.is_success() {
-        return Err(sanitize(status_error(
+        return Err(status_error(
             status.as_u16(),
             String::from_utf8_lossy(&bytes).into_owned(),
-        )));
+        ));
     }
-    let raw: Value =
-        serde_json::from_slice(&bytes).map_err(|err| sanitize(invalid_json(err.to_string())))?;
-    secrets::check_response(&raw, secret)?;
+    let raw: Value = serde_json::from_slice(&bytes).map_err(|err| invalid_json(err.to_string()))?;
     Ok((raw, bytes))
 }
 
@@ -3398,7 +3456,7 @@ mod tests {
             metadata: Value::Null,
         };
 
-        assert_eq!(request.input_budget_units(), 3);
+        assert_eq!(request.input_budget_units().unwrap(), 3);
         assert_eq!(estimate_token_budget_units([""]), 1);
     }
 
@@ -4218,6 +4276,13 @@ mod tests {
             {
                 assert_eq!(expected, actual);
             }
+            let mut missing_class = item;
+            missing_class.last_error_class = None;
+            missing_class.last_error = Some("429 timed out private provider text".into());
+            assert!(
+                matches!(dead_item_retry_error(&missing_class), ModelError::Queue(message)
+                if message == "terminal queue item is missing its error class")
+            );
         }
     }
 
@@ -4479,3 +4544,6 @@ mod tests {
         assert_eq!(records[1].cache.response_cache, CacheStatus::Hit);
     }
 }
+
+#[cfg(test)]
+mod credential_transport_tests;

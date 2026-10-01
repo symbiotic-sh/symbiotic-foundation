@@ -789,6 +789,20 @@ impl QueueBackend for SqliteQueue {
 fn configure(conn: &Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
         .map_err(storage_error)?;
+    // Refuse a previous development schema rather than modifying stored data.
+    let existing_queue = conn
+        .prepare("select 1 from sqlite_master where type = 'table' and name = 'queue_items'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(storage_error)?;
+    let has_error_class = conn
+        .prepare("select 1 from pragma_table_info('queue_items') where name = 'last_error_class'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(storage_error)?;
+    if existing_queue && !has_error_class {
+        return Err(QueueError::Storage(
+            "unsupported queue schema: missing last_error_class".into(),
+        ));
+    }
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(storage_error)?;
     conn.execute_batch(
@@ -806,6 +820,7 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
             lease_until text,
             idempotency_key text,
             last_error text,
+            last_error_class text,
             created_at text not null,
             updated_at text not null
         );
@@ -835,15 +850,6 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
         ",
     )
     .map_err(storage_error)?;
-    // Added after the first schema: queues created earlier gain the column.
-    let has_error_class = conn
-        .prepare("select 1 from pragma_table_info('queue_items') where name = 'last_error_class'")
-        .and_then(|mut stmt| stmt.exists([]))
-        .map_err(storage_error)?;
-    if !has_error_class {
-        conn.execute_batch("alter table queue_items add column last_error_class text")
-            .map_err(storage_error)?;
-    }
     Ok(())
 }
 
@@ -1115,6 +1121,33 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn previous_queue_schema_is_refused_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("create table queue_items (item_id text primary key, queue_id text, kind text, payload_json text, status text, attempt integer, max_attempts integer, run_after text, lease_owner text, lease_until text, idempotency_key text, last_error text, created_at text, updated_at text)").unwrap();
+        assert!(
+            matches!(SqliteQueue::open(&path), Err(QueueError::Storage(message)) if message.contains("unsupported queue schema"))
+        );
+        assert!(
+            !conn
+                .prepare(
+                    "select 1 from pragma_table_info('queue_items') where name = 'last_error_class'"
+                )
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        assert!(
+            !conn
+                .prepare("select 1 from sqlite_master where name = 'queue_events'")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+    }
+
     use super::*;
     use futures::future::join_all;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1639,48 +1672,6 @@ mod tests {
         let dead = reopened.get(&item.item_id).unwrap().unwrap();
         assert_eq!(dead.status, QueueStatus::Dead);
         assert_eq!(dead.attempt, 1);
-    }
-
-    #[tokio::test]
-    async fn a_queue_created_before_error_classes_gains_the_column() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "create table queue_items (
-                    item_id text primary key, queue_id text not null, kind text not null,
-                    payload_json text not null, status text not null, attempt integer not null,
-                    max_attempts integer not null, run_after text not null, lease_owner text,
-                    lease_until text, idempotency_key text, last_error text,
-                    created_at text not null, updated_at text not null
-                );",
-            )
-            .unwrap();
-        }
-        let queue = SqliteQueue::open(&path).unwrap();
-        let item = queue.enqueue(request("upgraded")).await.unwrap().item;
-        queue
-            .claim_item(&item.item_id, "worker", 60, None)
-            .await
-            .unwrap()
-            .unwrap();
-        queue
-            .fail_with(
-                &item.item_id,
-                "worker",
-                Failure {
-                    error: "timed out".to_string(),
-                    error_class: Some("timeout".to_string()),
-                    run_after: None,
-                },
-            )
-            .await
-            .unwrap();
-        let failed = queue.get(&item.item_id).unwrap().unwrap();
-        assert_eq!(failed.last_error_class.as_deref(), Some("timeout"));
-        // Opening again finds the column and changes nothing.
-        SqliteQueue::open(&path).unwrap();
     }
 
     struct CountingSink(AtomicUsize);

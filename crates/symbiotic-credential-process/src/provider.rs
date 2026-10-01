@@ -6,24 +6,24 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use symbiotic_ai_runtime::{
-    model::{GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
+    model::{CredentialBoundary, GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
     *,
 };
 use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, ProviderPayload};
 use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 
 #[derive(Clone)]
-struct SafeChat {
+struct DispatchedChat {
     inner: OpenAiCompatibleChatProvider,
     started: Arc<AtomicBool>,
 }
 #[derive(Clone)]
-struct SafeEmbedding {
+struct DispatchedEmbedding {
     inner: GeminiEmbeddingProvider,
     started: Arc<AtomicBool>,
 }
 
-impl ModelProvider for SafeChat {
+impl ModelProvider for DispatchedChat {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
@@ -32,9 +32,13 @@ impl ModelProvider for SafeChat {
     }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
-impl ModelProvider for SafeEmbedding {
+impl ModelProvider for DispatchedEmbedding {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
@@ -43,24 +47,26 @@ impl ModelProvider for SafeEmbedding {
     }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 #[async_trait]
-impl ChatProvider for SafeChat {
+impl ChatProvider for DispatchedChat {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.chat(request).await?;
-        response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
 }
 #[async_trait]
-impl EmbeddingProvider for SafeEmbedding {
+impl EmbeddingProvider for DispatchedEmbedding {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.embed(request).await?;
-        response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -261,14 +267,6 @@ pub(crate) async fn execute(
     payload: ProviderPayload,
     attempt_digest: &str,
 ) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
-    // Ambient proxies must not reroute an admitted destination or receive its secret.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(std::time::Duration::from_secs(route.timeout_seconds))
-        .build()
-        .map_err(|_| EgressError::InvalidRequest)?;
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
         (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(mut request)) => {
@@ -276,14 +274,15 @@ pub(crate) async fn execute(
             request.source = Some(attempt_digest.to_owned());
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
-            let provider = SafeChat {
+            let provider = DispatchedChat {
                 inner: OpenAiCompatibleChatProvider::new(
                     operator,
                     &route.model,
                     &route.destination,
                     secret.value(),
                 )
-                .with_client(client)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
                 .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes)
                 .with_output_limit(route.max_output_tokens),
@@ -317,14 +316,15 @@ pub(crate) async fn execute(
             request.source = Some(attempt_digest.to_owned());
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
-            let provider = SafeEmbedding {
+            let provider = DispatchedEmbedding {
                 inner: GeminiEmbeddingProvider::new(
                     "gemini",
                     &route.model,
                     secret.value(),
                     *dimensions,
                 )
-                .with_client(client)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
                 .with_request_limit(route.max_input_bytes)
                 .with_response_limit(route.max_response_bytes),
                 started: started.clone(),

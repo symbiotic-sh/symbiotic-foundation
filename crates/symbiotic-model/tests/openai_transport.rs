@@ -249,7 +249,7 @@ async fn configured_response_limit_refuses_oversized_body() {
         .await;
     server.join().unwrap();
     assert!(
-        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
+        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "credential-bearing provider failure")
     );
 }
 
@@ -261,12 +261,11 @@ async fn configured_request_limit_refuses_wire_body_before_connecting() {
     let result = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
         .with_request_limit(65536)
         .with_response_limit(65536)
-        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
         .with_request_limit(1)
         .chat(request())
         .await;
     assert!(
-        matches!(result, Err(symbiotic_model::ModelError::InvalidRequest(message)) if message == "provider request limit exceeded")
+        matches!(result, Err(symbiotic_model::ModelError::InvalidRequest(message)) if message == "credential-bearing provider failure")
     );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
@@ -289,7 +288,6 @@ async fn configured_request_limit_accepts_exact_encoded_body_size() {
     OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "synthetic-key")
         .with_request_limit(65536)
         .with_response_limit(65536)
-        .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
         .with_request_limit(serde_json::to_vec(&expected).unwrap().len())
         .chat(request)
         .await
@@ -320,7 +318,7 @@ async fn chunked_response_is_capped_without_content_length() {
         .await;
     server.join().unwrap();
     assert!(
-        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "provider response limit exceeded")
+        matches!(result, Err(symbiotic_model::ModelError::Provider(message)) if message == "credential-bearing provider failure")
     );
 }
 #[tokio::test]

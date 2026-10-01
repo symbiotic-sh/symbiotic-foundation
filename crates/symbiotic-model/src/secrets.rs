@@ -45,6 +45,34 @@ impl From<&String> for SecretValue<String> {
     }
 }
 
+/// Opaque Foundation-owned credential guard for adapter composition.
+/// It can be forwarded or cloned, but exposes neither the secret nor a policy
+/// override. Only Foundation constructs it; every result uses the same boundary.
+/// ```compile_fail
+/// use symbiotic_model::{OpenAiCompatibleChatProvider, ModelProvider};
+/// let provider = OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "key");
+/// println!("{:?}", provider.credential_boundary().unwrap());
+/// ```
+/// ```compile_fail
+/// use symbiotic_model::{OpenAiCompatibleChatProvider, ModelProvider};
+/// let provider = OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "key");
+/// println!("{}", provider.credential_boundary().unwrap().secret());
+/// ```
+#[derive(Clone)]
+pub struct CredentialBoundary {
+    key: SecretValue<String>,
+}
+
+impl CredentialBoundary {
+    pub(crate) fn new(key: SecretValue<String>) -> Self {
+        Self { key }
+    }
+
+    pub(crate) fn secret(&self) -> &str {
+        self.key.as_str()
+    }
+}
+
 /// Preserve useful error classes without retaining provider-controlled bytes.
 pub(crate) fn safe_error(error: crate::ModelError) -> crate::ModelError {
     use crate::ModelError;
@@ -55,13 +83,38 @@ pub(crate) fn safe_error(error: crate::ModelError) -> crate::ModelError {
         ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(safe),
         ModelError::Timeout(_) => ModelError::Timeout(safe),
         ModelError::Unavailable(_) => ModelError::Unavailable(safe),
-        _ => ModelError::Provider(safe),
+        ModelError::InvalidRequest(_) => ModelError::InvalidRequest(safe),
+        ModelError::Queue(_) => ModelError::Queue(safe),
+        ModelError::Cache(_) => ModelError::Cache(safe),
+        ModelError::Unsupported(capability) => ModelError::Unsupported(capability),
+        ModelError::Provider(_) => ModelError::Provider(safe),
     }
 }
 
-/// The finite encoding set previously enforced by the credential process.
+fn numeric_spellings(number: &serde_json::Number) -> Vec<String> {
+    let mut spellings = vec![number.to_string()];
+    if let Some(value) = number.as_f64() {
+        spellings.push(value.to_string());
+        if let Ok(value) = serde_json::to_string(&value) {
+            spellings.push(value);
+        }
+        let value = value as f32;
+        if value.is_finite() {
+            spellings.push(value.to_string());
+            if let Ok(value) = serde_json::to_string(&value) {
+                spellings.push(value);
+            }
+        }
+    }
+    spellings
+}
+
+/// The finite credential encoding set, including numeric re-spellings.
 fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate::ModelError> {
     let mut encodings = SecretValue::new(vec![secret.to_owned()]);
+    if let Ok(serde_json::Value::Number(number)) = serde_json::from_str(secret) {
+        encodings.extend(numeric_spellings(&number));
+    }
     let escaped = SecretValue::new(
         serde_json::to_string(secret)
             .map_err(|_| crate::ModelError::Provider("invalid credential encoding".into()))?,
@@ -94,7 +147,7 @@ fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate:
 }
 
 /// Refuse credential echoes in decoded strings, object keys and encoded numbers.
-/// Every HTTP adapter calls this before parsing or returning provider output.
+/// Used only by the complete adapter-result boundary.
 pub(crate) fn check_response(
     value: &serde_json::Value,
     secret: &str,
@@ -111,6 +164,9 @@ pub(crate) fn check_response(
             serde_json::Value::Object(values) => values
                 .iter()
                 .any(|(key, value)| contains_text(key, encodings) || contains(value, encodings)),
+            serde_json::Value::Number(number) => numeric_spellings(number)
+                .iter()
+                .any(|text| contains_text(text, encodings)),
             _ => false,
         }
     }
@@ -128,16 +184,82 @@ pub(crate) fn check_response(
     Ok(())
 }
 
-/// Check the final typed response too, including numbers normalized by an adapter.
-pub(crate) fn checked_response<T: serde::Serialize>(
-    response: T,
-    secret: &str,
+/// Type erasure for dynamic/composed adapters. Policy is still enforced only
+/// by `credential_boundary` using the credential owner's opaque guard.
+pub(crate) fn composed_result<T: serde::Serialize + serde::de::DeserializeOwned>(
+    provider: &dyn crate::ModelProvider,
+    result: Result<T, crate::ModelError>,
 ) -> Result<T, crate::ModelError> {
-    if !secret.is_empty() {
-        let value = serde_json::to_value(&response)
-            .map_err(|_| crate::ModelError::Provider("invalid provider response".into()))?;
-        check_response(&value, secret)?;
+    let Some(boundary) = provider.credential_boundary() else {
+        if provider.credential_fingerprint().is_some()
+            || !matches!(
+                provider.descriptor().auth_mode,
+                crate::ProviderAuthMode::None
+            )
+        {
+            return Err(crate::ModelError::Provider(
+                "credential result boundary is unavailable".into(),
+            ));
+        }
+        return result;
+    };
+    let result = result.and_then(|response| {
+        serde_json::to_value(response)
+            .map_err(|_| crate::ModelError::Provider("invalid adapter response".into()))
+    });
+    let value = credential_boundary(result, boundary)?;
+    // Decode only Foundation's own typed serialization after the boundary.
+    serde_json::from_value(value)
+        .map_err(|_| crate::ModelError::Provider("invalid adapter response".into()))
+}
+
+/// Responses crossing the credential boundary must surrender raw provider JSON.
+pub(crate) trait CredentialResponse: serde::Serialize {
+    fn discard_raw(&mut self);
+}
+
+// The erased representation used by object-safe composed adapters. It follows
+// the same inspection and raw-disposal path as concrete responses.
+impl CredentialResponse for serde_json::Value {
+    fn discard_raw(&mut self) {
+        if let Some(object) = self.as_object_mut() {
+            object.remove("raw_provider_response");
+        }
     }
+}
+
+macro_rules! credential_response {
+    ($($response:ty),+ $(,)?) => {$(
+        impl CredentialResponse for $response {
+            fn discard_raw(&mut self) {
+                self.raw_provider_response = None;
+            }
+        }
+    )+};
+}
+credential_response!(
+    crate::ChatResponse,
+    crate::EmbeddingResponse,
+    crate::ClassifyResponse
+);
+
+/// The sole credential boundary for a complete adapter result, after HTTP,
+/// typed decoding and answer validation, and before runtime bookkeeping.
+/// Inspect raw JSON and the final typed value together; never export raw JSON
+/// or provider-controlled error text from a credential-bearing call.
+pub(crate) fn credential_boundary<T: CredentialResponse>(
+    result: Result<T, crate::ModelError>,
+    boundary: &CredentialBoundary,
+) -> Result<T, crate::ModelError> {
+    let secret = boundary.secret();
+    if secret.is_empty() {
+        return result;
+    }
+    let mut response = result.map_err(safe_error)?;
+    let value = serde_json::to_value(&response)
+        .map_err(|_| safe_error(crate::ModelError::Provider(String::new())))?;
+    check_response(&value, secret)?;
+    response.discard_raw();
     Ok(response)
 }
 
@@ -169,9 +291,9 @@ mod tests {
     #[test]
     fn normalized_numeric_output_cannot_echo_credentials() {
         let raw: serde_json::Value = serde_json::from_str("1.234e8").unwrap();
-        assert!(check_response(&raw, "123400000").is_ok());
+        assert!(check_response(&raw, "123400000").is_err());
         let normalized: f32 = serde_json::from_value(raw).unwrap();
-        assert!(checked_response(vec![normalized], "123400000").is_err());
+        assert!(check_response(&serde_json::json!([normalized]), "123400000").is_err());
     }
     #[test]
     fn invalid_embedding_error_is_sanitized_as_provider_failure() {
