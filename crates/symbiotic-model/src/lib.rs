@@ -3197,6 +3197,17 @@ struct GeminiEmbedding {
     values: Vec<f32>,
 }
 
+impl GeminiEmbedding {
+    fn into_values(self) -> Result<Vec<f32>, ModelError> {
+        if self.values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Provider(
+                "Gemini embedding contains non-finite components".into(),
+            ));
+        }
+        Ok(self.values)
+    }
+}
+
 #[async_trait]
 impl EmbeddingProvider for GeminiEmbeddingProvider {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
@@ -3247,7 +3258,7 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                     .ok_or_else(|| {
                         ModelError::Provider("Gemini response missing embedding".to_string())
                     })?
-                    .values,
+                    .into_values()?,
             ]
         } else {
             let resp = self
@@ -3280,8 +3291,8 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
             }
             embeddings
                 .into_iter()
-                .map(|embedding| embedding.values)
-                .collect()
+                .map(GeminiEmbedding::into_values)
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(EmbeddingResponse {
             dimensions: self.dimensions,
@@ -3402,6 +3413,53 @@ mod tests {
     use std::time::Duration;
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
+
+    #[test]
+    fn gemini_single_embedding_rejects_non_finite_components() {
+        for number in ["1e39", "-1e39"] {
+            let raw: GeminiEmbedWireResponse =
+                serde_json::from_str(&format!(r#"{{"embedding":{{"values":[0.25,{number}]}}}}"#))
+                    .unwrap();
+            assert!(matches!(raw.embedding.unwrap().into_values(),
+                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+        }
+        let raw: GeminiEmbedWireResponse =
+            serde_json::from_str(r#"{"embedding":{"values":[0.25,-0.5,3e38]}}"#).unwrap();
+        let values = raw.embedding.unwrap().into_values().unwrap();
+        assert_eq!(values.len(), 3);
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn gemini_batch_embedding_rejects_non_finite_components() {
+        for number in ["1e39", "-1e39"] {
+            let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(&format!(
+                r#"{{"embeddings":[{{"values":[0.25,0.5]}},{{"values":[-0.5,{number}]}}]}}"#
+            ))
+            .unwrap();
+            let result: Result<Vec<_>, _> = raw
+                .embeddings
+                .unwrap()
+                .into_iter()
+                .map(GeminiEmbedding::into_values)
+                .collect();
+            assert!(matches!(result,
+                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+        }
+        let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(
+            r#"{"embeddings":[{"values":[0.25,0.5]},{"values":[-0.5,3e38]}]}"#,
+        )
+        .unwrap();
+        let vectors: Vec<_> = raw
+            .embeddings
+            .unwrap()
+            .into_iter()
+            .map(GeminiEmbedding::into_values)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().flatten().all(|value| value.is_finite()));
+    }
 
     #[cfg(feature = "queue")]
     static TEST_QUEUE_COUNTER: AtomicUsize = AtomicUsize::new(0);

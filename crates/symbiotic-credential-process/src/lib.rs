@@ -342,6 +342,7 @@ impl CredentialProcess {
             tokio::task::spawn_blocking(move || Secret::from_bytes(source.load(max)?)).await;
         let mut output = None;
         let mut error = None;
+        let mut diagnostics = Vec::new();
         match secret {
             Ok(Ok(secret)) => {
                 match provider::execute(
@@ -353,7 +354,8 @@ impl CredentialProcess {
                 )
                 .await
                 {
-                    Ok((answer, usage)) => {
+                    Ok((answer, usage, runtime_diagnostics)) => {
+                        diagnostics = runtime_diagnostics;
                         receipt.status = DispatchStatus::Succeeded;
                         receipt.usage = usage;
                         receipt.charge = ChargeReport::Measured {
@@ -386,6 +388,7 @@ impl CredentialProcess {
         // previously committed Unknown remains conservative for restart/reconciliation.
         let mut result = DispatchResult {
             error,
+            diagnostics,
             receipt,
             output,
             receipt_persisted: true,
@@ -416,6 +419,8 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         || route.max_response_bytes == 0
         || route.max_output_tokens == 0
         || route.max_in_flight == 0
+        || route.requests_per_minute == Some(0)
+        || route.input_units_per_minute == Some(0)
         || route.timeout_seconds == 0
         || route.max_response_bytes > max_frame as usize / 4
         || route.max_input_bytes > max_frame as usize / 2

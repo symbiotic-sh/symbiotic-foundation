@@ -9,8 +9,8 @@ use symbiotic_ai_runtime::{
     model::{GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
     *,
 };
-use symbiotic_egress::{EgressError, ProviderOutput, ProviderPayload};
-use symbiotic_trace::UsageTrace;
+use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, ProviderPayload};
+use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 
 #[derive(Clone)]
 struct SafeChat {
@@ -160,13 +160,34 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
     .map_err(|_| EgressError::InvalidRequest)
 }
 
+fn completed(
+    output: ProviderOutput,
+    trace: ModelInvocationTrace,
+) -> (ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    if let Some(entries) = trace.metadata[RUNTIME_DIAGNOSTICS].as_array() {
+        for entry in entries {
+            let diagnostic = match entry["kind"].as_str() {
+                Some("queue_complete_failed") => DispatchDiagnostic::QueueCompleteFailed,
+                Some("trace_write_failed") => DispatchDiagnostic::TraceWriteFailed,
+                Some("response_cache_write_failed") => DispatchDiagnostic::ResponseCacheWriteFailed,
+                _ => continue,
+            };
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    (output, trace.usage, diagnostics)
+}
+
 pub(crate) async fn execute(
     runtime: &Runtime,
     route: &RouteConfig,
     secret: Arc<Secret>,
     payload: ProviderPayload,
     attempt_digest: &str,
-) -> Result<(ProviderOutput, UsageTrace), ExecuteError> {
+) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
     // Ambient proxies must not reroute an admitted destination or receive its secret.
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -211,11 +232,11 @@ pub(crate) async fn execute(
                 },
                 may_have_dispatched: started.load(Ordering::SeqCst),
             })?;
-            Ok((
+            Ok(completed(
                 ProviderOutput::Chat {
                     text: response.text,
                 },
-                response.trace.usage,
+                response.trace,
             ))
         }
         (
@@ -251,12 +272,12 @@ pub(crate) async fn execute(
                     },
                     may_have_dispatched: started.load(Ordering::SeqCst),
                 })?;
-            Ok((
+            Ok(completed(
                 ProviderOutput::Embedding {
                     vectors: response.vectors,
                     dimensions: response.dimensions,
                 },
-                response.trace.usage,
+                response.trace,
             ))
         }
         _ => Err(EgressError::InvalidRequest.into()),
@@ -266,6 +287,85 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingTrace;
+    #[async_trait]
+    impl symbiotic_trace::TraceSink for FailingTrace {
+        async fn record_model_invocation(
+            &self,
+            _: ModelInvocationTrace,
+        ) -> Result<(), symbiotic_trace::TraceError> {
+            Err(symbiotic_trace::TraceError::Sink(
+                "private sink detail".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_runtime_failure_projects_only_static_diagnostics() {
+        let runtime = Runtime::open(RuntimeConfig {
+            trace_sink: Some(Arc::new(FailingTrace)),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let provider = runtime
+            .embedding(ModelBinding::new(model::HashEmbeddingProvider::new(2)))
+            .unwrap();
+        let mut response = provider
+            .embed(EmbeddingRequest {
+                inputs: vec!["synthetic input".into()],
+                dimensions: None,
+                task: None,
+                sensitivity: symbiotic_egress::Sensitivity::Private,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+        assert!(
+            response
+                .trace
+                .metadata
+                .to_string()
+                .contains("private sink detail")
+        );
+        // Extra metadata and unknown diagnostic kinds must not cross this boundary.
+        response.trace.metadata[RUNTIME_DIAGNOSTICS]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"kind": "private unknown kind", "error": "private detail"}));
+        response.trace.usage.input_tokens = Some(7);
+        let expected_vectors = response.vectors.clone();
+        let (output, usage, diagnostics) = completed(
+            ProviderOutput::Embedding {
+                vectors: response.vectors,
+                dimensions: response.dimensions,
+            },
+            response.trace,
+        );
+        assert!(
+            matches!(output, ProviderOutput::Embedding { vectors, dimensions: 2 }
+            if vectors == expected_vectors)
+        );
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(diagnostics, vec![DispatchDiagnostic::TraceWriteFailed]);
+        assert_eq!(
+            serde_json::to_string(&diagnostics).unwrap(),
+            r#"["trace_write_failed"]"#
+        );
+        assert!(serde_json::from_str::<DispatchDiagnostic>(r#""private unknown kind""#).is_err());
+    }
+
+    #[test]
+    fn invalid_embedding_error_is_sanitized_as_provider_failure() {
+        let error = safe_error(ModelError::Provider(
+            "Gemini embedding contains non-finite components".into(),
+        ));
+        assert!(matches!(error, ModelError::Provider(message)
+            if message == "credential-process provider failure"));
+    }
+
     #[test]
     fn numeric_provider_values_cannot_echo_credential_bytes() {
         let secret = Secret::from_bytes(zeroize::Zeroizing::new(b"123456789".to_vec())).unwrap();

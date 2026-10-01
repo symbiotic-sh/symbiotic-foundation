@@ -1094,6 +1094,79 @@ async fn expanded_wire_payload_is_refused(embedding: bool) {
 }
 
 #[tokio::test]
+async fn zero_request_pacing_is_refused_at_route_validation() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    fixture.config.routes[0].requests_per_minute = Some(0);
+    assert!(matches!(
+        CredentialProcess::open(fixture.config.clone()),
+        Err(EgressError::InvalidRequest)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.config.routes[0].requests_per_minute = None;
+    assert!(CredentialProcess::open(fixture.config).is_ok());
+}
+
+#[tokio::test]
+async fn zero_input_pacing_is_refused_at_route_validation() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    fixture.config.routes[0].input_units_per_minute = Some(0);
+    assert!(matches!(
+        CredentialProcess::open(fixture.config.clone()),
+        Err(EgressError::InvalidRequest)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.config.routes[0].input_units_per_minute = None;
+    assert!(CredentialProcess::open(fixture.config).is_ok());
+}
+
+#[tokio::test]
+async fn runtime_bookkeeping_failure_retains_paid_output_and_safe_diagnostic() {
+    let fixture = Fixture::new(200, "paid answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let db = rusqlite::Connection::open(fixture.config.state_dir.join("queue.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_completion BEFORE UPDATE OF status ON queue_items
+        WHEN NEW.status = 'succeeded'
+        BEGIN SELECT RAISE(FAIL, 'private bookkeeping failure'); END;",
+    )
+    .unwrap();
+    let (admission, payload) = fixture.attempt("completion-failure", 1, 1);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(&process, inject(admission.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        wire["diagnostics"],
+        serde_json::json!(["queue_complete_failed"])
+    );
+    assert!(!wire.to_string().contains("private bookkeeping failure"));
+    assert!(!wire.to_string().contains(SECRET));
+    assert_eq!(result.error, None);
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert!(result.receipt_persisted);
+    assert!(matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "paid answer"));
+    assert_eq!(result.receipt.usage.input_tokens, Some(7));
+    assert_eq!(result.receipt.usage.output_tokens, Some(3));
+    assert_eq!(
+        result.receipt.charge,
+        ChargeReport::Measured {
+            unit: "provider_requests".into(),
+            amount: 1
+        }
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    drop(process);
+    let process = fixture.process();
+    let AttemptStatus::Completed { result } = status(&process, &admission).await else {
+        panic!("missing completed result");
+    };
+    assert_eq!(serde_json::to_value(result).unwrap(), wire);
+}
+
+#[tokio::test]
 async fn conflicting_shared_route_limits_are_refused_at_startup() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     for field in ["concurrency", "requests", "input"] {

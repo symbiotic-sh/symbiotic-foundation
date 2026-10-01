@@ -376,12 +376,26 @@ pub struct DispatchReceipt {
     pub charge: ChargeReport,
 }
 
+/// Static runtime bookkeeping failures; never contain raw diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchDiagnostic {
+    /// The paid response could not be recorded as complete in the runtime queue.
+    QueueCompleteFailed,
+    /// The runtime could not persist the invocation trace.
+    TraceWriteFailed,
+    /// The runtime could not persist its response cache.
+    ResponseCacheWriteFailed,
+}
+
 /// Typed response to credential injection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchResult {
     /// Static failure code alongside accounting; absent only on success.
     pub error: Option<EgressError>,
+    /// Runtime side effects that failed without discarding the paid answer or usage.
+    pub diagnostics: Vec<DispatchDiagnostic>,
     /// False if the receipt write failed; restart still reports the earlier unknown charge.
     pub receipt_persisted: bool,
     /// Status and accounting.

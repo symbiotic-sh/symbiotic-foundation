@@ -405,6 +405,7 @@ mod tests {
         let receipt = registry.consume(&attempt, &grant.permit).unwrap();
         registry
             .finish(&DispatchResult {
+                diagnostics: Vec::new(),
                 receipt,
                 output: Some(ProviderOutput::Chat {
                     text: "retained".into(),
@@ -487,6 +488,7 @@ mod tests {
         };
         registry
             .finish(&DispatchResult {
+                diagnostics: Vec::new(),
                 receipt,
                 output: None,
                 error: Some(EgressError::CredentialUnavailable),
@@ -536,6 +538,7 @@ mod tests {
             receipt.charge = charge;
             registry
                 .finish(&DispatchResult {
+                    diagnostics: Vec::new(),
                     receipt,
                     output: None,
                     error: Some(EgressError::CredentialUnavailable),
@@ -581,6 +584,7 @@ mod tests {
         };
         registry
             .finish(&DispatchResult {
+                diagnostics: Vec::new(),
                 receipt,
                 output: Some(ProviderOutput::Chat {
                     text: "retained".into(),

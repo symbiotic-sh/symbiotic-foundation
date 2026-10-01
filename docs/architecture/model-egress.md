@@ -25,7 +25,7 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 | `ProviderPayload` | `Chat(ChatRequest)` or `Embedding(EmbeddingRequest)`; use its `digest()` helper, never a separately implemented serialization |
 | `DispatchPermit { token, attempt_digest }` | Opaque random capability, accepted exactly once, including across process restarts |
 | `InjectProviderCredential` | `operation_version`, `admission`, `permit`, `payload` |
-| `DispatchResult` | `receipt`, optional typed `output`, optional static `error: EgressError`, `receipt_persisted` |
+| `DispatchResult` | `receipt`, optional typed `output`, optional static `error: EgressError`, typed `diagnostics: Vec<DispatchDiagnostic>`, `receipt_persisted` |
 | `DispatchReceipt` | `attempt_digest`, `DispatchStatus`, provider-reported `UsageTrace`, `ChargeReport` |
 | `ProviderOutput` | Chat text or embedding vectors/dimensions; no raw provider response, raw error, credentials or trace metadata |
 
@@ -209,6 +209,10 @@ and other charges require reconciliation, so earlier history needs no aggregate 
 If the atomic final result/receipt write fails, the paid output still returns with
 `receipt_persisted = false`; restart retains the earlier unknown reservation and
 `Dispatched` state. Memory must record the received receipt itself.
+Runtime queue-completion, trace-write and response-cache-write failures return the
+static `queue_complete_failed`, `trace_write_failed` and `response_cache_write_failed`
+diagnostics alongside the paid output and measured charge, even when the separate
+registry write succeeds. Raw runtime diagnostic strings are never forwarded.
 
 V2 accepts only `ReservedBudget.unit = "provider_requests"`, `amount = 1`, with a finite
 invocation limit and `max_attempts`. The adapters enforce one HTTP request per permit:
@@ -234,7 +238,8 @@ Each route requires all `RouteConfig` fields documented in the Rust type, includ
 finite field/input/response/token/concurrency/timeout limits. Startup registers every
 route with the runtime and refuses conflicting concurrency or pacing limits for a
 shared model queue, including routes in different tenants. Unknown config fields
-are refused. `requests_per_minute` and `input_units_per_minute` can be null.
+are refused. `requests_per_minute` and `input_units_per_minute` must be positive
+when present; null leaves pacing unrestricted.
 
 Both admission and provider sources use one of:
 
@@ -269,6 +274,8 @@ The safe provider wrapper rejects a response containing the injected credential 
 any declared representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8
 (upper/lower hex), standard Base64 and URL-safe Base64 (padded/unpadded). It scans string
 values before forwarding and discards raw errors before the runtime can log them.
+The shared Gemini adapter rejects non-finite embedding components in single and
+batch responses with a static provider failure; dispatch retains an unknown charge.
 Other transformations are outside that finite guarantee. Persistent response caching,
 request debug capture and raw trace metadata forwarding are disabled. Provider-side
 cache isolation remains a route/deployment admission requirement; the broker does not
