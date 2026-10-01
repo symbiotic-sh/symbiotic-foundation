@@ -141,8 +141,9 @@ impl CredentialProcess {
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
-        // Extend the existing runtime database with replay protection, not a new
-        // execution ledger or scheduling queue. Memory remains the accounting owner.
+        // Extend the existing runtime database with replay and charge-recovery state.
+        // Reuse its scheduler; the canonical Foundation spend ledger remains
+        // implementation work under docs/architecture/boundary.md.
         let registry =
             Registry::open(&config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE))?;
         Ok(Self {

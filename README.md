@@ -31,8 +31,9 @@ Reusable Rust contracts for durable AI work:
   CSV/Markdown presentations; no Memory or application mutation dependency.
 
 This repository is contract-first. It intentionally does not own Symbiotic memory, Archive,
-Gatekeeper, Vault, Matrix transport, or agent role evolution. Product runtimes compose these crates
-and decide policy.
+Gatekeeper, Vault, Matrix transport, or agent role evolution.
+Ownership follows the [boundary contract](docs/architecture/boundary.md#ownership);
+current API gaps are documented in the architecture pages.
 
 ## Why This Exists
 
@@ -45,4 +46,4 @@ symbiotic-runtime -> foundation implementations + policy
 foundation        -> no dependency on memory/runtime
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/MIGRATION.md](docs/MIGRATION.md).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current crate map.

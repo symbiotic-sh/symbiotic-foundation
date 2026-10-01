@@ -12,9 +12,15 @@ back, so each product would build its own.
 `symbiotic-model` now owns that seam beside chat, embedding and rerank:
 `ModelCapability::Classify`, the `ClassifierProvider` trait, request and
 response types, a queue wrapper, and three providers. Thresholds and decisions
-stay with the caller.
+stay with the caller. The [boundary contract](boundary.md#ownership) governs
+product classification meaning, explicit Memory-run registered tasks and provider
+data authorization. This page describes the current classification API.
 
-## Contract
+## Current API shape
+
+The excerpt shows the task and response shape; it is not a complete struct
+literal. Obsolete policy fields still in the Rust types are pending removal under
+the [boundary contract](boundary.md#tenant-provider-bindings-and-data-access).
 
 ```rust
 #[async_trait]
@@ -26,7 +32,6 @@ pub struct ClassifyRequest {
     pub state: serde_json::Map<String, Value>, // the content classified
     pub questions: Vec<ClassifierQuestion>,    // answered independently, in order
     pub state_description: Option<String>,     // prompt opening for chat-backed providers
-    pub sensitivity: Sensitivity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
     pub metadata: Value,
@@ -80,9 +85,10 @@ and one trace per call. Its cache
 entries live under `{cache}/classify/{descriptor hash}/`, so classifiers with
 different identities or expected served models never share an entry. The
 other wrappers keep the historical `{cache}/{kind}/{request hash}` path, which
-does not include the model: two chat models sharing a cache directory can read
-each other's answers. That pre-existing defect is left for a separate change,
-because moving those paths would invalidate existing caches.
+does not include the model: two chat models sharing that lower-level cache
+directory can read each other's answers. Runtime-owned caches add descriptor
+scoping, but complete tenant/configuration result identity remains cleanup work
+required by [boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
 
 ## Providers
 
@@ -97,7 +103,9 @@ because moving those paths would invalidate existing caches.
 `JevClassifierProvider::typesafe(key)` targets `https://api.typesafe.ai/v1`
 with the pinned `jev-1.13.0`; `new(operator, model, base_url, key)` targets any
 host of the same API, and `from_resolver` obtains the key through the host's
-`CredentialResolver` (a bearer token or API key). Before sending it refuses
+`CredentialResolver` (a bearer token or API key). These current constructors
+are transport APIs; credential ownership and consumer adoption follow
+[boundary.md](boundary.md#storage-and-credentials). Before sending it refuses
 Jev 1.13's documented limits: 255 Choice options, 10 Score levels, 32,000
 tokens for the state plus the longest question, 64,000 for the request.
 Tokens are estimated as one per UTF-8 byte of JSON plus a 512-token template
@@ -106,7 +114,12 @@ response must name the expected served model (by default the requested one;
 `with_served_model` accepts a gateway's snapshot name), because thresholds are
 tuned on one version. HTTP statuses use the crate's classification: 408/504
 time out, 429 is rate limited, 5xx (including TypeSafe's 529 Overloaded) is
-unavailable; all three are retryable. Answers that do not match the questions
+unavailable. The current queue policy treats all three as retryable without proving
+zero charge; this is the [runtime retry gap](ai-runtime.md#policy-knobs).
+Opt-in `retry_provider_errors` also retries
+`ModelError::Provider` without checking charge certainty under the same gap.
+Retry admission follows the [spend contract](boundary.md#spend-ledger-and-budgets).
+Answers that do not match the questions
 are `ModelError::Provider`: a missing or extra answer, a wrong kind, a choice
 outside the options or not among the most probable, a distribution that sums
 more than 0.02 from 1 (it is then rescaled), confidence outside `[0, 1]`, or a
@@ -128,9 +141,10 @@ reply must be exactly that object: every question answered, no other keys,
 numbers in `[0, 1]`, Choice and Score keys exactly the requested ids. A label
 outside the offered ids therefore cannot be returned; it fails the call and
 the caller decides the fallback. Choice and Score probabilities are normalised
-to sum to 1, and `chosen` is the most probable id. The provider class follows
-the chat provider, so sensitivity routing keeps private content on a local
-model. Pass a `QueuedChatProvider` to share the chat model's queue.
+to sum to 1, and `chosen` is the most probable id. Provider class is descriptive;
+authorization follows [boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
+Consumers obtain classifiers through `Runtime::classifier`; queue wrappers and
+chat-provider composition stay inside Foundation.
 
 ## Defaults and pricing
 
@@ -145,7 +159,8 @@ structured output, `CostClass::Budget`, and the new advisory
 42_000, output_micro_usd_per_million_tokens: 0 }` ($0.042 per million input
 tokens, output free). `ModelPricing::cost_micro_usd(input, output)` estimates a
 call; a provider-reported cost, when present, stays in trace metadata as
-`reported_cost_usd`.
+`reported_cost_usd`. Accounting and monetary guarantees follow the
+[spend contract](boundary.md#spend-ledger-and-budgets).
 
 ## Gateways
 

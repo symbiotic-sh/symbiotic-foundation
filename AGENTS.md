@@ -5,9 +5,9 @@ Shared operating rules: the installed House Rules `AGENTS.md`; layout and naming
 ## Project references
 
 - [README.md](README.md): workspace purpose and crate responsibilities.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): crate boundaries and host-owned policy.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): current crate map and implementation gaps.
 - [docs/architecture/ai-runtime.md](docs/architecture/ai-runtime.md): the model-call entry point and runtime behavior.
-- [docs/MIGRATION.md](docs/MIGRATION.md): consumer adoption and remaining migration work.
+- [docs/architecture/boundary.md](docs/architecture/boundary.md): authoritative boundary contract.
 
 ## Build and verification
 

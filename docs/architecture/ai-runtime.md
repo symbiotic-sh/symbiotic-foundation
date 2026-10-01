@@ -6,6 +6,15 @@ provider stays inside the runtime: queueing, retries and backoff, rate and
 concurrency limits, cooldowns, attempt budgets, the response cache, traces,
 usage receipts and persistence.
 
+The [Foundation boundary contract](boundary.md) is authoritative for ownership,
+provider-principal authorization, spend, storage and supported modes. This page
+records current runtime behavior. Complete tenant/provider/configuration binding,
+explicit account isolation, canonical spend accounting and admission/maintenance
+bounds remain implementation work; this API alone supplies none of Memory's data
+authorization checks. The error-class retry gaps listed under
+[policy knobs](#policy-knobs) remain implementation work under the
+[spend contract](boundary.md#spend-ledger-and-budgets).
+
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 (issue #8).
 
@@ -23,6 +32,10 @@ let embed = runtime.embedding(ModelBinding::new(raw_embedder))?; // Arc<dyn Embe
 let rerank = runtime.rerank(ModelBinding::new(raw_reranker))?;   // Arc<dyn RerankProvider>
 let classify = runtime.classifier(ModelBinding::new(raw))?;      // Arc<dyn ClassifierProvider>
 ```
+
+This example shows current runtime assembly, not complete authorized credential
+dispatch. Credential-bearing transports stay inside Foundation; consumer adoption
+follows [boundary.md](boundary.md#ownership).
 
 A binding's `provider` is the raw transport: one of `symbiotic_model`'s HTTP
 providers, or a host type implementing the provider trait
@@ -60,16 +73,21 @@ so the state directory and everything in it are owner-only:
   entries, written through a temporary file and a rename.
 - A symlink, or a component owned by another user, anywhere under
   `responses/` or at the database files, is refused. It is never followed.
-  At open, components that an earlier version wrote with wider permissions
-  are tightened to `0700`/`0600`, so existing state keeps working.
+  The current implementation also tightens existing component permissions at open.
+  This does not establish a legacy-format compatibility requirement; state format
+  and unresolved-attempt handling follow
+  [boundary.md](boundary.md#storage-and-credentials).
 
 Queue records hold the request hash, never the request. A crash therefore
-cannot resume an in-flight call from the queue: the host re-issues its work,
-and the cache and attempt budget make the re-issue cheap and bounded. For
-example, a request that exhausted its attempts before a restart fails again
+cannot resume an in-flight call from the queue. Recovery requirements follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). The current credential backend
+provides [same-attempt recovery](model-egress.md#same-attempt-recovery-v2); the general
+runtime still requires that recovery integration. The cache and
+attempt budget are execution primitives, not spend reconciliation. For example,
+a request that exhausted its attempts before a restart fails again
 afterwards without another provider call.
 
-**Retention.** At open, and after every 10,000 finished calls, a persistent
+**Current retention settings.** At open, and after every 10,000 finished calls, a persistent
 runtime retires state older than `RuntimeConfig::retention` (seven days by
 default):
 
@@ -80,8 +98,14 @@ default):
   `response_max_bytes` (1 GiB by default). `None` disables either limit.
 
 An expired response also misses on read, before any sweep removes it.
+These are sweep-based soft cache limits, not hard byte admission bounds. Pending
+count/bytes and per-batch/idle work remain unbounded by these settings; see
+[boundary.md](boundary.md#bounds-as-labelled-settings).
 Periodic sweeps run on the blocking pool. A failed sweep is logged as a
 `tracing` warning and retried at the next interval; it never fails a call.
+This is a visibility gap: retention can stop without a caller-visible error.
+Visible maintenance failure reporting remains implementation work alongside the
+soft limits and unbounded maintenance noted above.
 A sweep or purge checks the whole cache tree before it deletes anything.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
@@ -94,10 +118,6 @@ matched by what its response's trace records: the request's `source` and
 by tenant or source puts that identity in the request's `source` or
 `role_binding`. The purge reads every entry once, so it suits erasure, not a
 hot path.
-
-Measured on one laptop with a 15 ms loopback provider, cap 64, 3,000 calls on
-one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
-1,750 calls/s.
 
 ## Calls in flight
 
@@ -136,7 +156,11 @@ There is no cancellation API. A provider that panics propagates the panic to
 the waiting caller; its lease is not renewed and expires after
 `lease_seconds`, as after a crash.
 
-## Shared limits
+## Current shared limits
+
+This describes current model/queue grouping, not the required tenant/account
+isolation. Explicit sharing and result identity follow
+[boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
 
 Every provider handed out for one queue shares the limits below. By default a
 queue is one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`); a
@@ -173,7 +197,11 @@ exhausted by a bad key is tried again with the new one. The fingerprint is
 one-way, and only a hash of it enters the queue's idempotency key. Neither
 the key nor the fingerprint is written to traces, receipts or queue
 payloads. A host provider without a credential returns `None`, and its
-budgets are keyed as before.
+budgets are keyed as before. This fresh queue budget does not establish charge
+certainty for an earlier attempt or authorize resubmitting an unknown charge;
+admission and recovery follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
+a known implementation gap.
 
 Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
@@ -181,6 +209,14 @@ fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
 per binding.
 
 ## Policy knobs
+
+Retry admission and recovery follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). The current `is_retryable`
+policy retries `ModelError::Timeout`, `ModelError::Unavailable` (5xx, including 529)
+and `ModelError::RateLimited` (429) without checking charge certainty. Opt-in
+`retry_provider_errors` adds `ModelError::Provider` to that policy. All four classes
+are known gaps across the shared queued chat, embedding, rerank and classification
+paths and remain implementation work.
 
 `ModelQueueConfig` fields:
 
@@ -194,8 +230,11 @@ per binding.
   (`QueueBackend::fail_with`), so no caller of the request retries earlier,
   and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
-  failures. Unavailable, rate-limited and timed-out calls always retry. Provider
-  errors never start a cooldown.
+  failures. `ModelQueueConfig::default()`
+  allows three attempts; DeepSeek catalogue policies allow four, and other catalogue
+  entries also permit multiple attempts. These settings expose the error-class
+  retry gaps listed above. Provider errors
+  never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
   debugging only: requests can contain sensitive text.
@@ -210,14 +249,22 @@ per binding.
   same class.
 - A lease that expires on an item's last allowed attempt, for example
   because the process crashed mid-call, ends the item as dead. A restarted
-  runtime does not make another paid attempt.
+  runtime does not make another paid attempt from that item. On a non-final
+  attempt, both queue backends instead mark the item failed and allow another
+  claim without checking the earlier attempt's charge certainty. This is another
+  recovery gap under the
+  [spend contract](boundary.md#spend-ledger-and-budgets).
 
 - `budget_renewal_seconds` (default `None`): once a request has exhausted
   its budget, later calls for the same request fail without a provider call
   while the queue remembers it. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
-  `Some(0)` gives every call its own budget, for hosts that schedule their own
-  retries. Renewing (and continuing a retry chain) replaces the dead item
+  `Some(0)` gives every call its own budget. These are current queue mechanics;
+  renewal does not prove zero charge or authorize resending an uncertain attempt.
+  Retry admission and recovery must follow
+  [boundary.md](boundary.md#spend-ledger-and-budgets); that alignment remains an
+  implementation gap.
+  Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
   budget over one another caller renewed in the meantime.
@@ -237,11 +284,17 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 - `CacheHit`, which repeats the original usage and receipt and makes no
   provider call.
 
-Cost estimation stays with the host's tariff: the receipt carries the token
-counts it needs. `QueueReceipt::redacted` replaces error text for logs that
-must not keep response bodies.
+These usage receipts support telemetry and cost reporting. They are not the
+canonical spend ledger or an enforceable monetary reservation. Accounting ownership
+and budget guarantees are specified in
+[boundary.md](boundary.md#spend-ledger-and-budgets). `QueueReceipt::redacted`
+replaces error text for logs that must not keep response bodies.
 
-## Side effects never change an outcome
+## Current post-provider writes
+
+The behavior below describes runtime cache/trace/queue writes. Foundation ledger
+reservation, settlement and unknown-charge recovery are durable obligations under
+[boundary.md](boundary.md#spend-ledger-and-budgets), not optional telemetry.
 
 Once the provider has answered, the call has been paid for, and the runtime
 returns the answer. The writes that follow are best-effort: the response
@@ -261,20 +314,16 @@ these writes fails:
 The same holds elsewhere. A cache hit whose trace write fails is still
 returned, with the diagnostic. A failed call keeps its own error when its
 failure trace or its cooldown cannot be written; those failures are logged,
-and the retry proceeds as scheduled.
+and any retry currently proceeds as scheduled. This does not establish safe retry
+admission; the current policy's charge-certainty gap is described above.
 
-## Response-cache compatibility
+## Custom response caches
 
-`ResponseCache` is the seam for a cache the runtime did not write. `load`
-receives the request kind, scope, request hash and the serialized request, so
-a host can compute its historical key, for example a hash of the raw prompt
-text, and return the stored response converted to the provider's response
-type. Returning `Ok(None)` falls through to a provider call. A host keeps an
-existing cache readable this way, and no re-run is needed.
-
-The runtime does not migrate foreign caches. A layout keyed by a one-way hash
-of inputs cannot be re-keyed without those inputs, so a host that must not pay
-twice keeps its reader as a `Custom` cache.
+`ResponseCache` is the seam for an alternate cache. `load` receives request kind,
+scope, request hash and the serialized request; `Ok(None)` falls through to a
+provider call. Custom caches must respect the result-identity and data-lifecycle
+contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access) and its
+[storage rules](boundary.md#storage-and-credentials).
 
 ## Backends and conformance
 

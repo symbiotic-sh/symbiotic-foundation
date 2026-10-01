@@ -1,5 +1,10 @@
 //! WP14 v2: Memory attests durable admission; Foundation owns credentials and dispatch.
 //! A signer must never sign an attempt until its K durability barrier has succeeded.
+//!
+//! These are the current v2 wire contracts. Memory-recorded reservations, processing
+//! markings and record-sequence route revocation reflect the existing implementation;
+//! canonical Foundation spend accounting and caller/provider grant-revision ordering
+//! remain implementation work under `docs/architecture/boundary.md`.
 
 pub use symbiotic_core::Sensitivity;
 pub use symbiotic_model::{ChatMessage, ChatRequest, EmbeddingRequest};
@@ -66,7 +71,8 @@ pub struct ReservedBudget {
     pub unit: String,
     /// Upper bound for this attempt; one request for the v2 adapters.
     pub amount: u64,
-    /// Invocation total, reserved atomically by Memory across attempts.
+    /// Current v2 invocation limit attested by Memory across attempts; canonical
+    /// reservation enforcement belongs to Foundation under the boundary contract.
     pub invocation_limit: u64,
 }
 
@@ -108,11 +114,13 @@ pub struct DurableAttempt {
     pub input_manifest_digest: String,
     /// Lowercase SHA-256 from [`ProviderPayload::digest`].
     pub input_digest: String,
-    /// Verified processing markings; empty is valid under unconfigured markings.
+    /// Existing v2 processing markings; empty is valid. The boundary contract uses
+    /// caller/provider read grants instead; this field does not attest those checks.
     pub markings: Vec<String>,
     /// Configured total attempts for this invocation.
     pub max_attempts: u32,
-    /// Trusted reservation already recorded by Memory.
+    /// Current v2 reservation attested by Memory. This is not evidence of a
+    /// canonical Foundation spend-ledger reservation under the boundary contract.
     pub reserved_budget: ReservedBudget,
 }
 
@@ -179,7 +187,9 @@ pub struct SignedAttempt {
     pub authentication: String,
 }
 
-/// Route restriction from Memory's serialization order.
+/// Current v2 route restriction from Memory's serialization order.
+/// This API does not establish the boundary contract's caller/provider
+/// grant-revision ordering at dispatch acceptance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRevocation {

@@ -16,8 +16,8 @@ hex.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-model = { path = "../symbiotic-model" }
 symbiotic-queue = { path = "../symbiotic-queue" }
-# The persistent backend. This crate is the only Foundation crate that links
-# SQLite; `symbiotic-model` and `symbiotic-queue` stay storage-free.
+# The persistent backend. `symbiotic-ai-runtime`, `symbiotic-queue-sqlite` and
+# `symbiotic-credential-process` link SQLite; the model/queue contracts do not.
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 symbiotic-trace = { path = "../symbiotic-trace" }
 tokio.workspace = true

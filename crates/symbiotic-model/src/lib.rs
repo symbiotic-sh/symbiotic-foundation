@@ -1,7 +1,9 @@
 //! Provider-neutral model runtime contracts.
 //!
 //! Implementations may wrap HTTP SDKs, local CLIs, subscription-backed tools,
-//! or host-owned adapters. Policy and scheduling are supplied by the host.
+//! or host-owned adapters. Foundation owns execution policy and scheduling through
+//! `symbiotic-ai-runtime`; Memory owns stored-input authorization and output commits.
+//! The authoritative contract is `docs/architecture/boundary.md`.
 //!
 //! The default `queue` feature adds the `Queued*` providers, which run calls
 //! through a `symbiotic-queue` backend. Without it, the crate is the provider
@@ -96,8 +98,9 @@ pub enum ModelCapability {
     AgentTask,
 }
 
-/// Relative price band for a model. Advisory: hosts use it for routing/budget
-/// decisions, not billing.
+/// Relative price band for advisory model selection. It does not establish an
+/// enforceable monetary reservation; Foundation owns spend accounting and budgets
+/// under `docs/architecture/boundary.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostClass {
