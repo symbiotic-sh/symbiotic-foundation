@@ -166,7 +166,10 @@ is signed and sent with `RevokeRoute`. Publication must be coordinated with Memo
 K writer: Foundation does not discover a route removal that Memory has not sent.
 Memory never signs an attempt serialized after its authority is revoked.
 Restrictions are monotonic; re-admission uses a new route identity/incarnation.
-Later expiry/revocation never withdraws an already recorded attempt's handoff.
+Foundation checks revocation order at both permit issuance and consumption. A revocation
+received between these operations refuses an unconsumed permit whose record sequence is
+at or after the revocation, leaving it `Permitted`; reattachment returns the same token.
+Later expiry/revocation never withdraws an already consumed handoff.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_revocations` replay-protection tables. They store hashes, ordinal/sequence,

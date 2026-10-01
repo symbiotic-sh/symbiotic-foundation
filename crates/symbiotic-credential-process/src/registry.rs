@@ -170,10 +170,32 @@ impl Registry {
             },
         };
         let json = serde_json::to_string(&receipt).map_err(|_| EgressError::StateUnavailable)?;
-        let changed = self.0.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
+        let route_key = digest(&(&attempt.tenant, &attempt.incarnation, &attempt.route))?;
+        let tx = self
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(state)?;
+        // Recheck record order at consumption: revocation can arrive after issue.
+        // Consumed or invalid capabilities retain the normal replay refusal.
+        let revoked: Option<u64> = tx
+            .query_row(
+                "SELECT sequence FROM egress_revocations WHERE route_key=?1 AND EXISTS (
+                    SELECT 1 FROM egress_permits
+                    WHERE attempt_digest=?2 AND token=?3 AND consumed=0
+                )",
+                params![route_key, attempt_digest, permit.token],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(state)?;
+        if revoked.is_some_and(|sequence| attempt.record_sequence >= sequence) {
+            return Err(EgressError::RouteRefused);
+        }
+        let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
         if changed != 1 {
             return Err(EgressError::PermitRefused);
         }
+        tx.commit().map_err(state)?;
         Ok(receipt)
     }
 
@@ -330,6 +352,48 @@ mod tests {
             "reserved_budget": { "unit": "provider_requests", "amount": 1, "invocation_limit": 1 }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn revocation_does_not_withdraw_consumed_permits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut registry = Registry::open(&path).unwrap();
+        let mut attempt = attempt();
+        attempt.record_sequence = 12;
+        let grant = registry.issue(&attempt).unwrap();
+        let receipt = registry.consume(&attempt, &grant.permit).unwrap();
+        registry
+            .revoke(&RouteRevocation {
+                tenant: attempt.tenant.clone(),
+                incarnation: attempt.incarnation.clone(),
+                route: attempt.route.clone(),
+                record_sequence: 11,
+            })
+            .unwrap();
+        for restart in [false, true] {
+            if restart {
+                drop(registry);
+                registry = Registry::open(&path).unwrap();
+            }
+            let reattached = registry.issue(&attempt).unwrap();
+            assert_eq!(reattached.permit.token, grant.permit.token);
+            let AttemptStatus::Dispatched { receipt: retained } = reattached.status else {
+                panic!("consumed handoff was withdrawn");
+            };
+            assert_eq!(
+                serde_json::to_value(&retained).unwrap(),
+                serde_json::to_value(&receipt).unwrap()
+            );
+            assert!(matches!(
+                registry.consume(&attempt, &grant.permit),
+                Err(EgressError::PermitRefused)
+            ));
+            assert_eq!(
+                serde_json::to_value(registry.receipt(&attempt).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&receipt).unwrap()
+            );
+        }
     }
 
     #[test]

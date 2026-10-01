@@ -307,6 +307,56 @@ async fn revocation_orders_by_durable_record_not_barrier_completion_or_later_exp
 }
 
 #[tokio::test]
+async fn revocation_between_issue_and_inject_refuses_unconsumed_later_records() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let mut process = fixture.process();
+    let (early, early_payload) = fixture.attempt("early", 1, 10);
+    let early_permit = permit(&process, &early).await;
+    let mut refused = Vec::new();
+    for sequence in [12, 11] {
+        let (admission, payload) = fixture.attempt(&format!("late-{sequence}"), 1, sequence);
+        let granted = permit(&process, &admission).await;
+        refused.push((admission, payload, granted));
+    }
+    revoke(&process, 11).await;
+    for restart in [false, true] {
+        if restart {
+            drop(process);
+            process = fixture.process();
+        }
+        for (admission, payload, granted) in &refused {
+            assert!(matches!(
+                exchange(
+                    &process,
+                    inject(admission.clone(), payload.clone(), granted.clone())
+                )
+                .await,
+                Err(EgressError::RouteRefused)
+            ));
+            assert!(matches!(
+                status(&process, admission).await,
+                AttemptStatus::Permitted
+            ));
+            assert!(matches!(
+                exchange(&process, Operation::Receipt(admission.clone())).await,
+                Ok(Reply::Receipt(None))
+            ));
+            let reattached = permit(&process, admission).await;
+            assert_eq!(reattached.token, granted.token);
+            assert_eq!(reattached.attempt_digest, granted.attempt_digest);
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+    let result = dispatched(
+        exchange(&process, inject(early, early_payload, early_permit))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn wrong_input_or_attempt_cannot_spend_a_permit() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     let process = fixture.process();
