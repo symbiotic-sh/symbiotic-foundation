@@ -31,8 +31,11 @@ Reusable Rust contracts for durable AI work:
   CSV/Markdown presentations; no Memory or application mutation dependency.
 
 This repository is contract-first. It intentionally does not own Symbiotic memory, Archive,
-Gatekeeper, Vault, Matrix transport, or agent role evolution. Product runtimes compose these crates
-and decide policy.
+Gatekeeper, Vault, Matrix transport, or agent role evolution. Products own business
+meaning; Memory authorizes stored inputs and commits derivations; the gateway
+authenticates callers; Foundation owns execution, credentials, retries and canonical
+spend accounting. The [boundary contract](docs/architecture/boundary.md) is authoritative;
+current API gaps are documented in the architecture pages.
 
 ## Why This Exists
 

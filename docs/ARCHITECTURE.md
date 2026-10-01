@@ -111,6 +111,12 @@ classifier, exact response cache, queue-bound chat/embedding/rerank/classifier
 wrappers, and retry classification. Codex CLI/session and optional `genai` adapters are still
 migration targets. The public contract remains ours.
 
+`ProviderCatalog::select` still filters by `SelectionRequest.sensitivity` and
+provider class, and `ChatClassifierProvider`'s Rust documentation still describes
+sensitivity routing. These are obsolete implementation/API documentation gaps
+pending removal; authorization follows
+[provider-principal data access](architecture/boundary.md#tenant-provider-bindings-and-data-access).
+
 The queue-bound wrappers (`QueuedChatProvider`, `QueuedEmbeddingProvider`,
 `QueuedRerankProvider`, `QueuedClassifierProvider`) are the default `queue`
 feature. With `default-features = false` the crate is the provider contracts
@@ -163,6 +169,7 @@ Owns normalized invocation traces:
 - queue item reference;
 - role binding;
 - source;
+- `sensitivity` (current required Rust field, obsolete and pending removal);
 - request/response hashes;
 - cache status;
 - token/media/cost usage;

@@ -45,26 +45,34 @@ rate-limiter/rerank/queue implementations.
    own code can allow exactly this boundary.
    - *Rejected:* `symbiotic_model::Runtime`, which would put SQLite into every
      model-contract build.
-4. **Limits are per model, shared by every binding.** Admission is a FIFO
+4. **Limits are per model, shared by every binding — superseded.** Current grouping follows
+   [explicit tenant/account sharing](../architecture/boundary.md#tenant-provider-bindings-and-data-access).
+   The original implementation used a FIFO
    semaphore per `queue_id`, with the backend cap as the cross-process
    backstop. Conflicting shared limits are an error, not first-wins.
    - *Rejected:* the backend cap alone, whose 25 ms claim polling is unfair and
      busy at high fan-in.
    - *Rejected:* a process-global default admission, which couples unrelated
      runtimes and tests.
-5. **The cache is a seam.** `ResponseCache` receives the serialized request so
-   hosts keep reading legacy layouts. The runtime's own cache is scoped by
-   provider descriptor.
+5. **The cache is a seam — legacy-reader requirement superseded.** Current storage follows
+   [current-format storage](../architecture/boundary.md#storage-and-credentials).
+   The original `ResponseCache` seam received the serialized request so hosts could
+   keep reading legacy layouts. The runtime's own cache is scoped by provider descriptor.
    - *Rejected:* migrating legacy caches, which is impossible for keys that are
      one-way hashes of inputs.
    - *Rejected:* the old per-kind shared directory, where two models could
      answer for each other.
-6. **Receipts, not host-side ledgers.** Per-attempt `QueueReceipt`s carry
-   usage, provider receipt metadata, units and waits. Hosts price them with
-   their own tariffs.
+6. **Receipts, not host-side ledgers — host tariff ownership superseded.** Accounting follows
+   [Foundation's canonical spend ledger](../architecture/boundary.md#spend-ledger-and-budgets).
+   Per-attempt `QueueReceipt`s carry
+   usage, provider receipt metadata, units and waits. The original design had hosts
+   price them with their own tariffs.
 7. **Retry knobs over forks.** A base delay (sub-second allowed), an opt-in to
    retry provider errors, and rate burst cover the behaviour a consumer's copy
    had. The defaults are unchanged.
+   Retry knobs do not establish safe admission: uncertain attempts must follow
+   [Foundation recovery](../architecture/boundary.md#spend-ledger-and-budgets).
+   Current timeout retries remain a gap assigned to audit PRs 5/6.
 8. **Repeating a finished request without a cached answer runs it again.**
    Before, this returned a cache error. Queue records coordinate calls; they do
    not hold answers.

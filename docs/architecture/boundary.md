@@ -93,9 +93,12 @@ If both have access, Foundation executes the admitted payload, and Memory stores
 any resulting derivation with a receipt reference and checked input provenance.
 
 Derived output is readable by at most the intersection of its inputs' readers by
-default; widening requires explicit release authority or declassification approval.
-This carries provider restrictions into derived data. Once data is returned to an
-agent, Memory cannot control which model that agent subsequently uses.
+default. Widening requires an explicit Memory release grant: a principal with
+release authority grants a specified reader set for the derived record, and Memory
+updates that record's reader set and the effective grant revision. Without that
+grant, the input intersection carries provider restrictions into derived data.
+Once data is returned to an agent, Memory cannot control which model that agent
+subsequently uses.
 
 ## Grant revision and dispatch ordering
 
@@ -165,6 +168,15 @@ A lost dispatch reply is recovered by authenticated same-attempt status/receipt
 lookup. It does not authorize replaying the provider request. Unknown external
 outcomes stop automatic resubmission and require reconciliation. Single-use permits
 protect Foundation handoff; they do not promise exactly-once external execution.
+
+This rule applies to every Foundation execution path, including runtime calls
+outside the credential process. Automatic retry requires evidence that the failed
+attempt was pre-transport or otherwise known zero-charge. An attempt whose transport
+may have started is never blindly resent: an uncertain timeout or other unknown
+outcome enters Foundation's same-attempt recovery and reconciliation path. An error
+class or unused attempt allowance alone does not establish that retry is safe.
+The current runtime's timeout retries violate this contract; correcting retry
+admission and recovery is assigned to audit PRs 5/6.
 
 For example, a request-bound invocation allows at most two provider requests. One
 attempt is accepted, then times out after transport starts. Foundation retains its

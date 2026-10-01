@@ -12,7 +12,8 @@ and its operational database; it has no second provider scheduler.
 
 **Implementation gaps:** the current schema still carries obsolete policy fields
 and a caller-supplied reservation, uses route-sequence revocation rather than
-current provider grant revisions, and lacks complete tenant/provider/configuration
+the [caller-and-provider grant-revision ordering](boundary.md#grant-revision-and-dispatch-ordering),
+still rejects a marking equal to `unclassified`, and lacks complete tenant/provider/configuration
 identity and the canonical Foundation spend ledger. Replacement protocol and
 accounting work must follow [boundary.md](boundary.md), not preserve these semantics.
 
@@ -151,7 +152,6 @@ The required grant-revision ordering is in
 [boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The current v2
 `RouteRevocation`/`RevokeRoute` API and registry compare serialized route sequences;
 this is an implementation gap, not the authorization contract for new adoption.
-Permit issuance does not grant a right to dispatch after a provider grant change.
 Already accepted handoffs and their accounting remain recoverable.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
@@ -232,7 +232,12 @@ finite field/input/response/token/concurrency/timeout settings. These are config
 limits, not measured capacity; their labels and qualification follow
 [boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every
 route with the runtime and refuses conflicting concurrency or pacing limits for a
-shared model queue, including routes in different tenants. Unknown config fields
+shared model queue, including routes in different tenants. When those limits agree,
+the current backend pools those tenants' rate buckets and cooldowns. This is the
+accidental sharing forbidden by the
+[boundary contract](boundary.md#tenant-provider-bindings-and-data-access), not the
+target configuration; explicit tenant/account isolation remains implementation work.
+Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.
 

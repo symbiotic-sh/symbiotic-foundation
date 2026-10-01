@@ -3,6 +3,10 @@
 This repo starts as a clean foundation. Existing Symbiotic code is migrated by
 adapters, not by big-bang replacement.
 
+The [Foundation boundary contract](architecture/boundary.md) is authoritative for
+consumer adoption. Historical prototype milestones below do not override its
+ownership, authorization, accounting or current-format requirements.
+
 ## Phase 0 — Contracts
 
 Status: implemented.
@@ -74,7 +78,7 @@ types need the new arm or field.
 
 Missing before product-wide use: Codex CLI/session adapter, optional `genai`
 adapter, stronger adapter-specific HTTP error classification, cost calculation,
-and host-owned credential resolution for concrete HTTP adapters.
+and complete Foundation-owned credential resolution for concrete HTTP adapters.
 
 ## Phase 3 — Trace Sinks
 
@@ -84,7 +88,7 @@ Status: partially implemented.
 
 | sink | target |
 | --- | --- |
-| usage meter | cost/budget records |
+| usage meter | usage and cost telemetry; canonical reservations and budgets belong to Foundation's spend ledger |
 | audit sink | forensic LLM I/O log |
 | Archive trace sink | memory/evolution capture source |
 | benchmark sink | experiment artifacts |
@@ -117,24 +121,32 @@ Status: in progress.
 
 - replace local `ChatProvider` and `EmbeddingProvider` traits with foundation
   traits or thin adapters;
-- replace local provider queue with host-supplied queue/model runtime;
+- replace local provider queues with Foundation's model runtime;
 - add `capture_model_trace` or accept an Archive trace document from the host;
 - preserve benchmark reproducibility.
 
 WP14 Foundation boundary: Memory can now depend on `symbiotic-egress` for the
 version-2 signed durable-attempt / single-use dispatch schema and `EgressClient`.
 Deploy `symbiotic-credential-process` separately with local file/keychain credentials;
-Memory retains K admission, barriers, reservations and protected recovery state.
-See [model egress](architecture/model-egress.md) for the exact schema, revocation
-ordering, charge limitations and consumer integration. Consumer adoption remains
+Memory owns caller/provider input authorization, guarded derivation commits and
+Foundation receipt references. Foundation owns execution reservations, the canonical
+spend ledger and same-attempt recovery. The current v2 caller-supplied reservation
+and route-sequence API remain implementation gaps, not adoption requirements.
+See the [boundary contract](architecture/boundary.md) for ownership and revocation
+ordering, and [model egress](architecture/model-egress.md) for the current schema,
+charge limitations and recovery API. Consumer adoption remains
 under symbiotic-sh/symbiotic-memory#208.
 
-Foundation side done (#8): `symbiotic-ai-runtime` is the stateful provider
+Foundation runtime facade implemented (#8): `symbiotic-ai-runtime` is the stateful provider
 runtime consumers call instead of assembling queues. It has an in-memory
 backend and the parity Memory's local stack needed: shared per-model
 admission, rate burst, per-attempt receipts, retry base delay and
 provider-error retries, eviction recovery, request capture, and a
-response-cache seam for legacy cache layouts. Consumer adoption is tracked in
+custom response-cache seam. Current per-model grouping requires explicit tenant/account
+isolation; cache identity must bind tenant, provider and effective configuration.
+There is no requirement to retain legacy cache readers. Timeout retry admission and
+same-attempt recovery alignment are assigned to audit PRs 5/6; see
+[current runtime gaps](architecture/ai-runtime.md). Consumer adoption is tracked in
 each consumer repository.
 
 Implemented earlier: memory CLI HTTP providers can use foundation model queues,

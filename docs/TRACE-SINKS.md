@@ -3,6 +3,10 @@
 Model and queue invocations produce data that is useful for many systems, but
 the foundation must not choose a single storage target.
 
+These sinks carry optional telemetry. Foundation's canonical spend ledger owns
+reservations, settlement and budgets under the
+[boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
+
 ## Principle
 
 ```text
@@ -23,7 +27,7 @@ The central event is `ModelInvocationTrace`:
 - `model` identity
 - `role_binding`, such as `memory.distill` or `agent.plan`
 - `source`, such as `recall`, `intake`, `benchmark`, or `cli`
-- `sensitivity`
+- `sensitivity` (current required Rust field, obsolete and pending removal; no data authority)
 - request and response hashes
 - cache status
 - token/media/cost usage
@@ -36,7 +40,7 @@ The central event is `ModelInvocationTrace`:
 
 | sink | responsibility |
 | --- | --- |
-| `UsageMeterSink` | cost, budgets, cache-hit accounting |
+| `UsageMeterSink` | usage/cost reporting and cache-hit telemetry; no canonical budget or settlement ownership |
 | `AuditSink` | forensic prompt/response references according to audit level |
 | `AgentMonitorSink` | agent fitness, process-engineer queries |
 | `ArchiveTraceSink` | raw capture source for memory/evolution |

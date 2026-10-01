@@ -11,7 +11,9 @@ provider-principal authorization, spend, storage and supported modes. This page
 records current runtime behavior. Complete tenant/provider/configuration binding,
 explicit account isolation, canonical spend accounting and admission/maintenance
 bounds remain implementation work; this API alone supplies none of Memory's data
-authorization checks.
+authorization checks. The runtime also retries timeouts without proving zero charge,
+contrary to the [spend contract](boundary.md#spend-ledger-and-budgets). Retry admission
+and same-attempt recovery alignment are assigned to audit PRs 5/6.
 
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 (issue #8).
@@ -77,11 +79,13 @@ so the state directory and everything in it are owner-only:
   [boundary.md](boundary.md#storage-and-credentials).
 
 Queue records hold the request hash, never the request. A crash therefore
-cannot resume an in-flight call from the queue. For credential-bound execution,
-recover the same attempt through [model egress](model-egress.md#same-attempt-recovery-v2);
-never blindly re-issue an uncertain paid attempt. The cache and attempt budget
-are execution primitives, not spend reconciliation. For
-example, a request that exhausted its attempts before a restart fails again
+cannot resume an in-flight call from the queue. Every Foundation execution path
+must recover an uncertain attempt rather than blindly re-issue it, under the
+[spend contract](boundary.md#spend-ledger-and-budgets). The current credential backend
+provides [same-attempt recovery](model-egress.md#same-attempt-recovery-v2); the general
+runtime still requires that recovery integration in audit PRs 5/6. The cache and
+attempt budget are execution primitives, not spend reconciliation. For example,
+a request that exhausted its attempts before a restart fails again
 afterwards without another provider call.
 
 **Current retention settings.** At open, and after every 10,000 finished calls, a persistent
@@ -100,6 +104,9 @@ count/bytes and per-batch/idle work remain unbounded by these settings; see
 [boundary.md](boundary.md#bounds-as-labelled-settings).
 Periodic sweeps run on the blocking pool. A failed sweep is logged as a
 `tracing` warning and retried at the next interval; it never fails a call.
+This is a visibility gap: retention can stop without a caller-visible error.
+Visible maintenance failure reporting remains implementation work alongside the
+soft limits and unbounded maintenance noted above.
 A sweep or purge checks the whole cache tree before it deletes anything.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
@@ -112,10 +119,6 @@ matched by what its response's trace records: the request's `source` and
 by tenant or source puts that identity in the request's `source` or
 `role_binding`. The purge reads every entry once, so it suits erasure, not a
 hot path.
-
-Measured on one laptop with a 15 ms loopback provider, cap 64, 3,000 calls on
-one thread: in memory 3,600 calls/s (the cap's ceiling), persistent
-1,750 calls/s.
 
 ## Calls in flight
 
@@ -204,6 +207,12 @@ per binding.
 
 ## Policy knobs
 
+Required retry admission follows the
+[spend contract](boundary.md#spend-ledger-and-budgets): only known pre-transport or
+otherwise zero-charge failures can be automatically retried. Uncertain timeouts
+enter Foundation recovery. The current error-class-based policy below does not
+meet that requirement; its correction belongs to audit PRs 5/6.
+
 `ModelQueueConfig` fields:
 
 - `rate_burst_seconds` (default `0`): seconds of rate budget available as an
@@ -216,8 +225,12 @@ per binding.
   (`QueueBackend::fail_with`), so no caller of the request retries earlier,
   and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
-  failures. Unavailable, rate-limited and timed-out calls always retry. Provider
-  errors never start a cooldown.
+  failures. Currently `is_retryable` treats unavailable, rate-limited and timed-out
+  calls as retryable without checking charge certainty. `ModelQueueConfig::default()`
+  allows three attempts; DeepSeek catalogue policies allow four, and other catalogue
+  entries also permit multiple attempts. These settings can resend an uncertain
+  timeout and are a known contract gap, not accepted retry behavior. Provider errors
+  never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
   debugging only: requests can contain sensitive text.
@@ -238,8 +251,11 @@ per binding.
   its budget, later calls for the same request fail without a provider call
   while the queue remembers it. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
-  `Some(0)` gives every call its own budget. Retry admission and recovery after
-  uncertain timeouts follow [boundary.md](boundary.md#spend-ledger-and-budgets).
+  `Some(0)` gives every call its own budget. These are current queue mechanics;
+  renewal does not prove zero charge or authorize resending an uncertain attempt.
+  Retry admission and recovery must follow
+  [boundary.md](boundary.md#spend-ledger-and-budgets); that alignment remains a gap
+  assigned to audit PRs 5/6.
   Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
@@ -290,7 +306,8 @@ these writes fails:
 The same holds elsewhere. A cache hit whose trace write fails is still
 returned, with the diagnostic. A failed call keeps its own error when its
 failure trace or its cooldown cannot be written; those failures are logged,
-and the retry proceeds as scheduled.
+and any retry currently proceeds as scheduled. This does not establish safe retry
+admission; the current policy's charge-certainty gap is described above.
 
 ## Custom response caches
 

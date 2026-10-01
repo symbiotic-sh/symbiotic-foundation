@@ -114,7 +114,10 @@ response must name the expected served model (by default the requested one;
 `with_served_model` accepts a gateway's snapshot name), because thresholds are
 tuned on one version. HTTP statuses use the crate's classification: 408/504
 time out, 429 is rate limited, 5xx (including TypeSafe's 529 Overloaded) is
-unavailable; all three are retryable. Answers that do not match the questions
+unavailable. The current queue policy treats all three as retryable without proving
+zero charge; this is the [runtime retry gap](ai-runtime.md#policy-knobs)
+assigned to audit PRs 5/6. Retry admission must follow the
+[spend contract](boundary.md#spend-ledger-and-budgets). Answers that do not match the questions
 are `ModelError::Provider`: a missing or extra answer, a wrong kind, a choice
 outside the options or not among the most probable, a distribution that sums
 more than 0.02 from 1 (it is then rescaled), confidence outside `[0, 1]`, or a
