@@ -17,6 +17,17 @@ struct Dispatched<P> {
     inner: P,
     started: Arc<AtomicBool>,
 }
+impl<P: ModelProvider> Dispatched<P> {
+    fn outcome<T>(&self, result: Result<T, ModelError>) -> Result<T, ModelError> {
+        if result.as_ref().err().is_some_and(|error| {
+            !matches!(error, ModelError::Timeout(_))
+                && self.inner.failure_charge(error) == model::FailureCharge::KnownZero
+        }) {
+            self.started.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+}
 impl<P: ModelProvider> ModelProvider for Dispatched<P> {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
@@ -27,6 +38,9 @@ impl<P: ModelProvider> ModelProvider for Dispatched<P> {
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
+    fn failure_charge(&self, error: &ModelError) -> model::FailureCharge {
+        self.inner.failure_charge(error)
+    }
     fn credential_boundary(&self) -> Option<&CredentialBoundary> {
         self.inner.credential_boundary()
     }
@@ -35,7 +49,7 @@ impl<P: ModelProvider> ModelProvider for Dispatched<P> {
 impl<P: ChatProvider> ChatProvider for Dispatched<P> {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.chat(request).await?;
+        let mut response = self.outcome(self.inner.chat(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -44,7 +58,7 @@ impl<P: ChatProvider> ChatProvider for Dispatched<P> {
 impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.embed(request).await?;
+        let mut response = self.outcome(self.inner.embed(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -53,15 +67,15 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
 impl<P: RerankProvider> RerankProvider for Dispatched<P> {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.rerank(request).await?;
+        let mut response = self.outcome(self.inner.rerank(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
 }
 
-// Once the raw adapter starts, conservatively retain the reservation even if
-// it fails while building/sending the request. Queue/setup failures before that
-// boundary are known not to have reached HTTP.
+// Once the raw adapter starts, retain the reservation unless it establishes
+// trusted KnownZero evidence. Queue/setup failures before that boundary are
+// known not to have reached HTTP.
 pub(crate) struct ExecuteError {
     pub(crate) code: EgressError,
     pub(crate) may_have_dispatched: bool,
@@ -88,6 +102,17 @@ fn route_binding<P>(
             provider,
         )
         .map_err(|_| EgressError::InvalidRequest)
+}
+
+fn accepted_route_binding<P>(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    provider: P,
+    handoff: model::AcceptedSpendHandoff,
+) -> Result<ModelBinding<P>, EgressError> {
+    let mut binding = route_binding(runtime, route, provider)?;
+    binding.accepted_spend = Some(handoff);
+    Ok(binding.with_response_cache(ResponseCacheMode::Off))
 }
 
 fn resolved_route<'a>(
@@ -235,6 +260,7 @@ fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
     // No hidden retry layer may spend a permit twice. Every retry must come back
     // through Memory's admission/barrier with its next ordinal.
     ModelQueueConfig {
+        provider_request_limit: route.provider_request_limit,
         max_in_flight: route.max_in_flight,
         requests_per_minute: route.requests_per_minute,
         input_units_per_minute: route.input_units_per_minute,
@@ -325,20 +351,68 @@ fn completed(
     (output, trace.usage, diagnostics)
 }
 
+/// Give each admitted attempt a queue identity while preserving provider-visible input.
+pub(crate) fn prepare_payload(payload: &mut ProviderPayload, attempt_digest: &str) {
+    match payload {
+        ProviderPayload::Chat(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
+        ProviderPayload::Embedding(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
+        ProviderPayload::Rerank(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
+    }
+}
+
+pub(crate) fn accepted_handoff(
+    attempt: &symbiotic_egress::DurableAttempt,
+    route: &RouteConfig,
+    payload: &ProviderPayload,
+) -> Result<model::AcceptedSpendHandoff, EgressError> {
+    let (kind, request_hash) = match payload {
+        ProviderPayload::Chat(request) => ("chat", model::configuration_revision(request)),
+        ProviderPayload::Embedding(request) => {
+            ("embedding", model::configuration_revision(request))
+        }
+        ProviderPayload::Rerank(request) => ("rerank", model::configuration_revision(request)),
+    };
+    let binding = BindingIdentity::new(
+        &route.tenant,
+        &route.route,
+        model::configuration_revision(route)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .0,
+        &route.account,
+    );
+    Ok(model::AcceptedSpendHandoff {
+        reservation: crate::spend_reservation(attempt, route)?,
+        input_identity: model::handoff_input_identity(
+            kind,
+            Some(&binding),
+            &request_hash.map_err(|_| EgressError::InvalidRequest)?.0,
+        )
+        .map_err(|_| EgressError::InvalidRequest)?,
+    })
+}
+
 pub(crate) async fn execute(
     runtime: &Runtime,
     route: &RouteConfig,
     secret: Arc<Secret>,
     payload: ProviderPayload,
-    attempt_digest: &str,
+    handoff: model::AcceptedSpendHandoff,
 ) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
-        (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(mut request)) => {
-            // Per-attempt queue identity without changing provider-visible inputs.
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
+        (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(request)) => {
             let provider = Dispatched {
                 inner: OpenAiCompatibleChatProvider::new(
                     operator,
@@ -354,19 +428,12 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .chat(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
+                .chat(accepted_route_binding(runtime, route, provider, handoff)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
-            let response = provider.chat(request).await.map_err(|error| ExecuteError {
-                code: match error {
-                    ModelError::Queue(_) => EgressError::StateUnavailable,
-                    ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
-                    _ => EgressError::Transport,
-                },
-                may_have_dispatched: started.load(Ordering::SeqCst),
-            })?;
+            let response = provider
+                .chat(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
             Ok(completed(
                 ProviderOutput::Chat {
                     text: response.text,
@@ -374,13 +441,7 @@ pub(crate) async fn execute(
                 response.trace,
             ))
         }
-        (
-            RouteProvider::GeminiEmbedding { dimensions },
-            ProviderPayload::Embedding(mut request),
-        ) => {
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
+        (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request)) => {
             let provider = Dispatched {
                 inner: GeminiEmbeddingProvider::new(
                     "gemini",
@@ -395,45 +456,7 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .embedding(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
-                .map_err(|_| EgressError::StateUnavailable)?;
-            let response = provider
-                .embed(request)
-                .await
-                .map_err(|error| ExecuteError {
-                    code: match error {
-                        ModelError::Queue(_) => EgressError::StateUnavailable,
-                        ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
-                        _ => EgressError::Transport,
-                    },
-                    may_have_dispatched: started.load(Ordering::SeqCst),
-                })?;
-            Ok(completed(
-                ProviderOutput::Embedding {
-                    vectors: response.vectors,
-                    dimensions: response.dimensions,
-                },
-                response.trace,
-            ))
-        }
-        (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(mut request)) => {
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
-            let resolved = resolved_route(runtime, route)?;
-            let provider = Dispatched {
-                inner: model::CompatibleEmbeddingProvider::from_binding(&resolved, secret.value())
-                    .map_err(|_| EgressError::InvalidRequest)?,
-                started: started.clone(),
-            };
-            let provider = runtime
-                .embedding(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
+                .embedding(accepted_route_binding(runtime, route, provider, handoff)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
             let response = provider
                 .embed(request)
@@ -447,10 +470,29 @@ pub(crate) async fn execute(
                 response.trace,
             ))
         }
-        (RouteProvider::CohereRerank { .. }, ProviderPayload::Rerank(mut request)) => {
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
+        (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(request)) => {
+            let resolved = resolved_route(runtime, route)?;
+            let provider = Dispatched {
+                inner: model::CompatibleEmbeddingProvider::from_binding(&resolved, secret.value())
+                    .map_err(|_| EgressError::InvalidRequest)?,
+                started: started.clone(),
+            };
+            let provider = runtime
+                .embedding(accepted_route_binding(runtime, route, provider, handoff)?)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let response = provider
+                .embed(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
+            Ok(completed(
+                ProviderOutput::Embedding {
+                    vectors: response.vectors,
+                    dimensions: response.dimensions,
+                },
+                response.trace,
+            ))
+        }
+        (RouteProvider::CohereRerank { .. }, ProviderPayload::Rerank(request)) => {
             let resolved = resolved_route(runtime, route)?;
             let provider = Dispatched {
                 inner: model::CohereRerankProvider::from_binding(&resolved, secret.value())
@@ -458,10 +500,7 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .rerank(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
+                .rerank(accepted_route_binding(runtime, route, provider, handoff)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
             let response = provider
                 .rerank(request)
@@ -482,6 +521,69 @@ pub(crate) async fn execute(
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct RejectBeforeTransport {
+        descriptor: ProviderDescriptor,
+        error: ModelError,
+    }
+    impl ModelProvider for RejectBeforeTransport {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+        fn failure_charge(&self, _: &ModelError) -> model::FailureCharge {
+            model::FailureCharge::KnownZero
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for RejectBeforeTransport {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse, ModelError> {
+            Err(self.error)
+        }
+    }
+    #[tokio::test]
+    async fn dispatched_wrapper_preserves_trusted_zero_charge_without_releasing_timeouts() {
+        for (error, started_after) in [
+            (
+                ModelError::Auth(model::DiagnosticCode::InvalidConfiguration),
+                false,
+            ),
+            (
+                ModelError::Timeout(model::DiagnosticCode::HttpTimeout),
+                true,
+            ),
+        ] {
+            let provider = Dispatched {
+                inner: RejectBeforeTransport {
+                    descriptor: ProviderDescriptor {
+                        identity: model::ModelIdentity::new("test", "synthetic", "1"),
+                        provider_class: model::ProviderClass::Local,
+                        capabilities: vec![model::ModelCapability::Chat],
+                        auth_mode: model::ProviderAuthMode::None,
+                        metadata: serde_json::Value::Null,
+                    },
+                    error,
+                },
+                started: Arc::new(AtomicBool::new(false)),
+            };
+            let request = ChatRequest {
+                messages: vec![],
+                response_format: None,
+                max_output_tokens: None,
+                temperature: None,
+                sensitivity: symbiotic_egress::Sensitivity::Private,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            };
+            let error = provider.chat(request).await.unwrap_err();
+            assert_eq!(
+                provider.failure_charge(&error),
+                model::FailureCharge::KnownZero
+            );
+            assert_eq!(provider.started.load(Ordering::SeqCst), started_after);
+        }
+    }
+
     struct FailingTrace;
     #[async_trait]
     impl symbiotic_trace::TraceSink for FailingTrace {
@@ -497,7 +599,9 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_runtime_failure_projects_only_static_diagnostics() {
+        let state = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(RuntimeConfig {
+            state_dir: Some(state.path().join("state")),
             trace_sink: Some(Arc::new(FailingTrace)),
             ..RuntimeConfig::default()
         })

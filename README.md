@@ -8,7 +8,7 @@ Reusable Rust contracts for durable AI work:
   and macOS keychain backends, single-use permits and typed usage. It reuses the
   model runtime with caching off. See [model egress](docs/architecture/model-egress.md).
 - `symbiotic-ai-runtime` — **the entry point for model calls.** Open one
-  `Runtime` (persistent with a state directory, in memory without) and get
+  `Runtime` (dispatch requires an explicit state directory) and get
   ready chat, embedding, rerank and classifier providers. Queueing, retries,
   limits, cooldowns, attempt budgets, caching, traces, usage receipts and
   persistence are internal. See [docs/architecture/ai-runtime.md](docs/architecture/ai-runtime.md).

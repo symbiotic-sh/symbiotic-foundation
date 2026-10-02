@@ -239,7 +239,10 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), ModelError> {
 impl ModelQueueConfig {
     /// Refuse unusable execution policy rather than normalizing it silently.
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.max_in_flight == 0
+        if self
+            .provider_request_limit
+            .is_some_and(|n| n > i64::MAX as u64)
+            || self.max_in_flight == 0
             || self.max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
             || self.lease_seconds == 0
             || i64::try_from(self.lease_seconds)

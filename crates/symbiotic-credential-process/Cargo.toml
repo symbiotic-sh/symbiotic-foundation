@@ -26,6 +26,7 @@ zeroize = "1"
 security-framework = "3.7"
 
 [dev-dependencies]
+symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tracing.workspace = true

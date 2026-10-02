@@ -185,19 +185,22 @@ lookup. It does not authorize replaying the provider request. Unknown external
 outcomes stop automatic resubmission and require reconciliation. Single-use permits
 protect Foundation handoff; they do not promise exactly-once external execution.
 
+Dispatch requires an explicit runtime `state_dir`; `Runtime::in_memory()` and
+`state_dir: None` refuse with the typed `SpendLedgerUnavailable` error. Foundation
+does not invent a default persistence path.
+
 This rule applies to every Foundation execution path, including runtime calls
 outside the credential process. Automatic retry requires evidence that the failed
 attempt was pre-transport or otherwise known zero-charge. An attempt whose transport
 may have started is never blindly resent: an uncertain timeout or other unknown
 outcome enters Foundation's same-attempt recovery and reconciliation path. An error
 class or unused attempt allowance alone does not establish that retry is safe.
-The current runtime retries `ModelError::Timeout`, `ModelError::Unavailable`
-(5xx, including 529) and `ModelError::RateLimited` (429) by error class without
-checking charge certainty. Enabling `retry_provider_errors` also retries
-`ModelError::Provider` on that basis. These are known violations across the shared
-queued chat, embedding, rerank and classification paths; retry admission and
-same-attempt recovery remain implementation work. The current credential-process
-backend disables these retries with one runtime attempt per permit.
+The shared queued chat, embedding, rerank and classification paths retain unknown
+charge after uncertain raw-provider failures and stop retries regardless of error class
+or unused attempt allowance. A trusted adapter may explicitly establish KnownZero;
+only that evidence permits release and retry. Credential permit consumption and ledger reservation are
+one immediate SQLite transaction; completion and accounting settlement are also
+atomic. The Memory-facing receipt protocol remains unchanged pending PR 6b.
 
 For example, a request-bound invocation allows at most two provider requests. One
 attempt is accepted, then times out after transport starts. Foundation retains its

@@ -32,7 +32,8 @@ rate-limiter, rerank and queue implementations from consumers.
      themselves. That is how the copies diverged: each consumer re-assembled
      the pieces and then re-implemented the missing ones.
 2. **Persistence is a runtime choice, not a consumer build.** A `state_dir`
-   selects the existing SQLite backend. None selects the in-memory backend.
+   selects the existing SQLite backend. Dispatch now requires an explicit directory;
+   `None` and `Runtime::in_memory()` refuse with `SpendLedgerUnavailable`.
    - *Rejected:* a new file-journal backend. The audit found that no backend
      can resume an in-flight call (queue items hold only a request hash), so
      a durable queue buys restart-persistent budgets, cooldowns and
@@ -73,10 +74,10 @@ rate-limiter, rerank and queue implementations from consumers.
    had. The defaults are unchanged.
    Retry admission and recovery follow the
    [spend contract](../architecture/boundary.md#spend-ledger-and-budgets).
-   Current error-class retries for timeout, unavailable and rate-limited calls,
-   plus `ModelError::Provider` when `retry_provider_errors` is enabled, remain
-   known implementation gaps.
-8. **Repeating a finished request without a cached answer runs it again.**
+   Automatic retry now requires explicit known-zero charge evidence; uncertain
+   outcomes retain their reservations until reconciliation.
+8. **Repeating a finished request without a cached answer runs it again — superseded.**
+   Same-attempt ledger recovery now returns the durable result without redispatch.
    Before, this returned a cache error. Queue records coordinate calls; they do
    not hold answers.
 9. **Retention.** A persistent runtime retires state older than seven days at

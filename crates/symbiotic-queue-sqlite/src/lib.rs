@@ -132,7 +132,9 @@ impl SqliteQueue {
         let now = Utc::now();
         let (updated, items) = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
             let items = stale_active_items_in_tx(&tx, queue_id, stale_before, now)?;
             let updated = match queue_id {
                 Some(queue_id) => tx
@@ -209,7 +211,9 @@ impl SqliteQueue {
     ) -> Result<usize, QueueError> {
         let now = Utc::now();
         let mut conn = self.conn.lock().map_err(lock_error)?;
-        let tx = conn.transaction().map_err(storage_error)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         let items = stale_active_items_in_tx(&tx, None, stale_before, now)?;
         let updated = tx
             .execute(
@@ -245,7 +249,9 @@ impl SqliteQueue {
     /// the next request with that key is inserted afresh.
     pub fn prune_terminal_before(&self, before: DateTime<Utc>) -> Result<usize, QueueError> {
         let mut conn = self.conn.lock().map_err(lock_error)?;
-        let tx = conn.transaction().map_err(storage_error)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
         let deleted = tx
             .execute(
                 "delete from queue_items
@@ -282,12 +288,11 @@ impl SqliteQueue {
 
         let (item, disposition) = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = if replacing.is_some() {
-                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            } else {
-                conn.transaction()
-            }
-            .map_err(storage_error)?;
+            // Acquire the writer lock before reading deduplication state;
+            // a concurrent ledger writer must not cause a read-to-write upgrade.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
             if let Some(key) = &request.idempotency_key {
                 let existing = find_by_idempotency(&tx, &request.queue_id, key)?;
                 if let Some(existing) = existing {
@@ -300,7 +305,11 @@ impl SqliteQueue {
                         QueueStatus::Succeeded | QueueStatus::Dead | QueueStatus::Stopped
                     );
                     let superseded = replacing.is_some_and(|current| existing.item_id != *current);
-                    if active || (terminal && !request.force) || superseded {
+                    let reclaimed = replacing.is_some()
+                        && existing.status == QueueStatus::Failed
+                        && existing.last_error
+                            == Some(symbiotic_core::DiagnosticCode::LeaseExpired);
+                    if (active && !reclaimed) || (terminal && !request.force) || superseded {
                         tx.commit().map_err(storage_error)?;
                         let disposition = if active {
                             EnqueueDisposition::ActiveDuplicate
@@ -315,6 +324,9 @@ impl SqliteQueue {
                 }
             }
 
+            if let Some(current) = replacing {
+                tx.execute("UPDATE queue_items SET status='stopped', last_error_class='queue' WHERE item_id=?1 AND status='failed'", [&current.0]).map_err(storage_error)?;
+            }
             let item = QueueItem {
                 item_id: QueueItemId::new(),
                 queue_id: request.queue_id,
@@ -711,7 +723,9 @@ impl QueueBackend for SqliteQueue {
         let now = Utc::now();
         let (reclaimed, events) = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
             let expired = expired_running_items_in_tx(&tx, queue_id, now)?;
             let reclaimed = reclaim_expired_in_tx(&tx, queue_id, now)?;
             let events = expired
@@ -827,10 +841,15 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
     .map(|active| active.unwrap_or(false))
 }
 
-const QUEUE_SCHEMA_VERSION: u32 = 2;
+/// Atomic current operational format: queue and spend tables, with no migrations.
+pub const QUEUE_SCHEMA_VERSION: u32 = 7;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "fullfsync", true)
         .map_err(storage_error)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(storage_error)?;
@@ -846,7 +865,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     // Before release, only an empty, unversioned queue can be initialized.
     let existing_queue = tx
-        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns')")
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_invocation_bindings', 'spend_cached_invocations')")
         .and_then(|mut stmt| stmt.exists([]))
         .map_err(storage_error)?;
     if schema_version != 0 || existing_queue {
@@ -856,6 +875,22 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     tx.execute_batch(
         "
+        create table spend_accounts (
+            account text primary key, request_limit integer, used integer not null default 0
+        );
+        create table spend_receipts (
+            reference text primary key, account text not null, invocation text not null,
+            binding text not null, reservation text not null, state text not null,
+            usage text, output text, handoff_input text, dispatch_owner text,
+            pre_dispatch_released integer not null default 0
+        );
+        create unique index spend_active_invocation on spend_receipts(account, invocation)
+            where state != 'released';
+        create index spend_invocation_lookup on spend_receipts(account, invocation);
+        create table spend_invocation_bindings (
+            account text not null, invocation text not null, binding text not null,
+            primary key (account, invocation)
+        );
         create table queue_items (
             item_id text primary key,
             queue_id text not null,
@@ -975,7 +1010,9 @@ fn update_running_item<T>(
     update: impl FnOnce(&Connection) -> Result<T, QueueError>,
 ) -> Result<T, QueueError> {
     let mut conn = conn.lock().map_err(lock_error)?;
-    let tx = conn.transaction().map_err(storage_error)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
     let current = get_required(&tx, item_id)?;
     if current.status != QueueStatus::Running {
         return Err(QueueError::NotRunning(
@@ -1084,7 +1121,8 @@ fn reclaim_expired_in_tx(
              lease_owner = null,
              lease_until = null,
              updated_at = ?2,
-             last_error = coalesce(last_error, 'lease_expired')
+             last_error = 'lease_expired',
+             last_error_class = 'queue'
          where queue_id = ?1
            and status = 'running'
            and lease_until is not null
@@ -1218,6 +1256,10 @@ mod tests {
             "queue_events",
             "queue_cooldowns",
             "QUEUE_EVENTS",
+            "spend_accounts",
+            "spend_receipts",
+            "spend_invocation_bindings",
+            "spend_cached_invocations",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("queue.sqlite");
@@ -1264,14 +1306,14 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_invocation_bindings')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
     }
 
     #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
-        for version in [-1, 0, 1, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+        for version in [-1, 0, 1, 2, 3, 4, 5, 6, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
             for existing in [false, true] {
                 if version == 0 && !existing {
                     continue;

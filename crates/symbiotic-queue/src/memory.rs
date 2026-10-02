@@ -122,7 +122,10 @@ impl MemoryQueue {
             {
                 let active = State::is_active(existing.status);
                 let superseded = replacing.is_some_and(|current| existing.item_id != *current);
-                if active || !request.force || superseded {
+                let reclaimed = replacing.is_some()
+                    && existing.status == QueueStatus::Failed
+                    && existing.last_error == Some(symbiotic_core::DiagnosticCode::LeaseExpired);
+                if (active && !reclaimed) || !request.force || superseded {
                     return Ok(EnqueueOutcome {
                         item: existing.clone(),
                         disposition: if active {
@@ -131,6 +134,17 @@ impl MemoryQueue {
                             EnqueueDisposition::TerminalDuplicate
                         },
                     });
+                }
+            }
+            if let Some(current) = replacing
+                && state
+                    .items
+                    .get(&current.0)
+                    .is_some_and(|i| i.status == QueueStatus::Failed)
+            {
+                state.set_status(&current.0, QueueStatus::Stopped);
+                if let Some(item) = state.items.get_mut(&current.0) {
+                    item.last_error_class = Some(symbiotic_core::FailureClass::Queue);
                 }
             }
             let item = QueueItem {
@@ -285,8 +299,8 @@ impl State {
             item.lease_owner = None;
             item.lease_until = None;
             item.updated_at = now;
-            item.last_error
-                .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
+            item.last_error = Some(symbiotic_core::DiagnosticCode::LeaseExpired);
+            item.last_error_class = Some(symbiotic_core::FailureClass::Queue);
             reclaimed.push(item.clone());
         }
         reclaimed

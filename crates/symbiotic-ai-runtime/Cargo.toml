@@ -11,8 +11,7 @@ description = "Stateful AI provider runtime: hands out ready queued providers an
 async-trait.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-hex.workspace = true
+rusqlite.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-model = { path = "../symbiotic-model" }
 symbiotic-queue = { path = "../symbiotic-queue" }

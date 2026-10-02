@@ -177,6 +177,9 @@ pub trait QueueBackend: Send + Sync {
     /// are one step, so two callers holding the same superseded item cannot
     /// both replace it. The default is not atomic; both Foundation backends
     /// are.
+    /// A Failed item reclaimed with LeaseExpired may also be replaced; the
+    /// caller must establish that the expired claim never dispatched. Retire
+    /// that old item as Stopped atomically so it cannot be claimed again.
     async fn enqueue_replacing(
         &self,
         mut request: EnqueueRequest,

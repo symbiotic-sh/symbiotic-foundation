@@ -133,6 +133,7 @@ impl Fixture {
                 tenant: "tenant".into(),
                 account: "account".into(),
                 account_sharing_key: None,
+                provider_request_limit: None,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -500,6 +501,7 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
         }
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
     drop(process);
     let process = fixture.process();
     let receipt = exchange(&process, Operation::Receipt(admission))
@@ -1053,6 +1055,7 @@ async fn known_zero_charge_releases_reservation_for_next_attempt() {
         );
     }
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 2));
 }
 
 #[tokio::test]
@@ -1456,6 +1459,7 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
     assert_eq!(reattached.permit.token, granted.token);
     assert!(matches!(reattached.status, AttemptStatus::Completed { .. }));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
 }
 
 #[tokio::test]
@@ -1680,6 +1684,51 @@ async fn independent_tenant_routes_accept_different_account_policies() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 
+fn ledger_totals(fixture: &Fixture) -> (u64, u64) {
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    (
+        conn.query_row(
+            "SELECT coalesce(sum(used), 0) FROM spend_accounts",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap(),
+        conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r.get(0))
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn spend_concurrent_dispatches_on_one_account_share_one_durable_budget() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::from_millis(30)).await;
+    fixture.config.routes[0].provider_request_limit = Some(1);
+    let process = fixture.process();
+    let (a, pa) = fixture.attempt("first-account-call", 1, 1);
+    let (b, pb) = fixture.attempt("second-account-call", 1, 2);
+    let ap = permit(&process, &a).await;
+    let bp = permit(&process, &b).await;
+    let (ra, rb) = tokio::join!(
+        exchange(&process, inject(a, pa, ap)),
+        exchange(&process, inject(b, pb, bp))
+    );
+    assert_eq!([&ra, &rb].iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Err(EgressError::BudgetRefused)))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
 #[tokio::test]
 async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() {
     use symbiotic_ai_runtime::model::{ModelAdapter, RerankRequest};
@@ -1689,132 +1738,205 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
         ModelAdapter::CohereRerank,
     ] {
         for keyless in [false, true] {
-            let rerank = adapter == ModelAdapter::CohereRerank;
-            let body = match adapter {
-                ModelAdapter::CohereRerank => r#"{"results":[{"index":0,"relevance_score":0.8}]}"#,
-                ModelAdapter::OllamaEmbedding => r#"{"embedding":[1,2]}"#,
-                _ => r#"{"data":[{"index":0,"embedding":[1,2]}]}"#,
-            };
-            let mut fixture = Fixture::with_http_response(
-                200,
-                body.into(),
-                Duration::ZERO,
-                "null",
-                true,
-                keyless,
-            )
-            .await;
-            let route = &mut fixture.config.routes[0];
-            if keyless {
-                route.secret = SecretSource::None;
-                route.secret_ref.clear();
-            }
-            route.provider = if rerank {
-                RouteProvider::CohereRerank {
-                    operator: "test".into(),
-                    rerank_input_bytes: 64,
-                    rerank_candidates: 2,
-                    rerank_context_tokens: 16,
-                    rerank_query_tokens: 8,
+            for measured_usage in [false, true] {
+                let rerank = adapter == ModelAdapter::CohereRerank;
+                let body = match adapter {
+                    ModelAdapter::CohereRerank => {
+                        r#"{"results":[{"index":0,"relevance_score":0.8}]}"#
+                    }
+                    ModelAdapter::OllamaEmbedding => r#"{"embedding":[1,2]}"#,
+                    _ => r#"{"data":[{"index":0,"embedding":[1,2]}]}"#,
+                };
+                let mut body: serde_json::Value = serde_json::from_str(body).unwrap();
+                if measured_usage {
+                    body["usage"] = serde_json::json!({"cost": "0.001"});
                 }
-            } else {
-                RouteProvider::CompatibleEmbedding {
-                    adapter,
-                    operator: "test".into(),
-                    dimensions: 2,
-                    embedding_full_dimensions: 1024,
-                    embedding_input_tokens: 16,
+                let mut fixture = Fixture::with_http_response(
+                    200,
+                    body.to_string(),
+                    Duration::ZERO,
+                    "null",
+                    true,
+                    keyless,
+                )
+                .await;
+                let route = &mut fixture.config.routes[0];
+                route.provider_request_limit = Some(1);
+                if keyless {
+                    route.secret = SecretSource::None;
+                    route.secret_ref.clear();
                 }
-            };
-            if !rerank {
-                let mut collision = fixture.config.clone();
-                let mut other = collision.routes[0].clone();
-                other.route = "other".into();
-                if let RouteProvider::CompatibleEmbedding { adapter, .. } = &mut other.provider {
-                    *adapter = if *adapter == ModelAdapter::OpenAiEmbedding {
-                        ModelAdapter::OllamaEmbedding
-                    } else {
-                        ModelAdapter::OpenAiEmbedding
-                    };
+                route.provider = if rerank {
+                    RouteProvider::CohereRerank {
+                        operator: "test".into(),
+                        rerank_input_bytes: 64,
+                        rerank_candidates: 2,
+                        rerank_context_tokens: 16,
+                        rerank_query_tokens: 8,
+                    }
+                } else {
+                    RouteProvider::CompatibleEmbedding {
+                        adapter,
+                        operator: "test".into(),
+                        dimensions: 2,
+                        embedding_full_dimensions: 1024,
+                        embedding_input_tokens: 16,
+                    }
+                };
+                if !rerank {
+                    let mut collision = fixture.config.clone();
+                    let mut other = collision.routes[0].clone();
+                    other.route = "other".into();
+                    if let RouteProvider::CompatibleEmbedding { adapter, .. } = &mut other.provider
+                    {
+                        *adapter = if *adapter == ModelAdapter::OpenAiEmbedding {
+                            ModelAdapter::OllamaEmbedding
+                        } else {
+                            ModelAdapter::OpenAiEmbedding
+                        };
+                    }
+                    collision.routes.push(other);
+                    assert!(CredentialProcess::open(collision).is_err());
                 }
-                collision.routes.push(other);
-                assert!(CredentialProcess::open(collision).is_err());
-            }
-            let process = fixture.process();
-            let (admission, _) = fixture.attempt("retrieval", 1, 10);
-            let payload = if rerank {
-                ProviderPayload::Rerank(RerankRequest {
-                    query: "query".into(),
-                    documents: vec!["candidate".into()],
-                    top_k: Some(1),
-                    sensitivity: Sensitivity::Private,
-                    role_binding: None,
-                    source: None,
-                    metadata: serde_json::Value::Null,
-                })
-            } else {
-                ProviderPayload::Embedding(EmbeddingRequest {
-                    inputs: vec!["input".into()],
-                    dimensions: Some(2),
-                    task: None,
-                    sensitivity: Sensitivity::Private,
-                    role_binding: None,
-                    source: None,
-                    metadata: serde_json::Value::Null,
-                })
-            };
-            let mut attempt = admission.attempt;
-            {
-                let mut oversized = payload.clone();
-                match &mut oversized {
-                    ProviderPayload::Rerank(request) => request.documents[0] = "x".repeat(17),
-                    ProviderPayload::Embedding(request) => request.inputs[0] = "x".repeat(17),
-                    _ => unreachable!(),
+                let process = fixture.process();
+                let (admission, _) = fixture.attempt("retrieval", 1, 10);
+                let payload = if rerank {
+                    ProviderPayload::Rerank(RerankRequest {
+                        query: "query".into(),
+                        documents: vec!["candidate".into()],
+                        top_k: Some(1),
+                        sensitivity: Sensitivity::Private,
+                        role_binding: None,
+                        source: None,
+                        metadata: serde_json::Value::Null,
+                    })
+                } else {
+                    ProviderPayload::Embedding(EmbeddingRequest {
+                        inputs: vec!["input".into()],
+                        dimensions: Some(2),
+                        task: None,
+                        sensitivity: Sensitivity::Private,
+                        role_binding: None,
+                        source: None,
+                        metadata: serde_json::Value::Null,
+                    })
+                };
+                let mut attempt = admission.attempt;
+                {
+                    let mut oversized = payload.clone();
+                    match &mut oversized {
+                        ProviderPayload::Rerank(request) => request.documents[0] = "x".repeat(17),
+                        ProviderPayload::Embedding(request) => request.inputs[0] = "x".repeat(17),
+                        _ => unreachable!(),
+                    }
+                    let (oversized_admission, _) =
+                        fixture.attempt("retrieval-over-capacity", 1, 10);
+                    let mut oversized_attempt = oversized_admission.attempt;
+                    oversized_attempt.input_digest = oversized.digest().unwrap();
+                    let oversized_admission = AdmissionKey::new(KEY.to_vec())
+                        .unwrap()
+                        .sign_attempt(oversized_attempt)
+                        .unwrap();
+                    let oversized_permit = permit(&process, &oversized_admission).await;
+                    assert!(matches!(
+                        exchange(
+                            &process,
+                            inject(oversized_admission.clone(), oversized, oversized_permit)
+                        )
+                        .await,
+                        Err(EgressError::LimitExceeded)
+                    ));
+                    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(ledger_totals(&fixture), (0, 0));
+                    assert!(matches!(
+                        status(&process, &oversized_admission).await,
+                        AttemptStatus::Permitted
+                    ));
                 }
-                let (oversized_admission, _) = fixture.attempt("retrieval-over-capacity", 1, 10);
-                let mut oversized_attempt = oversized_admission.attempt;
-                oversized_attempt.input_digest = oversized.digest().unwrap();
-                let oversized_admission = AdmissionKey::new(KEY.to_vec())
+                attempt.input_digest = payload.digest().unwrap();
+                let admission = AdmissionKey::new(KEY.to_vec())
                     .unwrap()
-                    .sign_attempt(oversized_attempt)
+                    .sign_attempt(attempt)
                     .unwrap();
-                let oversized_permit = permit(&process, &oversized_admission).await;
-                assert!(matches!(
-                    exchange(
-                        &process,
-                        inject(oversized_admission.clone(), oversized, oversized_permit)
+                let token = permit(&process, &admission).await;
+                let operation = inject(admission.clone(), payload.clone(), token);
+                let result = dispatched(exchange(&process, operation.clone()).await.unwrap());
+                assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+                assert_eq!(
+                    result.receipt.charge,
+                    if measured_usage {
+                        ChargeReport::Measured {
+                            unit: "provider_requests".into(),
+                            amount: 1,
+                        }
+                    } else {
+                        ChargeReport::Unknown {
+                            reserved: admission.attempt.reserved_budget.clone(),
+                        }
+                    }
+                );
+                assert!(result.error.is_none());
+                assert!(result.output.is_some());
+                assert!(result.receipt_persisted);
+                let encoded = serde_json::to_string(&result).unwrap();
+                serde_json::from_str::<DispatchResult>(&encoded).unwrap_or_else(|error| {
+                    panic!(
+                        "{adapter:?}, keyless={keyless}, measured_usage={measured_usage}: {error}"
                     )
-                    .await,
-                    Err(EgressError::LimitExceeded)
-                ));
-                assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-                assert!(matches!(
-                    status(&process, &oversized_admission).await,
-                    AttemptStatus::Permitted
-                ));
-            }
-            attempt.input_digest = payload.digest().unwrap();
-            let admission = AdmissionKey::new(KEY.to_vec())
-                .unwrap()
-                .sign_attempt(attempt)
+                });
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                assert!(exchange(&process, operation).await.is_err());
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(ledger_totals(&fixture), (1, 1));
+                let ledger = symbiotic_ai_runtime::spend::SqliteSpendLedger::open(
+                    &fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
                 .unwrap();
-            let token = permit(&process, &admission).await;
-            let operation = inject(admission, payload, token);
-            let result = dispatched(exchange(&process, operation.clone()).await.unwrap());
-            assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
-            assert_eq!(
-                result.receipt.charge,
-                ChargeReport::Measured {
-                    unit: "provider_requests".into(),
-                    amount: 1
-                }
-            );
-            assert!(result.error.is_none());
-            assert!(result.output.is_some());
-            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-            assert!(exchange(&process, operation).await.is_err());
-            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-            assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+                use symbiotic_ai_runtime::model::SpendLedger;
+                let canonical = ledger
+                    .receipt(&symbiotic_credential_process::spend_receipt_reference(
+                        &result.receipt,
+                    ))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    canonical.state,
+                    if measured_usage {
+                        symbiotic_ai_runtime::SpendState::Settled
+                    } else {
+                        symbiotic_ai_runtime::SpendState::Unknown
+                    }
+                );
+                let mut next_attempt = admission.attempt.clone();
+                next_attempt.invocation_id = "retrieval-next".into();
+                let next = AdmissionKey::new(KEY.to_vec())
+                    .unwrap()
+                    .sign_attempt(next_attempt)
+                    .unwrap();
+                let next_permit = permit(&process, &next).await;
+                assert!(matches!(
+                    exchange(&process, inject(next, payload, next_permit)).await,
+                    Err(EgressError::BudgetRefused)
+                ));
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(ledger_totals(&fixture), (1, 1));
+                drop(process);
+                let reopened = fixture.process();
+                let AttemptStatus::Completed { result: recovered } =
+                    status(&reopened, &admission).await
+                else {
+                    panic!("retrieval completion missing after restart");
+                };
+                assert_eq!(
+                    serde_json::to_value(&result).unwrap(),
+                    serde_json::to_value(recovered).unwrap()
+                );
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+            }
         }
     }
 }

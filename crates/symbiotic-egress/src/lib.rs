@@ -347,13 +347,27 @@ pub enum ProviderOutput {
     Chat { text: String },
     /// Embedding vectors.
     Embedding {
+        #[serde(deserialize_with = "deserialize_output_numbers")]
         vectors: Vec<Vec<f32>>,
         dimensions: usize,
     },
     /// Validated candidate indices and finite relevance scores.
     Rerank {
+        #[serde(deserialize_with = "deserialize_output_numbers")]
         hits: Vec<symbiotic_model::RerankHit>,
     },
+}
+
+// Internally tagged enums buffer fields through Serde's generic content model.
+// With arbitrary_precision enabled for provider billing, JSON decimal numbers
+// arrive there as maps. Restore JSON values before decoding typed output floats.
+fn deserialize_output_numbers<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 /// Charge settlement. Unknown means retain the entire reservation until reconciliation.

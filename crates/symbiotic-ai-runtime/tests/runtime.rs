@@ -68,6 +68,7 @@ struct Loopback {
     peak: Arc<AtomicUsize>,
     fail: Option<Arc<ModelError>>,
     delay: Duration,
+    credential: Option<Arc<symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider>>,
 }
 
 impl Loopback {
@@ -85,6 +86,7 @@ impl Loopback {
             peak: Arc::new(AtomicUsize::new(0)),
             fail: None,
             delay: Duration::from_millis(15),
+            credential: None,
         }
     }
 
@@ -106,6 +108,23 @@ impl Loopback {
 }
 
 impl ModelProvider for Loopback {
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.credential
+            .as_ref()
+            .and_then(|p| p.credential_fingerprint())
+    }
+    fn credential_boundary(&self) -> Option<&symbiotic_ai_runtime::model::CredentialBoundary> {
+        self.credential
+            .as_ref()
+            .and_then(|p| p.credential_boundary())
+    }
+    fn failure_charge(&self, error: &ModelError) -> symbiotic_ai_runtime::model::FailureCharge {
+        if matches!(error, ModelError::Timeout(_)) {
+            symbiotic_ai_runtime::model::FailureCharge::Unknown
+        } else {
+            symbiotic_ai_runtime::model::FailureCharge::KnownZero
+        }
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
     }
@@ -171,8 +190,91 @@ fn persistent(dir: &std::path::Path) -> Runtime {
 }
 
 #[tokio::test]
+async fn spend_dispatch_requires_an_explicit_state_directory() {
+    for runtime in [
+        Runtime::in_memory(),
+        Runtime::open(RuntimeConfig::default()).unwrap(),
+    ] {
+        let raw = Loopback::new(unique_identity());
+        let provider = runtime
+            .chat(binding(raw.clone()).with_policy(policy()))
+            .unwrap();
+        assert!(matches!(
+            provider.chat(request("no state")).await,
+            Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+            ))
+        ));
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+        assert!(!runtime.is_persistent());
+    }
+}
+
+#[tokio::test]
+async fn spend_timeout_never_uses_the_unused_attempt_allowance() {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_secs(2));
+    let sink = Arc::new(InMemoryReceiptSink::default());
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().into()),
+        receipt_sink: Some(sink.clone()),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let chat = runtime
+        .chat(binding(raw.clone()).with_policy(ModelQueueConfig {
+            request_timeout_seconds: Some(1),
+            logical_retry_attempts: 2,
+            retry_attempts: 2,
+            ..policy()
+        }))
+        .unwrap();
+    assert!(chat.chat(request("timeout")).await.is_err());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    let reference = sink
+        .receipts()
+        .into_iter()
+        .find(|r| r.status == ReceiptStatus::Failed)
+        .unwrap()
+        .spend_receipt
+        .unwrap();
+    drop((chat, runtime));
+    let receipt = persistent(dir.path())
+        .spend_receipt(&reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.state, symbiotic_ai_runtime::SpendState::Unknown);
+    assert!(receipt.usage.is_none());
+}
+
+#[tokio::test]
+async fn spend_lost_success_reply_recovers_without_response_cache_after_restart() {
+    let dir = private_tempdir();
+    let raw = Loopback::new(unique_identity());
+    let install = |runtime: &Runtime| {
+        runtime
+            .chat(
+                binding(raw.clone())
+                    .with_policy(policy())
+                    .with_response_cache(ResponseCacheMode::Off),
+            )
+            .unwrap()
+    };
+    let runtime = persistent(dir.path());
+    let original = install(&runtime).chat(request("lost reply")).await.unwrap();
+    drop(runtime);
+    let recovered = install(&persistent(dir.path()))
+        .chat(request("lost reply"))
+        .await
+        .unwrap();
+    assert_eq!(recovered.text, original.text);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn bindings_of_one_model_share_its_cap() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let answer = runtime
         .chat(binding(raw.clone()).with_policy(policy()))
@@ -230,7 +332,8 @@ async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_inde
 
 #[tokio::test]
 async fn host_provider_objects_can_be_bound() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw: Arc<dyn ChatProvider> = Arc::new(Loopback::new(unique_identity()));
     let chat = runtime.chat(binding(raw).with_policy(policy())).unwrap();
     assert!(
@@ -325,8 +428,9 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
     ));
     assert_eq!(down.calls.load(Ordering::SeqCst), 1);
 
-    // An in-memory runtime starts with a fresh budget.
-    Runtime::in_memory()
+    // A separate state directory starts with a fresh budget.
+    let fresh = private_tempdir();
+    persistent(fresh.path())
         .chat(binding())
         .unwrap()
         .chat(request("doomed"))
@@ -336,34 +440,37 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
 }
 
 #[tokio::test]
-async fn an_in_memory_runtime_caches_nothing_by_default_and_binding_sinks_apply() {
-    let runtime = Runtime::in_memory();
+async fn spend_cache_off_recovers_the_same_attempt_and_binding_sinks_apply() {
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let receipts = Arc::new(InMemoryReceiptSink::default());
     let chat = runtime
         .chat(
             binding(raw.clone())
                 .with_policy(policy())
-                .with_receipt_sink(receipts.clone()),
+                .with_receipt_sink(receipts.clone())
+                .with_response_cache(ResponseCacheMode::Off),
         )
         .unwrap();
     chat.chat(request("again")).await.unwrap();
     chat.chat(request("again")).await.unwrap();
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         receipts
             .receipts()
             .iter()
             .filter(|receipt| receipt.status == ReceiptStatus::Succeeded)
             .count(),
-        2
+        1
     );
 }
 
 #[tokio::test]
 async fn a_queue_id_isolates_a_role_or_pools_models() {
-    let runtime = Runtime::in_memory();
-    let raw = Loopback::new(unique_identity());
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(150));
     let one_slot = ModelQueueConfig {
         max_in_flight: 1,
         ..policy()
@@ -425,7 +532,8 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
 
 #[tokio::test]
 async fn pooled_models_keep_separate_budgets_for_the_same_request() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let pool = symbiotic_ai_runtime::AccountSharingKey::new("chat:pool:budgets");
     let down = Loopback::new(unique_identity()).unavailable();
     let up = Loopback::new(unique_identity());
@@ -554,25 +662,26 @@ async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
     );
 }
 
-/// `MemoryQueue`.
-mod in_memory {
+/// Persistent dispatch with a custom response cache.
+mod custom_cache {
     use super::*;
 
     #[tokio::test]
     async fn an_abandoned_call_does_not_block_the_identical_request_behind_it() {
-        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(
-            Runtime::in_memory(),
-        )
+        let state = private_tempdir();
+        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(persistent(
+            state.path(),
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call() {
-        // An in-memory runtime caches nothing by default; a host cache
-        // answers the later callers.
+        // A host cache answers later callers independently of the operational store.
+        let state = private_tempdir();
         let cache = private_tempdir();
         super::a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
-            Runtime::in_memory(),
+            persistent(state.path()),
             ResponseCacheMode::Custom(Arc::new(DirResponseCache::new(cache.path()))),
         )
         .await;
@@ -828,12 +937,36 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
 
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
     assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
-    // The bad key's terminal refusal is retained: it does not call again.
+    // Credential rotation does not erase the first attempt's uncertain charge.
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
-    assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "{err:?}"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let reference = receipts
+        .receipts()
+        .into_iter()
+        .find_map(|r| r.spend_receipt)
+        .unwrap();
+    let err = bind(KEY_B).chat(request("rotate")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "rotating an unreconciled credential must refuse dispatch: {err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // This synthetic endpoint establishes that its rejected key incurred no charge.
+    runtime
+        .reconcile_spend(&reference, symbiotic_ai_runtime::SpendState::Released, None)
+        .unwrap();
 
-    // A new key is a new credential, with its own budget.
+    // A reconciled zero-charge attempt permits the rotated key's new handoff.
     let answer = bind(KEY_B)
         .chat(request("rotate"))
         .await
@@ -901,8 +1034,9 @@ mod rotation_and_cap {
     use super::*;
 
     #[tokio::test]
-    async fn in_memory_a_rotated_credential_gets_a_fresh_budget() {
-        a_rotated_credential_gets_a_fresh_budget(Runtime::in_memory()).await;
+    async fn separate_state_a_rotated_credential_gets_a_fresh_budget() {
+        let state = private_tempdir();
+        a_rotated_credential_gets_a_fresh_budget(persistent(state.path())).await;
     }
 
     #[tokio::test]
@@ -912,8 +1046,9 @@ mod rotation_and_cap {
     }
 
     #[tokio::test]
-    async fn in_memory_logical_attempts_cap_provider_calls() {
-        logical_attempts_cap_provider_calls(Runtime::in_memory()).await;
+    async fn separate_state_logical_attempts_cap_provider_calls() {
+        let state = private_tempdir();
+        logical_attempts_cap_provider_calls(persistent(state.path())).await;
     }
 
     #[tokio::test]
@@ -992,8 +1127,8 @@ async fn an_expired_cached_response_misses_and_the_sweep_removes_it() {
     ask(&runtime).await;
     assert_eq!(
         raw.calls.load(Ordering::SeqCst),
-        2,
-        "an expired entry misses"
+        1,
+        "ledger recovery prevents redispatch after cache expiry"
     );
 
     // The sweep at open removes expired entries.
@@ -1075,10 +1210,10 @@ async fn purging_a_source_removes_only_its_responses() {
         })
         .unwrap();
     assert_eq!(removed, 1);
-    // The purged answer is asked again; the other is still cached.
+    // Cache purge preserves the paid attempt and its recovery result.
     chat.chat(from("tenant-a/doc-1", "one")).await.unwrap();
     chat.chat(from("tenant-b/doc-2", "two")).await.unwrap();
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
     assert_eq!(Runtime::in_memory().purge_responses(|_| true).unwrap(), 0);
 }
 
@@ -1180,7 +1315,8 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
             Ok(())
         }
     }
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let cache = Arc::new(OneEntry(std::sync::Mutex::new(None)));
     for settings in [
@@ -1220,8 +1356,10 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
 
 #[tokio::test]
 async fn independent_accounts_and_runtimes_do_not_share_rate_budget() {
-    let runtime = Runtime::in_memory();
-    let other_runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
+    let other_state = private_tempdir();
+    let other_runtime = persistent(other_state.path());
     let raw = Loopback::new(unique_identity());
     let policy = ModelQueueConfig {
         requests_per_minute: Some(1),
@@ -1255,7 +1393,8 @@ async fn independent_accounts_and_runtimes_do_not_share_rate_budget() {
 
 #[tokio::test]
 async fn explicit_account_sharing_enforces_one_rate_budget_across_tenants() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let policy = ModelQueueConfig {
         requests_per_minute: Some(1),
@@ -1745,4 +1884,553 @@ async fn restored_stopped_and_exhausted_dead_items_cannot_surface_stored_text() 
         assert!(!format!("{restored:?} {restored}").contains(KEY));
         assert_eq!(broken.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn execution_timeout_returns_receipt_without_telemetry_and_lookup_survives_restart() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let calls = raw.calls.clone();
+    let identity = binding(raw.clone()).identity.unwrap();
+    let error = runtime
+        .execute_chat(
+            binding(raw)
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off),
+            "explicit-timeout-invocation",
+            request("uncertain transport"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error.source, ModelError::Timeout(_)));
+    let status = error.attempt.unwrap().unwrap();
+    assert_eq!(status.state, symbiotic_ai_runtime::SpendState::Unknown);
+    assert!(!status.output_available);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(runtime);
+
+    let restarted = persistent(dir.path());
+    assert_eq!(
+        restarted
+            .invocation_status(&identity, None, "explicit-timeout-invocation")
+            .unwrap()
+            .unwrap(),
+        status
+    );
+    assert!(
+        restarted
+            .spend_receipt(&status.reference)
+            .unwrap()
+            .is_some()
+    );
+    let other_account =
+        symbiotic_ai_runtime::BindingIdentity::new("other-tenant", "provider", "1", "account");
+    assert!(
+        restarted
+            .invocation_status(&other_account, None, "explicit-timeout-invocation")
+            .unwrap()
+            .is_none()
+    );
+    restarted
+        .reconcile_spend(
+            &status.reference,
+            symbiotic_ai_runtime::SpendState::Released,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        restarted
+            .invocation_status(&identity, None, "explicit-timeout-invocation")
+            .unwrap()
+            .unwrap()
+            .state,
+        symbiotic_ai_runtime::SpendState::Released
+    );
+}
+
+#[tokio::test]
+async fn execution_success_returns_durable_receipt_and_same_invocation_recovers_output() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let calls = raw.calls.clone();
+    let configured = binding(raw)
+        .with_policy(policy())
+        .with_response_cache(ResponseCacheMode::Off);
+    let first = runtime
+        .execute_chat(
+            configured.clone(),
+            "explicit-success",
+            request("paid output"),
+        )
+        .await
+        .unwrap();
+    let status = first.attempt.unwrap().unwrap();
+    assert!(status.output_available);
+    // Loopback reports no usage: a successful output never fabricates zero charge.
+    assert_eq!(status.state, symbiotic_ai_runtime::SpendState::Unknown);
+    drop(runtime);
+    let restarted = persistent(dir.path());
+    let recovered = restarted
+        .execute_chat(configured, "explicit-success", request("paid output"))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&recovered.output).unwrap(),
+        serde_json::to_value(&first.output).unwrap()
+    );
+    assert_eq!(recovered.attempt.unwrap().unwrap(), status);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_distinct_explicit_invocations_do_not_share_an_accepted_attempt() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let calls = raw.calls.clone();
+    let configured = binding(raw)
+        .with_policy(policy())
+        .with_response_cache(ResponseCacheMode::Off);
+    let first = runtime
+        .execute_chat(
+            configured.clone(),
+            "first-invocation",
+            request("same input"),
+        )
+        .await
+        .unwrap();
+    let second = runtime
+        .execute_chat(configured, "second-invocation", request("same input"))
+        .await
+        .unwrap();
+    assert_ne!(
+        first.attempt.unwrap().unwrap().reference,
+        second.attempt.unwrap().unwrap().reference
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn execution_reusing_explicit_invocation_with_changed_inputs_is_refused() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let calls = raw.calls.clone();
+    let configured = binding(raw).with_policy(policy());
+    runtime
+        .execute_chat(
+            configured.clone(),
+            "fixed-invocation",
+            request("accepted input"),
+        )
+        .await
+        .unwrap();
+    // Prime a valid cache entry for the changed input under another invocation.
+    runtime
+        .execute_chat(
+            configured.clone(),
+            "cache-primer",
+            request("different input"),
+        )
+        .await
+        .unwrap();
+    let error = runtime
+        .execute_chat(configured, "fixed-invocation", request("different input"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+    ));
+    assert!(error.attempt.unwrap().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn execution_known_zero_failure_returns_released_attempt_receipt() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Auth(
+        symbiotic_core::DiagnosticCode::InvalidConfiguration,
+    ));
+    let identity = binding(raw.clone()).identity.unwrap();
+    let error = runtime
+        .execute_chat(
+            binding(raw)
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off),
+            "known-zero-invocation",
+            request("refused before transport"),
+        )
+        .await
+        .unwrap_err();
+    let status = error.attempt.unwrap().unwrap();
+    assert_eq!(status.state, symbiotic_ai_runtime::SpendState::Released);
+    assert!(!status.output_available);
+    assert_eq!(
+        runtime
+            .invocation_status(&identity, None, "known-zero-invocation")
+            .unwrap()
+            .unwrap(),
+        status
+    );
+}
+
+struct ReconcileAndReserveOnFailure {
+    ledger: Arc<symbiotic_ai_runtime::spend::SqliteSpendLedger>,
+    newer_reference: symbiotic_ai_runtime::SpendReceiptRef,
+}
+
+#[async_trait]
+impl symbiotic_ai_runtime::QueueReceiptSink for ReconcileAndReserveOnFailure {
+    async fn record_receipt(&self, receipt: symbiotic_ai_runtime::QueueReceipt) {
+        if receipt.status != ReceiptStatus::Failed {
+            return;
+        }
+        let ledger = self.ledger.clone();
+        let newer_reference = self.newer_reference.clone();
+        tokio::task::spawn_blocking(move || {
+            use symbiotic_ai_runtime::{SpendLedger, SpendState};
+            let reference = receipt.spend_receipt.unwrap();
+            let old = ledger.receipt(&reference).unwrap().unwrap();
+            ledger
+                .finish(&reference, SpendState::Released, None, None)
+                .unwrap();
+            let mut newer = old.reservation;
+            newer.reference = newer_reference;
+            assert!(ledger.reserve(&newer).unwrap());
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn execution_error_keeps_its_exact_receipt_when_a_new_attempt_is_accepted_before_return() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let identity = binding(raw.clone()).identity.unwrap();
+    let newer_reference = symbiotic_ai_runtime::SpendReceiptRef("newer-accepted-attempt".into());
+    let sink = Arc::new(ReconcileAndReserveOnFailure {
+        ledger: Arc::new(
+            symbiotic_ai_runtime::spend::SqliteSpendLedger::open(
+                &dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap(),
+        ),
+        newer_reference: newer_reference.clone(),
+    });
+    let error = runtime
+        .execute_chat(
+            binding(raw)
+                .with_policy(policy())
+                .with_receipt_sink(sink)
+                .with_response_cache(ResponseCacheMode::Off),
+            "racing-invocation",
+            request("original attempt"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error.source, ModelError::Timeout(_)));
+    let exact = error.attempt.unwrap().unwrap();
+    assert_ne!(exact.reference, newer_reference);
+    assert_eq!(exact.state, symbiotic_ai_runtime::SpendState::Released);
+    let latest = runtime
+        .invocation_status(&identity, None, "racing-invocation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.reference, newer_reference);
+    assert_eq!(latest.state, symbiotic_ai_runtime::SpendState::Unknown);
+}
+
+#[tokio::test]
+async fn execution_explicit_invocations_are_isolated_by_binding_inside_a_shared_account() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let calls = raw.calls.clone();
+    let sharing = symbiotic_ai_runtime::AccountSharingKey("explicit-shared-account".into());
+    let identities = [
+        symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "provider-a", "1", "account"),
+        symbiotic_ai_runtime::BindingIdentity::new("tenant-b", "provider-a", "1", "account"),
+        symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "provider-b", "1", "account"),
+        symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "provider-a", "2", "account"),
+    ];
+    let mut statuses = Vec::new();
+    for identity in &identities {
+        let result = runtime
+            .execute_chat(
+                ModelBinding::new(raw.clone())
+                    .with_identity(identity.clone())
+                    .with_account_sharing(sharing.clone())
+                    .with_policy(policy())
+                    .with_response_cache(ResponseCacheMode::Off),
+                "same-caller-invocation",
+                request("same input"),
+            )
+            .await
+            .unwrap();
+        let status = result.attempt.unwrap().unwrap();
+        assert!(
+            statuses.iter().all(
+                |old: &symbiotic_ai_runtime::ExecutionAttemptStatus| old.reference
+                    != status.reference
+            )
+        );
+        statuses.push(status);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), identities.len());
+    for (identity, status) in identities.iter().zip(statuses) {
+        assert_eq!(
+            runtime
+                .invocation_status(identity, Some(&sharing), "same-caller-invocation")
+                .unwrap()
+                .unwrap(),
+            status
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_explicit_invocations_bypass_cache_and_recover_their_own_output_after_restart() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let configured = binding(raw.clone()).with_policy(policy());
+    let primer = runtime
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    let selected = runtime
+        .execute_chat(configured.clone(), "cached-invocation", request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.output.trace.cache.response_cache,
+        symbiotic_trace::CacheStatus::NotApplicable
+    );
+    assert_ne!(
+        selected.attempt.unwrap().unwrap().reference,
+        serde_json::from_value::<symbiotic_ai_runtime::SpendReceiptRef>(
+            primer.trace.metadata["spend_receipt"].clone()
+        )
+        .unwrap()
+    );
+    let identity = configured.identity.as_ref().unwrap();
+    assert!(
+        runtime
+            .invocation_status(identity, None, "cached-invocation")
+            .unwrap()
+            .unwrap()
+            .output_available
+    );
+    let error = runtime
+        .execute_chat(configured.clone(), "cached-invocation", request("Y"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+    ));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    runtime.purge_responses(|_| true).unwrap();
+    drop(runtime);
+    let restarted = persistent(dir.path());
+    let recovered = restarted
+        .execute_chat(configured, "cached-invocation", request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(recovered.output).unwrap(),
+        serde_json::to_value(selected.output).unwrap()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT used FROM spend_accounts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn spend_credential_rotation_cannot_bypass_an_unknown_timeout() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut original = Loopback::new(unique_identity()).slow(Duration::from_secs(2));
+    original.credential = Some(Arc::new(
+        symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
+            "loopback",
+            "synthetic",
+            "http://localhost",
+            KEY_A,
+        ),
+    ));
+    let mut rotated = original.clone().slow(Duration::ZERO);
+    rotated.credential = Some(Arc::new(
+        symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
+            "loopback",
+            "synthetic",
+            "http://localhost",
+            KEY_B,
+        ),
+    ));
+    let configure = |raw| {
+        binding(raw)
+            .with_policy(ModelQueueConfig {
+                request_timeout_seconds: Some(1),
+                ..policy()
+            })
+            .with_response_cache(ResponseCacheMode::Off)
+    };
+    let first = runtime.chat(configure(original.clone())).unwrap();
+    assert!(matches!(
+        first.chat(request("rotation timeout")).await,
+        Err(ModelError::Timeout(_))
+    ));
+    let second = runtime.chat(configure(rotated)).unwrap();
+    let error = second.chat(request("rotation timeout")).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(original.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_reconciled_invocation_retries_despite_a_warm_cache() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let configured = binding(raw.clone()).with_policy(ModelQueueConfig {
+        logical_retry_attempts: 2,
+        retry_attempts: 2,
+        ..policy()
+    });
+    let error = runtime
+        .execute_chat(configured.clone(), "A", request("X"))
+        .await
+        .unwrap_err();
+    let first = error.attempt.unwrap().unwrap();
+    runtime
+        .reconcile_spend(
+            &first.reference,
+            symbiotic_ai_runtime::SpendState::Released,
+            None,
+        )
+        .unwrap();
+    raw.fail = None;
+    let configured = binding(raw.clone()).with_policy(ModelQueueConfig {
+        logical_retry_attempts: 2,
+        retry_attempts: 2,
+        ..policy()
+    });
+    // An implicit invocation warms the cache for exactly the same binding and input.
+    runtime
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    let retried = runtime
+        .execute_chat(configured, "A", request("X"))
+        .await
+        .unwrap();
+    assert_ne!(retried.attempt.unwrap().unwrap().reference, first.reference);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+}
+
+struct RefuseCacheAccess;
+impl symbiotic_ai_runtime::ResponseCache for RefuseCacheAccess {
+    fn load(
+        &self,
+        _: &symbiotic_ai_runtime::model::CacheEntry<'_>,
+    ) -> Result<Option<serde_json::Value>, ModelError> {
+        panic!("explicit invocations must never read result cache");
+    }
+    fn store(
+        &self,
+        _: &symbiotic_ai_runtime::model::CacheEntry<'_>,
+        _: &serde_json::Value,
+    ) -> Result<(), ModelError> {
+        panic!("explicit invocations must never write result cache");
+    }
+}
+
+#[tokio::test]
+async fn execution_with_invocation_never_accesses_custom_result_cache() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let configured = binding(raw.clone())
+        .with_policy(policy())
+        .with_invocation("A")
+        .with_response_cache(ResponseCacheMode::Custom(Arc::new(RefuseCacheAccess)));
+    let first = runtime
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    let recovered = runtime
+        .chat(configured)
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Auth(
+        symbiotic_core::DiagnosticCode::InvalidConfiguration,
+    ));
+    let configured = binding(raw.clone()).with_policy(policy());
+    let first = runtime
+        .execute_chat(configured.clone(), "A", request("X"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        first.attempt.unwrap().unwrap().state,
+        symbiotic_ai_runtime::SpendState::Released
+    );
+    let refused = runtime
+        .execute_chat(configured, "A", request("Y"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.source.code(),
+        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+    );
+    assert!(refused.attempt.unwrap().is_none());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
