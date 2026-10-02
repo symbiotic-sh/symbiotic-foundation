@@ -193,7 +193,7 @@ impl Fixture {
             attempt_ordinal: ordinal,
             record_sequence: sequence,
             recorded_at: 100,
-            expires_at: 101,
+            expires_at: unix_seconds() + 3600,
             recovery_expires_at: 4_000_000_000,
             caller_binding: "caller".into(),
             route: "chat".into(),
@@ -215,6 +215,170 @@ impl Fixture {
         )
     }
 }
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn exchange_wire(
+    process: &CredentialProcess,
+    operation: Operation,
+) -> Result<Reply, EgressError> {
+    let bytes = serde_json::to_vec(&Request {
+        version: PROTOCOL_VERSION,
+        operation,
+    })
+    .unwrap();
+    let response = process
+        .handle(serde_json::from_slice(&bytes).unwrap())
+        .await;
+    serde_json::from_slice::<Response>(&serde_json::to_vec(&response).unwrap())
+        .unwrap()
+        .result
+}
+
+#[tokio::test]
+async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthorization() {
+    for restart in [false, true] {
+        let mut fixture = Fixture::new(200, "reauthorized answer".into(), Duration::ZERO).await;
+        fixture.config.routes[0].max_attempts = 1;
+        fixture.config.routes[0].provider_request_limit = Some(1);
+        let mut process = fixture.process().await;
+        let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+        let (first, payload) = fixture.attempt("authority-deadline", 1, 10);
+        let mut first = first.attempt;
+        first.recorded_at = unix_seconds();
+        first.expires_at = first.recorded_at + 2;
+        let first = key.sign_attempt(first).unwrap();
+        let granted = permit(&process, &first).await;
+        assert!(unix_seconds() < first.attempt.expires_at);
+        // Serialized after the consumer's successful check, but delayed until
+        // Foundation's clock has reached the exclusive authority deadline.
+        let bytes = serde_json::to_vec(&Request {
+            version: PROTOCOL_VERSION,
+            operation: inject(first.clone(), payload.clone(), granted.clone()),
+        })
+        .unwrap();
+        while unix_seconds() < first.attempt.expires_at {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = process
+            .handle(serde_json::from_slice(&bytes).unwrap())
+            .await;
+        let response: Response =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(matches!(
+            response.result,
+            Err(EgressError::AuthorityExpired)
+        ));
+        assert!(matches!(
+            status(&process, &first).await,
+            AttemptStatus::Invalidated
+        ));
+        assert!(matches!(
+            exchange(&process, Operation::Receipt(signed_id(&first))).await,
+            Ok(Reply::Receipt(None))
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger_totals(&fixture), (0, 0));
+        let db = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT consumed, accepted_attempts FROM egress_permits",
+                [],
+                |r| Ok((r.get::<_, bool>(0)?, r.get::<_, u32>(1)?))
+            )
+            .unwrap(),
+            (false, 0)
+        );
+        drop(db);
+        if restart {
+            drop(process);
+            process = fixture.process().await;
+        }
+        let reattached = permit(&process, &first).await;
+        assert_eq!(reattached.token, granted.token);
+        assert!(matches!(
+            exchange_wire(&process, inject(first.clone(), payload.clone(), reattached)).await,
+            Err(EgressError::AuthorityExpired)
+        ));
+        let mut second = first.attempt.clone();
+        second.recorded_at = unix_seconds();
+        second.expires_at = second.recorded_at + 3600;
+        // A newly signed deadline cannot mutate an existing attempt identity.
+        assert!(matches!(
+            exchange_wire(
+                &process,
+                Operation::IssuePermit(key.sign_attempt(second.clone()).unwrap().into())
+            )
+            .await,
+            Err(EgressError::InvalidRequest)
+        ));
+        second.attempt_ordinal += 1;
+        second.record_sequence += 1;
+        let second = key.sign_attempt(second).unwrap();
+        let second_permit = permit(&process, &second).await;
+        let result = dispatched(
+            exchange_wire(&process, inject(second.clone(), payload, second_permit))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.receipt.attempt_id, second.attempt.attempt_id());
+        assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger_totals(&fixture), (1, 1));
+    }
+}
+
+#[tokio::test]
+async fn accepted_handoff_completes_and_recovers_after_authority_deadline() {
+    let mut fixture = Fixture::new(200, "accepted answer".into(), Duration::from_secs(2)).await;
+    fixture.config.routes[0].timeout_seconds = 4;
+    let process = fixture.process().await;
+    let (mut admission, payload) = fixture.attempt("accepted-deadline", 1, 10);
+    admission.attempt.recorded_at = unix_seconds();
+    admission.attempt.expires_at = admission.attempt.recorded_at + 2;
+    let admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange_wire(
+            &process,
+            inject(admission.clone(), payload.clone(), granted.clone()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(unix_seconds() >= admission.attempt.expires_at);
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert_eq!(result.receipt.spend_state, SpendState::Settled);
+    drop(process);
+    let process = fixture.process().await;
+    let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {
+        panic!("accepted result was withdrawn after authority expiry");
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    assert!(matches!(
+        exchange_wire(&process, inject(admission, payload, granted)).await,
+        Err(EgressError::PermitRefused)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
 async fn exchange(process: &CredentialProcess, operation: Operation) -> Result<Reply, EgressError> {
     process
         .handle(Request {
@@ -558,6 +722,23 @@ async fn unsigned_or_expired_at_record_authority_never_gets_a_permit() {
         exchange(&process, Operation::IssuePermit(admission.into())).await,
         Err(EgressError::InvalidRequest)
     ));
+    let (admission, _) = fixture.attempt("deadline-bounds", 1, 10);
+    for expires_at in [unix_seconds(), i64::MAX as u64 + 1] {
+        let mut attempt = admission.attempt.clone();
+        attempt.expires_at = expires_at;
+        let signed = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(attempt)
+            .unwrap();
+        let expected = if expires_at > i64::MAX as u64 {
+            EgressError::InvalidRequest
+        } else {
+            EgressError::AuthorityExpired
+        };
+        assert!(
+            matches!(exchange(&process, Operation::IssuePermit(signed.into())).await, Err(error) if error == expected)
+        );
+    }
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1572,12 +1753,13 @@ async fn recovery_same_identity_with_different_signed_digest_is_refused() {
     let (admission, _) = fixture.attempt("digest-mismatch", 1, 10);
     permit(&process, &admission).await;
     let key = AdmissionKey::new(KEY.to_vec()).unwrap();
-    for field in 0..3 {
+    for field in 0..4 {
         let mut changed = admission.attempt.clone();
         match field {
             0 => changed.record_sequence += 1,
             1 => changed.input_digest = "c".repeat(64),
-            _ => changed.recovery_expires_at += 1,
+            2 => changed.recovery_expires_at += 1,
+            _ => changed.expires_at += 1,
         }
         assert!(matches!(
             exchange(

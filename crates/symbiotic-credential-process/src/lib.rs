@@ -350,6 +350,7 @@ impl CredentialProcess {
             || a.record_sequence == 0
             || a.record_sequence > i64::MAX as u64
             || a.recorded_at >= a.expires_at
+            || a.expires_at > i64::MAX as u64
             || a.recovery_expires_at <= a.recorded_at
             || a.recovery_expires_at > i64::MAX as u64
             || !is_digest(&a.input_digest)
@@ -620,6 +621,9 @@ fn invocation_binding(a: &DurableAttempt) -> Result<String, EgressError> {
     immutable.attempt_ordinal = 0;
     immutable.record_sequence = 0;
     immutable.recorded_at = 0;
+    // Authority is rechecked for each attempt; a renewed deadline does not
+    // change the invocation's input/provider or immutable recovery binding.
+    immutable.expires_at = 0;
     immutable.grant_revision = 0;
     digest(&immutable)
 }

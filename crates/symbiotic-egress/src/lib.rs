@@ -1,5 +1,6 @@
 //! Memory attests durable input authorization; Foundation owns dispatch and accounting.
 //! Sign admissions only after durability and ordered publication of the grant revision.
+//! All protocol timestamps are absolute Unix seconds (UTC), never milliseconds.
 
 pub use symbiotic_core::Sensitivity;
 pub use symbiotic_model::{
@@ -37,6 +38,9 @@ pub enum EgressError {
     /// Permit absent, mismatched, or already consumed.
     #[error("permit refused or already used")]
     PermitRefused,
+    /// The signed exclusive authority deadline elapsed before acceptance; no charge.
+    #[error("attempt authority expired before acceptance")]
+    AuthorityExpired,
     /// A new attempt cannot reuse an unsettled uncertain dispatch.
     #[error("previous attempt requires reconciliation")]
     ReconciliationRequired,
@@ -76,7 +80,9 @@ pub struct DurableAttempt {
     pub record_sequence: u64,
     /// Trusted time at serialization, Unix seconds.
     pub recorded_at: u64,
-    /// Authority expiry checked at serialization, exclusive Unix seconds.
+    /// Exclusive authority deadline in Unix seconds, covering the earliest applicable
+    /// expiry of caller/provider input authority. Signed and digested; Foundation
+    /// checks its own clock inside the acceptance transaction before consuming/reserving.
     pub expires_at: u64,
     /// Exclusive Unix-second deadline for recovering terminal results. Signed and immutable.
     pub recovery_expires_at: u64,
@@ -410,9 +416,9 @@ pub struct DispatchResult {
 pub enum AttemptStatus {
     /// No permit has been issued for this identity.
     NotIssued,
-    /// Permit committed, not consumed, and still under the published grant revision.
+    /// Permit committed, not consumed, with current revision and unexpired authority.
     Permitted,
-    /// Grant revision changed before handoff; no charge or attempt allowance consumed.
+    /// Revision changed or authority expired before handoff; no charge or allowance consumed.
     Invalidated,
     /// Permit consumed; completion is not durably known (including a process crash).
     Dispatched { receipt: DispatchReceipt },

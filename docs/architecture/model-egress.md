@@ -40,6 +40,15 @@ provide a replacement wire schema. `input_digest` hashes the exact typed
 Memory's manifest bytes; Foundation verifies the binding, not the manifest's
 policy contents. Secret references are tenant scoped, not file paths.
 
+All protocol timestamps are absolute Unix seconds (UTC), never milliseconds.
+`recorded_at` is the serialization time. The required signed/digested `expires_at`
+is the exclusive authority deadline, greater than `recorded_at` and at most
+`i64::MAX`. Memory sets it to cover the earliest applicable expiry of caller or
+provider input authority, including their authorization dependencies. Foundation
+checks its own clock at acceptance as described below. This is a per-attempt
+deadline; a newly authorized attempt may renew it without changing the invocation's
+input/provider binding. The separate recovery deadline remains immutable across retries.
+
 The replacement integration order is specified once in
 [boundary.md](boundary.md#grant-revision-and-dispatch-ordering). The admission MAC
 key is distinct from provider credentials and authenticates trusted admission;
@@ -53,7 +62,7 @@ implementation.
 ## Same-attempt recovery (v3)
 
 V3 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version and HMAC domains are 3; the egress registry schema stamp is 4.
+versions, configuration version and HMAC domains are 3; the egress registry schema stamp is 5.
 Opening a registry with a different stamp fails with `Version`; no migration or reset is
 performed. Operators must reconcile any old live attempts before provisioning fresh state;
 never delete active replay history.
@@ -87,8 +96,8 @@ requests converge on one permit, and concurrent injections admit at most one han
 | State | Fields / meaning |
 | --- | --- |
 | `NotIssued` | No permit for this identity; lookup does not issue one |
-| `Permitted` | Unconsumed permit under the published revision |
-| `Invalidated` | Unconsumed permit superseded by publication; see [revocation rules](#revocation-replay-and-unknown-charges) |
+| `Permitted` | Unconsumed permit under the published revision with unexpired authority |
+| `Invalidated` | Unconsumed permit superseded by publication or authority expiry; see [revocation rules](#revocation-replay-and-unknown-charges) |
 | `Dispatched { receipt }` | Consumed, with no durable completion; receipt retains unknown reservation |
 | `Completed { result }` | `DispatchResult` with typed `ProviderOutput`, measured usage/charge, no error |
 | `Failed { result }` | `DispatchResult` with static `EgressError`, no output, and known-zero or unknown charge |
@@ -100,7 +109,8 @@ across invocation retries, distinct from authority `expires_at`, and chosen by M
 for its recovery window. Terminal results are unavailable at or after that deadline.
 Completion after the deadline persists accounting but never stores recovery output.
 Expiry neither permits a new dispatch nor deletes accounting or replay tombstones.
-Permitted and uncertain dispatched attempts keep their state after the deadline.
+Pending permits and uncertain dispatched attempts retain their authority/execution
+state independently of the recovery deadline.
 
 Expired result rows are cleared incrementally at startup, before operations, and every
 second during socket serving, even when idle or connection slots are occupied. Each call
@@ -163,24 +173,33 @@ this contract. Memory adoption implements this integration.
 Publication durably advances the revision and refuses rollback; an exact replay
 is idempotent. Permit issuance checks the published revision but reserves nothing.
 Dispatch acceptance rechecks exact equality in the same immediate transaction as
-permit consumption and ledger reservation. That transaction is the acceptance
-point and is serialized with publication.
+permit consumption and ledger reservation. Inside that transaction, after acquiring
+the writer lock and before consuming or reserving, Foundation samples its own clock
+and requires `now < expires_at`. That transaction is the acceptance point and is
+serialized with publication. A delayed attempt at or past its exclusive deadline
+returns `EgressError::AuthorityExpired` (wire code `authority_expired`), with no
+permit consumption, reservation, receipt or charge. New permit issuance also refuses
+expired authority; exact reattachment still returns the existing capability and status.
 
-A permit invalidated by a grant-revision change before handoff has status
+A permit invalidated by a grant-revision change or authority expiry before handoff has status
 `Invalidated`: it is not a charge, does not occupy the invocation and does not consume
 `max_attempts`. Its capability remains refused, even if its K record preceded the change.
 After Memory reauthorizes both principals, the next admission under the published revision
 is a new handoff for the same invocation, with the following ordinal and a higher record
-sequence; it cannot mutate an existing signed attempt. For example, ordinal 1 issued
+sequence and a currently valid signed deadline; it cannot mutate an existing signed attempt.
+Ordinary expiry needs no revision publication, so reauthorization after expiry can
+use the same published revision. For example, ordinal 1 issued
 under revision 10 and invalidated by revision 11 permits a newly signed ordinal 2 under
 revision 11 even with `max_attempts = 1`. Accepted handoffs retain execution, accounting,
-status and receipt recovery after publication; any retry must match the current revision.
+status and receipt recovery after publication or authority expiry; any retry must
+match the current revision and carry its newly checked authority deadline.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_grant_revisions` replay-protection tables. They store hashes, ordinal/sequence,
-grant-revision bindings, accepted-handoff counts, consumption status, recoverable permit
-tokens and accounting receipts. Pending status is projected from the stored permit revision
-and the durably published revision, so publication needs no permit-history scan. V3 also stores
+grant-revision bindings, authority deadlines, accepted-handoff counts, consumption status,
+recoverable permit tokens and accounting receipts. Pending status is projected from the
+stored permit revision, the durably published revision and Foundation's clock, so
+publication and authority expiry need no permit-history scan. V3 also stores
 safe typed results until the signed recovery deadline, never prompts or provider credentials.
 The owner-only database and same-UID authenticated IPC protect these recovery values.
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede

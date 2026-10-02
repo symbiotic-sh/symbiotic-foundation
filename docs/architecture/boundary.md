@@ -119,16 +119,24 @@ continuing permission to dispatch.
 The ordered call contract is:
 
 1. Memory checks the requesting principal and provider against all stored inputs
-   and binds admission to the effective grant revision and exact invocation inputs.
+   and binds the signed admission to the effective grant revision, exact invocation
+   inputs and an exclusive authority deadline covering the earliest applicable
+   expiry of either principal's authority and its authorization dependencies.
 2. Pending admissions, including queued work and retries, re-check the current
    grant revision for both the requesting principal and provider before dispatch.
    A changed revision requires current authorization of both against all stored
    inputs; a call no longer authorized is refused.
 3. Foundation accepts a handoff only after the revision check is ordered with grant
-   updates and the attempt's reservation/replay state is durable. The handoff is
+   updates and its own clock is strictly before the signed authority deadline.
+   Foundation checks that deadline inside the acceptance transaction, before permit
+   consumption or reservation, and makes the attempt's reservation/replay state durable.
+   An expired pending attempt is refused with a typed error, consumes no permit or
+   attempt allowance, reserves nothing and is not a charge. Reauthorization can
+   admit a new attempt for that invocation even without a grant revision change.
+   The handoff is
    the acceptance of that specific provider attempt, not enqueue or permit issuance.
 4. Foundation executes the accepted attempt and preserves its accounting and
-   recovery state. Later revocation does not withdraw that accepted handoff or
+   recovery state. Later revocation or authority expiry does not withdraw that accepted handoff or
    imply that data already sent can be recalled.
 5. Memory checks current commit guards and output authority before committing a
    derivation. Execution success alone does not authorize an output commit.
@@ -137,7 +145,20 @@ The revision check and handoff must not leave a race in which either principal's
 input authorization has changed but pending work can still dispatch under an old
 revision. The trusted admission integration must establish this ordering;
 wall-clock timestamps or asynchronous revocation notification alone do not
-establish it.
+establish revision ordering. Ordinary authority expiry need not publish a grant
+revision: the signed deadline independently closes the delay between Memory's
+check and Foundation's acceptance. All protocol timestamps use absolute Unix
+seconds (UTC), including record times, authority deadlines and recovery deadlines;
+deadlines are exclusive. The v3 signed/digested `DurableAttempt.expires_at` carries
+the authority deadline; `recovery_expires_at` separately bounds terminal-result recovery.
+
+For example, Memory checks attempt D at Unix second 100 with `expires_at = 101`.
+IPC or admission delay reaches Foundation's acceptance at second 101 or later.
+Foundation refuses D with `AuthorityExpired` before consuming its permit or
+reserving a request. A newly authorized attempt with the next ordinal, higher
+record sequence and fresh deadline may proceed under the same grant revision.
+An attempt accepted at second 100 keeps its execution, accounting and recovery
+after second 101; a retry requires a new authority check and deadline.
 
 For example, attempt A waits under revision 10. Removing the provider's input grant
 publishes revision 11 before A's handoff is accepted. A is refused even if its

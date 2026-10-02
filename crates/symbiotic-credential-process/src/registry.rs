@@ -8,7 +8,7 @@ pub(crate) struct Registry(Connection);
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 4;
+const REGISTRY_SCHEMA_VERSION: u16 = 5;
 
 struct PreviousAttempt {
     binding: String,
@@ -17,6 +17,7 @@ struct PreviousAttempt {
     record_sequence: u64,
     consumed: bool,
     grant_revision: u64,
+    expires_at: u64,
     accepted_attempts: u32,
 }
 
@@ -50,7 +51,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 4 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 5 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -61,6 +62,7 @@ impl Registry {
                 ordinal INTEGER NOT NULL,
                 record_sequence INTEGER NOT NULL,
                 token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
                 recovery_expires_at INTEGER NOT NULL,
                 finished INTEGER NOT NULL DEFAULT 0,
                 result TEXT,
@@ -99,12 +101,13 @@ impl Registry {
             .map_err(state)?;
         Self::check_revision(&tx, a)?;
         let previous = tx.query_row(
-            "SELECT invocation_binding, ordinal, receipt, record_sequence, consumed, grant_revision, accepted_attempts
+            "SELECT invocation_binding, ordinal, receipt, record_sequence, consumed, grant_revision, accepted_attempts, expires_at
              FROM egress_permits WHERE invocation_key=?1 ORDER BY ordinal DESC LIMIT 1", [&invocation_key],
             |row| Ok(PreviousAttempt {
                 binding: row.get(0)?, ordinal: row.get(1)?, receipt: row.get(2)?,
                 record_sequence: row.get(3)?, consumed: row.get(4)?,
                 grant_revision: row.get(5)?, accepted_attempts: row.get(6)?,
+                expires_at: row.get(7)?,
             })).optional().map_err(state)?;
         let mut accepted_attempts = 0;
         if let Some(previous) = previous {
@@ -120,9 +123,11 @@ impl Registry {
                 return Err(EgressError::InvalidRequest);
             }
             accepted_attempts = previous.accepted_attempts;
-            // Publication invalidates a pending permit without accepting a handoff.
+            // Revision publication or expiry invalidates a pending permit without a handoff.
             // It has no charge or receipt and leaves the invocation allowance intact.
-            if previous.consumed || previous.grant_revision == a.grant_revision {
+            if previous.consumed
+                || (previous.grant_revision == a.grant_revision && now()? < previous.expires_at)
+            {
                 let receipt = previous
                     .receipt
                     .ok_or(EgressError::ReconciliationRequired)?;
@@ -153,9 +158,12 @@ impl Registry {
         if accepted_attempts >= max_attempts {
             return Err(EgressError::BudgetRefused);
         }
+        if now()? >= a.expires_at {
+            return Err(EgressError::AuthorityExpired);
+        }
         let token = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at, grant_key, grant_revision, accepted_attempts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at, grant_key, a.grant_revision, accepted_attempts]).map_err(state)?;
+        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at, grant_key, grant_revision, accepted_attempts, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at, grant_key, a.grant_revision, accepted_attempts, a.expires_at]).map_err(state)?;
         tx.commit().map_err(state)?;
         Ok(PermitGrant {
             permit: DispatchPermit {
@@ -226,6 +234,12 @@ impl Registry {
         // Recheck the current route allowance even for a permit issued before restart.
         if accepted_attempts >= max_attempts {
             return Err(EgressError::BudgetRefused);
+        }
+        // Sample Foundation's clock after acquiring the writer transaction and
+        // immediately before consumption/reservation. IPC or admission lock
+        // delays must never turn an expired signed authority into a handoff.
+        if now()? >= attempt.expires_at {
+            return Err(EgressError::AuthorityExpired);
         }
         let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1, accepted_attempts=accepted_attempts+1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
         if changed != 1 {
@@ -310,7 +324,7 @@ impl Registry {
             .0
             .query_row(
                 "SELECT p.consumed, p.finished, p.recovery_expires_at, p.receipt, p.result,
-                        p.grant_revision = g.revision
+                        p.grant_revision = g.revision, p.expires_at
                  FROM egress_permits p JOIN egress_grant_revisions g ON g.grant_key=p.grant_key
                  WHERE p.invocation_key=?1 AND p.ordinal=?2",
                 params![key, id.attempt_ordinal],
@@ -322,16 +336,26 @@ impl Registry {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, bool>(5)?,
+                        row.get::<_, u64>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(state)?;
-        let Some((consumed, finished, expires, receipt, result, current_revision)) = row else {
+        let Some((
+            consumed,
+            finished,
+            expires,
+            receipt,
+            result,
+            current_revision,
+            authority_expires,
+        )) = row
+        else {
             return Ok(AttemptStatus::NotIssued);
         };
         if !consumed {
-            return Ok(if current_revision {
+            return Ok(if current_revision && time < authority_expires {
                 AttemptStatus::Permitted
             } else {
                 AttemptStatus::Invalidated
@@ -471,13 +495,138 @@ mod tests {
     fn attempt() -> DurableAttempt {
         serde_json::from_value(serde_json::json!({
             "tenant": "tenant", "incarnation": "incarnation", "invocation_id": "retry",
-            "attempt_ordinal": 1, "record_sequence": 1, "recorded_at": 100, "expires_at": 200,
+            "attempt_ordinal": 1, "record_sequence": 1, "recorded_at": 100, "expires_at": now().unwrap() + 3600,
             "recovery_expires_at": 4000000000u64, "caller_binding": "caller", "route": "chat", "destination": "https://example.test",
             "model": "model", "method": "POST", "secret_ref": "key", "manifest_ref": "manifest",
             "input_manifest_digest": "a".repeat(64), "input_digest": "b".repeat(64),
             "grant_revision": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn authority_expiry_while_waiting_for_acceptance_consumes_and_reserves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut registry = open(&path);
+        let mut first = attempt();
+        first.recorded_at = now().unwrap();
+        first.expires_at = first.recorded_at + 2;
+        let granted = registry.issue(&first, 1).unwrap();
+        assert!(matches!(
+            registry
+                .attempt_status(&first.attempt_id(), first.expires_at - 1)
+                .unwrap(),
+            AttemptStatus::Permitted
+        ));
+        // Hold the acceptance writer lock while valid authority expires. The
+        // consumer's check and issuance have succeeded, but acceptance must use
+        // Foundation's clock after acquiring its immediate transaction.
+        let mut blocker = Connection::open(&path).unwrap();
+        let lock = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let attempt = first.clone();
+        let permit = granted.permit.clone();
+        let (started, ready) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(now().unwrap() < attempt.expires_at);
+            started.send(()).unwrap();
+            let result = registry.consume(&attempt, &permit, &reservation(&attempt), 1);
+            (registry, result)
+        });
+        ready.recv().unwrap();
+        while now().unwrap() < first.expires_at {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        lock.commit().unwrap();
+        let (mut registry, result) = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(EgressError::AuthorityExpired)),
+            "expired authority was accepted"
+        );
+        assert!(matches!(
+            registry
+                .attempt_status(&first.attempt_id(), first.expires_at)
+                .unwrap(),
+            AttemptStatus::Invalidated
+        ));
+        assert!(registry.receipt(&first.attempt_id()).unwrap().is_none());
+        assert_eq!(
+            registry
+                .0
+                .query_row(
+                    "SELECT consumed, accepted_attempts FROM egress_permits",
+                    [],
+                    |r| { Ok((r.get::<_, bool>(0)?, r.get::<_, u32>(1)?)) }
+                )
+                .unwrap(),
+            (false, 0)
+        );
+        for table in ["spend_receipts", "spend_accounts"] {
+            assert_eq!(
+                registry
+                    .0
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        drop(registry);
+        registry = open(&path);
+        let reattached = registry.issue(&first, 1).unwrap();
+        assert_eq!(reattached.permit.token, granted.permit.token);
+        assert!(matches!(reattached.status, AttemptStatus::Invalidated));
+        assert!(matches!(
+            registry.consume(&first, &granted.permit, &reservation(&first), 1),
+            Err(EgressError::AuthorityExpired)
+        ));
+        // Reauthorization renews this attempt's deadline, without a revision
+        // publication or spending the one accepted-attempt allowance.
+        let mut second = first.clone();
+        second.recorded_at = now().unwrap();
+        second.expires_at = second.recorded_at + 3600;
+        assert!(matches!(
+            registry.issue(&second, 1),
+            Err(EgressError::InvalidRequest)
+        ));
+        second.attempt_ordinal += 1;
+        second.record_sequence += 1;
+        let granted = registry.issue(&second, 1).unwrap();
+        let receipt = registry
+            .consume(&second, &granted.permit, &reservation(&second), 1)
+            .unwrap();
+        // An already accepted handoff survives authority expiry and preserves
+        // accounting, completion and recovery through the separate recovery deadline.
+        assert!(matches!(
+            registry
+                .attempt_status(&second.attempt_id(), second.expires_at)
+                .unwrap(),
+            AttemptStatus::Dispatched { .. }
+        ));
+        let mut receipt = receipt;
+        receipt.status = DispatchStatus::Succeeded;
+        receipt.spend_state = SpendState::Settled;
+        receipt.usage.input_tokens = Some(1);
+        registry
+            .finish(&DispatchResult {
+                receipt,
+                output: Some(ProviderOutput::Chat {
+                    text: "accepted answer".into(),
+                }),
+                error: None,
+                diagnostics: Vec::new(),
+                receipt_persisted: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            registry
+                .attempt_status(&second.attempt_id(), second.expires_at)
+                .unwrap(),
+            AttemptStatus::Completed { .. }
+        ));
+        assert!(registry.receipt(&second.attempt_id()).unwrap().is_some());
     }
 
     #[test]
@@ -553,10 +702,10 @@ mod tests {
             ) INSERT INTO egress_permits
                 (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
                  token, recovery_expires_at, consumed, finished, receipt, result,
-                 grant_key, grant_revision, accepted_attempts)
+                 grant_key, grant_revision, accepted_attempts, expires_at)
                 SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
                        token, recovery_expires_at, 1, 1, receipt, result,
-                       grant_key, grant_revision, n
+                       grant_key, grant_revision, n, expires_at
                 FROM egress_permits, ord WHERE ordinal=1;",
             )
             .unwrap();
@@ -635,9 +784,9 @@ mod tests {
             VALUES(2) UNION ALL SELECT n+1 FROM ord WHERE n<10000
         ) INSERT INTO egress_permits
             (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
-             token, recovery_expires_at, consumed, receipt, grant_key, grant_revision, accepted_attempts)
+             token, recovery_expires_at, consumed, receipt, grant_key, grant_revision, accepted_attempts, expires_at)
             SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
-                   token, recovery_expires_at, 1, receipt, grant_key, grant_revision, n FROM egress_permits, ord WHERE ordinal=1;",
+                   token, recovery_expires_at, 1, receipt, grant_key, grant_revision, n, expires_at FROM egress_permits, ord WHERE ordinal=1;",
             )
             .unwrap();
         attempt.attempt_ordinal = 10001;
@@ -883,7 +1032,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 5] {
+        for version in [1, 2, 3, 4, 6] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
