@@ -137,9 +137,9 @@ The one way hosts run model calls. `Runtime::open(RuntimeConfig { state_dir, .. 
 returns a runtime that hands out ready `Arc<dyn …Provider>`s per binding. It
 currently implements queueing, retries, shared limits, cooldowns, attempt budgets,
 the response cache, traces, receipts and persistence: SQLite under
-`state_dir`, or in memory. Alongside the SQLite backend and credential-process implementation, it
+`state_dir`; without one, dispatch returns `SpendLedgerUnavailable`. Alongside the SQLite backend and credential-process implementation, it
 links SQLite; contract crates do not. Typed tenant/provider/revision/account identity scopes results; account sharing is
-explicit. The canonical spend ledger remains boundary-alignment work. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+explicit. The canonical request-spend ledger shares the operational database with queue and attempt state. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
 
 ### `symbiotic-egress` and `symbiotic-credential-process`
 

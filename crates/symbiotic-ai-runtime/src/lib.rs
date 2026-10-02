@@ -24,7 +24,8 @@
 //!   directory and everything the runtime keeps in it are owner-only; the
 //!   runtime refuses a state directory open to others, owned by someone
 //!   else or reached through a symlink.
-//! - Without one, state is in memory and ends with the process.
+//! - Without one, dispatch is refused with `SpendLedgerUnavailable`; no
+//!   default state directory is chosen.
 //!
 //! Once a provider call starts, it belongs to the runtime. A caller that
 //! stops waiting (a dropped future, a timeout around the call) does not
@@ -54,6 +55,8 @@ use symbiotic_queue_sqlite::SqliteQueue;
 use symbiotic_trace::TraceSink;
 
 mod maintained;
+pub mod spend;
+pub use model::{SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState};
 
 use maintained::{MaintainedQueue, ResponseRetention};
 
@@ -80,8 +83,8 @@ pub const RESPONSES_DIR: &str = "responses";
 pub struct RuntimeConfig {
     /// Validated deployment registry; no provider is inferred when absent.
     pub registry: Option<Arc<model::ModelRegistry>>,
-    /// Private directory for persistent state. `None` keeps all state in
-    /// memory. A missing directory is created owner-only.
+    /// Private directory required for dispatch. `None` refuses dispatch with
+    /// `SpendLedgerUnavailable`. A missing directory is created owner-only.
     pub state_dir: Option<PathBuf>,
     /// Lease-owner prefix for this process. Defaults to the crate name and
     /// process id; a random suffix keeps restarts distinct.
@@ -139,6 +142,9 @@ pub enum ResponseCacheMode {
 pub struct ModelBinding<P> {
     /// Raw transport whose effective configuration is checked at binding.
     pub provider: P,
+    /// Foundation-internal handoff already reserved atomically with its permit.
+    #[doc(hidden)]
+    pub accepted_spend: Option<SpendReceiptRef>,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
     /// Explicit quota pool. `None` isolates by tenant and concrete account.
@@ -161,6 +167,7 @@ impl<P> ModelBinding<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
+            accepted_spend: None,
             identity: None,
             account_sharing_key: None,
             policy: None,
@@ -210,6 +217,7 @@ impl<P> ModelBinding<P> {
 /// The limits every binding of one concrete account shares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SharedLimits {
+    provider_request_limit: Option<u64>,
     max_in_flight: usize,
     requests_per_minute: Option<u32>,
     input_units_per_minute: Option<u64>,
@@ -219,6 +227,7 @@ struct SharedLimits {
 impl SharedLimits {
     fn of(policy: &ModelQueueConfig) -> Self {
         Self {
+            provider_request_limit: policy.provider_request_limit,
             max_in_flight: policy.max_in_flight.max(1),
             requests_per_minute: policy.requests_per_minute,
             input_units_per_minute: policy.input_units_per_minute,
@@ -231,6 +240,7 @@ struct Inner {
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
+    spend: Arc<dyn SpendLedger>,
     registry: Option<Arc<model::ModelRegistry>>,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
@@ -270,8 +280,13 @@ impl Runtime {
             Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
             None => Arc::new(MemoryQueue::new()),
         };
+        let spend: Arc<dyn SpendLedger> = match &config.state_dir {
+            Some(dir) => Arc::new(spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?),
+            None => Arc::new(model::UnavailableSpendLedger),
+        };
         Ok(Self {
             inner: Arc::new(Inner {
+                spend,
                 queue,
                 admission: ModelAdmission::new(),
                 rate_state: model::ModelRateState::default(),
@@ -286,7 +301,25 @@ impl Runtime {
         })
     }
 
-    /// An in-memory runtime with default settings.
+    /// Canonical receipt lookup. Consumer commit refusal never alters this receipt.
+    pub fn spend_receipt(
+        &self,
+        reference: &SpendReceiptRef,
+    ) -> Result<Option<SpendReceipt>, ModelError> {
+        self.inner.spend.receipt(reference)
+    }
+
+    /// Foundation-owned reconciliation; callers must establish external charge evidence.
+    pub fn reconcile_spend(
+        &self,
+        reference: &SpendReceiptRef,
+        state: SpendState,
+        usage: Option<symbiotic_trace::UsageTrace>,
+    ) -> Result<(), ModelError> {
+        self.inner.spend.finish(reference, state, usage, None)
+    }
+
+    /// An in-memory runtime for configuration inspection; dispatch is refused.
     pub fn in_memory() -> Self {
         Self::open(RuntimeConfig::default()).expect("an in-memory runtime needs no I/O")
     }
@@ -449,7 +482,8 @@ impl Runtime {
         let provider =
             QueuedChatProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
                 .with_admission(self.inner.admission.clone())
-                .with_rate_state(self.inner.rate_state.clone());
+                .with_rate_state(self.inner.rate_state.clone())
+                .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
         Ok(Arc::new(bound.sinks.apply_chat(provider)))
     }
 
@@ -470,7 +504,8 @@ impl Runtime {
             bound.policy,
         )
         .with_admission(self.inner.admission.clone())
-        .with_rate_state(self.inner.rate_state.clone());
+        .with_rate_state(self.inner.rate_state.clone())
+        .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
         Ok(Arc::new(bound.sinks.apply_embedding(provider)))
     }
 
@@ -484,7 +519,8 @@ impl Runtime {
         let provider =
             QueuedRerankProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
                 .with_admission(self.inner.admission.clone())
-                .with_rate_state(self.inner.rate_state.clone());
+                .with_rate_state(self.inner.rate_state.clone())
+                .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
         Ok(Arc::new(bound.sinks.apply_rerank(provider)))
     }
 
@@ -505,7 +541,8 @@ impl Runtime {
             bound.policy,
         )
         .with_admission(self.inner.admission.clone())
-        .with_rate_state(self.inner.rate_state.clone());
+        .with_rate_state(self.inner.rate_state.clone())
+        .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
         Ok(Arc::new(bound.sinks.apply_classifier(provider)))
     }
 
@@ -525,19 +562,10 @@ impl Runtime {
                     symbiotic_core::DiagnosticCode::BindingIdentityIsRequired,
                 )
             })?;
-        let account_scope = match &binding.account_sharing_key {
-            Some(key) if !key.0.trim().is_empty() => serde_json::json!({"shared": key}),
-            Some(_) => {
-                return Err(ModelError::InvalidRequest(
-                    symbiotic_core::DiagnosticCode::AccountSharingKeyIsEmpty,
-                ));
-            }
-            None => serde_json::json!({"tenant": identity.tenant, "account": identity.account}),
-        };
-        let queue_id = QueueId::new(format!(
-            "account:{}",
-            model::configuration_revision(&account_scope)?.0
-        ));
+        let queue_id = QueueId::new(account_scope(
+            &identity,
+            binding.account_sharing_key.as_ref(),
+        )?);
         let mut policy = if let Some(registry) = &self.inner.registry {
             let resolved = registry.binding(&identity.tenant, &identity.provider)?;
             if resolved.binding.identity != identity
@@ -775,4 +803,25 @@ fn open_persistent_queue(
 
 fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {
     ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
+}
+
+/// Canonical account key shared by pacing, reservation and credential acceptance.
+#[doc(hidden)]
+pub fn account_scope(
+    identity: &BindingIdentity,
+    sharing: Option<&AccountSharingKey>,
+) -> Result<String, ModelError> {
+    let scope = match sharing {
+        Some(key) if !key.0.trim().is_empty() => serde_json::json!({"shared": key}),
+        Some(_) => {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::AccountSharingKeyIsEmpty,
+            ));
+        }
+        None => serde_json::json!({"tenant": identity.tenant, "account": identity.account}),
+    };
+    Ok(format!(
+        "account:{}",
+        model::configuration_revision(&scope)?.0
+    ))
 }

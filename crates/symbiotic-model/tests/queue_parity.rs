@@ -110,6 +110,10 @@ impl Loopback {
 }
 
 impl ModelProvider for Loopback {
+    // Synthetic failures never perform transport or incur provider spend.
+    fn failure_charge(&self, _: &ModelError) -> symbiotic_model::FailureCharge {
+        symbiotic_model::FailureCharge::KnownZero
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
     }
@@ -181,6 +185,7 @@ fn queued(
     config: ModelQueueConfig,
 ) -> QueuedChatProvider<Loopback> {
     QueuedChatProvider::new(provider, queue, "worker", config)
+        .with_spend_ledger(test_spend::ledger(), None)
 }
 
 #[tokio::test]
@@ -598,7 +603,7 @@ async fn a_host_response_cache_answers_before_the_queue() {
 }
 
 #[tokio::test]
-async fn exhausted_retries_keep_the_class_of_the_last_failure() {
+async fn known_zero_retries_stop_at_an_uncertain_timeout() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
     let raw = Loopback::new(unique_identity()).failing_first(vec![
         ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
@@ -612,7 +617,7 @@ async fn exhausted_retries_keep_the_class_of_the_last_failure() {
     assert!(matches!(err, ModelError::Timeout(_)), "{err:?}");
     assert!(matches!(
         err,
-        ModelError::Timeout(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+        ModelError::Timeout(symbiotic_core::DiagnosticCode::HttpTimeout)
     ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
 }
@@ -624,6 +629,9 @@ struct CountingClassifier {
 }
 
 impl ModelProvider for CountingClassifier {
+    fn failure_charge(&self, _: &ModelError) -> symbiotic_model::FailureCharge {
+        symbiotic_model::FailureCharge::KnownZero
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
@@ -655,7 +663,8 @@ async fn an_invalid_classify_request_takes_no_queue_slot() {
         queue.clone(),
         "worker",
         config(),
-    );
+    )
+    .with_spend_ledger(test_spend::ledger(), None);
     let mut state = serde_json::Map::new();
     state.insert("message".into(), json!("synthetic"));
     let err = classifier
@@ -1301,7 +1310,8 @@ async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
         queue.clone(),
         "worker",
         leased(),
-    );
+    )
+    .with_spend_ledger(test_spend::ledger(), None);
     let call = tokio::spawn(async move { provider.chat(request("boom")).await });
     let err = call.await.expect_err("the call panics");
     assert!(err.is_panic(), "{backend}: {err:?}");
@@ -2182,3 +2192,6 @@ async fn a_running_receipt_counts_the_whole_rate_budget_wait(
         "{backend}: the wait is throttle, not queue wait: {queued_ms} ms"
     );
 }
+
+#[path = "support/spend.rs"]
+mod test_spend;

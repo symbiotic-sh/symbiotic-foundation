@@ -827,10 +827,15 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
     .map(|active| active.unwrap_or(false))
 }
 
-const QUEUE_SCHEMA_VERSION: u32 = 2;
+/// Atomic current operational format: queue and spend tables, with no migrations.
+pub const QUEUE_SCHEMA_VERSION: u32 = 3;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "fullfsync", true)
         .map_err(storage_error)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(storage_error)?;
@@ -846,7 +851,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     // Before release, only an empty, unversioned queue can be initialized.
     let existing_queue = tx
-        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns')")
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')")
         .and_then(|mut stmt| stmt.exists([]))
         .map_err(storage_error)?;
     if schema_version != 0 || existing_queue {
@@ -856,6 +861,16 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     tx.execute_batch(
         "
+        create table spend_accounts (
+            account text primary key, request_limit integer, used integer not null default 0
+        );
+        create table spend_receipts (
+            reference text primary key, account text not null, invocation text not null,
+            binding text not null, reservation text not null, state text not null,
+            usage text, output text
+        );
+        create unique index spend_active_invocation on spend_receipts(account, invocation)
+            where state != 'released';
         create table queue_items (
             item_id text primary key,
             queue_id text not null,
@@ -1264,14 +1279,14 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
     }
 
     #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
-        for version in [-1, 0, 1, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+        for version in [-1, 0, 1, 2, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
             for existing in [false, true] {
                 if version == 0 && !existing {
                     continue;

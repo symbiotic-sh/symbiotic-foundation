@@ -2398,6 +2398,7 @@ mod tests {
                 "worker",
                 queue_config(cache.clone()),
             )
+            .with_spend_ledger(crate::test_spend::ledger(), None)
         };
         let a = NamedClassifier::new("jev-1.13.0", "jev-1.13.0", 0.1);
         let other_model = NamedClassifier::new("jev-1.14.0", "jev-1.14.0", 0.8);
@@ -2922,6 +2923,9 @@ mod tests {
     #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for CountingClassifier {
+        fn failure_charge(&self, _: &ModelError) -> crate::FailureCharge {
+            crate::FailureCharge::KnownZero
+        }
         fn descriptor(&self) -> &ProviderDescriptor {
             self.inner.descriptor()
         }
@@ -2972,6 +2976,7 @@ mod tests {
             "worker",
             queue_config(Some(dir.path().join("cache"))),
         )
+        .with_spend_ledger(crate::test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
         let first = provider
@@ -3011,7 +3016,8 @@ mod tests {
             Arc::new(SqliteQueue::in_memory().unwrap()),
             "worker",
             queue_config(None),
-        );
+        )
+        .with_spend_ledger(crate::test_spend::ledger(), None);
         let response = queued
             .classify(request(vec![goal_question()]))
             .await
@@ -3038,6 +3044,7 @@ mod tests {
                 ..queue_config(None)
             },
         )
+        .with_spend_ledger(crate::test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
         assert!(matches!(
             provider.classify(request(vec![goal_question()])).await,

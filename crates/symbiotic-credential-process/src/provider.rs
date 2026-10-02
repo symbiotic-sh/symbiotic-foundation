@@ -190,6 +190,7 @@ fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
     // No hidden retry layer may spend a permit twice. Every retry must come back
     // through Memory's admission/barrier with its next ordinal.
     ModelQueueConfig {
+        provider_request_limit: route.provider_request_limit,
         max_in_flight: route.max_in_flight,
         requests_per_minute: route.requests_per_minute,
         input_units_per_minute: route.input_units_per_minute,
@@ -289,10 +290,12 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .chat(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
+                .chat({
+                    let mut binding = route_binding(runtime, route, provider)?;
+                    binding.accepted_spend =
+                        Some(SpendReceiptRef(format!("egress:{attempt_digest}")));
+                    binding.with_response_cache(ResponseCacheMode::Off)
+                })
                 .map_err(|_| EgressError::StateUnavailable)?;
             let response = provider.chat(request).await.map_err(|error| ExecuteError {
                 code: match error {
@@ -330,10 +333,12 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .embedding(
-                    route_binding(runtime, route, provider)?
-                        .with_response_cache(ResponseCacheMode::Off),
-                )
+                .embedding({
+                    let mut binding = route_binding(runtime, route, provider)?;
+                    binding.accepted_spend =
+                        Some(SpendReceiptRef(format!("egress:{attempt_digest}")));
+                    binding.with_response_cache(ResponseCacheMode::Off)
+                })
                 .map_err(|_| EgressError::StateUnavailable)?;
             let response = provider
                 .embed(request)
@@ -377,7 +382,9 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_runtime_failure_projects_only_static_diagnostics() {
+        let state = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(RuntimeConfig {
+            state_dir: Some(state.path().join("state")),
             trace_sink: Some(Arc::new(FailingTrace)),
             ..RuntimeConfig::default()
         })

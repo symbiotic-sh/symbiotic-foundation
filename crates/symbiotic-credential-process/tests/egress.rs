@@ -117,6 +117,7 @@ impl Fixture {
                 tenant: "tenant".into(),
                 account: "account".into(),
                 account_sharing_key: None,
+                provider_request_limit: None,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -484,6 +485,7 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
         }
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
     drop(process);
     let process = fixture.process();
     let receipt = exchange(&process, Operation::Receipt(admission))
@@ -1037,6 +1039,7 @@ async fn known_zero_charge_releases_reservation_for_next_attempt() {
         );
     }
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 2));
 }
 
 #[tokio::test]
@@ -1440,6 +1443,7 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
     assert_eq!(reattached.permit.token, granted.token);
     assert!(matches!(reattached.status, AttemptStatus::Completed { .. }));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
 }
 
 #[tokio::test]
@@ -1662,4 +1666,49 @@ async fn independent_tenant_routes_accept_different_account_policies() {
     config.routes.push(second);
     assert!(CredentialProcess::open(config).is_ok());
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+fn ledger_totals(fixture: &Fixture) -> (u64, u64) {
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    (
+        conn.query_row(
+            "SELECT coalesce(sum(used), 0) FROM spend_accounts",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap(),
+        conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r.get(0))
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn spend_concurrent_dispatches_on_one_account_share_one_durable_budget() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::from_millis(30)).await;
+    fixture.config.routes[0].provider_request_limit = Some(1);
+    let process = fixture.process();
+    let (a, pa) = fixture.attempt("first-account-call", 1, 1);
+    let (b, pb) = fixture.attempt("second-account-call", 1, 2);
+    let ap = permit(&process, &a).await;
+    let bp = permit(&process, &b).await;
+    let (ra, rb) = tokio::join!(
+        exchange(&process, inject(a, pa, ap)),
+        exchange(&process, inject(b, pb, bp))
+    );
+    assert_eq!([&ra, &rb].iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Err(EgressError::BudgetRefused)))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
 }

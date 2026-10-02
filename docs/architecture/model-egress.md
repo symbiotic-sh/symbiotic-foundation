@@ -163,9 +163,11 @@ The owner-only database and same-UID authenticated IPC protect these recovery va
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede
 handoff. A process lock prevents two credential processes using one state directory.
 These tables do not schedule jobs. The existing runtime remains the only model
-queue/scheduler. They supply replay and charge-recovery primitives; the canonical
-Foundation spend ledger remains implementation work under
-[boundary.md](boundary.md#spend-ledger-and-budgets).
+queue/scheduler. Permit consumption reserves through the canonical Foundation ledger in the same
+transaction; completion updates the ledger and recovery result atomically. Route
+`provider_request_limit` configures an absolute account request allowance, distinct
+from pacing or monetary observations. The existing receipt is a projection of ledger
+state; Memory-facing typed reference/schema changes belong to PR 6b.
 
 Before handoff the consumed permit has a durable `ChargeReport::Unknown` carrying the
 full reservation. Timeout, uncertain provider failure or crash leaves it reserved.

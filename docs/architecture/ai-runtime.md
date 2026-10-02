@@ -9,10 +9,8 @@ usage receipts and persistence.
 The [Foundation boundary contract](boundary.md) is authoritative for ownership,
 provider-principal authorization, spend, storage and supported modes. This page
 records current runtime behavior. Typed tenant/provider/configuration binding scopes execution and result reuse.
-Canonical spend accounting and admission/maintenance bounds remain implementation work; this API alone supplies none of Memory's data
-authorization checks. The error-class retry gaps listed under
-[policy knobs](#policy-knobs) remain implementation work under the
-[spend contract](boundary.md#spend-ledger-and-budgets).
+The canonical spend ledger owns reservations and recovery; admission/maintenance
+bounds remain implementation work. This API supplies none of Memory's data authorization checks.
 
 Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 (issue #8).
@@ -23,7 +21,7 @@ Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 use symbiotic_ai_runtime::{ModelBinding, ModelQueueConfig, Runtime, RuntimeConfig};
 
 let runtime = Runtime::open(RuntimeConfig {
-    state_dir: Some(data_dir.join("ai-runtime")), // None: in memory
+    state_dir: Some(data_dir.join("ai-runtime")), // required for dispatch
     ..RuntimeConfig::default()
 })?;
 let policy = ModelQueueConfig::default(); // explicit, conservative policy for this account
@@ -51,7 +49,7 @@ the same state.
 | `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
 | `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
 | `policy` | Required explicit policy, or the configured registry account | Concurrency, rate limits, retries, timeout |
-| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
+| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: no response cache; same-attempt ledger recovery still applies. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
 
 ## Configured registry
@@ -106,6 +104,7 @@ reach runtime bookkeeping, and discards raw provider JSON.
 
 | | `state_dir: None` | `state_dir: Some(dir)` |
 |---|---|---|
+| Dispatch | Refused: `SpendLedgerUnavailable` | Durable reservation before provider execution |
 | Queue backend | `MemoryQueue` (in-process, bounded terminal history) | `SqliteQueue` at `dir/queue.sqlite` |
 | Cooldowns, attempt budgets, deduplication | End with the process | Survive restarts |
 | Response cache (`Default` mode) | None | `dir/responses/<kind>/<binding and transport hash>/<request hash>.json` |
@@ -128,14 +127,15 @@ so the state directory and everything in it are owner-only:
   and unresolved-attempt handling follow
   [boundary.md](boundary.md#storage-and-credentials).
 
-Queue records hold the request hash, never the request. A crash therefore
-cannot resume an in-flight call from the queue. Recovery requirements follow the
-[spend contract](boundary.md#spend-ledger-and-budgets). The current credential backend
-provides [same-attempt recovery](model-egress.md#same-attempt-recovery-v2); the general
-runtime still requires that recovery integration. The cache and
-attempt budget are execution primitives, not spend reconciliation. For example,
-a request that exhausted its attempts before a restart fails again
-afterwards without another provider call.
+The ledger durably reserves one provider request before dispatch and retains Unknown
+charge after crash, timeout or missing usage; success settles measured usage.
+`QueueReceipt::spend_receipt` carries a typed `SpendReceiptRef`, looked up through
+`Runtime::spend_receipt` even after queue retention. Same-attempt output recovery is
+independent of cache purge/expiry; callers identify new invocations through request
+identity (including `source`). Consumer commit refusal never releases spend.
+`Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
+counts against the absolute account request allowance until reconciliation; unknown
+replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
 
 **Current retention settings.** At open, and after every 10,000 finished calls, a persistent
 runtime retires state older than `RuntimeConfig::retention` (seven days by
@@ -241,19 +241,18 @@ the descriptor; custom providers must describe their effective configuration.
 The key also includes the provider's credential generation,
 `ModelProvider::credential_fingerprint`. The HTTP providers derive it from
 their API key with `api_key_fingerprint`, a domain-separated SHA-256 of the
-key. Rotating a key therefore starts a fresh attempt budget: a request
-exhausted by a bad key is tried again with the new one. The fingerprint is
+key. Rotating a key starts a fresh queue attempt allowance; the ledger still
+refuses a new handoff until any uncertain prior charge is reconciled. The fingerprint is
 one-way, and only a hash of it enters the queue's idempotency key. Neither
 the key nor the fingerprint is written to traces, receipts or queue
 payloads. A host provider without a credential returns `None`, and its
 budgets are keyed as before. This fresh queue budget does not establish charge
 certainty for an earlier attempt or authorize resubmitting an unknown charge;
 admission and recovery follow the
-[spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
-a known implementation gap.
+[spend contract](boundary.md#spend-ledger-and-budgets). The ledger is consulted before any new handoff.
 
 Raw bindings without a registry must agree on `max_in_flight`, `requests_per_minute`,
-`input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
+`input_units_per_minute`, `rate_burst_seconds` and `provider_request_limit`. A binding that disagrees
 fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
 per raw binding. Registry bindings of one account use an identical configured
 execution policy, including timeout and retries.
@@ -262,11 +261,14 @@ execution policy, including timeout and retries.
 
 Retry admission and recovery follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). The current `is_retryable`
-policy retries `ModelError::Timeout`, `ModelError::Unavailable` (5xx, including 529)
-and `ModelError::RateLimited` (429) without checking charge certainty. Opt-in
-`retry_provider_errors` adds `ModelError::Provider` to that policy. All four classes
-are known gaps across the shared queued chat, embedding, rerank and classification
-paths and remain implementation work.
+policy considers `ModelError::Unavailable` (5xx, including 529)
+and `ModelError::RateLimited` (429) only with explicit known-zero charge evidence. Opt-in
+`retry_provider_errors` adds `ModelError::Provider` to that policy. These classes
+now enforce charge certainty across the shared queued chat, embedding, rerank and classification
+paths; timeout or unknown charge requires reconciliation.
+
+`provider_request_limit` (default `None`) is an absolute account request allowance
+with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporting.
 
 `ModelQueueConfig` fields:
 
@@ -282,8 +284,7 @@ paths and remain implementation work.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
   failures. `ModelQueueConfig::default()`
   allows three attempts when explicitly chosen; registry account policies specify
-  their own finite total attempts. These settings expose the error-class
-  retry gaps listed above. Provider errors
+  their own finite total attempts. Retries require known-zero evidence. Provider errors
   never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
@@ -301,10 +302,8 @@ paths and remain implementation work.
 - A lease that expires on an item's last allowed attempt, for example
   because the process crashed mid-call, ends the item as dead. A restarted
   runtime does not make another paid attempt from that item. On a non-final
-  attempt, both queue backends instead mark the item failed and allow another
-  claim without checking the earlier attempt's charge certainty. This is another
-  recovery gap under the
-  [spend contract](boundary.md#spend-ledger-and-budgets).
+  attempt, both queue backends allow another claim, but the ledger refuses a
+  new dispatch until the uncertain charge is reconciled.
 
 - `budget_renewal_seconds` (default `None`): once a request has exhausted
   its budget, later calls for the same request fail without a provider call
@@ -312,9 +311,7 @@ paths and remain implementation work.
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
   `Some(0)` gives every call its own budget. These are current queue mechanics;
   renewal does not prove zero charge or authorize resending an uncertain attempt.
-  Retry admission and recovery must follow
-  [boundary.md](boundary.md#spend-ledger-and-budgets); that alignment remains an
-  implementation gap.
+  Ledger recovery still returns a completed same attempt even with caching off.
   Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
@@ -359,7 +356,7 @@ these writes fails:
   `RUNTIME_DIAGNOSTICS` (`"runtime_diagnostics"`), as
   `{"kind": ..., "error": ...}` entries, and the receipt's `metadata` carries
   the same list. The kinds are `response_cache_write_failed`,
-  `trace_write_failed` and `queue_complete_failed`;
+  `trace_write_failed`, `queue_complete_failed` and `spend_settlement_failed`;
 - it is logged as a `tracing` warning.
 
 The same holds elsewhere. A cache hit whose trace write fails is still
@@ -369,8 +366,8 @@ limiter is not allowed. Stopped items cannot be claimed, continued as logical re
 chains or renewed by `budget_renewal_seconds`; identical waiters and later calls
 return the recorded refusal while the queue retains the item. Failures without a
 retry deadline also stop the item. Retryable failures with a deadline become failed
-or dead according to their attempt budget. This does not establish safe retry
-admission; the current policy's charge-certainty gap is described above.
+or dead according to their attempt budget. Retry also requires the known-zero
+charge evidence described above.
 
 ## Custom response caches
 

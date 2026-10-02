@@ -117,6 +117,8 @@ pub enum ReceiptStatus {
 /// wait split. A cache hit repeats the original usage and costs nothing new.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueueReceipt {
+    /// Canonical accounting reference; telemetry is never the accounting owner.
+    pub spend_receipt: Option<crate::SpendReceiptRef>,
     pub binding: Option<symbiotic_core::BindingIdentity>,
     pub queue_id: QueueId,
     /// `chat`, `embedding`, `rerank` or `classify`.
@@ -481,6 +483,8 @@ pub(crate) struct QueueRuntime {
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
     pub(crate) rate_state: crate::ModelRateState,
+    pub(crate) spend: Arc<dyn crate::SpendLedger>,
+    pub(crate) accepted_spend: Option<crate::SpendReceiptRef>,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
     /// Queue identity override; `None` uses the descriptor's `queue_id`.
     pub(crate) queue_id: Option<QueueId>,
@@ -501,6 +505,8 @@ impl QueueRuntime {
             receipt_sink: None,
             admission: None,
             rate_state: crate::ModelRateState::default(),
+            spend: Arc::new(crate::UnavailableSpendLedger),
+            accepted_spend: None,
             response_cache: None,
             queue_id: None,
             binding_identity: None,
@@ -532,6 +538,18 @@ macro_rules! queue_runtime_builders {
         /// Deliver per-attempt usage receipts to `sink`.
         pub fn with_receipt_sink(mut self, sink: Arc<dyn $crate::QueueReceiptSink>) -> Self {
             self.runtime.receipt_sink = Some(sink);
+            self
+        }
+
+        /// Install the runtime-owned canonical ledger and optional already accepted handoff.
+        #[doc(hidden)]
+        pub fn with_spend_ledger(
+            mut self,
+            ledger: Arc<dyn $crate::SpendLedger>,
+            accepted: Option<$crate::SpendReceiptRef>,
+        ) -> Self {
+            self.runtime.spend = ledger;
+            self.runtime.accepted_spend = accepted;
             self
         }
 

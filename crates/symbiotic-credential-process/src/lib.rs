@@ -38,6 +38,9 @@ pub struct RouteConfig {
     pub account: String,
     /// Explicit account quota sharing across routes or tenants.
     pub account_sharing_key: Option<symbiotic_ai_runtime::AccountSharingKey>,
+    /// Absolute durable request allowance for this account; no monetary ceiling.
+    #[serde(default)]
+    pub provider_request_limit: Option<u64>,
     /// Route identifier.
     pub route: String,
     /// Opaque reference scoped to this tenant.
@@ -149,9 +152,7 @@ impl CredentialProcess {
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
-        // Extend the existing runtime database with replay and charge-recovery state.
-        // Reuse its scheduler; the canonical Foundation spend ledger remains
-        // implementation work under docs/architecture/boundary.md.
+        // Replay and ledger acceptance share the runtime operational database.
         let registry =
             Registry::open(&config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE))?;
         Ok(Self {
@@ -256,7 +257,11 @@ impl CredentialProcess {
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .consume(&request.admission.attempt, &request.permit)?;
+                    .consume(
+                        &request.admission.attempt,
+                        &request.permit,
+                        &spend_reservation(&request.admission.attempt, &route)?,
+                    )?;
                 // Spawning occurs immediately after consumption with no await in
                 // between. Client cancellation cannot leave a consumed-but-cancelled
                 // live task; a process crash leaves the durable unknown receipt.
@@ -367,10 +372,12 @@ impl CredentialProcess {
                         diagnostics = runtime_diagnostics;
                         receipt.status = DispatchStatus::Succeeded;
                         receipt.usage = usage;
-                        receipt.charge = ChargeReport::Measured {
-                            unit: "provider_requests".into(),
-                            amount: 1,
-                        };
+                        if symbiotic_ai_runtime::model::has_measured_usage(&receipt.usage) {
+                            receipt.charge = ChargeReport::Measured {
+                                unit: "provider_requests".into(),
+                                amount: 1,
+                            };
+                        }
                         output = Some(answer);
                     }
                     Err(failure) => {
@@ -551,6 +558,32 @@ fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
     #[cfg(not(unix))]
     return Err(EgressError::StateUnavailable);
     Ok(ProcessLock(file))
+}
+
+/// Typed internal receipt reference; the Memory-facing wire conversion belongs to PR 6b.
+pub fn spend_receipt_reference(receipt: &DispatchReceipt) -> symbiotic_ai_runtime::SpendReceiptRef {
+    symbiotic_ai_runtime::SpendReceiptRef(format!("egress:{}", receipt.attempt_digest))
+}
+fn spend_reservation(
+    a: &DurableAttempt,
+    route: &RouteConfig,
+) -> Result<symbiotic_ai_runtime::SpendReservation, EgressError> {
+    Ok(symbiotic_ai_runtime::SpendReservation {
+        reference: symbiotic_ai_runtime::SpendReceiptRef(format!("egress:{}", digest(a)?)),
+        account: symbiotic_ai_runtime::account_scope(
+            &symbiotic_ai_runtime::BindingIdentity::new(
+                &route.tenant,
+                &route.route,
+                "ledger",
+                &route.account,
+            ),
+            route.account_sharing_key.as_ref(),
+        )
+        .map_err(|_| EgressError::InvalidRequest)?,
+        invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?,
+        binding: digest(a)?,
+        request_limit: route.provider_request_limit,
+    })
 }
 
 #[cfg(all(test, unix))]

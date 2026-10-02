@@ -106,6 +106,13 @@ impl Loopback {
 }
 
 impl ModelProvider for Loopback {
+    fn failure_charge(&self, error: &ModelError) -> symbiotic_ai_runtime::model::FailureCharge {
+        if matches!(error, ModelError::Timeout(_)) {
+            symbiotic_ai_runtime::model::FailureCharge::Unknown
+        } else {
+            symbiotic_ai_runtime::model::FailureCharge::KnownZero
+        }
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.descriptor
     }
@@ -171,8 +178,91 @@ fn persistent(dir: &std::path::Path) -> Runtime {
 }
 
 #[tokio::test]
+async fn spend_dispatch_requires_an_explicit_state_directory() {
+    for runtime in [
+        Runtime::in_memory(),
+        Runtime::open(RuntimeConfig::default()).unwrap(),
+    ] {
+        let raw = Loopback::new(unique_identity());
+        let provider = runtime
+            .chat(binding(raw.clone()).with_policy(policy()))
+            .unwrap();
+        assert!(matches!(
+            provider.chat(request("no state")).await,
+            Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+            ))
+        ));
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+        assert!(!runtime.is_persistent());
+    }
+}
+
+#[tokio::test]
+async fn spend_timeout_never_uses_the_unused_attempt_allowance() {
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_secs(2));
+    let sink = Arc::new(InMemoryReceiptSink::default());
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().into()),
+        receipt_sink: Some(sink.clone()),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let chat = runtime
+        .chat(binding(raw.clone()).with_policy(ModelQueueConfig {
+            request_timeout_seconds: Some(1),
+            logical_retry_attempts: 2,
+            retry_attempts: 2,
+            ..policy()
+        }))
+        .unwrap();
+    assert!(chat.chat(request("timeout")).await.is_err());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    let reference = sink
+        .receipts()
+        .into_iter()
+        .find(|r| r.status == ReceiptStatus::Failed)
+        .unwrap()
+        .spend_receipt
+        .unwrap();
+    drop((chat, runtime));
+    let receipt = persistent(dir.path())
+        .spend_receipt(&reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.state, symbiotic_ai_runtime::SpendState::Unknown);
+    assert!(receipt.usage.is_none());
+}
+
+#[tokio::test]
+async fn spend_lost_success_reply_recovers_without_response_cache_after_restart() {
+    let dir = private_tempdir();
+    let raw = Loopback::new(unique_identity());
+    let install = |runtime: &Runtime| {
+        runtime
+            .chat(
+                binding(raw.clone())
+                    .with_policy(policy())
+                    .with_response_cache(ResponseCacheMode::Off),
+            )
+            .unwrap()
+    };
+    let runtime = persistent(dir.path());
+    let original = install(&runtime).chat(request("lost reply")).await.unwrap();
+    drop(runtime);
+    let recovered = install(&persistent(dir.path()))
+        .chat(request("lost reply"))
+        .await
+        .unwrap();
+    assert_eq!(recovered.text, original.text);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn bindings_of_one_model_share_its_cap() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let answer = runtime
         .chat(binding(raw.clone()).with_policy(policy()))
@@ -230,7 +320,8 @@ async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_inde
 
 #[tokio::test]
 async fn host_provider_objects_can_be_bound() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw: Arc<dyn ChatProvider> = Arc::new(Loopback::new(unique_identity()));
     let chat = runtime.chat(binding(raw).with_policy(policy())).unwrap();
     assert!(
@@ -325,8 +416,9 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
     ));
     assert_eq!(down.calls.load(Ordering::SeqCst), 1);
 
-    // An in-memory runtime starts with a fresh budget.
-    Runtime::in_memory()
+    // A separate state directory starts with a fresh budget.
+    let fresh = private_tempdir();
+    persistent(fresh.path())
         .chat(binding())
         .unwrap()
         .chat(request("doomed"))
@@ -336,34 +428,37 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
 }
 
 #[tokio::test]
-async fn an_in_memory_runtime_caches_nothing_by_default_and_binding_sinks_apply() {
-    let runtime = Runtime::in_memory();
+async fn spend_cache_off_recovers_the_same_attempt_and_binding_sinks_apply() {
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let receipts = Arc::new(InMemoryReceiptSink::default());
     let chat = runtime
         .chat(
             binding(raw.clone())
                 .with_policy(policy())
-                .with_receipt_sink(receipts.clone()),
+                .with_receipt_sink(receipts.clone())
+                .with_response_cache(ResponseCacheMode::Off),
         )
         .unwrap();
     chat.chat(request("again")).await.unwrap();
     chat.chat(request("again")).await.unwrap();
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         receipts
             .receipts()
             .iter()
             .filter(|receipt| receipt.status == ReceiptStatus::Succeeded)
             .count(),
-        2
+        1
     );
 }
 
 #[tokio::test]
 async fn a_queue_id_isolates_a_role_or_pools_models() {
-    let runtime = Runtime::in_memory();
-    let raw = Loopback::new(unique_identity());
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
+    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(150));
     let one_slot = ModelQueueConfig {
         max_in_flight: 1,
         ..policy()
@@ -425,7 +520,8 @@ async fn a_queue_id_isolates_a_role_or_pools_models() {
 
 #[tokio::test]
 async fn pooled_models_keep_separate_budgets_for_the_same_request() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let pool = symbiotic_ai_runtime::AccountSharingKey::new("chat:pool:budgets");
     let down = Loopback::new(unique_identity()).unavailable();
     let up = Loopback::new(unique_identity());
@@ -554,25 +650,26 @@ async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
     );
 }
 
-/// `MemoryQueue`.
-mod in_memory {
+/// Persistent dispatch with a custom response cache.
+mod custom_cache {
     use super::*;
 
     #[tokio::test]
     async fn an_abandoned_call_does_not_block_the_identical_request_behind_it() {
-        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(
-            Runtime::in_memory(),
-        )
+        let state = private_tempdir();
+        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(persistent(
+            state.path(),
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call() {
-        // An in-memory runtime caches nothing by default; a host cache
-        // answers the later callers.
+        // A host cache answers later callers independently of the operational store.
+        let state = private_tempdir();
         let cache = private_tempdir();
         super::a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
-            Runtime::in_memory(),
+            persistent(state.path()),
             ResponseCacheMode::Custom(Arc::new(DirResponseCache::new(cache.path()))),
         )
         .await;
@@ -828,12 +925,27 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
 
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
     assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
-    // The bad key's terminal refusal is retained: it does not call again.
+    // Credential rotation does not erase the first attempt's uncertain charge.
     let err = bind(KEY_A).chat(request("rotate")).await.unwrap_err();
-    assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "{err:?}"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let reference = receipts
+        .receipts()
+        .into_iter()
+        .find_map(|r| r.spend_receipt)
+        .unwrap();
+    // This synthetic endpoint establishes that its rejected key incurred no charge.
+    runtime
+        .reconcile_spend(&reference, symbiotic_ai_runtime::SpendState::Released, None)
+        .unwrap();
 
-    // A new key is a new credential, with its own budget.
+    // A reconciled zero-charge attempt permits the rotated key's new handoff.
     let answer = bind(KEY_B)
         .chat(request("rotate"))
         .await
@@ -901,8 +1013,9 @@ mod rotation_and_cap {
     use super::*;
 
     #[tokio::test]
-    async fn in_memory_a_rotated_credential_gets_a_fresh_budget() {
-        a_rotated_credential_gets_a_fresh_budget(Runtime::in_memory()).await;
+    async fn separate_state_a_rotated_credential_gets_a_fresh_budget() {
+        let state = private_tempdir();
+        a_rotated_credential_gets_a_fresh_budget(persistent(state.path())).await;
     }
 
     #[tokio::test]
@@ -912,8 +1025,9 @@ mod rotation_and_cap {
     }
 
     #[tokio::test]
-    async fn in_memory_logical_attempts_cap_provider_calls() {
-        logical_attempts_cap_provider_calls(Runtime::in_memory()).await;
+    async fn separate_state_logical_attempts_cap_provider_calls() {
+        let state = private_tempdir();
+        logical_attempts_cap_provider_calls(persistent(state.path())).await;
     }
 
     #[tokio::test]
@@ -992,8 +1106,8 @@ async fn an_expired_cached_response_misses_and_the_sweep_removes_it() {
     ask(&runtime).await;
     assert_eq!(
         raw.calls.load(Ordering::SeqCst),
-        2,
-        "an expired entry misses"
+        1,
+        "ledger recovery prevents redispatch after cache expiry"
     );
 
     // The sweep at open removes expired entries.
@@ -1075,10 +1189,10 @@ async fn purging_a_source_removes_only_its_responses() {
         })
         .unwrap();
     assert_eq!(removed, 1);
-    // The purged answer is asked again; the other is still cached.
+    // Cache purge preserves the paid attempt and its recovery result.
     chat.chat(from("tenant-a/doc-1", "one")).await.unwrap();
     chat.chat(from("tenant-b/doc-2", "two")).await.unwrap();
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
     assert_eq!(Runtime::in_memory().purge_responses(|_| true).unwrap(), 0);
 }
 
@@ -1180,7 +1294,8 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
             Ok(())
         }
     }
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let cache = Arc::new(OneEntry(std::sync::Mutex::new(None)));
     for settings in [
@@ -1220,8 +1335,10 @@ async fn effective_configuration_partitions_cache_even_when_custom_cache_ignores
 
 #[tokio::test]
 async fn independent_accounts_and_runtimes_do_not_share_rate_budget() {
-    let runtime = Runtime::in_memory();
-    let other_runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
+    let other_state = private_tempdir();
+    let other_runtime = persistent(other_state.path());
     let raw = Loopback::new(unique_identity());
     let policy = ModelQueueConfig {
         requests_per_minute: Some(1),
@@ -1255,7 +1372,8 @@ async fn independent_accounts_and_runtimes_do_not_share_rate_budget() {
 
 #[tokio::test]
 async fn explicit_account_sharing_enforces_one_rate_budget_across_tenants() {
-    let runtime = Runtime::in_memory();
+    let state = private_tempdir();
+    let runtime = persistent(state.path());
     let raw = Loopback::new(unique_identity());
     let policy = ModelQueueConfig {
         requests_per_minute: Some(1),

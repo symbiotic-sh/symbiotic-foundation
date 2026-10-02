@@ -62,6 +62,11 @@ pub use queue_runtime::{
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
+#[cfg(feature = "queue")]
+mod spend;
+#[cfg(feature = "queue")]
+pub use spend::*;
+
 mod secrets;
 pub use secrets::{CredentialBoundary, SecretValue};
 mod registry;
@@ -320,9 +325,20 @@ impl ModelError {
     }
 }
 
+/// Adapter evidence about a failed provider call; error class alone supplies none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureCharge {
+    Unknown,
+    KnownZero,
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+    /// Override only with evidence that the failed attempt incurred no charge.
+    fn failure_charge(&self, _error: &ModelError) -> FailureCharge {
+        FailureCharge::Unknown
+    }
     /// Refuse unsupported or unbounded transport configuration before execution.
     fn validate_configuration(&self) -> Result<(), ModelError> {
         Ok(())
@@ -351,6 +367,9 @@ impl<T> ModelProvider for Arc<T>
 where
     T: ModelProvider + ?Sized,
 {
+    fn failure_charge(&self, error: &ModelError) -> FailureCharge {
+        self.as_ref().failure_charge(error)
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         (**self).descriptor()
     }
@@ -450,6 +469,9 @@ pub enum ResolvedAuth {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelQueueConfig {
+    /// Absolute durable account request allowance, separate from pacing and money.
+    #[serde(default)]
+    pub provider_request_limit: Option<u64>,
     pub max_in_flight: usize,
     pub lease_seconds: u64,
     pub logical_retry_attempts: u32,
@@ -498,6 +520,7 @@ fn default_retry_base_delay_ms() -> u64 {
 impl Default for ModelQueueConfig {
     fn default() -> Self {
         Self {
+            provider_request_limit: None,
             max_in_flight: 1,
             lease_seconds: 600,
             logical_retry_attempts: 3,
@@ -732,6 +755,7 @@ where
 /// Usage receipts of one queued call.
 #[cfg(feature = "queue")]
 struct CallReceipts {
+    accepted_spend: Option<SpendReceiptRef>,
     sink: Option<Arc<dyn QueueReceiptSink>>,
     binding: Option<symbiotic_core::BindingIdentity>,
     queue_id: QueueId,
@@ -770,6 +794,11 @@ impl CallReceipts {
             return;
         };
         sink.record_receipt(QueueReceipt {
+            spend_receipt: item.filter(|i| i.attempt > 0).map(|i| {
+                self.accepted_spend.clone().unwrap_or_else(|| {
+                    SpendReceiptRef(format!("runtime:{}:{}", i.item_id.0, i.attempt))
+                })
+            }),
             binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
@@ -845,6 +874,9 @@ fn elapsed_ms(since: std::time::Instant) -> u64 {
 #[cfg(feature = "queue")]
 struct QueuedCall<Req> {
     queue: Arc<dyn QueueBackend>,
+    spend: Arc<dyn SpendLedger>,
+    accepted_spend: Option<SpendReceiptRef>,
+    invocation: String,
     worker_id: String,
     config: ModelQueueConfig,
     queue_id: QueueId,
@@ -867,6 +899,24 @@ struct QueuedCall<Req> {
 
 #[cfg(feature = "queue")]
 impl<Req> QueuedCall<Req> {
+    fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
+        &self,
+    ) -> Result<Option<Res>, ModelError> {
+        if self.accepted_spend.is_some() {
+            return Ok(None);
+        }
+        self.spend
+            .invocation(&self.queue_id.0, &self.invocation)?
+            .and_then(|receipt| receipt.output)
+            .map(|output| {
+                secrets::composed_result(
+                    self.result_owner.as_ref(),
+                    serde_json::from_value(output).map_err(|_| spend::storage()),
+                )
+            })
+            .transpose()
+    }
+
     fn cache_entry(&self) -> CacheEntry<'_> {
         CacheEntry {
             kind: &self.kind,
@@ -1186,9 +1236,13 @@ where
     let idempotency_key = Some(format!("{}:{provider_identity}:{request_hash}", queue_id.0));
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
+        spend: runtime.spend.clone(),
+        accepted_spend: runtime.accepted_spend.clone(),
+        invocation: hash_json(&(&descriptor, &request_hash))?,
         worker_id: runtime.worker_id.clone(),
         config: runtime.config.clone(),
         receipts: CallReceipts {
+            accepted_spend: runtime.accepted_spend.clone(),
             sink: runtime.receipt_sink.clone(),
             binding: runtime.binding_identity.clone(),
             queue_id: queue_id.clone(),
@@ -1226,6 +1280,9 @@ where
         return Ok(cached);
     }
 
+    if let Some(output) = this.recovered::<Res>()? {
+        return Ok(output);
+    }
     let queued_at = std::time::Instant::now();
     // Cooldown + rate-bucket wait accumulated across loop iterations, so the
     // trace can report the throttle-wait vs http-time split (the measured
@@ -1419,6 +1476,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
                     return Ok(Followed::Answer(cached));
                 }
+                if let Some(output) = self.recovered::<Res>()? {
+                    return Ok(Followed::Answer(output));
+                }
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1508,10 +1568,49 @@ where
         Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
         Err(err) => return Err(queue_error(err)),
     };
+    let reference = this
+        .accepted_spend
+        .clone()
+        .unwrap_or_else(|| SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt)));
+    let reserve = if this.accepted_spend.is_some() {
+        this.spend.receipt(&reference).and_then(|r| {
+            r.filter(|r| r.state == SpendState::Unknown)
+                .map(|_| true)
+                .ok_or_else(spend::reconciliation)
+        })
+    } else {
+        this.spend.reserve(&SpendReservation {
+            reference: reference.clone(),
+            account: this.queue_id.0.clone(),
+            invocation: this.invocation.clone(),
+            binding: this.invocation.clone(),
+            request_limit: config.provider_request_limit,
+        })
+    };
+    if !matches!(reserve, Ok(true)) {
+        let err = reserve.err().unwrap_or_else(spend::reconciliation);
+        queue
+            .fail_with(
+                &item.item_id,
+                worker_id,
+                Failure {
+                    error: err.code(),
+                    error_class: Some(error_class(&err)),
+                    run_after: None,
+                },
+            )
+            .await
+            .map_err(queue_error)?;
+        return Err(err);
+    }
     // Only an attempt that reaches the provider spends rate budget.
     if let Some(rate) = rate
         && let Err(err) = rate.charge()
     {
+        if this.accepted_spend.is_none() {
+            this.spend
+                .finish(&reference, SpendState::Released, None, None)?;
+        }
         queue
             .fail(&item.item_id, worker_id, err.code(), None)
             .await
@@ -1524,7 +1623,7 @@ where
         &item.item_id,
         worker_id,
         config.lease_seconds,
-        settle(&call_state, &item, provider, call, &clock),
+        settle(&call_state, &item, provider, call, &clock, &reference),
     )
     .await;
     drop(permit);
@@ -1600,6 +1699,7 @@ enum Settled<Res> {
         provider_ms: u64,
         completed: Result<(), symbiotic_queue::QueueError>,
     },
+
     Retryable {
         err: ModelError,
         failed: Result<FailOutcome, symbiotic_queue::QueueError>,
@@ -1622,6 +1722,7 @@ async fn settle<P, Req, Res, F, Fut>(
     provider: P,
     call: F,
     clock: &AttemptClock,
+    reference: &SpendReceiptRef,
 ) -> Settled<Res>
 where
     P: ModelProvider + Clone,
@@ -1665,6 +1766,29 @@ where
         provider_ms: Some(provider_ms),
     };
 
+    let known_zero = result.as_ref().err().is_some_and(|err| {
+        !matches!(err, ModelError::Timeout(_))
+            && provider.failure_charge(err) == FailureCharge::KnownZero
+    });
+    if known_zero
+        && this.accepted_spend.is_none()
+        && let Err(err) = this
+            .spend
+            .finish(reference, SpendState::Released, None, None)
+    {
+        let failed = queue
+            .fail_with(
+                &item.item_id,
+                worker_id,
+                Failure {
+                    error: err.code(),
+                    error_class: Some(error_class(&err)),
+                    run_after: None,
+                },
+            )
+            .await;
+        return Settled::Failed { err, failed };
+    }
     match result {
         Ok(mut response) => {
             let mut trace = response.trace().clone();
@@ -1677,7 +1801,41 @@ where
             trace.timing.throttle_wait_ms = Some(throttle_wait_ms);
             trace.timing.provider_ms = Some(provider_ms);
             trace.timing.total_ms = Some(clock.queued_at.elapsed().as_millis() as u64);
+            if !trace.metadata.is_object() {
+                trace.metadata = serde_json::json!({"value": trace.metadata});
+            }
+            trace.metadata["spend_receipt"] = serde_json::json!(reference);
             response.set_trace(trace);
+            if this.accepted_spend.is_none() {
+                let usage = response.trace().usage.clone();
+                let state = if has_measured_usage(&usage) {
+                    SpendState::Settled
+                } else {
+                    SpendState::Unknown
+                };
+                let saved = serde_json::to_value(&response)
+                    .map_err(|_| spend::storage())
+                    .and_then(|output| {
+                        this.spend.finish(
+                            reference,
+                            state,
+                            if has_measured_usage(&usage) {
+                                Some(usage)
+                            } else {
+                                None
+                            },
+                            Some(output),
+                        )
+                    });
+                if let Err(err) = saved {
+                    note_side_effect(
+                        &mut response,
+                        &this.queue_id,
+                        "spend_settlement_failed",
+                        err.code(),
+                    );
+                }
+            }
             let response = this.record_success(response).await;
             let completed = queue.complete(&item.item_id, worker_id).await;
             Settled::Succeeded {
@@ -1686,7 +1844,7 @@ where
                 completed,
             }
         }
-        Err(err) if is_retryable(&err, config) => {
+        Err(err) if known_zero && is_retryable(&err, config) => {
             this.receipts
                 .record(
                     ReceiptStatus::Failed,
@@ -1756,6 +1914,13 @@ where
             Settled::Retryable { err, failed }
         }
         Err(err) => {
+            if is_transient(&err)
+                && let Err(failure) =
+                    note_model_cooldown(queue, &this.queue_id, &err, config.retry_base_delay_ms)
+                        .await
+            {
+                warn_side_effect(&this.queue_id, "cooldown_write_failed", failure.code());
+            }
             this.receipts
                 .record(
                     ReceiptStatus::Failed,
@@ -1770,8 +1935,16 @@ where
                     &item.item_id,
                     worker_id,
                     Failure {
-                        error: err.code(),
-                        error_class: Some(error_class(&err)),
+                        error: if known_zero {
+                            err.code()
+                        } else {
+                            DiagnosticCode::SpendReconciliationRequired
+                        },
+                        error_class: Some(if known_zero {
+                            error_class(&err)
+                        } else {
+                            FailureClass::Queue
+                        }),
                         run_after: None,
                     },
                 )
@@ -3426,6 +3599,12 @@ fn hash_text(text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[cfg(all(test, feature = "queue"))]
+extern crate self as symbiotic_model;
+#[cfg(all(test, feature = "queue"))]
+#[path = "../tests/support/spend.rs"]
+mod test_spend;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3730,6 +3909,9 @@ mod tests {
     #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for DeadThenSuccessChat {
+        fn failure_charge(&self, _: &ModelError) -> crate::FailureCharge {
+            crate::FailureCharge::KnownZero
+        }
         fn descriptor(&self) -> &ProviderDescriptor {
             &self.descriptor
         }
@@ -3796,6 +3978,9 @@ mod tests {
     #[cfg(feature = "queue")]
     #[async_trait]
     impl ModelProvider for SlowUnavailableChat {
+        fn failure_charge(&self, _: &ModelError) -> crate::FailureCharge {
+            crate::FailureCharge::KnownZero
+        }
         fn descriptor(&self) -> &ProviderDescriptor {
             &self.descriptor
         }
@@ -3907,7 +4092,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
         let results = futures::future::join_all((0..8).map(|idx| {
             let provider = provider.clone();
             async move { provider.chat(chat_request(&format!("request-{idx}"))).await }
@@ -3945,6 +4131,7 @@ mod tests {
                 ..ModelQueueConfig::default()
             },
         )
+        .with_spend_ledger(test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
         let first = provider.chat(chat_request("hello")).await.unwrap();
@@ -3993,6 +4180,7 @@ mod tests {
                 ..ModelQueueConfig::default()
             },
         )
+        .with_spend_ledger(test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
         provider.chat(chat_request("first")).await.unwrap();
@@ -4061,7 +4249,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         provider.chat(chat_request("first")).await.unwrap();
         let second = tokio::spawn({
@@ -4123,7 +4312,8 @@ mod tests {
                 response_cache_dir: Some(dir.path().join("cache")),
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let results = futures::future::join_all((0..2).map(|_| {
             let provider = provider.clone();
@@ -4199,7 +4389,8 @@ mod tests {
                 response_cache_dir: Some(dir.path().join("cache")),
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let response = provider.chat(request).await.unwrap();
 
@@ -4235,7 +4426,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let response = provider.chat(chat_request("hello")).await.unwrap();
 
@@ -4264,7 +4456,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let err = provider.chat(chat_request("hello")).await.unwrap_err();
 
@@ -4296,7 +4489,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let run = futures::future::join_all((0..2).map(|_| {
             let provider = provider.clone();
@@ -4330,7 +4524,8 @@ mod tests {
                 response_cache_dir: None,
                 ..ModelQueueConfig::default()
             },
-        );
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
 
         let response = provider.chat(chat_request("hello")).await.unwrap();
 
@@ -4698,6 +4893,7 @@ mod tests {
                 ..ModelQueueConfig::default()
             },
         )
+        .with_spend_ledger(test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
         let first = provider.rerank(rerank_request("query")).await.unwrap();
