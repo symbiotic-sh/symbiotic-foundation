@@ -38,6 +38,7 @@ struct PreviousAttempt {
     consumed: bool,
     grant_revision: u64,
     expires_at: u64,
+    accepted_attempts: u32,
 }
 
 fn state(_: rusqlite::Error) -> EgressError {
@@ -77,6 +78,7 @@ impl Registry {
                 invocation_binding TEXT NOT NULL,
                 grant_key TEXT NOT NULL,
                 grant_revision INTEGER NOT NULL,
+                accepted_attempts INTEGER NOT NULL DEFAULT 0,
                 ordinal INTEGER NOT NULL,
                 record_sequence INTEGER NOT NULL,
                 token TEXT NOT NULL,
@@ -119,14 +121,15 @@ impl Registry {
             .map_err(state)?;
         Self::check_revision(&tx, a)?;
         let previous = tx.query_row(
-            "SELECT invocation_binding, ordinal, receipt, record_sequence, consumed, grant_revision, expires_at
+            "SELECT invocation_binding, ordinal, receipt, record_sequence, consumed, grant_revision, accepted_attempts, expires_at
              FROM egress_permits WHERE invocation_key=?1 ORDER BY ordinal DESC LIMIT 1", [&invocation_key],
             |row| Ok(PreviousAttempt {
                 binding: row.get(0)?, ordinal: row.get(1)?, receipt: row.get(2)?,
                 record_sequence: row.get(3)?, consumed: row.get(4)?,
-                grant_revision: row.get(5)?,
-                expires_at: row.get(6)?,
+                grant_revision: row.get(5)?, accepted_attempts: row.get(6)?,
+                expires_at: row.get(7)?,
             })).optional().map_err(state)?;
+        let mut accepted_attempts = 0;
         if let Some(previous) = previous {
             if previous.binding != binding {
                 return Err(EgressError::InvalidRequest);
@@ -138,6 +141,7 @@ impl Registry {
             if a.record_sequence <= previous.record_sequence {
                 return Err(EgressError::InvalidRequest);
             }
+            accepted_attempts = previous.accepted_attempts;
             // Revision publication or expiry invalidates a pending permit without a handoff.
             // It has no charge or receipt and leaves the invocation allowance intact.
             if previous.consumed
@@ -167,13 +171,6 @@ impl Registry {
                 }
             }
         }
-        let accepted_attempts: u32 = tx
-            .query_row(
-                "SELECT count(*) FROM egress_permits WHERE invocation_key=?1 AND consumed=1",
-                [&invocation_key],
-                |r| r.get(0),
-            )
-            .map_err(state)?;
         // Only the current reservation can spend: prior attempts were zero.
         if accepted_attempts >= max_attempts {
             return Err(EgressError::BudgetRefused);
@@ -182,8 +179,8 @@ impl Registry {
             return Err(EgressError::AuthorityExpired);
         }
         let token = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at, grant_key, grant_revision, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at, grant_key, a.grant_revision, a.expires_at]).map_err(state)?;
+        tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at, grant_key, grant_revision, accepted_attempts, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at, grant_key, a.grant_revision, accepted_attempts, a.expires_at]).map_err(state)?;
         tx.commit().map_err(state)?;
         Ok(PermitGrant {
             permit: DispatchPermit {
@@ -247,8 +244,7 @@ impl Registry {
             .map_err(state)?;
         let (accepted_attempts, superseded): (u32, bool) = tx
             .query_row(
-                "SELECT (SELECT count(*) FROM egress_permits accepted
-                WHERE accepted.invocation_key=p.invocation_key AND accepted.consumed=1), EXISTS(
+                "SELECT p.accepted_attempts, EXISTS(
                 SELECT 1 FROM egress_permits successor
                 WHERE successor.invocation_key=p.invocation_key AND successor.ordinal>p.ordinal)
              FROM egress_permits p WHERE p.attempt_digest=?1 AND p.token=?2 AND p.consumed=0",
@@ -276,7 +272,7 @@ impl Registry {
         if now()? >= attempt.expires_at {
             return Err(EgressError::AuthorityExpired);
         }
-        let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
+        let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1, accepted_attempts=accepted_attempts+1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
         if changed != 1 {
             return Err(EgressError::PermitRefused);
         }
@@ -628,7 +624,6 @@ mod tests {
                 .spend_state,
             SpendState::Released
         );
-        assert_eq!(registry.0.query_row("SELECT count(*) FROM pragma_table_info('egress_permits') WHERE name='accepted_attempts'", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
     }
 
     #[test]
@@ -688,7 +683,7 @@ mod tests {
             registry
                 .0
                 .query_row(
-                    "SELECT sum(consumed), count(*) FROM egress_permits WHERE consumed=1",
+                    "SELECT sum(consumed), sum(accepted_attempts) FROM egress_permits",
                     [],
                     |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?))
                 )
@@ -774,7 +769,7 @@ mod tests {
             registry
                 .0
                 .query_row(
-                    "SELECT count(*) FROM egress_permits WHERE consumed=1",
+                    "SELECT accepted_attempts FROM egress_permits WHERE ordinal=4",
                     [],
                     |r| r.get::<_, u32>(0)
                 )
@@ -850,7 +845,7 @@ mod tests {
             registry
                 .0
                 .query_row(
-                    "SELECT consumed, (SELECT count(*) FROM egress_permits WHERE consumed=1) FROM egress_permits",
+                    "SELECT consumed, accepted_attempts FROM egress_permits",
                     [],
                     |r| { Ok((r.get::<_, bool>(0)?, r.get::<_, u32>(1)?)) }
                 )
@@ -996,10 +991,10 @@ mod tests {
             ) INSERT INTO egress_permits
                 (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
                  token, recovery_expires_at, consumed, finished, receipt, result,
-                 grant_key, grant_revision, expires_at)
+                 grant_key, grant_revision, accepted_attempts, expires_at)
                 SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
                        token, recovery_expires_at, 1, 1, receipt, result,
-                       grant_key, grant_revision, expires_at
+                       grant_key, grant_revision, n, expires_at
                 FROM egress_permits, ord WHERE ordinal=1;",
             )
             .unwrap();
@@ -1050,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_admission_counts_consumed_rows_with_large_history() {
+    fn retry_admission_uses_bounded_indexed_work_with_large_history() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = open(&dir.path().join("registry.sqlite"));
         let mut attempt = attempt();
@@ -1078,13 +1073,16 @@ mod tests {
             VALUES(2) UNION ALL SELECT n+1 FROM ord WHERE n<10000
         ) INSERT INTO egress_permits
             (attempt_digest, invocation_key, invocation_binding, ordinal, record_sequence,
-             token, recovery_expires_at, consumed, receipt, grant_key, grant_revision, expires_at)
+             token, recovery_expires_at, consumed, receipt, grant_key, grant_revision, accepted_attempts, expires_at)
             SELECT printf('%064d', n), invocation_key, invocation_binding, n, n,
-                   token, recovery_expires_at, 1, receipt, grant_key, grant_revision, expires_at FROM egress_permits, ord WHERE ordinal=1;",
+                   token, recovery_expires_at, 1, receipt, grant_key, grant_revision, n, expires_at FROM egress_permits, ord WHERE ordinal=1;",
             )
             .unwrap();
         attempt.attempt_ordinal = 10001;
         attempt.record_sequence = 10001;
+        // Interrupt any admission needing 1,000 VM instructions. An indexed
+        // predecessor lookup fits; an aggregate over 10,000 receipts cannot.
+        registry.0.progress_handler(1000, Some(|| true));
         assert!(registry.issue(&attempt, 20000).is_ok());
         registry
             .publish_revision(&GrantRevision {
