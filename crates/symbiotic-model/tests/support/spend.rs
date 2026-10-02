@@ -29,6 +29,9 @@ pub fn ledger_with_after_reserve(
     })
 }
 impl SpendLedger for Fixture {
+    fn release_before_dispatch(&self, r: &SpendReceiptRef) -> Result<(), ModelError> {
+        self.ledger.release_before_dispatch(r)
+    }
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
         let accepted = self.ledger.reserve(r)?;
         if accepted && let Some(hook) = &self.after_reserve {
@@ -51,12 +54,6 @@ impl SpendLedger for Fixture {
     }
     fn invocation(&self, a: &str, i: &str) -> Result<Option<SpendReceipt>, ModelError> {
         self.ledger.invocation(a, i)
-    }
-    fn abort_before_dispatch(
-        &self,
-        reference: &symbiotic_model::SpendReceiptRef,
-    ) -> Result<(), ModelError> {
-        self.ledger.abort_before_dispatch(reference)
     }
     fn finish(
         &self,

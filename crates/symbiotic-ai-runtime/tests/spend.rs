@@ -22,6 +22,69 @@ fn open(path: &std::path::Path) -> SqliteSpendLedger {
     SqliteSpendLedger::open(path).unwrap()
 }
 #[test]
+fn pre_dispatch_release_survives_restart_and_cannot_erase_a_provider_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let aborted = reservation("aborted", "invocation", "account");
+    let ledger = open(&path);
+    ledger.reserve(&aborted).unwrap();
+    for _ in 0..2 {
+        ledger.release_before_dispatch(&aborted.reference).unwrap();
+    }
+    drop(ledger);
+    let ledger = open(&path);
+    let receipt = ledger.receipt(&aborted.reference).unwrap().unwrap();
+    assert_eq!(receipt.state, SpendState::Released);
+    assert!(receipt.pre_dispatch_released);
+    let attempted = reservation("attempted", "invocation", "account");
+    assert!(ledger.reserve(&attempted).unwrap());
+    ledger
+        .finish(&attempted.reference, SpendState::Released, None, None)
+        .unwrap();
+    assert!(
+        ledger
+            .release_before_dispatch(&attempted.reference)
+            .is_err()
+    );
+    assert!(
+        !ledger
+            .receipt(&attempted.reference)
+            .unwrap()
+            .unwrap()
+            .pre_dispatch_released
+    );
+}
+
+#[test]
+fn pre_dispatch_release_and_attempt_evidence_roll_back_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let ledger = open(&path);
+    let aborted = reservation("aborted", "invocation", "account");
+    ledger.reserve(&aborted).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_attempt_evidence BEFORE UPDATE OF pre_dispatch_released ON spend_receipts BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    assert!(ledger.release_before_dispatch(&aborted.reference).is_err());
+    let receipt = ledger.receipt(&aborted.reference).unwrap().unwrap();
+    assert_eq!(receipt.state, SpendState::Unknown);
+    assert!(!receipt.pre_dispatch_released);
+    assert!(matches!(
+        ledger.reserve(&reservation("other", "other", "account")),
+        Err(ModelError::BudgetExhausted(
+            DiagnosticCode::SpendBudgetExhausted
+        ))
+    ));
+    conn.execute_batch("DROP TRIGGER refuse_attempt_evidence;")
+        .unwrap();
+    ledger.release_before_dispatch(&aborted.reference).unwrap();
+    assert!(
+        ledger
+            .reserve(&reservation("retry", "invocation", "account"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn spend_crash_retains_unknown_and_refuses_a_second_attempt_until_reconciliation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");

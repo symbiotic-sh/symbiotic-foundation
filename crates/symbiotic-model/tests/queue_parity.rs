@@ -919,6 +919,7 @@ struct CountsRenewals {
     fail_cooldown_writes: std::sync::atomic::AtomicBool,
     fail_completions: std::sync::atomic::AtomicBool,
     fail_heartbeats: std::sync::atomic::AtomicBool,
+    fail_heartbeat_at: AtomicUsize,
     completion_state: AtomicUsize,
     running_read: tokio::sync::Notify,
 }
@@ -936,6 +937,7 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         fail_cooldown_writes: std::sync::atomic::AtomicBool::new(false),
         fail_completions: std::sync::atomic::AtomicBool::new(false),
         fail_heartbeats: std::sync::atomic::AtomicBool::new(false),
+        fail_heartbeat_at: AtomicUsize::new(0),
         completion_state: AtomicUsize::new(0),
         running_read: tokio::sync::Notify::new(),
     })
@@ -980,8 +982,10 @@ on_both_backends!(
     a_failed_trace_write_still_completes_the_item,
     a_slow_reservation_renews_its_lease_before_dispatch,
     lease_loss_during_reservation_refuses_dispatch,
-    reservation_storage_failure_preserves_the_last_provider_attempt,
+    a_reservation_storage_failure_preserves_the_last_provider_attempt,
     lease_loss_at_transport_boundary_preserves_unused_provider_attempts,
+    a_crash_before_reservation_preserves_the_last_provider_attempt,
+    a_heartbeat_failure_before_transport_preserves_the_last_provider_attempt,
     reconciliation_reopens_an_unknown_attempt_within_its_budget,
     reconciliation_preserves_exhausted_attempt_limits,
     reconciliation_permits_an_explicit_budget_renewal,
@@ -1045,8 +1049,10 @@ impl QueueBackend for CountsRenewals {
         worker_id: &str,
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
-        self.renewals.fetch_add(1, Ordering::SeqCst);
-        if self.fail_heartbeats.load(Ordering::SeqCst) {
+        let renewal = self.renewals.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_heartbeats.load(Ordering::SeqCst)
+            || self.fail_heartbeat_at.load(Ordering::SeqCst) == renewal
+        {
             return Err(QueueError::LeaseMismatch(
                 symbiotic_core::DiagnosticCode::QueueFailure,
             ));
@@ -2265,8 +2271,9 @@ struct ObservedSpend {
     inner: Arc<dyn symbiotic_model::SpendLedger>,
     reservations: Mutex<Vec<symbiotic_model::SpendReservation>>,
     delay: Duration,
+    fail_reservations: std::sync::atomic::AtomicBool,
+    panic_reservation: std::sync::atomic::AtomicBool,
     fail_settlement: std::sync::atomic::AtomicBool,
-    fail_reserve: std::sync::atomic::AtomicBool,
 }
 
 impl ObservedSpend {
@@ -2275,8 +2282,9 @@ impl ObservedSpend {
             inner: test_spend::ledger(),
             reservations: Mutex::new(Vec::new()),
             delay,
+            fail_reservations: std::sync::atomic::AtomicBool::new(false),
+            panic_reservation: std::sync::atomic::AtomicBool::new(false),
             fail_settlement: std::sync::atomic::AtomicBool::new(false),
-            fail_reserve: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2303,9 +2311,19 @@ impl ObservedSpend {
 }
 
 impl symbiotic_model::SpendLedger for ObservedSpend {
+    fn release_before_dispatch(
+        &self,
+        reference: &symbiotic_model::SpendReceiptRef,
+    ) -> Result<(), ModelError> {
+        self.inner.release_before_dispatch(reference)
+    }
     fn reserve(&self, reservation: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
         std::thread::sleep(self.delay);
-        if self.fail_reserve.load(Ordering::SeqCst) {
+        assert!(
+            !self.panic_reservation.load(Ordering::SeqCst),
+            "crashed before reservation"
+        );
+        if self.fail_reservations.load(Ordering::SeqCst) {
             return Err(ModelError::Queue(
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
@@ -2343,12 +2361,6 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         self.inner.invocation(account, invocation)
     }
 
-    fn abort_before_dispatch(
-        &self,
-        reference: &symbiotic_model::SpendReceiptRef,
-    ) -> Result<(), ModelError> {
-        self.inner.abort_before_dispatch(reference)
-    }
     fn finish(
         &self,
         reference: &symbiotic_model::SpendReceiptRef,
@@ -2422,19 +2434,129 @@ async fn lease_loss_during_reservation_refuses_dispatch(backend: &str, queue: Ar
         "{backend}: no transport incurred a charge"
     );
     queue.fail_heartbeats.store(false, Ordering::SeqCst);
+    // Reservation finished beyond the real lease: reclaim must preserve the attempt.
     queue
         .reclaim_expired_leases(&raw.descriptor.queue_id())
         .await
         .unwrap();
-    let response = provider
-        .chat(request("lost reservation lease"))
-        .await
-        .unwrap();
     assert_eq!(
-        response.text, "lost reservation lease",
-        "{backend}: an aborted claim must preserve the last provider attempt"
+        provider
+            .chat(request("lost reservation lease"))
+            .await
+            .unwrap()
+            .text,
+        "lost reservation lease",
+        "{backend}"
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+async fn a_reservation_storage_failure_preserves_the_last_provider_attempt(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity());
+    let spend = ObservedSpend::new(Duration::ZERO);
+    spend.fail_reservations.store(true, Ordering::SeqCst);
+    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
+    for _ in 0..2 {
+        let err = provider
+            .chat(request("storage recovers"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            "{backend}"
+        );
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0, "{backend}");
+        assert!(spend.reservations.lock().unwrap().is_empty());
+    }
+    spend.fail_reservations.store(false, Ordering::SeqCst);
+    assert_eq!(
+        provider
+            .chat(request("storage recovers"))
+            .await
+            .unwrap()
+            .text,
+        "storage recovers",
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+async fn a_crash_before_reservation_preserves_the_last_provider_attempt(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity());
+    let spend = ObservedSpend::new(Duration::ZERO);
+    spend.panic_reservation.store(true, Ordering::SeqCst);
+    let provider = queued(
+        raw.clone(),
+        queue.clone(),
+        ModelQueueConfig {
+            lease_seconds: 1,
+            ..leased()
+        },
+    )
+    .with_spend_ledger(spend.clone(), None);
+    let crashed = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.chat(request("crashed before accounting")).await }
+    });
+    assert!(crashed.await.unwrap_err().is_panic(), "{backend}");
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+    assert!(spend.reservations.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    queue
+        .reclaim_expired_leases(&raw.descriptor.queue_id())
+        .await
+        .unwrap();
+    spend.panic_reservation.store(false, Ordering::SeqCst);
+    assert_eq!(
+        provider
+            .chat(request("crashed before accounting"))
+            .await
+            .unwrap()
+            .text,
+        "crashed before accounting",
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+async fn a_heartbeat_failure_before_transport_preserves_the_last_provider_attempt(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    // Both ownership checks: immediately after reserve and after Running telemetry.
+    for heartbeat in [1, 2] {
+        let queue = counted(queue.inner.clone());
+        queue.fail_heartbeat_at.store(heartbeat, Ordering::SeqCst);
+        let raw = Loopback::new(unique_identity());
+        let spend = ObservedSpend::new(Duration::ZERO);
+        let provider = queued(
+            raw.clone(),
+            queue,
+            ModelQueueConfig {
+                lease_seconds: 1,
+                ..leased()
+            },
+        )
+        .with_spend_ledger(spend.clone(), None);
+        let input = format!("heartbeat {heartbeat}");
+        provider.chat(request(&input)).await.unwrap_err();
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0, "{backend}");
+        // On the old implementation this expires into Dead at the final claim.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let answer = tokio::time::timeout(Duration::from_secs(3), provider.chat(request(&input)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.text, input, "{backend}");
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+    }
 }
 
 async fn reconciliation_reopens_an_unknown_attempt_within_its_budget(
@@ -2857,31 +2979,6 @@ async fn settlement_failure_is_visible_retains_unknown_and_refuses_redispatch(
     );
 }
 
-async fn reservation_storage_failure_preserves_the_last_provider_attempt(
-    backend: &str,
-    queue: Arc<CountsRenewals>,
-) {
-    let raw = Loopback::new(unique_identity());
-    let spend = ObservedSpend::new(Duration::ZERO);
-    spend.fail_reserve.store(true, Ordering::SeqCst);
-    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
-    let error = provider.chat(request("busy ledger")).await.unwrap_err();
-    assert_eq!(
-        error.code(),
-        symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
-        "{backend}"
-    );
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 0, "{backend}");
-    assert!(spend.reservations.lock().unwrap().is_empty());
-    spend.fail_reserve.store(false, Ordering::SeqCst);
-    assert_eq!(
-        provider.chat(request("busy ledger")).await.unwrap().text,
-        "busy ledger",
-        "{backend}"
-    );
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
-}
-
 struct AbortAtRunning(Arc<CountsRenewals>);
 #[async_trait]
 impl symbiotic_model::QueueReceiptSink for AbortAtRunning {
@@ -2921,7 +3018,7 @@ async fn lease_loss_at_transport_boundary_preserves_unused_provider_attempts(
                 .receipt(&spend.last_reference())
                 .unwrap()
                 .unwrap()
-                .dispatch_aborted
+                .pre_dispatch_released
         );
         queue.fail_heartbeats.store(false, Ordering::SeqCst);
         // Retry without the aborting telemetry hook; runtime itself reclaims the lease.

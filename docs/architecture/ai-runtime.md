@@ -171,6 +171,12 @@ charge after crash, timeout or missing usage; success settles measured usage.
 `Runtime::spend_receipt` even after queue retention. Same-attempt output recovery is
 independent of cache purge/expiry; callers identify new invocations through request
 identity (including `source`). Consumer commit refusal never releases spend.
+Queue claims that fail before reservation, or whose reservations are atomically
+released before transport, do not consume the provider-attempt allowance. The
+ledger records pre-dispatch release separately from ordinary `Released` accounting:
+a known-zero provider failure still consumes an attempt. Followers use this evidence
+even after lease reclaim marks the queue item dead. A later identical call can
+reconsider a pre-dispatch storage failure once the ledger is available again.
 `Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
 counts against the absolute account request allowance until reconciliation; unknown
 replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
@@ -446,7 +452,7 @@ The same holds elsewhere. A cache hit whose trace write fails is still
 returned, with the diagnostic. A failed failure-trace write is logged. A failed cooldown write returns a
 queue error and persists a stopped item, because execution without its account
 limiter is not allowed. Stopped items cannot be claimed directly. Genuine terminal refusals, including
-cooldown-storage failures, cannot be continued or renewed. A later handoff may
+cooldown-storage and pre-transport rate-state failures, cannot be continued or renewed. A later handoff may
 reconsider an account-budget refusal or an uncertain-charge refusal whose receipt
 has been reconciled to Released. Provider attempts still count toward the logical
 attempt limit. Account reservation
@@ -494,7 +500,7 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 6 and the current queue table layouts.
+queue files require schema version 7 and the current queue table layouts.
 Other layouts are refused without migration. Queue and ledger mutations acquire
 the SQLite write lock before reading state, so concurrent writers do not require
 a read-to-write transaction upgrade. Unknown stored failure codes/classes

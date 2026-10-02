@@ -204,7 +204,7 @@ fn receipt_in(
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let row = conn
         .query_row(
-            "SELECT reservation, state, usage, output, dispatch_aborted FROM spend_receipts WHERE reference=?1",
+            "SELECT reservation, state, usage, output, pre_dispatch_released FROM spend_receipts WHERE reference=?1",
             [&reference.0],
             |r| {
                 Ok((
@@ -218,10 +218,10 @@ fn receipt_in(
         )
         .optional()
         .map_err(storage)?;
-    row.map(|(r, state, usage, output, dispatch_aborted)| {
+    row.map(|(r, state, usage, output, pre_dispatch_released)| {
         Ok(SpendReceipt {
             reservation: serde_json::from_str(&r).map_err(storage)?,
-            dispatch_aborted,
+            pre_dispatch_released,
             state: match state.as_str() {
                 "unknown" => SpendState::Unknown,
                 "released" => SpendState::Released,
@@ -253,6 +253,23 @@ fn invocation_in(
 }
 
 impl SpendLedger for SqliteSpendLedger {
+    fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let old = receipt_in(&tx, reference)?.ok_or_else(conflict)?;
+        if old.state != SpendState::Unknown && !old.pre_dispatch_released {
+            return Err(conflict());
+        }
+        Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
+        tx.execute(
+            "UPDATE spend_receipts SET pre_dispatch_released=1 WHERE reference=?1",
+            [&reference.0],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
@@ -305,19 +322,6 @@ impl SpendLedger for SqliteSpendLedger {
     ) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
         invocation_in(&conn, account, invocation)
-    }
-    fn abort_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
-        let mut conn = self.0.lock().map_err(storage)?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage)?;
-        Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
-        tx.execute(
-            "UPDATE spend_receipts SET dispatch_aborted=1 WHERE reference=?1",
-            [&reference.0],
-        )
-        .map_err(storage)?;
-        tx.commit().map_err(storage)
     }
     fn finish(
         &self,

@@ -992,47 +992,78 @@ impl<Req> QueuedCall<Req> {
         .await
     }
 
-    async fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
-        if self.accepted_spend.is_none() {
-            let spend = self.spend.clone();
-            let reference = reference.clone();
-            run_blocking(move || spend.abort_before_dispatch(&reference)).await?;
-        }
-        Ok(())
-    }
-
-    async fn abort_dispatch(
+    /// Every known-zero pre-transport exit settles both accounting and the queue.
+    /// If ownership is already gone, the durable release still lets followers
+    /// recover the unused provider attempt after lease reclaim.
+    async fn abort_before_dispatch(
         &self,
         item: &QueueItem,
-        reference: &SpendReceiptRef,
-    ) -> Result<(), ModelError> {
-        self.release_before_dispatch(reference).await?;
-        match self
+        reference: Option<&SpendReceiptRef>,
+        mut err: ModelError,
+    ) -> (ModelError, Result<FailOutcome, symbiotic_queue::QueueError>) {
+        if self.accepted_spend.is_none()
+            && let Some(reference) = reference
+        {
+            let spend = self.spend.clone();
+            let reference = reference.clone();
+            if let Err(release_err) =
+                run_blocking(move || spend.release_before_dispatch(&reference)).await
+            {
+                err = release_err;
+            }
+        }
+        let failed = self
             .queue
             .fail_with(
                 &item.item_id,
                 &self.worker_id,
                 Failure {
-                    error: DiagnosticCode::QueueFailure,
-                    error_class: Some(FailureClass::Queue),
+                    error: err.code(),
+                    error_class: Some(error_class(&err)),
                     run_after: None,
                 },
             )
-            .await
-        {
-            Ok(_) => Ok(()),
-            // A new owner may already hold the item. The durable abort proof
-            // survives reclaim, so the old worker must not alter the new lease.
+            .await;
+        // A reclaimed item may already belong to another worker. Leave that
+        // lease alone; the durable release preserves the unused attempt.
+        let failed = match failed {
             Err(
                 symbiotic_queue::QueueError::LeaseMismatch(_)
                 | symbiotic_queue::QueueError::NotRunning(_),
-            ) => Ok(()),
-            Err(error) => Err(queue_error(error)),
-        }
+            ) => Ok(FailOutcome::Stopped),
+            other => other,
+        };
+        (err, failed)
     }
 
-    // Reconsider accounting refusals and claims with durable proof that no
-    // transport started. Provider failures retain their spent attempt budget.
+    /// Queue claims and provider attempts differ. Reservation must precede
+    /// dispatch, so absent receipts and confirmed pre-dispatch releases cost
+    /// no attempt; Unknown and ordinary Released receipts still count.
+    async fn provider_attempts(&self, item: &QueueItem) -> Result<u32, ModelError> {
+        if self.accepted_spend.is_some() {
+            return Ok(item.attempt);
+        }
+        let spend = self.spend.clone();
+        let item_id = item.item_id.0.clone();
+        let claims = item.attempt;
+        run_blocking(move || {
+            let mut attempts = 0;
+            for claim in 1..=claims {
+                let reference = SpendReceiptRef(format!("runtime:{item_id}:{claim}"));
+                if spend
+                    .receipt(&reference)?
+                    .is_some_and(|r| !r.pre_dispatch_released)
+                {
+                    attempts += 1;
+                }
+            }
+            Ok(attempts)
+        })
+        .await
+    }
+
+    // Reconsider accounting refusals and proven pre-dispatch storage/ownership
+    // aborts. Other stopped failures, including rate failures, remain terminal.
     async fn reconsider_stopped(
         &self,
         item: &QueueItem,
@@ -1040,44 +1071,38 @@ impl<Req> QueuedCall<Req> {
         if self.accepted_spend.is_some() {
             return Ok(None);
         }
-        let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
-        let spend = self.spend.clone();
-        let current = run_blocking(move || spend.receipt(&reference)).await?;
-        let aborted = current
-            .as_ref()
-            .is_some_and(|r| r.dispatch_aborted && r.state == SpendState::Released);
-        let denied = if aborted {
-            true
-        } else {
-            match item.last_error {
-                Some(DiagnosticCode::SpendBudgetExhausted) => true,
-                Some(DiagnosticCode::SpendLedgerUnavailable | DiagnosticCode::LeaseExpired) => {
-                    current.is_none()
+        match item.last_error {
+            Some(DiagnosticCode::SpendBudgetExhausted) => {}
+            Some(DiagnosticCode::SpendReconciliationRequired) => {
+                let spend = self.spend.clone();
+                let account = self.queue_id.0.clone();
+                let invocation = self.invocation.clone();
+                let receipt = run_blocking(move || spend.invocation(&account, &invocation)).await?;
+                if !receipt.is_some_and(|r| r.state == SpendState::Released) {
+                    return Ok(None);
                 }
-                Some(DiagnosticCode::QueueFailure) => false,
-                Some(DiagnosticCode::SpendReconciliationRequired) => {
-                    let spend = self.spend.clone();
-                    let account = self.queue_id.0.clone();
-                    let invocation = self.invocation.clone();
-                    let receipt =
-                        run_blocking(move || spend.invocation(&account, &invocation)).await?;
-                    if !receipt.is_some_and(|r| r.state == SpendState::Released) {
-                        return Ok(None);
-                    }
-                    current.is_none()
-                }
-                _ => return Ok(None),
             }
-        };
-        if !denied && item.last_error != Some(DiagnosticCode::SpendReconciliationRequired) {
-            return Ok(None);
+            Some(
+                DiagnosticCode::SpendLedgerUnavailable
+                | DiagnosticCode::QueueFailure
+                | DiagnosticCode::LeaseExpired,
+            ) => {
+                let spend = self.spend.clone();
+                let reference =
+                    SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+                let receipt = run_blocking(move || spend.receipt(&reference)).await?;
+                let unused =
+                    receipt.as_ref().is_some_and(|r| r.pre_dispatch_released) || receipt.is_none();
+                if !unused {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
         }
         let state = logical_retry_state(&item.payload, logical_max_attempts(&self.config));
-        // Reservation denial is a queue claim, never a provider attempt.
         let attempts_used = state
             .attempts_used
-            .saturating_add(item.attempt)
-            .saturating_sub(u32::from(denied));
+            .saturating_add(self.provider_attempts(item).await?);
         if attempts_used >= state.max_attempts {
             return if budget_renewed(item, &self.config)? {
                 self.renew_budget(&item.item_id).await.map(Some)
@@ -1131,6 +1156,7 @@ impl<Req> QueuedCall<Req> {
             dead,
             &self.config,
             err,
+            self.provider_attempts(dead).await?,
         )
         .await
     }
@@ -1646,7 +1672,14 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             return Ok(Followed::Moved);
         }
         match current.status {
-            QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
+            QueueStatus::Stopped => {
+                if let Some(next) = self.reconsider_stopped(&current).await? {
+                    *enqueue = next;
+                    Ok(Followed::Moved)
+                } else {
+                    Err(dead_item_retry_error(&current))
+                }
+            }
             QueueStatus::Dead if budget_renewed(&current, config)? => {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
@@ -1827,8 +1860,14 @@ where
                 }
             })
             .await;
-            if matches!(reserve, Ok(true)) {
-                this.attempt_context.capture(&reference)?;
+            if matches!(reserve, Ok(true))
+                && let Err(err) = this.attempt_context.capture(&reference)
+            {
+                let (err, failed) = this
+                    .abort_before_dispatch(&item, Some(&reference), err)
+                    .await;
+                failed.map_err(queue_error)?;
+                return Err(err);
             }
             // A blocking reservation can finish after ownership was lost. It
             // must never authorize a provider call under that stale claim.
@@ -1841,44 +1880,30 @@ where
                     .map_err(queue_error)
             };
             if let Err(err) = ownership {
-                if matches!(reserve, Ok(true)) {
-                    this.abort_dispatch(&item, &reference).await?;
-                }
+                let (err, failed) = this
+                    .abort_before_dispatch(
+                        &item,
+                        matches!(reserve, Ok(true)).then_some(&reference),
+                        err,
+                    )
+                    .await;
+                failed.map_err(queue_error)?;
                 return Err(err);
             }
             if !matches!(reserve, Ok(true)) {
                 let err = reserve.err().unwrap_or_else(spend::reconciliation);
-                queue
-                    .fail_with(
-                        &item.item_id,
-                        worker_id,
-                        Failure {
-                            error: err.code(),
-                            error_class: Some(error_class(&err)),
-                            run_after: None,
-                        },
-                    )
-                    .await
-                    .map_err(queue_error)?;
+                let (err, failed) = this.abort_before_dispatch(&item, None, err).await;
+                failed.map_err(queue_error)?;
                 return Err(err);
             }
             // Only an attempt that reaches the provider spends rate budget.
             if let Some(rate) = rate
                 && let Err(err) = rate.charge()
             {
-                this.release_before_dispatch(&reference).await?;
-                queue
-                    .fail_with(
-                        &item.item_id,
-                        worker_id,
-                        Failure {
-                            error: err.code(),
-                            error_class: Some(error_class(&err)),
-                            run_after: None,
-                        },
-                    )
-                    .await
-                    .map_err(queue_error)?;
+                let (err, failed) = this
+                    .abort_before_dispatch(&item, Some(&reference), err)
+                    .await;
+                failed.map_err(queue_error)?;
                 return Err(err);
             }
             Ok(settle(
@@ -2023,29 +2048,23 @@ where
     // Running telemetry may itself await. Validate ownership once more at
     // the actual transport boundary; after dispatch retain its outcome.
     if ownership_lost.load(std::sync::atomic::Ordering::SeqCst) {
-        let err = this
-            .abort_dispatch(item, reference)
-            .await
-            .err()
-            .unwrap_or(ModelError::Queue(DiagnosticCode::QueueFailure));
-        return Settled::Failed {
-            err,
-            failed: Ok(FailOutcome::Stopped),
-        };
+        let (err, failed) = this
+            .abort_before_dispatch(
+                item,
+                Some(reference),
+                ModelError::Queue(DiagnosticCode::QueueFailure),
+            )
+            .await;
+        return Settled::Failed { err, failed };
     }
     if let Err(err) = queue
         .heartbeat(&item.item_id, worker_id, config.lease_seconds)
         .await
     {
-        let err = this
-            .abort_dispatch(item, reference)
-            .await
-            .err()
-            .unwrap_or_else(|| queue_error(err));
-        return Settled::Failed {
-            err,
-            failed: Ok(FailOutcome::Stopped),
-        };
+        let (err, failed) = this
+            .abort_before_dispatch(item, Some(reference), queue_error(err))
+            .await;
+        return Settled::Failed { err, failed };
     }
     let provider_started = std::time::Instant::now();
     let result = within_timeout(
@@ -2629,9 +2648,10 @@ async fn reenqueue_dead_item(
     item: &QueueItem,
     config: &ModelQueueConfig,
     err: &ModelError,
+    provider_attempts: u32,
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
     let state = logical_retry_state(&item.payload, logical_max_attempts(config));
-    let attempts_used = state.attempts_used.saturating_add(item.attempt);
+    let attempts_used = state.attempts_used.saturating_add(provider_attempts);
     if item.status == QueueStatus::Stopped || attempts_used >= state.max_attempts {
         return Ok(None);
     }
@@ -5124,11 +5144,15 @@ mod tests {
             let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
             let accounted = spend.receipt(&reference).unwrap().unwrap();
             assert_eq!(accounted.state, SpendState::Released);
-            assert!(
-                install(ModelRateState::default())
-                    .chat(chat_request("rate failure"))
-                    .await
-                    .is_err()
+            assert!(accounted.pre_dispatch_released);
+            let repeated = install(ModelRateState::default())
+                .chat(chat_request("rate failure"))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                repeated.code(),
+                DiagnosticCode::RateBucketDisappeared,
+                "a refunded reservation cannot reopen a terminal rate failure"
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(

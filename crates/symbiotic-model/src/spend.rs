@@ -87,8 +87,10 @@ pub fn handoff_input_identity(
 pub struct SpendReceipt {
     pub reservation: SpendReservation,
     pub state: SpendState,
-    /// Durable proof that this reservation was released before provider transport.
-    pub dispatch_aborted: bool,
+    /// Confirmed release before transport: this queue claim used no provider attempt.
+    /// Ordinary Released accounting, including known-zero provider failures, still did.
+    #[serde(default)]
+    pub pre_dispatch_released: bool,
     pub usage: Option<UsageTrace>,
     /// Same-attempt runtime result, or credential completion evidence; egress
     /// output bytes stay in its authenticated, deadline-bounded recovery store.
@@ -99,6 +101,9 @@ pub struct SpendReceipt {
 /// A successful reserve returns true only for a newly accepted attempt.
 pub trait SpendLedger: Send + Sync {
     fn reserve(&self, reservation: &SpendReservation) -> Result<bool, ModelError>;
+    /// Atomically release a reservation and record that transport never started.
+    /// Must not reclassify a provider attempt already settled or reconciled.
+    fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError>;
     /// Atomically validate and consume dispatch ownership for an accepted handoff.
     /// Reuse, identity mismatch and non-unknown accounting are refused.
     fn acquire_handoff(
@@ -115,8 +120,6 @@ pub trait SpendLedger: Send + Sync {
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError>;
-    /// Release a reservation with durable evidence that provider transport never started.
-    fn abort_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError>;
     fn finish(
         &self,
         reference: &SpendReceiptRef,
@@ -140,6 +143,9 @@ impl SpendLedger for UnavailableSpendLedger {
     fn reserve(&self, _: &SpendReservation) -> Result<bool, ModelError> {
         Err(storage())
     }
+    fn release_before_dispatch(&self, _: &SpendReceiptRef) -> Result<(), ModelError> {
+        Err(storage())
+    }
     fn acquire_handoff(
         &self,
         _: &AcceptedSpendHandoff,
@@ -153,9 +159,6 @@ impl SpendLedger for UnavailableSpendLedger {
         Err(storage())
     }
     fn invocation(&self, _: &str, _: &str) -> Result<Option<SpendReceipt>, ModelError> {
-        Err(storage())
-    }
-    fn abort_before_dispatch(&self, _: &SpendReceiptRef) -> Result<(), ModelError> {
         Err(storage())
     }
     fn finish(
