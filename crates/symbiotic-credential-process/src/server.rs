@@ -65,7 +65,8 @@ pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result
                         },
                     };
                 let _ =
-                    tokio::time::timeout(timeout, write_frame(&mut stream, &response, limit)).await;
+                    tokio::time::timeout(timeout, write_response(&mut stream, &response, limit))
+                        .await;
             });
         }
     };
@@ -81,5 +82,69 @@ pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result
     tokio::select! {
         result = serve => result,
         result = cleanup => result,
+    }
+}
+
+async fn write_response(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: &Response,
+    limit: u32,
+) -> Result<(), EgressError> {
+    match write_frame(stream, response, limit).await {
+        // Serialization finishes before write_frame sends its length prefix,
+        // so this refusal is still the connection's first and only frame.
+        Err(EgressError::LimitExceeded) => {
+            write_frame(
+                stream,
+                &Response {
+                    version: PROTOCOL_VERSION,
+                    result: Err(EgressError::LimitExceeded),
+                },
+                limit,
+            )
+            .await
+        }
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_response_returns_a_typed_refusal_before_writing_any_bytes() {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let response = Response {
+            version: PROTOCOL_VERSION,
+            result: Ok(symbiotic_egress::Reply::Dispatched(
+                symbiotic_egress::DispatchResult {
+                    error: None,
+                    diagnostics: Vec::new(),
+                    receipt_persisted: true,
+                    receipt: symbiotic_egress::DispatchReceipt {
+                        attempt_digest: "a".repeat(64),
+                        attempt_id: symbiotic_egress::AttemptId {
+                            tenant: "tenant".into(),
+                            incarnation: "incarnation".into(),
+                            invocation_id: "i".repeat(4096),
+                            attempt_ordinal: 1,
+                        },
+                        reference: symbiotic_egress::SpendReceiptRef("reference".into()),
+                        status: symbiotic_egress::DispatchStatus::Succeeded,
+                        usage: symbiotic_trace::UsageTrace::default(),
+                        spend_state: symbiotic_egress::SpendState::Settled,
+                    },
+                    output: Some(symbiotic_egress::ProviderOutput::Chat {
+                        text: "paid answer".repeat(1024),
+                    }),
+                },
+            )),
+        };
+        let sent = write_response(&mut writer, &response, 1024).await;
+        drop(writer);
+        assert!(sent.is_ok());
+        let received: Response = read_frame(&mut reader, 1024).await.unwrap();
+        assert!(matches!(received.result, Err(EgressError::LimitExceeded)));
     }
 }

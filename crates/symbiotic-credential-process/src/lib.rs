@@ -450,6 +450,19 @@ fn is_digest(value: &str) -> bool {
 }
 
 fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError> {
+    // Every receipt echoes three identity strings; JSON can encode each input
+    // byte as six bytes (\\u00xx). Preserve the existing fourfold response
+    // allowance, plus room for the fixed receipt/status/permit envelopes.
+    let reply_bound = route
+        .max_field_bytes
+        .checked_mul(3 * 6)
+        .and_then(|identity| {
+            route
+                .max_response_bytes
+                .checked_mul(4)
+                .and_then(|response| identity.checked_add(response))
+        })
+        .and_then(|bytes| bytes.checked_add(4096));
     if route.account.trim().is_empty()
         || route.tenant.is_empty()
         || route.route.is_empty()
@@ -464,7 +477,7 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         || route.input_units_per_minute == Some(0)
         || route.max_attempts == 0
         || route.timeout_seconds == 0
-        || route.max_response_bytes > max_frame as usize / 4
+        || reply_bound.is_none_or(|bytes| bytes > max_frame as usize)
         || route.max_input_bytes > max_frame as usize / 2
     {
         return Err(EgressError::InvalidRequest);

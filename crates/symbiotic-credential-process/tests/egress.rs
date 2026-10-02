@@ -2323,3 +2323,15 @@ async fn failed_settlement_keeps_typed_receipt_unknown_and_preserves_paid_output
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
 }
+
+#[tokio::test]
+async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    for field_bytes in [fixture.config.max_frame_bytes as usize, usize::MAX] {
+        fixture.config.routes[0].max_field_bytes = field_bytes;
+        assert!(matches!(
+            CredentialProcess::open(fixture.config.clone()),
+            Err(EgressError::InvalidRequest)
+        ));
+    }
+}

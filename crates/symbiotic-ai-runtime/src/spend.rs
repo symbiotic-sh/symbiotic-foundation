@@ -49,6 +49,7 @@ impl SqliteSpendLedger {
     pub fn reserve_in(
         conn: &rusqlite::Transaction<'_>,
         r: &SpendReservation,
+        attempt_limit: Option<u32>,
     ) -> Result<bool, ModelError> {
         // All reservation paths fix the invocation's input binding in this same
         // immediate transaction. Released predecessors never erase the binding.
@@ -87,6 +88,13 @@ impl SqliteSpendLedger {
         if active {
             return Err(conflict());
         }
+        if let Some(limit) = attempt_limit
+            && attempts_in(conn, &r.account, &r.invocation, None)? >= limit
+        {
+            return Err(ModelError::BudgetExhausted(
+                DiagnosticCode::AttemptBudgetExhausted,
+            ));
+        }
         let changed = conn.execute("UPDATE spend_accounts SET used=used+1 WHERE account=?1 AND used<9223372036854775807 AND (?2 IS NULL OR used<?2)", params![r.account, limit]).map_err(storage)?;
         if changed != 1 {
             return Err(ModelError::BudgetExhausted(
@@ -106,7 +114,7 @@ impl SqliteSpendLedger {
         if handoff.input_identity.is_empty() {
             return Err(conflict());
         }
-        if !Self::reserve_in(conn, &handoff.reservation)? {
+        if !Self::reserve_in(conn, &handoff.reservation, None)? {
             let input: Option<String> = conn
                 .query_row(
                     "SELECT handoff_input FROM spend_receipts WHERE reference=?1",
@@ -240,7 +248,32 @@ fn invocation_in(
         .map(Option::flatten)
 }
 
+fn attempts_in(
+    conn: &Connection,
+    account: &str,
+    invocation: &str,
+    reference_prefix: Option<&str>,
+) -> Result<u32, ModelError> {
+    conn.query_row(
+        "SELECT count(*) FROM spend_receipts WHERE account=?1 AND invocation=?2
+         AND pre_dispatch_released=0
+         AND (?3 IS NULL OR substr(reference, 1, length(?3))=?3)",
+        params![account, invocation, reference_prefix],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
 impl SpendLedger for SqliteSpendLedger {
+    fn attempts(
+        &self,
+        account: &str,
+        invocation: &str,
+        reference_prefix: Option<&str>,
+    ) -> Result<u32, ModelError> {
+        let conn = self.0.lock().map_err(storage)?;
+        attempts_in(&conn, account, invocation, reference_prefix)
+    }
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
@@ -258,12 +291,16 @@ impl SpendLedger for SqliteSpendLedger {
         .map_err(storage)?;
         tx.commit().map_err(storage)
     }
-    fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
+    fn reserve(
+        &self,
+        r: &SpendReservation,
+        attempt_limit: Option<u32>,
+    ) -> Result<bool, ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let accepted = Self::reserve_in(&tx, r)?;
+        let accepted = Self::reserve_in(&tx, r, attempt_limit)?;
         tx.commit().map_err(storage)?;
         Ok(accepted)
     }

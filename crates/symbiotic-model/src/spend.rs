@@ -102,7 +102,20 @@ pub struct SpendReceipt {
 /// Accounting boundary used by every queued operation and credential handoff.
 /// A successful reserve returns true only for a newly accepted attempt.
 pub trait SpendLedger: Send + Sync {
-    fn reserve(&self, reservation: &SpendReservation) -> Result<bool, ModelError>;
+    /// Enforce an optional invocation attempt ceiling atomically with reservation.
+    fn reserve(
+        &self,
+        reservation: &SpendReservation,
+        attempt_limit: Option<u32>,
+    ) -> Result<bool, ModelError>;
+    /// Count canonical provider attempts, excluding confirmed pre-dispatch releases.
+    /// A reference prefix scopes implicit calls to their current queue item.
+    fn attempts(
+        &self,
+        account: &str,
+        invocation: &str,
+        reference_prefix: Option<&str>,
+    ) -> Result<u32, ModelError>;
     /// Atomically release a reservation and record that transport never started.
     /// Must not reclassify a provider attempt already settled or reconciled.
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError>;
@@ -143,7 +156,10 @@ pub(crate) fn reconciliation() -> ModelError {
 #[doc(hidden)]
 pub struct UnavailableSpendLedger;
 impl SpendLedger for UnavailableSpendLedger {
-    fn reserve(&self, _: &SpendReservation) -> Result<bool, ModelError> {
+    fn reserve(&self, _: &SpendReservation, _: Option<u32>) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn attempts(&self, _: &str, _: &str, _: Option<&str>) -> Result<u32, ModelError> {
         Err(storage())
     }
     fn release_before_dispatch(&self, _: &SpendReceiptRef) -> Result<(), ModelError> {

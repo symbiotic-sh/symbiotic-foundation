@@ -2100,7 +2100,7 @@ impl symbiotic_ai_runtime::QueueReceiptSink for ReconcileAndReserveOnFailure {
                 .unwrap();
             let mut newer = old.reservation;
             newer.reference = newer_reference;
-            assert!(ledger.reserve(&newer).unwrap());
+            assert!(ledger.reserve(&newer, None).unwrap());
         })
         .await
         .unwrap();
@@ -2431,4 +2431,58 @@ async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
     );
     assert!(refused.attempt.unwrap().is_none());
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_attempt_limit_survives_terminal_queue_pruning() {
+    let dir = private_tempdir();
+    let raw = Loopback::new(unique_identity()).unavailable();
+    let configured = binding(raw.clone())
+        .with_policy(ModelQueueConfig {
+            logical_retry_attempts: 1,
+            retry_attempts: 1,
+            // Renewal is deliberately immediately due: explicit identity cannot renew.
+            budget_renewal_seconds: Some(0),
+            ..policy()
+        })
+        .with_response_cache(ResponseCacheMode::Off);
+    let runtime = persistent(dir.path());
+    runtime
+        .execute_chat(configured.clone(), "bounded", request("input"))
+        .await
+        .unwrap_err();
+    drop(runtime);
+    let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+    let payload: String = conn
+        .query_row("SELECT payload_json FROM queue_items", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&payload)
+            .unwrap()
+            .get("logical_retry")
+            .is_none()
+    );
+    drop(conn);
+    let queue = symbiotic_queue_sqlite::SqliteQueue::open(dir.path().join("queue.sqlite")).unwrap();
+    assert_eq!(
+        queue
+            .prune_terminal_before(chrono::Utc::now() + chrono::Duration::seconds(1))
+            .unwrap(),
+        1
+    );
+    drop(queue);
+    let runtime = persistent(dir.path());
+    runtime
+        .execute_chat(configured.clone(), "bounded", request("input"))
+        .await
+        .unwrap_err();
+    runtime
+        .execute_chat(configured, "bounded", request("input"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        raw.calls.load(Ordering::SeqCst),
+        1,
+        "explicit replay renewed its attempt allowance"
+    );
 }

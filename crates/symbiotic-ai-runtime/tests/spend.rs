@@ -27,7 +27,7 @@ fn pre_dispatch_release_survives_restart_and_cannot_erase_a_provider_attempt() {
     let path = dir.path().join("queue.sqlite");
     let aborted = reservation("aborted", "invocation", "account");
     let ledger = open(&path);
-    ledger.reserve(&aborted).unwrap();
+    ledger.reserve(&aborted, None).unwrap();
     for _ in 0..2 {
         ledger.release_before_dispatch(&aborted.reference).unwrap();
     }
@@ -37,7 +37,7 @@ fn pre_dispatch_release_survives_restart_and_cannot_erase_a_provider_attempt() {
     assert_eq!(receipt.state, SpendState::Released);
     assert!(receipt.pre_dispatch_released);
     let attempted = reservation("attempted", "invocation", "account");
-    assert!(ledger.reserve(&attempted).unwrap());
+    assert!(ledger.reserve(&attempted, None).unwrap());
     ledger
         .finish(&attempted.reference, SpendState::Released, None, None)
         .unwrap();
@@ -61,7 +61,7 @@ fn pre_dispatch_release_and_attempt_evidence_roll_back_together() {
     let path = dir.path().join("queue.sqlite");
     let ledger = open(&path);
     let aborted = reservation("aborted", "invocation", "account");
-    ledger.reserve(&aborted).unwrap();
+    ledger.reserve(&aborted, None).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("CREATE TRIGGER refuse_attempt_evidence BEFORE UPDATE OF pre_dispatch_released ON spend_receipts BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
     assert!(ledger.release_before_dispatch(&aborted.reference).is_err());
@@ -69,7 +69,7 @@ fn pre_dispatch_release_and_attempt_evidence_roll_back_together() {
     assert_eq!(receipt.state, SpendState::Unknown);
     assert!(!receipt.pre_dispatch_released);
     assert!(matches!(
-        ledger.reserve(&reservation("other", "other", "account")),
+        ledger.reserve(&reservation("other", "other", "account"), None),
         Err(ModelError::BudgetExhausted(
             DiagnosticCode::SpendBudgetExhausted
         ))
@@ -79,7 +79,7 @@ fn pre_dispatch_release_and_attempt_evidence_roll_back_together() {
     ledger.release_before_dispatch(&aborted.reference).unwrap();
     assert!(
         ledger
-            .reserve(&reservation("retry", "invocation", "account"))
+            .reserve(&reservation("retry", "invocation", "account"), None)
             .unwrap()
     );
 }
@@ -89,21 +89,21 @@ fn spend_crash_retains_unknown_and_refuses_a_second_attempt_until_reconciliation
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
     let original = reservation("first", "invocation", "account");
-    assert!(open(&path).reserve(&original).unwrap());
+    assert!(open(&path).reserve(&original, None).unwrap());
     // Drop every connection without settling: same durable state as a crashed worker.
     let ledger = open(&path);
     let receipt = ledger.receipt(&original.reference).unwrap().unwrap();
     assert_eq!(receipt.state, SpendState::Unknown);
     assert!(receipt.usage.is_none());
-    assert!(!ledger.reserve(&original).unwrap());
+    assert!(!ledger.reserve(&original, None).unwrap());
     assert!(matches!(
-        ledger.reserve(&reservation("replay", "invocation", "account")),
+        ledger.reserve(&reservation("replay", "invocation", "account"), None),
         Err(ModelError::Queue(
             DiagnosticCode::SpendReconciliationRequired
         ))
     ));
     assert!(matches!(
-        ledger.reserve(&reservation("new", "new", "account")),
+        ledger.reserve(&reservation("new", "new", "account"), None),
         Err(ModelError::BudgetExhausted(
             DiagnosticCode::SpendBudgetExhausted
         ))
@@ -112,14 +112,14 @@ fn spend_crash_retains_unknown_and_refuses_a_second_attempt_until_reconciliation
         .finish(&original.reference, SpendState::Released, None, None)
         .unwrap();
     let retry = reservation("retry", "invocation", "account");
-    assert!(ledger.reserve(&retry).unwrap());
+    assert!(ledger.reserve(&retry, None).unwrap());
 }
 #[test]
 fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = open(&dir.path().join("queue.sqlite"));
     let failed = reservation("failed", "failure", "account");
-    ledger.reserve(&failed).unwrap();
+    ledger.reserve(&failed, None).unwrap();
     ledger
         .finish(&failed.reference, SpendState::Released, None, None)
         .unwrap();
@@ -127,7 +127,7 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
         .finish(&failed.reference, SpendState::Released, None, None)
         .unwrap();
     let paid = reservation("paid", "success", "account");
-    ledger.reserve(&paid).unwrap();
+    ledger.reserve(&paid, None).unwrap();
     let usage = UsageTrace {
         input_tokens: Some(7),
         reported_cost_usd: Some("0.0000123".into()),
@@ -144,7 +144,7 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
             )
             .unwrap();
     }
-    assert!(!ledger.reserve(&paid).unwrap());
+    assert!(!ledger.reserve(&paid, None).unwrap());
     let receipt = ledger.receipt(&paid.reference).unwrap().unwrap();
     assert_eq!(receipt.usage.unwrap().input_tokens, Some(7));
     assert!(
@@ -153,16 +153,16 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
             .is_err()
     );
     let over = reservation("over", "over", "account");
-    assert!(ledger.reserve(&over).is_err());
+    assert!(ledger.reserve(&over, None).is_err());
     let isolated = reservation("isolated", "success", "other-account");
-    assert!(ledger.reserve(&isolated).unwrap());
+    assert!(ledger.reserve(&isolated, None).unwrap());
 }
 #[test]
 fn spend_missing_usage_never_fabricates_zero_or_releases_successful_output() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = open(&dir.path().join("queue.sqlite"));
     let r = reservation("missing", "invocation", "account");
-    ledger.reserve(&r).unwrap();
+    ledger.reserve(&r, None).unwrap();
     ledger
         .finish(
             &r.reference,
@@ -182,7 +182,7 @@ fn spend_missing_usage_never_fabricates_zero_or_releases_successful_output() {
             .is_err()
     );
     let another = reservation("another", "other", "account");
-    assert!(ledger.reserve(&another).is_err());
+    assert!(ledger.reserve(&another, None).is_err());
     ledger
         .finish(
             &r.reference,
@@ -211,11 +211,10 @@ fn spend_concurrent_reservations_across_handles_enforce_one_account_budget() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                ledger.reserve(&reservation(
-                    &i.to_string(),
-                    &i.to_string(),
-                    "shared-account",
-                ))
+                ledger.reserve(
+                    &reservation(&i.to_string(), &i.to_string(), "shared-account"),
+                    None,
+                )
             })
         })
         .collect();
@@ -241,12 +240,12 @@ fn spend_invocation_lookup_uses_an_index_for_retained_history_and_latest_release
     let path = dir.path().join("queue.sqlite");
     let ledger = open(&path);
     let first = reservation("first", "invocation", "account");
-    ledger.reserve(&first).unwrap();
+    ledger.reserve(&first, None).unwrap();
     ledger
         .finish(&first.reference, SpendState::Released, None, None)
         .unwrap();
     let latest = reservation("latest", "invocation", "account");
-    ledger.reserve(&latest).unwrap();
+    ledger.reserve(&latest, None).unwrap();
     ledger
         .finish(&latest.reference, SpendState::Released, None, None)
         .unwrap();
@@ -294,7 +293,7 @@ fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() 
             .unwrap()
             .is_none()
     );
-    ledger.reserve(&original).unwrap();
+    ledger.reserve(&original, None).unwrap();
     ledger
         .finish(&original.reference, SpendState::Released, None, None)
         .unwrap();
@@ -302,14 +301,14 @@ fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() 
     changed.reference = SpendReceiptRef("delayed".into());
     changed.binding = "changed-input".into();
     assert!(matches!(
-        delayed.reserve(&changed),
+        delayed.reserve(&changed, None),
         Err(ModelError::Queue(
             DiagnosticCode::SpendReconciliationRequired
         ))
     ));
     assert!(delayed.receipt(&changed.reference).unwrap().is_none());
     changed.binding = original.binding;
-    assert!(delayed.reserve(&changed).unwrap());
+    assert!(delayed.reserve(&changed, None).unwrap());
 }
 
 #[test]
@@ -318,22 +317,22 @@ fn spend_allowance_follows_configuration_and_keeps_usage() {
     let path = dir.path().join("queue.sqlite");
     let mut first = reservation("first", "first", "account");
     first.request_limit = None;
-    open(&path).reserve(&first).unwrap();
+    open(&path).reserve(&first, None).unwrap();
     let ledger = open(&path);
     let mut next = reservation("next", "next", "account");
     for limit in [0, 1] {
         next.request_limit = Some(limit);
         assert!(matches!(
-            ledger.reserve(&next),
+            ledger.reserve(&next, None),
             Err(ModelError::BudgetExhausted(_))
         ));
         assert!(ledger.receipt(&next.reference).unwrap().is_none());
     }
     next.request_limit = Some(2);
-    assert!(ledger.reserve(&next).unwrap());
+    assert!(ledger.reserve(&next, None).unwrap());
     let mut unlimited = reservation("unlimited", "unlimited", "account");
     unlimited.request_limit = None;
-    assert!(ledger.reserve(&unlimited).unwrap());
+    assert!(ledger.reserve(&unlimited, None).unwrap());
     assert_eq!(
         ledger.receipt(&first.reference).unwrap().unwrap().state,
         SpendState::Unknown
@@ -345,5 +344,57 @@ fn spend_allowance_follows_configuration_and_keeps_usage() {
                 .get::<_, i64>(0))
             .unwrap(),
         3
+    );
+}
+
+#[test]
+fn invocation_attempt_ceiling_counts_known_zero_but_not_pre_dispatch_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let ledger = open(&path);
+    let aborted = reservation("runtime:item:1", "bounded", "account");
+    assert!(ledger.reserve(&aborted, Some(1)).unwrap());
+    ledger.release_before_dispatch(&aborted.reference).unwrap();
+    assert_eq!(ledger.attempts("account", "bounded", None).unwrap(), 0);
+    let dispatched = reservation("runtime:item:2", "bounded", "account");
+    assert!(ledger.reserve(&dispatched, Some(1)).unwrap());
+    ledger
+        .finish(&dispatched.reference, SpendState::Released, None, None)
+        .unwrap();
+    drop(ledger);
+    let ledger = open(&path);
+    assert_eq!(ledger.attempts("account", "bounded", None).unwrap(), 1);
+    assert_eq!(
+        ledger
+            .attempts("account", "bounded", Some("runtime:item:"))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        ledger
+            .attempts("account", "bounded", Some("runtime:other:"))
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        ledger.reserve(&reservation("retry", "bounded", "account"), Some(1)),
+        Err(ModelError::BudgetExhausted(
+            DiagnosticCode::AttemptBudgetExhausted
+        ))
+    ));
+    // Refusing a retry consumes neither an account allowance nor a new receipt.
+    assert!(
+        ledger
+            .receipt(&SpendReceiptRef("retry".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ledger
+            .reserve(
+                &reservation("other", "other-invocation", "account"),
+                Some(1)
+            )
+            .unwrap()
     );
 }

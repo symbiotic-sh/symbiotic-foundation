@@ -29,11 +29,23 @@ pub fn ledger_with_after_reserve(
     })
 }
 impl SpendLedger for Fixture {
+    fn attempts(
+        &self,
+        account: &str,
+        invocation: &str,
+        reference_prefix: Option<&str>,
+    ) -> Result<u32, ModelError> {
+        self.ledger.attempts(account, invocation, reference_prefix)
+    }
     fn release_before_dispatch(&self, r: &SpendReceiptRef) -> Result<(), ModelError> {
         self.ledger.release_before_dispatch(r)
     }
-    fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
-        let accepted = self.ledger.reserve(r)?;
+    fn reserve(
+        &self,
+        r: &SpendReservation,
+        attempt_limit: Option<u32>,
+    ) -> Result<bool, ModelError> {
+        let accepted = self.ledger.reserve(r, attempt_limit)?;
         if accepted && let Some(hook) = &self.after_reserve {
             hook();
         }

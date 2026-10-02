@@ -2309,13 +2309,25 @@ impl ObservedSpend {
 }
 
 impl symbiotic_model::SpendLedger for ObservedSpend {
+    fn attempts(
+        &self,
+        account: &str,
+        invocation: &str,
+        reference_prefix: Option<&str>,
+    ) -> Result<u32, ModelError> {
+        self.inner.attempts(account, invocation, reference_prefix)
+    }
     fn release_before_dispatch(
         &self,
         reference: &symbiotic_model::SpendReceiptRef,
     ) -> Result<(), ModelError> {
         self.inner.release_before_dispatch(reference)
     }
-    fn reserve(&self, reservation: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
+    fn reserve(
+        &self,
+        reservation: &symbiotic_model::SpendReservation,
+        attempt_limit: Option<u32>,
+    ) -> Result<bool, ModelError> {
         std::thread::sleep(self.delay);
         assert!(
             !self.panic_reservation.load(Ordering::SeqCst),
@@ -2326,7 +2338,7 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
         }
-        let accepted = self.inner.reserve(reservation)?;
+        let accepted = self.inner.reserve(reservation, attempt_limit)?;
         if accepted {
             self.reservations.lock().unwrap().push(reservation.clone());
         }

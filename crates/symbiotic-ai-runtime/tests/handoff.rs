@@ -144,7 +144,7 @@ fn ordinary_or_released_reservations_do_not_authorize_an_accepted_handoff() {
     let mut ordinary = handoff;
     ordinary.reservation.reference = SpendReceiptRef("ordinary".into());
     ordinary.reservation.invocation = "ordinary".into();
-    ledger.reserve(&ordinary.reservation).unwrap();
+    ledger.reserve(&ordinary.reservation, None).unwrap();
     assert!(
         ledger
             .acquire_handoff(&ordinary, "account-a", "exact-input-1", "owner")
