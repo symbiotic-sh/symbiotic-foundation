@@ -67,6 +67,15 @@ impl SpendLedger for Fixture {
     fn invocation(&self, a: &str, i: &str) -> Result<Option<SpendReceipt>, ModelError> {
         self.ledger.invocation(a, i)
     }
+    fn discard_output(&self, account: &str, invocation: &str) -> Result<bool, ModelError> {
+        self.ledger.discard_output(account, invocation)
+    }
+    fn purge_outputs(
+        &self,
+        matches: &dyn Fn(&serde_json::Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        self.ledger.purge_outputs(matches)
+    }
     fn finish(
         &self,
         r: &SpendReceiptRef,

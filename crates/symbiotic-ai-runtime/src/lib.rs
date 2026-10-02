@@ -102,7 +102,8 @@ pub struct RuntimeConfig {
     /// Persistent state older than this is retired: queue records of
     /// finished calls, and calls orphaned by a crash. Seven days by default.
     /// Retiring a finished call only drops its deduplication record; cached
-    /// responses follow `response_max_age` and `response_max_bytes`.
+    /// responses follow `response_max_age` and `response_max_bytes`. Explicit
+    /// invocation recovery expires after this window from provider completion.
     pub retention: Duration,
     /// Cached responses older than this miss, and the retention sweep
     /// removes them. 30 days by default; `None` keeps them indefinitely.
@@ -298,13 +299,16 @@ impl Runtime {
     /// needed, opens (or creates) its queue database and retires state older
     /// than the retention window.
     pub fn open(config: RuntimeConfig) -> Result<Self, ModelError> {
-        let queue: Arc<dyn QueueBackend> = match &config.state_dir {
-            Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
-            None => Arc::new(MemoryQueue::new()),
-        };
-        let spend: Arc<dyn SpendLedger> = match &config.state_dir {
-            Some(dir) => Arc::new(spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?),
-            None => Arc::new(model::UnavailableSpendLedger),
+        let (queue, spend): (Arc<dyn QueueBackend>, Arc<dyn SpendLedger>) = match &config.state_dir
+        {
+            Some(dir) => {
+                let (queue, spend) = open_persistent_queue(dir, &config)?;
+                (Arc::new(queue), spend)
+            }
+            None => (
+                Arc::new(MemoryQueue::new()),
+                Arc::new(model::UnavailableSpendLedger),
+            ),
         };
         Ok(Self::from_state(config, queue, spend))
     }
@@ -375,13 +379,25 @@ impl Runtime {
     /// example all responses to requests from one source when that source
     /// is erased. It sees what the response's trace records: the request's
     /// `source` and `role_binding`, and the model. Returns how many
-    /// responses were removed; an in-memory runtime keeps none.
+    /// cached responses and explicit recovery payloads were removed; an in-memory
+    /// runtime keeps none. Recovery deletion preserves completion and accounting.
     pub fn purge_responses(
         &self,
         matches: impl Fn(&CachedResponse) -> bool,
     ) -> Result<usize, ModelError> {
         match &self.inner.state_dir {
-            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches),
+            Some(dir) => {
+                let recovered = self.inner.spend.purge_outputs(&|output| {
+                    let timestamp = spend::output_timestamp(output)?;
+                    let bytes = u64::try_from(output.to_string().len()).map_err(|_| {
+                        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable)
+                    })?;
+                    let response = CachedResponse::from_value(output, timestamp.into(), bytes)?;
+                    Ok(matches(&response))
+                })?;
+                let cached = DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches)?;
+                Ok(recovered + cached)
+            }
             None => Ok(0),
         }
     }
@@ -857,7 +873,7 @@ impl Sinks {
 fn open_persistent_queue(
     dir: &Path,
     config: &RuntimeConfig,
-) -> Result<MaintainedQueue, ModelError> {
+) -> Result<(MaintainedQueue, Arc<spend::SqliteSpendLedger>), ModelError> {
     // The state directory is the host's: it must already be private, or be
     // created so. Inside it, everything is the runtime's own: owner-only,
     // with wider permissions from earlier versions tightened, and no
@@ -883,8 +899,10 @@ fn open_persistent_queue(
     }
     let queue = SqliteQueue::open(&path)
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
+    let spend = Arc::new(spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention)?);
     let queue = MaintainedQueue::new(
         queue,
+        spend.clone(),
         config.retention,
         ResponseRetention {
             cache: DirResponseCache::new(responses),
@@ -893,7 +911,7 @@ fn open_persistent_queue(
         },
     );
     queue.maintain()?;
-    Ok(queue)
+    Ok((queue, spend))
 }
 
 fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {

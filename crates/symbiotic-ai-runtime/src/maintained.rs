@@ -36,6 +36,7 @@ pub(crate) struct MaintainedQueue {
 
 struct Sweep {
     queue: SqliteQueue,
+    spend: Arc<crate::spend::SqliteSpendLedger>,
     retention: chrono::Duration,
     responses: ResponseRetention,
 }
@@ -49,6 +50,7 @@ impl Sweep {
             .retire_stale_active(cutoff, ORPHANED)
             .and_then(|_| self.queue.prune_terminal_before(cutoff))
             .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
+        self.spend.expire_outputs()?;
         self.responses
             .cache
             .prune(self.responses.max_age, self.responses.max_bytes)?;
@@ -59,12 +61,14 @@ impl Sweep {
 impl MaintainedQueue {
     pub(crate) fn new(
         queue: SqliteQueue,
+        spend: Arc<crate::spend::SqliteSpendLedger>,
         retention: Duration,
         responses: ResponseRetention,
     ) -> Self {
         Self {
             sweep: Arc::new(Sweep {
                 queue: queue.clone(),
+                spend,
                 retention: chrono::Duration::from_std(retention)
                     .unwrap_or_else(|_| chrono::Duration::days(3650)),
                 responses,

@@ -20,10 +20,11 @@ pub struct ExecutionAttemptStatus {
 
 impl From<SpendReceipt> for ExecutionAttemptStatus {
     fn from(receipt: SpendReceipt) -> Self {
+        let output_available = receipt.recovery_output().is_some();
         Self {
             reference: receipt.reservation.reference,
             state: receipt.state,
-            output_available: receipt.output.is_some(),
+            output_available,
         }
     }
 }
@@ -122,6 +123,25 @@ impl Runtime {
             .spend
             .invocation(&account, &invocation)
             .map(|receipt| receipt.map(ExecutionAttemptStatus::from))
+    }
+
+    /// Discard an explicit invocation's recovery after acceptance or input erasure.
+    /// The host must authenticate the account authority, as for `invocation_status`.
+    /// Completion evidence, accounting and replay protection remain durable.
+    pub fn discard_invocation_output(
+        &self,
+        identity: &BindingIdentity,
+        sharing: Option<&AccountSharingKey>,
+        invocation: &str,
+    ) -> Result<bool, ModelError> {
+        if !identity.is_valid() || invocation.trim().is_empty() {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        let account = account_scope(identity, sharing)?;
+        let invocation = crate::model::execution_invocation_identity(identity, invocation)?;
+        self.inner.spend.discard_output(&account, &invocation)
     }
 
     execute!(

@@ -51,6 +51,7 @@ pub struct SpendReservation {
     pub account: String,
     pub invocation: String,
     /// Immutable input/provider-binding digest for the logical invocation.
+    /// Explicit runtime invocations also bind their original total attempt ceiling.
     /// Individual attempt identity belongs to `reference`.
     pub binding: String,
     /// Absolute account request allowance; no time window or monetary ceiling.
@@ -99,6 +100,20 @@ pub struct SpendReceipt {
     pub output: Option<Value>,
 }
 
+impl SpendReceipt {
+    /// Content-free success evidence, preserved after recovery payload deletion.
+    pub fn completion_evidence() -> Value {
+        serde_json::json!({"output_received": true})
+    }
+
+    /// Same-attempt runtime payload, excluding content-free completion evidence.
+    pub fn recovery_output(&self) -> Option<&Value> {
+        self.output
+            .as_ref()
+            .filter(|output| **output != Self::completion_evidence())
+    }
+}
+
 /// Accounting boundary used by every queued operation and credential handoff.
 /// A successful reserve returns true only for a newly accepted attempt.
 pub trait SpendLedger: Send + Sync {
@@ -135,6 +150,13 @@ pub trait SpendLedger: Send + Sync {
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError>;
+    /// Discard recovery for an authenticated account/invocation, preserving completion.
+    fn discard_output(&self, account: &str, invocation: &str) -> Result<bool, ModelError>;
+    /// Delete matching runtime recovery payloads while preserving accounting evidence.
+    fn purge_outputs(
+        &self,
+        matches: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError>;
     fn finish(
         &self,
         reference: &SpendReceiptRef,
@@ -178,6 +200,15 @@ impl SpendLedger for UnavailableSpendLedger {
         Err(storage())
     }
     fn invocation(&self, _: &str, _: &str) -> Result<Option<SpendReceipt>, ModelError> {
+        Err(storage())
+    }
+    fn discard_output(&self, _: &str, _: &str) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn purge_outputs(
+        &self,
+        _: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
         Err(storage())
     }
     fn finish(

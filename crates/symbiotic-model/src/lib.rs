@@ -904,7 +904,7 @@ impl<Req> QueuedCall<Req> {
     async fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<Res>, ModelError> {
-        if self.accepted_spend.is_some() {
+        if self.accepted_spend.is_some() || !self.explicit_invocation {
             return Ok(None);
         }
         let spend = self.spend.clone();
@@ -921,14 +921,14 @@ impl<Req> QueuedCall<Req> {
                 return Err(spend::reconciliation());
             }
             if let Some(receipt) = &receipt
-                && receipt.output.is_some()
+                && receipt.recovery_output().is_some()
             {
                 context.capture(&receipt.reservation.reference)?;
             }
             Ok(receipt)
         })
         .await?
-        .and_then(|receipt| receipt.output)
+        .and_then(|receipt| receipt.recovery_output().cloned())
         .map(|output| {
             secrets::composed_result(
                 self.result_owner.as_ref(),
@@ -1390,8 +1390,18 @@ where
         provider.credential_fingerprint(),
     ))?;
     // Credential generations partition queue/cache state, not charge recovery.
-    let attempt_binding =
-        hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?;
+    // Explicit replay must retain its original total provider-attempt ceiling.
+    // Implicit queue items retain their existing budget-renewal policy.
+    let attempt_binding = match &runtime.invocation {
+        Some(_) => hash_json(&(
+            kind,
+            &descriptor,
+            &runtime.binding_identity,
+            &request_hash,
+            logical_max_attempts(&runtime.config),
+        ))?,
+        None => hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?,
+    };
     let invocation = match &runtime.invocation {
         Some(invocation) => execution_invocation_identity(
             runtime
@@ -2107,6 +2117,9 @@ where
     match result {
         Ok(mut response) => {
             let mut trace = response.trace().clone();
+            if this.explicit_invocation {
+                trace.timestamp = Utc::now();
+            }
             trace.queue_item_id = Some(item.item_id.clone());
             trace.request_hash = this.request_hash.clone();
             let queued_ms = provider_started.duration_since(clock.queued_at).as_millis() as u64;
@@ -2131,12 +2144,16 @@ where
                 } else {
                     SpendState::Unknown
                 };
-                let response_to_save = response.clone();
+                let response_to_save = this.explicit_invocation.then(|| response.clone());
                 let spend = this.spend.clone();
                 let reference = reference.clone();
                 let saved = run_blocking(move || {
-                    let output =
-                        serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?;
+                    let output = match response_to_save {
+                        Some(response) => {
+                            serde_json::to_value(response).map_err(|_| spend::storage())?
+                        }
+                        None => SpendReceipt::completion_evidence(),
+                    };
                     spend.finish(
                         &reference,
                         state,

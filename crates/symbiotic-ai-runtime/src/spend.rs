@@ -23,7 +23,10 @@ fn state_name(state: SpendState) -> &'static str {
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
-pub struct SqliteSpendLedger(Mutex<Connection>);
+pub struct SqliteSpendLedger {
+    connection: Mutex<Connection>,
+    retention: Option<chrono::Duration>,
+}
 impl SqliteSpendLedger {
     /// Open an already initialized Foundation queue database.
     pub fn open(path: &Path) -> Result<Self, ModelError> {
@@ -41,7 +44,44 @@ impl SqliteSpendLedger {
         if version != symbiotic_queue_sqlite::QUEUE_SCHEMA_VERSION {
             return Err(storage(()));
         }
-        Ok(Self(Mutex::new(conn)))
+        Ok(Self {
+            connection: Mutex::new(conn),
+            retention: None,
+        })
+    }
+
+    /// Apply the runtime's existing recovery retention policy.
+    pub(crate) fn with_retention(
+        mut self,
+        retention: std::time::Duration,
+    ) -> Result<Self, ModelError> {
+        self.retention = Some(chrono::Duration::from_std(retention).map_err(storage)?);
+        Ok(self)
+    }
+
+    /// Delete expired runtime payloads while retaining completion and accounting.
+    pub(crate) fn expire_outputs(&self) -> Result<usize, ModelError> {
+        let Some(retention) = self.retention else {
+            return Ok(0);
+        };
+        let cutoff = chrono::Utc::now() - retention;
+        self.purge_outputs(&|output| Ok(output_timestamp(output)? <= cutoff))
+    }
+
+    fn read_current(
+        &self,
+        reference: &SpendReceiptRef,
+    ) -> Result<Option<SpendReceipt>, ModelError> {
+        let mut conn = self.connection.lock().map_err(storage)?;
+        if self.retention.is_none() {
+            return receipt_in(&conn, reference);
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let receipt = current_receipt_in(&tx, reference, self.retention)?;
+        tx.commit().map_err(storage)?;
+        Ok(receipt)
     }
 
     /// Reserve inside the caller's immediate transaction (permit/replay acceptance).
@@ -194,6 +234,45 @@ impl SqliteSpendLedger {
     }
 }
 
+/// Provider completion time recorded in the runtime's existing response trace.
+pub(crate) fn output_timestamp(
+    output: &serde_json::Value,
+) -> Result<chrono::DateTime<chrono::Utc>, ModelError> {
+    serde_json::from_value(
+        output
+            .pointer("/trace/timestamp")
+            .cloned()
+            .ok_or_else(|| storage(()))?,
+    )
+    .map_err(storage)
+}
+
+fn discard_in(conn: &Connection, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+    conn.execute(
+        "UPDATE spend_receipts SET output=?2 WHERE reference=?1",
+        params![reference.0, SpendReceipt::completion_evidence().to_string()],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+fn current_receipt_in(
+    conn: &Connection,
+    reference: &SpendReceiptRef,
+    retention: Option<chrono::Duration>,
+) -> Result<Option<SpendReceipt>, ModelError> {
+    let mut receipt = receipt_in(conn, reference)?;
+    if let Some(receipt) = &mut receipt
+        && let Some(output) = receipt.recovery_output()
+        && let Some(retention) = retention
+        && output_timestamp(output)? <= chrono::Utc::now() - retention
+    {
+        discard_in(conn, reference)?;
+        receipt.output = Some(SpendReceipt::completion_evidence());
+    }
+    Ok(receipt)
+}
+
 fn receipt_in(
     conn: &Connection,
     reference: &SpendReceiptRef,
@@ -271,11 +350,11 @@ impl SpendLedger for SqliteSpendLedger {
         invocation: &str,
         reference_prefix: Option<&str>,
     ) -> Result<u32, ModelError> {
-        let conn = self.0.lock().map_err(storage)?;
+        let conn = self.connection.lock().map_err(storage)?;
         attempts_in(&conn, account, invocation, reference_prefix)
     }
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
-        let mut conn = self.0.lock().map_err(storage)?;
+        let mut conn = self.connection.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -296,7 +375,7 @@ impl SpendLedger for SqliteSpendLedger {
         r: &SpendReservation,
         attempt_limit: Option<u32>,
     ) -> Result<bool, ModelError> {
-        let mut conn = self.0.lock().map_err(storage)?;
+        let mut conn = self.connection.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -311,7 +390,7 @@ impl SpendLedger for SqliteSpendLedger {
         input_identity: &str,
         owner: &str,
     ) -> Result<(), ModelError> {
-        let mut conn = self.0.lock().map_err(storage)?;
+        let mut conn = self.connection.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -337,16 +416,69 @@ impl SpendLedger for SqliteSpendLedger {
         tx.commit().map_err(storage)
     }
     fn receipt(&self, reference: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError> {
-        let conn = self.0.lock().map_err(storage)?;
-        receipt_in(&conn, reference)
+        self.read_current(reference)
     }
     fn invocation(
         &self,
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError> {
-        let conn = self.0.lock().map_err(storage)?;
-        invocation_in(&conn, account, invocation)
+        let mut conn = self.connection.lock().map_err(storage)?;
+        if self.retention.is_none() {
+            return invocation_in(&conn, account, invocation);
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let receipt = invocation_in(&tx, account, invocation)?;
+        let receipt = receipt
+            .map(|receipt| current_receipt_in(&tx, &receipt.reservation.reference, self.retention))
+            .transpose()?
+            .flatten();
+        tx.commit().map_err(storage)?;
+        Ok(receipt)
+    }
+    fn discard_output(&self, account: &str, invocation: &str) -> Result<bool, ModelError> {
+        let mut conn = self.connection.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let receipt = invocation_in(&tx, account, invocation)?;
+        let removed = if let Some(receipt) = receipt.filter(|r| r.recovery_output().is_some()) {
+            discard_in(&tx, &receipt.reservation.reference)?;
+            true
+        } else {
+            false
+        };
+        tx.commit().map_err(storage)?;
+        Ok(removed)
+    }
+    fn purge_outputs(
+        &self,
+        matches: &dyn Fn(&serde_json::Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        let mut conn = self.connection.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let mut statement = tx
+            .prepare("SELECT reference, output FROM spend_receipts WHERE output IS NOT NULL")
+            .map_err(storage)?;
+        let mut rows = statement.query([]).map_err(storage)?;
+        let mut removed = 0;
+        while let Some(row) = rows.next().map_err(storage)? {
+            let output: String = row.get(1).map_err(storage)?;
+            let output: serde_json::Value = serde_json::from_str(&output).map_err(storage)?;
+            if output != SpendReceipt::completion_evidence() && matches(&output)? {
+                let reference = SpendReceiptRef(row.get(0).map_err(storage)?);
+                discard_in(&tx, &reference)?;
+                removed += 1;
+            }
+        }
+        drop(rows);
+        drop(statement);
+        tx.commit().map_err(storage)?;
+        Ok(removed)
     }
     fn finish(
         &self,
@@ -355,7 +487,7 @@ impl SpendLedger for SqliteSpendLedger {
         usage: Option<UsageTrace>,
         output: Option<serde_json::Value>,
     ) -> Result<(), ModelError> {
-        let mut conn = self.0.lock().map_err(storage)?;
+        let mut conn = self.connection.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;

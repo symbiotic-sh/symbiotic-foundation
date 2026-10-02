@@ -743,7 +743,11 @@ async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
             max_in_flight: 2,
             ..config()
         },
-    );
+    )
+    .with_binding_identity(symbiotic_core::BindingIdentity::new(
+        "test", "provider", "1", "account",
+    ))
+    .with_invocation("retry-delay".into());
     // Two callers of the same request: one runs the failing attempt, the
     // other waits on the same queue item.
     let (first, second) = tokio::join!(
@@ -2371,6 +2375,17 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         self.inner.invocation(account, invocation)
     }
 
+    fn discard_output(&self, account: &str, invocation: &str) -> Result<bool, ModelError> {
+        self.inner.discard_output(account, invocation)
+    }
+
+    fn purge_outputs(
+        &self,
+        matches: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        self.inner.purge_outputs(matches)
+    }
+
     fn finish(
         &self,
         reference: &symbiotic_model::SpendReceiptRef,
@@ -2704,7 +2719,7 @@ async fn a_joined_waiter_recovers_durable_output_from_every_queue_state(
         let gate = Arc::new(tokio::sync::Notify::new());
         let mut raw = Loopback::new(unique_identity());
         raw.completion_gate = Some(gate.clone());
-        // Without caching, the paid answer exists only in the canonical ledger.
+        // Explicit callers join one invocation; its recovery is independent of caching.
         let provider = queued(
             raw.clone(),
             queue.clone(),
@@ -2715,6 +2730,10 @@ async fn a_joined_waiter_recovers_durable_output_from_every_queue_state(
                 ..config()
             },
         )
+        .with_binding_identity(symbiotic_core::BindingIdentity::new(
+            "test", "provider", "1", "account",
+        ))
+        .with_invocation(format!("joined-{bookkeeping_state}"))
         .with_receipt_sink(receipts.clone());
         let first = tokio::spawn({
             let provider = provider.clone();
