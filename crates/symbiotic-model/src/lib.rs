@@ -24,10 +24,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use symbiotic_core::{
-    InvocationSource, ModelIdentity, ModelName, ModelTier, Operation, Operator, QueueId,
-    RoleBinding, Sensitivity, TraceId,
+pub use symbiotic_core::{
+    DiagnosticCode, FailureClass, ModelIdentity, ProviderPrincipalId, TenantId,
 };
+use symbiotic_core::{ModelName, Operation, Operator, QueueId, Sensitivity, TraceId};
 use symbiotic_trace::{
     CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
@@ -37,7 +37,7 @@ use thiserror::Error;
 #[cfg(feature = "queue")]
 use chrono::Duration as ChronoDuration;
 #[cfg(feature = "queue")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 #[cfg(feature = "queue")]
 use std::time::Duration;
 #[cfg(feature = "queue")]
@@ -62,6 +62,10 @@ pub use queue_runtime::{
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
+mod secrets;
+pub use secrets::{CredentialBoundary, SecretValue};
+mod registry;
+pub use registry::*;
 mod classify;
 pub mod wire;
 #[cfg(feature = "queue")]
@@ -126,10 +130,9 @@ pub enum ReasoningTier {
 /// on when planning a call. Distinct from [`ModelCapability`], which names the
 /// operation kinds a provider serves (chat/embedding/rerank/...).
 ///
-/// Additive-only: every field has a serde default so archived artifacts keep
-/// loading as fields are added.
+/// Advisory metadata supplied by the validated deployment registry.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelCapabilities {
     /// Maximum context window in tokens, when known.
     pub context_window: Option<u32>,
@@ -145,7 +148,7 @@ pub struct ModelCapabilities {
 /// (USD 1 per million tokens = 1_000_000). Advisory, like [`CostClass`]:
 /// hosts use it for estimates; the provider's bill is authoritative.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelPricing {
     pub input_micro_usd_per_million_tokens: u64,
     pub output_micro_usd_per_million_tokens: u64,
@@ -195,14 +198,6 @@ pub struct ProviderDescriptor {
 impl ProviderDescriptor {
     pub fn queue_id(&self) -> QueueId {
         self.identity.queue_id()
-    }
-
-    /// Capability flags for this model, resolved from the catalog by identity.
-    /// Unknown models get the conservative [`ModelCapabilities::default`] —
-    /// deliberately budget-pessimistic (`cost_class: Standard`, never `Free`,
-    /// even for uncatalogued `:free` models), so budget routing stays safe.
-    pub fn model_capabilities(&self) -> ModelCapabilities {
-        default_model_capabilities(&self.identity).unwrap_or_default()
     }
 }
 
@@ -276,33 +271,62 @@ pub struct RerankResponse {
     pub raw_provider_response: Option<Value>,
 }
 
-#[derive(Debug, Error)]
+/// Provider/runtime failures contain only a closed diagnostic code or capability.
+/// Adapter output and validation text cannot become an error payload.
+/// ```compile_fail
+/// use symbiotic_model::ModelError;
+/// let key = "synthetic-validation-key";
+/// let error = ModelError::Auth(format!("invalid key {key}"));
+/// ```
+#[derive(Clone, Copy, Debug, Error)]
 pub enum ModelError {
     #[error("provider unavailable: {0}")]
-    Unavailable(String),
+    Unavailable(symbiotic_core::DiagnosticCode),
     #[error("provider auth failed: {0}")]
-    Auth(String),
+    Auth(symbiotic_core::DiagnosticCode),
     #[error("provider rate limited: {0}")]
-    RateLimited(String),
+    RateLimited(symbiotic_core::DiagnosticCode),
     #[error("budget exhausted: {0}")]
-    BudgetExhausted(String),
+    BudgetExhausted(symbiotic_core::DiagnosticCode),
     #[error("provider timed out: {0}")]
-    Timeout(String),
+    Timeout(symbiotic_core::DiagnosticCode),
     #[error("capability unsupported: {0:?}")]
     Unsupported(ModelCapability),
     #[error("invalid request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(symbiotic_core::DiagnosticCode),
     #[error("provider failed: {0}")]
-    Provider(String),
+    Provider(symbiotic_core::DiagnosticCode),
     #[error("model queue failed: {0}")]
-    Queue(String),
+    Queue(symbiotic_core::DiagnosticCode),
     #[error("model cache failed: {0}")]
-    Cache(String),
+    Cache(symbiotic_core::DiagnosticCode),
+}
+
+impl ModelError {
+    /// Static diagnostic used by logs and durable queue failure records.
+    pub const fn code(&self) -> DiagnosticCode {
+        match self {
+            Self::Unavailable(code) => *code,
+            Self::Auth(code) => *code,
+            Self::RateLimited(code) => *code,
+            Self::BudgetExhausted(code) => *code,
+            Self::Timeout(code) => *code,
+            Self::InvalidRequest(code) => *code,
+            Self::Provider(code) => *code,
+            Self::Queue(code) => *code,
+            Self::Cache(code) => *code,
+            Self::Unsupported(_) => DiagnosticCode::InvalidConfiguration,
+        }
+    }
 }
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+    /// Refuse unsupported or unbounded transport configuration before execution.
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        Ok(())
+    }
 
     /// A stable, non-secret fingerprint of the credential this provider
     /// calls with, or `None` when it has none. The queue runtime keys
@@ -311,6 +335,14 @@ pub trait ModelProvider: Send + Sync {
     /// must never be the credential or a reversible form of it; see
     /// [`api_key_fingerprint`]. The runtime does not store or trace it.
     fn credential_fingerprint(&self) -> Option<String> {
+        None
+    }
+
+    /// Forward the opaque credential owner for composed adapter results.
+    /// Foundation creates this guard; adapters cannot replace its result policy
+    /// or read its secret. Credential-bearing adapters without a guard are refused.
+    #[doc(hidden)]
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
         None
     }
 }
@@ -323,8 +355,16 @@ where
         (**self).descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        (**self).validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         (**self).credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        (**self).credential_boundary()
     }
 }
 
@@ -392,98 +432,30 @@ pub trait CredentialResolver: Send + Sync {
     async fn resolve_auth(&self, mode: &ProviderAuthMode) -> Result<ResolvedAuth, ModelError>;
 }
 
-#[derive(Clone, Debug)]
+/// Resolved provider authentication; secret material has no diagnostic representation.
+/// ```compile_fail
+/// use symbiotic_model::{ResolvedAuth, SecretValue};
+/// let auth = ResolvedAuth::Bearer(SecretValue::from("synthetic"));
+/// println!("{auth:?}");
+/// ```
+#[derive(Clone)]
 pub enum ResolvedAuth {
     None,
-    Bearer(String),
-    ApiKey(String),
-    Headers(Vec<(String, String)>),
+    Bearer(SecretValue<String>),
+    ApiKey(SecretValue<String>),
+    Headers(Vec<(String, SecretValue<String>)>),
     LocalSession { tool: String, account: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SelectionRequest {
-    pub capability: ModelCapability,
-    pub tier: Option<ModelTier>,
-    pub sensitivity: Sensitivity,
-    pub role_binding: Option<RoleBinding>,
-    pub source: Option<InvocationSource>,
-    pub preferred: Option<ModelIdentity>,
-    pub allowed_classes: Vec<ProviderClass>,
-}
-
-#[async_trait]
-pub trait ModelSelector: Send + Sync {
-    async fn select(&self, request: SelectionRequest) -> Result<Vec<ModelIdentity>, ModelError>;
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ProviderCatalog {
-    providers: Vec<ProviderDescriptor>,
-}
-
-impl ProviderCatalog {
-    pub fn new(providers: Vec<ProviderDescriptor>) -> Self {
-        Self { providers }
-    }
-
-    pub fn register(&mut self, descriptor: ProviderDescriptor) {
-        self.providers.push(descriptor);
-    }
-
-    pub fn providers(&self) -> &[ProviderDescriptor] {
-        &self.providers
-    }
-
-    pub fn select(&self, request: &SelectionRequest) -> Vec<ModelIdentity> {
-        let allowed = if request.allowed_classes.is_empty() {
-            vec![
-                ProviderClass::Local,
-                ProviderClass::Cloud,
-                ProviderClass::Aggregator,
-                ProviderClass::CliSession,
-            ]
-        } else {
-            request.allowed_classes.clone()
-        };
-        let mut candidates = self
-            .providers
-            .iter()
-            .filter(|provider| provider.capabilities.contains(&request.capability))
-            .filter(|provider| allowed.contains(&provider.provider_class))
-            .filter(|provider| {
-                !matches!(
-                    request.sensitivity,
-                    Sensitivity::Private | Sensitivity::Restricted
-                ) || matches!(
-                    provider.provider_class,
-                    ProviderClass::Local | ProviderClass::CliSession
-                )
-            })
-            .map(|provider| provider.identity.clone())
-            .collect::<Vec<_>>();
-        if let Some(preferred) = &request.preferred {
-            candidates.sort_by_key(|candidate| if candidate == preferred { 0 } else { 1 });
-        }
-        candidates
-    }
-}
-
-#[async_trait]
-impl ModelSelector for ProviderCatalog {
-    async fn select(&self, request: SelectionRequest) -> Result<Vec<ModelIdentity>, ModelError> {
-        Ok(self.select(&request))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelQueueConfig {
     pub max_in_flight: usize,
     pub lease_seconds: u64,
     pub logical_retry_attempts: u32,
     pub retry_attempts: u32,
     pub retry_jitter_seconds: u64,
-    /// Longest provider call; `None` never times out. A caller that stops
+    /// Longest provider call; execution requires a finite nonzero value. A caller that stops
     /// waiting does not cancel a call in flight (the runtime owns it), so
     /// this is also what bounds a call nobody waits for.
     pub request_timeout_seconds: Option<u64>,
@@ -544,259 +516,6 @@ impl Default for ModelQueueConfig {
     }
 }
 
-/// Production-oriented queue defaults for known model identities.
-///
-/// Unknown models deliberately return `None` so the host/product layer can apply
-/// its operation defaults. Direct use of `ModelQueueConfig::default()` remains a
-/// conservative local fallback; local Ollama-style models also get an explicit
-/// one-at-a-time catalog entry.
-pub fn default_model_queue_config(identity: &ModelIdentity) -> Option<ModelQueueConfig> {
-    match identity.queue_id().0.as_str() {
-        "chat:deepseek:deepseek-flash" | "chat:deepseek:deepseek-v4-flash" => {
-            Some(ModelQueueConfig {
-                max_in_flight: 2_000,
-                lease_seconds: 600,
-                logical_retry_attempts: 4,
-                retry_attempts: 4,
-                retry_jitter_seconds: 20,
-                request_timeout_seconds: Some(600),
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                response_cache_dir: None,
-                ..ModelQueueConfig::default()
-            })
-        }
-        "chat:deepseek:deepseek-v4-pro" => Some(ModelQueueConfig {
-            max_in_flight: 400,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(600),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "chat:gemini:gemini-3.5-flash" => Some(ModelQueueConfig {
-            max_in_flight: 100,
-            lease_seconds: 600,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(1_000),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "chat:gemini:gemini-3.1-pro-preview" => Some(ModelQueueConfig {
-            max_in_flight: 500,
-            lease_seconds: 600,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: Some(100),
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "embedding:gemini:gemini-embedding-2" => Some(ModelQueueConfig {
-            max_in_flight: 1_000,
-            lease_seconds: 300,
-            logical_retry_attempts: 6,
-            retry_attempts: 6,
-            retry_jitter_seconds: 10,
-            request_timeout_seconds: Some(300),
-            requests_per_minute: Some(4_500),
-            input_units_per_minute: Some(5_000_000),
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        "embedding:openrouter:qwen/qwen3-embedding-8b"
-        | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelQueueConfig {
-            max_in_flight: 2_000,
-            lease_seconds: 300,
-            logical_retry_attempts: 6,
-            retry_attempts: 6,
-            retry_jitter_seconds: 10,
-            request_timeout_seconds: Some(300),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // Nemotron free reranker: keep the elevated openrouter concurrency but cap the per-request
-        // timeout at 60s (the free tier stalls rather than erroring) and let requests_per_minute fall
-        // through to the host's default rate bucket (None here).
-        "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelQueueConfig {
-            max_in_flight: 200,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(60),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // TypeSafe System One (Jev 1.13). Account limits checked 2026-09-28:
-        // 1,200 requests/min and 250,000 tokens/s (15M/min), adjusted
-        // dynamically by TypeSafe. One call answers every question in about
-        // 0.4 s, so 32 in flight stays under the request limit; short
-        // timeout and jitter because callers usually wait on the answer.
-        "classify:typesafe:jev-1.13.0" => Some(ModelQueueConfig {
-            max_in_flight: 32,
-            lease_seconds: 60,
-            logical_retry_attempts: 3,
-            retry_attempts: 3,
-            retry_jitter_seconds: 2,
-            request_timeout_seconds: Some(30),
-            requests_per_minute: Some(1_200),
-            input_units_per_minute: Some(15_000_000),
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        // (openrouter qwen chat: removed the conservative 200/600rpm entry — falls through to the
-        // generic operator=openrouter fallback at 1000; throttle reactively only if it starts 429ing.)
-        _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
-            Some(ModelQueueConfig {
-                max_in_flight: 1,
-                lease_seconds: 600,
-                logical_retry_attempts: 2,
-                retry_attempts: 2,
-                retry_jitter_seconds: 0,
-                request_timeout_seconds: Some(600),
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                response_cache_dir: None,
-                ..ModelQueueConfig::default()
-            })
-        }
-        // Sane default for any not-individually-catalogued OpenRouter model (chat or embedding):
-        // OpenRouter fronts many providers and handles high concurrency, so without this an
-        // uncatalogued model would fall to max_in_flight=8 and serialize. Matches the catalogued
-        // OpenRouter embedding rate (1000); the queue's retry/backoff absorbs any 429 bursts.
-        _ if identity.operator.0 == "openrouter" => Some(ModelQueueConfig {
-            max_in_flight: 1_000,
-            lease_seconds: 600,
-            logical_retry_attempts: 4,
-            retry_attempts: 4,
-            retry_jitter_seconds: 20,
-            request_timeout_seconds: Some(600),
-            requests_per_minute: None,
-            input_units_per_minute: None,
-            response_cache_dir: None,
-            ..ModelQueueConfig::default()
-        }),
-        _ => None,
-    }
-}
-
-/// Capability flags for known model identities, mirroring the
-/// [`default_model_queue_config`] catalog convention: unknown models return
-/// `None` so the host can apply its own defaults (or fall back to
-/// `ModelCapabilities::default()` via [`ProviderDescriptor::model_capabilities`]).
-///
-/// Values are advisory seam metadata (context budgets, routing hints), not
-/// provider-enforced limits.
-pub fn default_model_capabilities(identity: &ModelIdentity) -> Option<ModelCapabilities> {
-    match identity.queue_id().0.as_str() {
-        "chat:deepseek:deepseek-v4-flash" => Some(ModelCapabilities {
-            context_window: Some(128_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Standard,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "chat:deepseek:deepseek-v4-pro" => Some(ModelCapabilities {
-            context_window: Some(128_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Extended,
-            cost_class: CostClass::Standard,
-            pricing: None,
-        }),
-        "chat:gemini:gemini-3.5-flash" => Some(ModelCapabilities {
-            context_window: Some(1_000_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Standard,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "chat:gemini:gemini-3.1-pro-preview" => Some(ModelCapabilities {
-            context_window: Some(1_000_000),
-            tool_use: true,
-            structured_output: true,
-            reasoning_tier: ReasoningTier::Extended,
-            cost_class: CostClass::Premium,
-            pricing: None,
-        }),
-        "embedding:gemini:gemini-embedding-2" => Some(ModelCapabilities {
-            context_window: Some(2_048),
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        "embedding:openrouter:qwen/qwen3-embedding-8b"
-        | "embedding:openrouter:qwen/qwen3-embedding-4b" => Some(ModelCapabilities {
-            context_window: Some(32_768),
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Budget,
-            pricing: None,
-        }),
-        // TypeSafe System One: typed answers, 64k tokens per request (32k for
-        // the state plus the longest question), $0.042 per million input
-        // tokens, output free. OpenRouter serves the same version through
-        // its `/systemone` route at the same listed token price; its credit
-        // purchase fee makes the direct key cheaper when you have one.
-        "classify:typesafe:jev-1.13.0" | "classify:openrouter:typesafe/jev-1.13" => {
-            Some(ModelCapabilities {
-                context_window: Some(64_000),
-                tool_use: false,
-                structured_output: true,
-                reasoning_tier: ReasoningTier::None,
-                cost_class: CostClass::Budget,
-                pricing: Some(ModelPricing {
-                    input_micro_usd_per_million_tokens: 42_000,
-                    output_micro_usd_per_million_tokens: 0,
-                }),
-            })
-        }
-        "rerank:openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free" => Some(ModelCapabilities {
-            context_window: None,
-            tool_use: false,
-            structured_output: false,
-            reasoning_tier: ReasoningTier::None,
-            cost_class: CostClass::Free,
-            pricing: None,
-        }),
-        // Deliberately pessimistic floor for local models: local qwen-class chat
-        // models DO support tool use, but until per-model local entries exist we
-        // only guarantee cost (free). Catalogue a model explicitly if routing
-        // needs to rely on more.
-        _ if identity.operator.0 == "ollama" || identity.operator.0 == "local" => {
-            Some(ModelCapabilities {
-                context_window: None,
-                tool_use: false,
-                structured_output: false,
-                reasoning_tier: ReasoningTier::None,
-                cost_class: CostClass::Free,
-                pricing: None,
-            })
-        }
-        _ => None,
-    }
-}
-
 #[cfg(feature = "queue")]
 /// Queue-bound wrapper for a [`ChatProvider`].
 ///
@@ -836,8 +555,16 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -853,7 +580,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Chat,
             "chat",
-            None,
             request,
             |inner: C, request| async move { inner.chat(request).await },
             self.inner.clone(),
@@ -898,8 +624,16 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -915,7 +649,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Embedding,
             "embedding",
-            None,
             request,
             |inner: E, request| async move { inner.embed(request).await },
             self.inner.clone(),
@@ -963,8 +696,16 @@ where
         self.inner.descriptor()
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 
@@ -980,7 +721,6 @@ where
             self.inner.descriptor().clone(),
             ModelCapability::Rerank,
             "rerank",
-            None,
             request,
             |inner: R, request| async move { inner.rerank(request).await },
             self.inner.clone(),
@@ -993,6 +733,7 @@ where
 #[cfg(feature = "queue")]
 struct CallReceipts {
     sink: Option<Arc<dyn QueueReceiptSink>>,
+    binding: Option<symbiotic_core::BindingIdentity>,
     queue_id: QueueId,
     kind: String,
     request_hash: String,
@@ -1022,13 +763,14 @@ impl CallReceipts {
         status: ReceiptStatus,
         item: Option<&QueueItem>,
         trace: Option<&ModelInvocationTrace>,
-        error: Option<String>,
+        error: Option<DiagnosticCode>,
         timing: AttemptTiming,
     ) {
         let Some(sink) = &self.sink else {
             return;
         };
         sink.record_receipt(QueueReceipt {
+            binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
             item_id: item.map(|item| item.item_id.clone()),
@@ -1055,12 +797,20 @@ fn load_cached<Res: for<'de> Deserialize<'de>>(
     cache: &dyn ResponseCache,
     entry: &CacheEntry<'_>,
 ) -> Result<Option<Res>, ModelError> {
-    cache
-        .load(entry)?
-        .map(|value| {
-            serde_json::from_value(value).map_err(|err| ModelError::Cache(err.to_string()))
-        })
-        .transpose()
+    let Some(value) = cache.load(entry)? else {
+        return Ok(None);
+    };
+    if value
+        .pointer("/trace/metadata/result_scope")
+        .and_then(Value::as_str)
+        != entry.scope
+        || value.pointer("/trace/request_hash").and_then(Value::as_str) != Some(entry.request_hash)
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
 }
 
 /// Run `work` on tokio's blocking pool and wait for it. A `ResponseCache`
@@ -1074,15 +824,15 @@ async fn run_blocking<T: Send + 'static>(
     match tokio::task::spawn_blocking(work).await {
         Ok(output) => output,
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-        Err(err) => Err(ModelError::Cache(format!(
-            "response cache work did not finish: {err}"
-        ))),
+        Err(_err) => Err(ModelError::Cache(
+            symbiotic_core::DiagnosticCode::CacheFailure,
+        )),
     }
 }
 
 #[cfg(feature = "queue")]
-fn queue_error(err: symbiotic_queue::QueueError) -> ModelError {
-    ModelError::Queue(err.to_string())
+fn queue_error(_err: symbiotic_queue::QueueError) -> ModelError {
+    ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
 }
 
 #[cfg(feature = "queue")]
@@ -1099,8 +849,10 @@ struct QueuedCall<Req> {
     config: ModelQueueConfig,
     queue_id: QueueId,
     descriptor: ProviderDescriptor,
+    result_owner: Arc<dyn ModelProvider>,
     capability: ModelCapability,
     kind: String,
+    binding_identity: Option<symbiotic_core::BindingIdentity>,
     // Response-cache subdirectory under `kind`; see `run_queued`.
     cache_scope: Option<String>,
     cache: Option<Arc<dyn ResponseCache>>,
@@ -1197,14 +949,15 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         item: Option<&QueueItem>,
     ) -> Result<Option<Res>, ModelError>
     where
-        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+        Res: Serialize + TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
     {
         let Some(cache) = self.cache.clone() else {
             return Ok(None);
         };
         let call = self.clone();
         let loaded =
-            run_blocking(move || load_cached::<Res>(cache.as_ref(), &call.cache_entry())).await?;
+            run_blocking(move || load_cached::<Res>(cache.as_ref(), &call.cache_entry())).await;
+        let loaded = secrets::composed_result(self.result_owner.as_ref(), loaded)?;
         let Some(cached) = loaded else {
             return Ok(None);
         };
@@ -1236,14 +989,23 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
         let mut response = response;
+        let mut trace = response.trace().clone();
+        if !trace.metadata.is_object() {
+            trace.metadata = serde_json::json!({ "value": trace.metadata });
+        }
+        trace.metadata["result_scope"] = serde_json::json!(self.cache_scope);
+        trace.metadata["binding"] =
+            serde_json::to_value(&self.binding_identity).expect("binding identity serializes");
+        response.set_trace(trace);
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
             let shared = Arc::new(response);
             let stored = run_blocking({
                 let shared = shared.clone();
                 move || {
-                    let value = serde_json::to_value(&*shared)
-                        .map_err(|err| ModelError::Cache(err.to_string()))?;
+                    let value = serde_json::to_value(&*shared).map_err(|_err| {
+                        ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
+                    })?;
                     cache.store(&call.cache_entry(), &value)
                 }
             })
@@ -1255,7 +1017,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                     &mut response,
                     &self.queue_id,
                     "response_cache_write_failed",
-                    &err,
+                    err.code(),
                 );
             }
         }
@@ -1264,7 +1026,12 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 .record_model_invocation(response.trace().clone())
                 .await
         {
-            note_side_effect(&mut response, &self.queue_id, "trace_write_failed", &err);
+            note_side_effect(
+                &mut response,
+                &self.queue_id,
+                "trace_write_failed",
+                err.code(),
+            );
         }
         response
     }
@@ -1283,7 +1050,6 @@ impl<Req> QueuedCall<Req> {
         trace.trace_id = TraceId::new();
         trace.queue_item_id = queue_item_id;
         trace.model = self.descriptor.identity.clone();
-        trace.request_hash = self.request_hash.clone();
         trace.cache.response_cache = CacheStatus::Hit;
         trace.outcome = InvocationOutcome::Succeeded;
         trace.error_class = None;
@@ -1292,7 +1058,12 @@ impl<Req> QueuedCall<Req> {
         if let Some(trace_sink) = &self.trace_sink
             && let Err(err) = trace_sink.record_model_invocation(trace).await
         {
-            note_side_effect(&mut response, &self.queue_id, "trace_write_failed", &err);
+            note_side_effect(
+                &mut response,
+                &self.queue_id,
+                "trace_write_failed",
+                err.code(),
+            );
         }
         response
     }
@@ -1317,14 +1088,18 @@ impl<Req> QueuedCall<Req> {
                 usage: UsageTrace::default(),
                 timing: TimingTrace::default(),
                 outcome: InvocationOutcome::Failed,
-                error_class: Some(err.to_string()),
+                error_class: Some(error_class(err)),
                 audit_refs: Vec::new(),
-                metadata: serde_json::json!({}),
+                metadata: serde_json::json!({"binding": self.binding_identity}),
                 timestamp: Utc::now(),
             })
             .await;
         if let Err(trace_err) = written {
-            warn_side_effect(&self.queue_id, "failure_trace_write_failed", &trace_err);
+            warn_side_effect(
+                &self.queue_id,
+                "failure_trace_write_failed",
+                trace_err.code(),
+            );
         }
     }
 }
@@ -1332,11 +1107,11 @@ impl<Req> QueuedCall<Req> {
 /// A side effect of a call (a cache, trace, cooldown or queue write)
 /// failed. The call's outcome stands; the failure is logged as a warning.
 #[cfg(feature = "queue")]
-fn warn_side_effect(queue_id: &QueueId, kind: &str, error: &dyn std::fmt::Display) {
+fn warn_side_effect(queue_id: &QueueId, kind: &str, error: DiagnosticCode) {
     tracing::warn!(
         queue_id = %queue_id.0,
         kind,
-        %error,
+        error = error.code(),
         "model call side effect failed; the call's outcome stands"
     );
 }
@@ -1348,7 +1123,7 @@ fn note_side_effect<Res: TraceCarrier>(
     response: &mut Res,
     queue_id: &QueueId,
     kind: &str,
-    error: &dyn std::fmt::Display,
+    error: DiagnosticCode,
 ) {
     warn_side_effect(queue_id, kind, error);
     let mut trace = response.trace().clone();
@@ -1360,7 +1135,7 @@ fn note_side_effect<Res: TraceCarrier>(
             serde_json::json!({ "value": original })
         };
     }
-    let entry = serde_json::json!({ "kind": kind, "error": error.to_string() });
+    let entry = serde_json::json!({ "kind": kind, "error": error.code() });
     match trace.metadata.get_mut(RUNTIME_DIAGNOSTICS) {
         Some(Value::Array(list)) => list.push(entry),
         _ => trace.metadata[RUNTIME_DIAGNOSTICS] = serde_json::json!([entry]),
@@ -1373,14 +1148,9 @@ fn note_side_effect<Res: TraceCarrier>(
 #[allow(clippy::too_many_arguments)]
 async fn run_queued<P, Req, Res, F, Fut>(
     runtime: &QueueRuntime,
-    descriptor: ProviderDescriptor,
+    mut descriptor: ProviderDescriptor,
     capability: ModelCapability,
     kind: &str,
-    // Response-cache subdirectory under `kind`. `None` keeps the historical
-    // `{cache}/{kind}/{request hash}` path, which is shared by every provider
-    // of that kind: two chat models sharing a cache directory can read each
-    // other's cached answers. Classification passes a descriptor hash.
-    cache_scope: Option<String>,
     request: Req,
     call: F,
     provider: P,
@@ -1393,21 +1163,26 @@ where
     F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
 {
+    runtime.config.validate()?;
+    provider.validate_configuration()?;
     let queue_id = runtime
         .queue_id
         .clone()
         .unwrap_or_else(|| descriptor.queue_id());
     let request_hash = hash_json(&request)?;
-    let request_value = serde_json::to_value(&request)
-        .map_err(|err| ModelError::InvalidRequest(err.to_string()))?;
+    let request_value = serde_json::to_value(&request).map_err(|_err| {
+        ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+    })?;
     // The provider is part of the key: models pooled on one queue share its
     // limits, never each other's attempt budgets or results. So is its
     // credential's fingerprint, when it has one: a rotated credential gets
     // a fresh budget. Only a hash of the fingerprint is stored.
-    let provider_identity = match provider.credential_fingerprint() {
-        Some(fingerprint) => hash_json(&(&descriptor, fingerprint))?,
-        None => hash_json(&descriptor)?,
-    };
+    descriptor.metadata = serde_json::json!({"configuration": descriptor.metadata, "binding": runtime.binding_identity});
+    let provider_identity = hash_json(&(
+        &descriptor,
+        &runtime.binding_identity,
+        provider.credential_fingerprint(),
+    ))?;
     let idempotency_key = Some(format!("{}:{provider_identity}:{request_hash}", queue_id.0));
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
@@ -1415,19 +1190,22 @@ where
         config: runtime.config.clone(),
         receipts: CallReceipts {
             sink: runtime.receipt_sink.clone(),
+            binding: runtime.binding_identity.clone(),
             queue_id: queue_id.clone(),
             kind: kind.to_string(),
             request_hash: request_hash.clone(),
-            input_units: request.input_budget_units(),
+            input_units: request.input_budget_units()?,
         },
         queue_id,
         descriptor,
+        result_owner: Arc::new(provider.clone()),
         capability,
         kind: kind.to_string(),
-        cache_scope,
+        binding_identity: runtime.binding_identity.clone(),
+        cache_scope: Some(provider_identity),
         cache: runtime.cache(),
         trace_sink: runtime.trace_sink.clone(),
-        sensitivity: request_sensitivity(&request_value),
+        sensitivity: request.sensitivity(),
         request,
         request_hash,
         request_value,
@@ -1465,7 +1243,8 @@ where
         .await;
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
-            QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
+            QueueStatus::Stopped => return Err(dead_item_retry_error(&enqueue.item)),
+            QueueStatus::Dead if budget_renewed(&enqueue.item, config)? => {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
             QueueStatus::Dead => {
@@ -1511,26 +1290,27 @@ where
         };
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
-        let rate = match check_model_budget(queue_id, config, &this.request).await? {
-            RateCheck::Cleared(rate) => rate,
-            RateCheck::Wait(wait) => {
-                // Wait for budget in short slices without holding a model
-                // slot, and look at the item and the cache in between: a
-                // duplicate whose answer arrives returns without spending.
-                drop(permit);
-                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
-                let slice = throttle_started.elapsed();
-                throttle_wait += slice;
-                waiting_attempt = Some((attempt_started, attempt_throttle + slice));
-                if let Followed::Answer(answer) = this
-                    .waiting_on_item(&call_state, &mut enqueue, config)
-                    .await?
-                {
-                    return Ok(answer);
+        let rate =
+            match check_model_budget(&runtime.rate_state, queue_id, config, &this.request).await? {
+                RateCheck::Cleared(rate) => rate,
+                RateCheck::Wait(wait) => {
+                    // Wait for budget in short slices without holding a model
+                    // slot, and look at the item and the cache in between: a
+                    // duplicate whose answer arrives returns without spending.
+                    drop(permit);
+                    tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                    let slice = throttle_started.elapsed();
+                    throttle_wait += slice;
+                    waiting_attempt = Some((attempt_started, attempt_throttle + slice));
+                    if let Followed::Answer(answer) = this
+                        .waiting_on_item(&call_state, &mut enqueue, config)
+                        .await?
+                    {
+                        return Ok(answer);
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         let throttled = throttle_started.elapsed();
         attempt_throttle += throttled;
         throttle_wait += throttled;
@@ -1555,11 +1335,10 @@ where
         let ended = match attempt.await {
             Ok(ended) => ended?,
             Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-            Err(err) => {
-                return Err(ModelError::Queue(format!(
-                    "{} attempt did not finish: {err}",
-                    queue_id.0
-                )));
+            Err(_err) => {
+                return Err(ModelError::Queue(
+                    symbiotic_core::DiagnosticCode::QueueFailure,
+                ));
             }
         };
         match ended {
@@ -1604,7 +1383,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         config: &ModelQueueConfig,
     ) -> Result<Followed<Res>, ModelError>
     where
-        Res: TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
+        Res: Serialize + TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
     {
         let current = self
             .queue
@@ -1616,7 +1395,8 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             return Ok(Followed::Moved);
         };
         match current.status {
-            QueueStatus::Dead if budget_renewed(&current, config) => {
+            QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
+            QueueStatus::Dead if budget_renewed(&current, config)? => {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1704,8 +1484,9 @@ async fn run_attempt<P, Req, Res, F, Fut>(
     clock: AttemptClock,
 ) -> Result<AttemptEnd<Res>, ModelError>
 where
+    P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1728,8 +1509,14 @@ where
         Err(err) => return Err(queue_error(err)),
     };
     // Only an attempt that reaches the provider spends rate budget.
-    if let Some(rate) = rate {
-        rate.charge();
+    if let Some(rate) = rate
+        && let Err(err) = rate.charge()
+    {
+        queue
+            .fail(&item.item_id, worker_id, err.code(), None)
+            .await
+            .map_err(queue_error)?;
+        return Err(err);
     }
 
     let settled = holding_lease(
@@ -1753,7 +1540,12 @@ where
             // The answer is paid for: a failed completion is noted, not
             // returned in its place.
             if let Err(err) = completed {
-                note_side_effect(&mut response, &this.queue_id, "queue_complete_failed", &err);
+                note_side_effect(
+                    &mut response,
+                    &this.queue_id,
+                    "queue_complete_failed",
+                    err.code(),
+                );
             }
             this.receipts
                 .record(
@@ -1832,8 +1624,9 @@ async fn settle<P, Req, Res, F, Fut>(
     clock: &AttemptClock,
 ) -> Settled<Res>
 where
+    P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -1861,9 +1654,10 @@ where
     let result = within_timeout(
         &this.queue_id,
         config.request_timeout_seconds,
-        call(provider, this.request.clone()),
+        call(provider.clone(), this.request.clone()),
     )
     .await;
+    let result = secrets::composed_result(&provider, result);
     let provider_ms = elapsed_ms(provider_started);
     let failed_timing = || AttemptTiming {
         queue_wait_ms: None,
@@ -1898,24 +1692,53 @@ where
                     ReceiptStatus::Failed,
                     Some(item),
                     None,
-                    Some(err.to_string()),
+                    Some(err.code()),
                     failed_timing(),
                 )
                 .await;
-            let delay_ms = retry_delay_ms(
+            let delay_ms = match retry_delay_ms(
                 item.attempt,
                 config,
                 &item.item_id,
                 &this.request_hash,
                 &err,
-            );
-            // The cooldown protects the provider; failing to record it does
-            // not change this attempt's outcome or its retry.
+            ) {
+                Ok(delay) => delay,
+                Err(err) => {
+                    let failed = queue
+                        .fail_with(
+                            &item.item_id,
+                            worker_id,
+                            Failure {
+                                error: err.code(),
+                                error_class: Some(error_class(&err)),
+                                run_after: None,
+                            },
+                        )
+                        .await;
+                    return Settled::Failed { err, failed };
+                }
+            };
+            // Failed limiter state refuses visibly and cannot admit a retry.
             if is_transient(&err)
                 && let Err(cooldown_err) =
                     note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
             {
-                warn_side_effect(&this.queue_id, "cooldown_write_failed", &cooldown_err);
+                let failed = queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: cooldown_err.code(),
+                            error_class: Some(symbiotic_core::FailureClass::Queue),
+                            run_after: None,
+                        },
+                    )
+                    .await;
+                return Settled::Failed {
+                    err: cooldown_err,
+                    failed,
+                };
             }
             // One exact deadline, kept by the backend: this caller and any
             // duplicate waiting on the item retry no earlier than it.
@@ -1924,7 +1747,7 @@ where
                     &item.item_id,
                     worker_id,
                     Failure {
-                        error: err.to_string(),
+                        error: err.code(),
                         error_class: Some(error_class(&err)),
                         run_after: Some(Utc::now() + ChronoDuration::milliseconds(delay_ms as i64)),
                     },
@@ -1938,7 +1761,7 @@ where
                     ReceiptStatus::Failed,
                     Some(item),
                     None,
-                    Some(err.to_string()),
+                    Some(err.code()),
                     failed_timing(),
                 )
                 .await;
@@ -1947,7 +1770,7 @@ where
                     &item.item_id,
                     worker_id,
                     Failure {
-                        error: err.to_string(),
+                        error: err.code(),
                         error_class: Some(error_class(&err)),
                         run_after: None,
                     },
@@ -1961,7 +1784,7 @@ where
 /// `call`, failed as a timeout once `timeout_seconds` have passed.
 #[cfg(feature = "queue")]
 async fn within_timeout<T>(
-    queue_id: &QueueId,
+    _queue_id: &QueueId,
     timeout_seconds: Option<u64>,
     call: impl std::future::Future<Output = Result<T, ModelError>>,
 ) -> Result<T, ModelError> {
@@ -1971,10 +1794,9 @@ async fn within_timeout<T>(
     tokio::time::timeout(Duration::from_secs(timeout), call)
         .await
         .unwrap_or_else(|_| {
-            Err(ModelError::Timeout(format!(
-                "{} timed out after {}s",
-                queue_id.0, timeout
-            )))
+            Err(ModelError::Timeout(
+                symbiotic_core::DiagnosticCode::HttpTimeout,
+            ))
         })
 }
 
@@ -2080,8 +1902,8 @@ fn retry_delay_ms(
     item_id: &QueueItemId,
     request_hash: &str,
     err: &ModelError,
-) -> u64 {
-    retry_backoff_ms(attempt, config.retry_base_delay_ms)
+) -> Result<u64, ModelError> {
+    Ok(retry_backoff_ms(attempt, config.retry_base_delay_ms)
         .saturating_add(
             retry_jitter_seconds(
                 config.retry_jitter_seconds,
@@ -2089,10 +1911,10 @@ fn retry_delay_ms(
                 request_hash,
                 attempt,
                 err,
-            )
+            )?
             .saturating_mul(1_000),
         )
-        .clamp(1, 120_000)
+        .clamp(1, 120_000))
 }
 
 #[cfg(test)]
@@ -2108,7 +1930,9 @@ fn retry_after_seconds(
         retry_jitter_seconds: max_jitter_seconds,
         ..ModelQueueConfig::default()
     };
-    retry_delay_ms(attempt, &config, item_id, request_hash, err).div_ceil(1_000)
+    retry_delay_ms(attempt, &config, item_id, request_hash, err)
+        .unwrap()
+        .div_ceil(1_000)
 }
 
 #[cfg(feature = "queue")]
@@ -2118,9 +1942,9 @@ fn retry_jitter_seconds(
     request_hash: &str,
     attempt: u32,
     err: &ModelError,
-) -> u64 {
+) -> Result<u64, ModelError> {
     if max_jitter_seconds == 0 {
-        return 0;
+        return Ok(0);
     }
     let err_kind = match err {
         ModelError::RateLimited(_) => "rate_limited",
@@ -2136,17 +1960,30 @@ fn retry_jitter_seconds(
     let digest = hasher.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(bytes) % (max_jitter_seconds + 1)
+    let range = max_jitter_seconds
+        .checked_add(1)
+        .ok_or(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))?;
+    Ok(u64::from_le_bytes(bytes) % range)
 }
 
 /// Whether a request another call exhausted (or that was exhausted before a
 /// restart) gets a fresh attempt budget: only when the policy renews budgets
 /// and the renewal time has passed since the request went dead.
 #[cfg(feature = "queue")]
-fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> bool {
-    config.budget_renewal_seconds.is_some_and(|seconds| {
-        Utc::now() - item.updated_at >= ChronoDuration::seconds(seconds as i64)
-    })
+fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> Result<bool, ModelError> {
+    let Some(seconds) = config.budget_renewal_seconds else {
+        return Ok(false);
+    };
+    let deadline = i64::try_from(seconds)
+        .ok()
+        .and_then(ChronoDuration::try_seconds)
+        .and_then(|duration| item.updated_at.checked_add_signed(duration))
+        .ok_or(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))?;
+    Ok(Utc::now() >= deadline)
 }
 
 #[cfg(feature = "queue")]
@@ -2169,60 +2006,65 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 /// Stable class name of an error, kept on failed queue items so a later
 /// call reports the same class.
 #[cfg(feature = "queue")]
-fn error_class(err: &ModelError) -> String {
+fn error_class(err: &ModelError) -> FailureClass {
     match err {
-        ModelError::Unavailable(_) => "unavailable".to_string(),
-        ModelError::Auth(_) => "auth".to_string(),
-        ModelError::RateLimited(_) => "rate_limited".to_string(),
-        ModelError::BudgetExhausted(_) => "budget_exhausted".to_string(),
-        ModelError::Timeout(_) => "timeout".to_string(),
-        ModelError::Unsupported(capability) => format!(
-            "unsupported:{}",
-            serde_json::to_value(capability)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_default()
-        ),
-        ModelError::InvalidRequest(_) => "invalid_request".to_string(),
-        ModelError::Provider(_) => "provider".to_string(),
-        ModelError::Queue(_) => "queue".to_string(),
-        ModelError::Cache(_) => "cache".to_string(),
+        ModelError::Unavailable(_) => FailureClass::Unavailable,
+        ModelError::Auth(_) => FailureClass::Auth,
+        ModelError::RateLimited(_) => FailureClass::RateLimited,
+        ModelError::BudgetExhausted(_) => FailureClass::BudgetExhausted,
+        ModelError::Timeout(_) => FailureClass::Timeout,
+        ModelError::InvalidRequest(_) => FailureClass::InvalidRequest,
+        ModelError::Provider(_) => FailureClass::Provider,
+        ModelError::Queue(_) => FailureClass::Queue,
+        ModelError::Cache(_) => FailureClass::Cache,
+        ModelError::Unsupported(ModelCapability::Chat) => FailureClass::UnsupportedChat,
+        ModelError::Unsupported(ModelCapability::Embedding) => FailureClass::UnsupportedEmbedding,
+        ModelError::Unsupported(ModelCapability::Rerank) => FailureClass::UnsupportedRerank,
+        ModelError::Unsupported(ModelCapability::Classify) => FailureClass::UnsupportedClassify,
+        ModelError::Unsupported(ModelCapability::Vision) => FailureClass::UnsupportedVision,
+        ModelError::Unsupported(ModelCapability::ImageGeneration) => {
+            FailureClass::UnsupportedImageGeneration
+        }
+        ModelError::Unsupported(ModelCapability::VideoGeneration) => {
+            FailureClass::UnsupportedVideoGeneration
+        }
+        ModelError::Unsupported(ModelCapability::AgentTask) => FailureClass::UnsupportedAgentTask,
     }
 }
 
-/// The error a dead item stands for, from its recorded class. Items failed
-/// before classes were recorded fall back to reading the message.
+/// Restore only typed persisted class/code, never provider or stored text.
 #[cfg(feature = "queue")]
 fn dead_item_retry_error(item: &QueueItem) -> ModelError {
-    let error = item
-        .last_error
-        .clone()
-        .unwrap_or_else(|| "dead queue item".to_string());
-    match item.last_error_class.as_deref() {
-        Some("unavailable") => ModelError::Unavailable(error),
-        Some("auth") => ModelError::Auth(error),
-        Some("rate_limited") => ModelError::RateLimited(error),
-        Some("budget_exhausted") => ModelError::BudgetExhausted(error),
-        Some("timeout") => ModelError::Timeout(error),
-        Some("invalid_request") => ModelError::InvalidRequest(error),
-        Some("queue") => ModelError::Queue(error),
-        Some("cache") => ModelError::Cache(error),
-        Some(class) => class
-            .strip_prefix("unsupported:")
-            .and_then(|capability| {
-                serde_json::from_value(Value::String(capability.to_string())).ok()
-            })
-            .map_or(ModelError::Provider(error), ModelError::Unsupported),
-        None => {
-            let lower = error.to_ascii_lowercase();
-            if lower.contains("rate") || lower.contains("429") {
-                ModelError::RateLimited(error)
-            } else if lower.contains("timeout") || lower.contains("timed out") {
-                ModelError::Timeout(error)
-            } else {
-                ModelError::Unavailable(error)
-            }
+    let code = item.last_error.unwrap_or(DiagnosticCode::QueueFailure);
+    match item.last_error_class {
+        Some(FailureClass::Unavailable) => ModelError::Unavailable(code),
+        Some(FailureClass::Auth) => ModelError::Auth(code),
+        Some(FailureClass::RateLimited) => ModelError::RateLimited(code),
+        Some(FailureClass::BudgetExhausted) => ModelError::BudgetExhausted(code),
+        Some(FailureClass::Timeout) => ModelError::Timeout(code),
+        Some(FailureClass::InvalidRequest) => ModelError::InvalidRequest(code),
+        Some(FailureClass::Provider) => ModelError::Provider(code),
+        Some(FailureClass::Queue) => ModelError::Queue(code),
+        Some(FailureClass::Cache) => ModelError::Cache(code),
+        Some(FailureClass::UnsupportedChat) => ModelError::Unsupported(ModelCapability::Chat),
+        Some(FailureClass::UnsupportedEmbedding) => {
+            ModelError::Unsupported(ModelCapability::Embedding)
         }
+        Some(FailureClass::UnsupportedRerank) => ModelError::Unsupported(ModelCapability::Rerank),
+        Some(FailureClass::UnsupportedClassify) => {
+            ModelError::Unsupported(ModelCapability::Classify)
+        }
+        Some(FailureClass::UnsupportedVision) => ModelError::Unsupported(ModelCapability::Vision),
+        Some(FailureClass::UnsupportedImageGeneration) => {
+            ModelError::Unsupported(ModelCapability::ImageGeneration)
+        }
+        Some(FailureClass::UnsupportedVideoGeneration) => {
+            ModelError::Unsupported(ModelCapability::VideoGeneration)
+        }
+        Some(FailureClass::UnsupportedAgentTask) => {
+            ModelError::Unsupported(ModelCapability::AgentTask)
+        }
+        None => ModelError::Queue(DiagnosticCode::TerminalQueueItemIsMissingItsErrorClass),
     }
 }
 
@@ -2244,6 +2086,7 @@ fn model_queue_payload(
         "capability": capability,
         "request_hash": request_hash,
         "model": descriptor.identity,
+        "binding": descriptor.metadata.get("binding"),
         "logical_retry": {
             "attempts_used": retry_state.attempts_used,
             "max_attempts": retry_state.max_attempts,
@@ -2288,7 +2131,7 @@ async fn reenqueue_dead_item(
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
     let state = logical_retry_state(&item.payload, logical_max_attempts(config));
     let attempts_used = state.attempts_used.saturating_add(item.attempt);
-    if attempts_used >= state.max_attempts {
+    if item.status == QueueStatus::Stopped || attempts_used >= state.max_attempts {
         return Ok(None);
     }
     let remaining_attempts = state.max_attempts - attempts_used;
@@ -2297,7 +2140,7 @@ async fn reenqueue_dead_item(
         max_attempts: state.max_attempts,
     };
     let payload = model_queue_payload(&capability, request_hash, descriptor, next_state);
-    let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err);
+    let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err)?;
     // Replace the dead item only while it is still the newest for the
     // request: a caller holding a stale item must not start a second chain.
     let outcome = queue
@@ -2314,7 +2157,7 @@ async fn reenqueue_dead_item(
             &item.item_id,
         )
         .await
-        .map_err(|err| ModelError::Queue(err.to_string()))?;
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
     Ok(Some(outcome))
 }
 
@@ -2357,77 +2200,88 @@ async fn reenqueue_with_fresh_budget(
             current,
         )
         .await
-        .map_err(|err| ModelError::Queue(err.to_string()))
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
 }
 
 #[cfg(feature = "queue")]
 fn exhausted_request_error(
-    queue_id: &QueueId,
-    item: &QueueItem,
-    config: &ModelQueueConfig,
+    _queue_id: &QueueId,
+    _item: &QueueItem,
+    _config: &ModelQueueConfig,
     last_error: &ModelError,
 ) -> ModelError {
-    let state = logical_retry_state(&item.payload, logical_max_attempts(config));
-    let attempts_used = state.attempts_used.saturating_add(item.attempt);
-    let message = format!(
-        "{} request exhausted after {}/{} logical attempt(s): {}",
-        queue_id.0,
-        attempts_used,
-        state.max_attempts,
-        item.last_error
-            .clone()
-            .unwrap_or_else(|| "unknown provider error".to_string())
-    );
-    // Keep the class of the last failure, so callers can still tell a rate
-    // limit or timeout from a provider fault once retries run out.
     match last_error {
-        ModelError::RateLimited(_) => ModelError::RateLimited(message),
-        ModelError::Timeout(_) => ModelError::Timeout(message),
-        ModelError::Unavailable(_) => ModelError::Unavailable(message),
-        ModelError::Auth(_) => ModelError::Auth(message),
-        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(message),
-        ModelError::InvalidRequest(_) => ModelError::InvalidRequest(message),
-        ModelError::Queue(_) => ModelError::Queue(message),
-        ModelError::Cache(_) => ModelError::Cache(message),
+        ModelError::RateLimited(_) => {
+            ModelError::RateLimited(DiagnosticCode::AttemptBudgetExhausted)
+        }
+        ModelError::Timeout(_) => ModelError::Timeout(DiagnosticCode::AttemptBudgetExhausted),
+        ModelError::Unavailable(_) => {
+            ModelError::Unavailable(DiagnosticCode::AttemptBudgetExhausted)
+        }
+        ModelError::Auth(_) => ModelError::Auth(DiagnosticCode::AttemptBudgetExhausted),
+        ModelError::BudgetExhausted(_) => {
+            ModelError::BudgetExhausted(DiagnosticCode::AttemptBudgetExhausted)
+        }
+        ModelError::InvalidRequest(_) => {
+            ModelError::InvalidRequest(DiagnosticCode::AttemptBudgetExhausted)
+        }
+        ModelError::Queue(_) => ModelError::Queue(DiagnosticCode::AttemptBudgetExhausted),
+        ModelError::Cache(_) => ModelError::Cache(DiagnosticCode::AttemptBudgetExhausted),
+        ModelError::Provider(_) => ModelError::Provider(DiagnosticCode::AttemptBudgetExhausted),
         ModelError::Unsupported(capability) => ModelError::Unsupported(*capability),
-        ModelError::Provider(_) => ModelError::Provider(message),
     }
 }
 
 #[cfg(feature = "queue")]
-static MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+type RateGates = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
+
+/// Rate state owned by a runtime and shared only through its account keys.
 #[cfg(feature = "queue")]
-static MODEL_RATE_BUCKETS: OnceLock<Mutex<HashMap<String, RateBucket>>> = OnceLock::new();
-/// Per queue: held from an attempt's rate-budget check through its claim.
-#[cfg(feature = "queue")]
-static MODEL_RATE_GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+#[derive(Clone, Default)]
+pub struct ModelRateState {
+    buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
+    gates: Arc<Mutex<RateGates>>,
+}
 
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
-    fn input_budget_units(&self) -> u64;
+    fn input_budget_units(&self) -> Result<u64, ModelError>;
+    fn sensitivity(&self) -> Sensitivity;
 }
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for ChatRequest {
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(self.messages.iter().map(|message| message.content.as_str()))
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
+            self.messages.iter().map(|message| message.content.as_str()),
+        ))
     }
 }
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for EmbeddingRequest {
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(self.inputs.iter().map(String::as_str))
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
+            self.inputs.iter().map(String::as_str),
+        ))
     }
 }
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for RerankRequest {
-    fn input_budget_units(&self) -> u64 {
-        estimate_token_budget_units(
+    fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(estimate_token_budget_units(
             std::iter::once(self.query.as_str()).chain(self.documents.iter().map(String::as_str)),
-        )
+        ))
     }
 }
 
@@ -2516,22 +2370,26 @@ struct RateCharge {
 /// duplicate holds it, or its retry time has not come), spends nothing.
 #[cfg(feature = "queue")]
 struct RateGrant {
+    state: ModelRateState,
     _gate: tokio::sync::OwnedMutexGuard<()>,
     charges: Vec<RateCharge>,
 }
 
 #[cfg(feature = "queue")]
 impl RateGrant {
-    fn charge(self) {
-        let map = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut buckets) = map.lock() else {
-            return;
-        };
+    fn charge(self) -> Result<(), ModelError> {
+        let mut buckets = self.state.buckets.lock().map_err(|_| {
+            ModelError::Queue(symbiotic_core::DiagnosticCode::RateBucketLockPoisoned)
+        })?;
         for charge in &self.charges {
-            if let Some(bucket) = buckets.get_mut(&charge.key) {
-                bucket.charge(charge.amount);
-            }
+            buckets
+                .get_mut(&charge.key)
+                .ok_or({
+                    ModelError::Queue(symbiotic_core::DiagnosticCode::RateBucketDisappeared)
+                })?
+                .charge(charge.amount);
         }
+        Ok(())
     }
 }
 
@@ -2550,6 +2408,7 @@ enum RateCheck {
 /// claim.
 #[cfg(feature = "queue")]
 async fn check_model_budget<R>(
+    state: &ModelRateState,
     queue_id: &QueueId,
     config: &ModelQueueConfig,
     request: &R,
@@ -2575,25 +2434,25 @@ where
                 queue_id.0, config.rate_burst_seconds
             ),
             per_minute: input_units_per_minute as f64,
-            amount: request.input_budget_units() as f64,
+            amount: request.input_budget_units()? as f64,
         });
     }
     if charges.is_empty() {
         return Ok(RateCheck::Cleared(None));
     }
     let gate = {
-        let gates = MODEL_RATE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut gates) = gates.lock() else {
-            return Ok(RateCheck::Cleared(None));
-        };
+        let mut gates = state
+            .gates
+            .lock()
+            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::RateGateLockPoisoned))?;
         gates.entry(queue_id.0.clone()).or_default().clone()
     };
     let held = gate.lock_owned().await;
     let wait = {
-        let buckets = MODEL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut buckets) = buckets.lock() else {
-            return Ok(RateCheck::Cleared(None));
-        };
+        let mut buckets = state
+            .buckets
+            .lock()
+            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
         charges
             .iter()
             .filter_map(|charge| {
@@ -2608,6 +2467,7 @@ where
     };
     Ok(match wait {
         None => RateCheck::Cleared(Some(RateGrant {
+            state: state.clone(),
             _gate: held,
             charges,
         })),
@@ -2625,45 +2485,14 @@ async fn wait_for_model_cooldown(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
 ) -> Result<(), ModelError> {
-    let durable_until = queue
-        .cooldown_until(queue_id)
-        .await
-        .map_err(|err| ModelError::Queue(err.to_string()))?;
-    let local_sleep_for = {
-        let map = MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut guard) = map.lock() else {
-            return Ok(());
-        };
-        if let Some(until) = guard.get(&queue_id.0).copied() {
-            let now = Instant::now();
-            if until <= now {
-                guard.remove(&queue_id.0);
-                None
-            } else {
-                Some(until.saturating_duration_since(now))
-            }
-        } else {
-            None
+    loop {
+        let durable_until = queue.cooldown_until(queue_id).await.map_err(queue_error)?;
+        let sleep_for = durable_until.and_then(|until| (until - Utc::now()).to_std().ok());
+        match sleep_for {
+            Some(duration) if !duration.is_zero() => tokio::time::sleep(duration).await,
+            _ => return Ok(()),
         }
-    };
-    let durable_sleep_for = durable_until.and_then(|until| {
-        let now = Utc::now();
-        if until <= now {
-            None
-        } else {
-            (until - now).to_std().ok()
-        }
-    });
-    let sleep_for = match (local_sleep_for, durable_sleep_for) {
-        (Some(local), Some(durable)) => Some(local.max(durable)),
-        (Some(local), None) => Some(local),
-        (None, Some(durable)) => Some(durable),
-        (None, None) => None,
-    };
-    if let Some(sleep_for) = sleep_for {
-        tokio::time::sleep(sleep_for).await;
     }
-    Ok(())
 }
 
 #[cfg(feature = "queue")]
@@ -2680,44 +2509,24 @@ async fn note_model_cooldown(
         _ => 1,
     };
     let millis = retry_delay_ms.saturating_mul(multiplier).clamp(1, 60_000);
-    let until_instant = Instant::now() + Duration::from_millis(millis);
     let until_utc = Utc::now() + ChronoDuration::milliseconds(millis as i64);
-    {
-        let map = MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut guard) = map.lock() else {
-            queue
-                .note_cooldown(queue_id, until_utc)
-                .await
-                .map_err(|err| ModelError::Queue(err.to_string()))?;
-            return Ok(());
-        };
-        guard
-            .entry(queue_id.0.clone())
-            .and_modify(|current| {
-                if *current < until_instant {
-                    *current = until_instant;
-                }
-            })
-            .or_insert(until_instant);
-    }
     queue
         .note_cooldown(queue_id, until_utc)
         .await
-        .map_err(|err| ModelError::Queue(err.to_string()))?;
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
     Ok(())
 }
 
-#[cfg(feature = "queue")]
-fn request_sensitivity(request: &Value) -> Sensitivity {
-    request
-        .get("sensitivity")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or(Sensitivity::Shareable)
+/// Opaque revision of a serializable configuration. Never pass secret values.
+pub fn configuration_revision(
+    settings: &impl Serialize,
+) -> Result<symbiotic_core::ConfigurationRevision, ModelError> {
+    hash_json(settings).map(symbiotic_core::ConfigurationRevision)
 }
 
 fn hash_json<T: Serialize>(value: &T) -> Result<String, ModelError> {
-    let bytes = serde_json::to_vec(value).map_err(|err| ModelError::Provider(err.to_string()))?;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_err| ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))
@@ -2839,32 +2648,50 @@ impl ChatProvider for StaticChatProvider {
 #[derive(Clone)]
 pub struct OpenAiCompatibleChatProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: String,
-    api_key: zeroize::Zeroizing<String>,
+    api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     thinking: Option<ThinkingMode>,
     reasoning_effort: Option<String>,
+    max_output_tokens: Option<u32>,
 }
 
 /// Provider extension supported by compatible APIs such as DeepSeek.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
+    /// Enable provider thinking.
     Enabled,
+    /// Disable provider thinking; reasoning effort is refused.
     Disabled,
 }
 
+/// Refuse settings that would otherwise be silently omitted from the wire.
+fn validate_chat_settings(
+    thinking: Option<ThinkingMode>,
+    effort: Option<&str>,
+) -> Result<(), ModelError> {
+    if effort.is_some_and(|s| s.trim().is_empty())
+        || (thinking == Some(ThinkingMode::Disabled) && effort.is_some())
+    {
+        return Err(ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::UnsupportedChatSettingsReasoningEffortRequiresThinkingAndMustBeNonempty));
+    }
+    Ok(())
+}
+
 impl OpenAiCompatibleChatProvider {
+    /// Construct a compatible chat transport; finite byte and output limits are required to execute.
     pub fn new(
         operator: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        api_key: impl Into<String>,
+        api_key: impl Into<SecretValue<String>>,
     ) -> Self {
         let operator = operator.into();
         let model = model.into();
+        let base_url = base_url.into();
         Self {
             descriptor: ProviderDescriptor {
                 identity: ModelIdentity {
@@ -2877,46 +2704,65 @@ impl OpenAiCompatibleChatProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "openai-compatible" }),
+                metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": registry::validate_endpoint(&base_url).ok().map(|()| base_url.as_str()) }),
             },
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
-            api_key: zeroize::Zeroizing::new(api_key.into()),
+            client: HttpClient::default(),
+            base_url,
+            api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
             thinking: None,
             reasoning_effort: None,
+            max_output_tokens: None,
         }
     }
 
-    /// Reuse the consumer's connection pool and timeout policy.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// Clients cannot be injected through the public API.
+    /// ```compile_fail
+    /// use symbiotic_model::OpenAiCompatibleChatProvider;
+    /// OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "key")
+    ///     .with_client(reqwest::Client::new());
+    /// ```
+    /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
+        self.client = HttpClient(Ok(http_client(Some(timeout_seconds))?));
+        Ok(self)
     }
 
     /// Bound the complete encoded HTTP request body before transmission.
     pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_request_bytes"] = serde_json::json!(max_bytes);
         self.max_request_bytes = Some(max_bytes);
         self
     }
 
     /// Bound response bodies before buffering, including provider error bodies.
     pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_response_bytes"] = serde_json::json!(max_bytes);
         self.max_response_bytes = Some(max_bytes);
         self
     }
 
+    /// Configured output-token ceiling; requests above it are refused.
+    pub fn with_output_limit(mut self, max_tokens: u32) -> Self {
+        self.descriptor.metadata["max_output_tokens"] = serde_json::json!(max_tokens);
+        self.max_output_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Configure thinking; combining disabled thinking with effort is refused.
     pub fn with_thinking(mut self, thinking: Option<ThinkingMode>) -> Self {
+        self.descriptor.metadata["thinking"] =
+            serde_json::to_value(thinking).expect("thinking serializes");
         self.thinking = thinking;
         self
     }
 
+    /// Configure a nonempty reasoning effort; invalid settings are refused on binding or execution.
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         let effort = effort.into();
-        if !effort.trim().is_empty() {
-            self.reasoning_effort = Some(effort);
-        }
+        self.descriptor.metadata["reasoning_effort"] = Value::String(effort.clone());
+        self.reasoning_effort = Some(effort);
         self
     }
 }
@@ -2927,8 +2773,25 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
         &self.descriptor
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        registry::validate_endpoint(&self.base_url)?;
+        self.client.get()?;
+        required_byte_limit(self.max_request_bytes)?;
+        required_byte_limit(self.max_response_bytes)?;
+        if self.max_output_tokens == Some(0) {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::OutputTokenLimitMustBeNonzero,
+            ));
+        }
+        validate_chat_settings(self.thinking, self.reasoning_effort.as_deref())
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
-        api_key_fingerprint(&self.api_key)
+        api_key_fingerprint(self.api_key.secret())
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        Some(&self.api_key)
     }
 }
 
@@ -3031,144 +2894,203 @@ fn reported_cost_usd(raw: &Value) -> Option<String> {
 
 #[async_trait]
 impl ChatProvider for OpenAiCompatibleChatProvider {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        let body = wire::openai_chat_body(
-            &self.descriptor.identity.model.0,
-            &request,
-            self.thinking,
-            self.reasoning_effort.as_deref(),
-            self.max_request_bytes,
-        )?;
-        let resp = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(self.api_key.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = bounded_response_text(resp, self.max_response_bytes).await?;
-            return Err(status_error(status.as_u16(), body));
-        }
-        let raw: Value = bounded_response_json(resp, self.max_response_bytes).await?;
-        let parsed: OpenAiChatWireResponse = serde_json::from_value(raw.clone())
-            .map_err(|err| ModelError::Provider(err.to_string()))?;
-        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
-            ModelError::Provider("OpenAI-compatible response had no choices".to_string())
-        })?;
-        let usage = parsed.usage.unwrap_or_default();
-        let content = choice
-            .message
-            .as_ref()
-            .and_then(|message| message.content.as_deref())
-            .unwrap_or_default();
-        let mut trace = success_trace(
-            &self.descriptor,
-            request.sensitivity,
-            request.role_binding.clone(),
-            request.source.clone(),
-            hash_json(&request)?,
-            Some(content),
-        );
-        trace.usage = UsageTrace {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            media_units: None,
-            cost_micro_usd: None,
-            reported_cost_usd: reported_cost_usd(&raw),
-        };
-        let nested_hit = usage
-            .prompt_tokens_details
-            .and_then(|details| details.cached_tokens);
-        let (hit, miss) = prompt_cache_counts(
-            usage.prompt_tokens,
-            usage.prompt_cache_hit_tokens,
-            usage.prompt_cache_miss_tokens,
-            nested_hit,
-        );
-        trace.metadata = serde_json::json!({
-            "provider": {
-                "response_id": raw.get("id").and_then(Value::as_str),
-                "served_model": raw.get("model").and_then(Value::as_str),
-                "created": raw.get("created").and_then(Value::as_i64),
-                "reasoning_tokens": trace.usage.reasoning_tokens,
-                "reported_cost_usd": trace.usage.reported_cost_usd,
-            },
-            "cache_miss_tokens": miss,
-            "observed_cache_tokens": {
-                "hit": usage.prompt_cache_hit_tokens,
-                "miss": usage.prompt_cache_miss_tokens,
-                "nested_hit": nested_hit,
-            },
-        });
-        trace.cache = CacheTrace {
-            response_cache: CacheStatus::Miss,
-            prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
-            cached_input_tokens: hit,
-        };
-        Ok(ChatResponse {
-            text: content.to_string(),
-            finish_reason: choice.finish_reason,
-            trace,
-            raw_provider_response: Some(raw),
-        })
+    async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        secrets::credential_boundary(
+            (async {
+                self.validate_configuration()?;
+                let output = request
+                    .max_output_tokens
+                    .or(self.max_output_tokens)
+                    .filter(|n| *n > 0)
+                    .ok_or({
+                        ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::FiniteOutputTokensAreRequired,
+                        )
+                    })?;
+                if self.max_output_tokens.is_some_and(|limit| output > limit) {
+                    return Err(ModelError::InvalidRequest(
+                        symbiotic_core::DiagnosticCode::OutputTokenLimitExceeded,
+                    ));
+                }
+                request.max_output_tokens = Some(output);
+                let body = wire::openai_chat_body(
+                    &self.descriptor.identity.model.0,
+                    &request,
+                    self.thinking,
+                    self.reasoning_effort.as_deref(),
+                    self.max_request_bytes,
+                )?;
+                let builder = self
+                    .client
+                    .get()?
+                    .post(format!(
+                        "{}/chat/completions",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+                let builder = if self.api_key.secret().is_empty() {
+                    builder
+                } else {
+                    builder.bearer_auth(self.api_key.secret())
+                };
+                let (raw, _) = provider_response_json(
+                    builder,
+                    self.max_response_bytes,
+                    ModelError::Unavailable,
+                )
+                .await?;
+                let parsed: OpenAiChatWireResponse =
+                    serde_json::from_value(raw.clone()).map_err(|_err| {
+                        ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+                    })?;
+                let choice = parsed.choices.into_iter().next().ok_or({
+                    ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::OpenaiCompatibleResponseHadNoChoices,
+                    )
+                })?;
+                let usage = parsed.usage.unwrap_or_default();
+                let content = choice
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.content.as_deref())
+                    .unwrap_or_default();
+                let mut trace = success_trace(
+                    &self.descriptor,
+                    request.sensitivity,
+                    request.role_binding.clone(),
+                    request.source.clone(),
+                    hash_json(&request)?,
+                    Some(content),
+                );
+                trace.usage = UsageTrace {
+                    input_tokens: usage.prompt_tokens,
+                    output_tokens: usage.completion_tokens,
+                    reasoning_tokens: usage
+                        .completion_tokens_details
+                        .and_then(|details| details.reasoning_tokens),
+                    media_units: None,
+                    cost_micro_usd: None,
+                    reported_cost_usd: reported_cost_usd(&raw),
+                };
+                let nested_hit = usage
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens);
+                let (hit, miss) = prompt_cache_counts(
+                    usage.prompt_tokens,
+                    usage.prompt_cache_hit_tokens,
+                    usage.prompt_cache_miss_tokens,
+                    nested_hit,
+                );
+                trace.metadata = serde_json::json!({
+                    "provider": {
+                        "response_id": raw.get("id").and_then(Value::as_str),
+                        "served_model": raw.get("model").and_then(Value::as_str),
+                        "created": raw.get("created").and_then(Value::as_i64),
+                        "reasoning_tokens": trace.usage.reasoning_tokens,
+                        "reported_cost_usd": trace.usage.reported_cost_usd,
+                    },
+                    "cache_miss_tokens": miss,
+                    "observed_cache_tokens": {
+                        "hit": usage.prompt_cache_hit_tokens,
+                        "miss": usage.prompt_cache_miss_tokens,
+                        "nested_hit": nested_hit,
+                    },
+                });
+                trace.cache = CacheTrace {
+                    response_cache: CacheStatus::Miss,
+                    prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
+                    cached_input_tokens: hit,
+                };
+                Ok(ChatResponse {
+                    text: content.to_string(),
+                    finish_reason: choice.finish_reason,
+                    trace,
+                    raw_provider_response: Some(raw),
+                })
+            })
+            .await,
+            &self.api_key,
+        )
     }
 }
 
 #[derive(Clone)]
 pub struct GeminiEmbeddingProvider {
     descriptor: ProviderDescriptor,
-    client: reqwest::Client,
-    api_key: zeroize::Zeroizing<String>,
+    client: HttpClient,
+    api_key: CredentialBoundary,
     max_response_bytes: Option<usize>,
     max_request_bytes: Option<usize>,
     dimensions: usize,
+    #[cfg(test)]
+    test_endpoint: Option<String>,
 }
 
 impl GeminiEmbeddingProvider {
-    pub fn new(model: impl Into<String>, api_key: impl Into<String>, dimensions: usize) -> Self {
+    #[cfg(test)]
+    fn at_test_endpoint(mut self, endpoint: String) -> Self {
+        self.test_endpoint = Some(endpoint);
+        self
+    }
+
+    fn endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.test_endpoint {
+            return endpoint;
+        }
+        "https://generativelanguage.googleapis.com/v1beta"
+    }
+    /// Construct a Gemini transport with an owned key and explicit dimensions.
+    pub fn new(
+        operator: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<SecretValue<String>>,
+        dimensions: usize,
+    ) -> Self {
         let model = model.into();
         Self {
             descriptor: ProviderDescriptor {
-                identity: ModelIdentity::new("embedding", "gemini", model),
+                identity: ModelIdentity::new("embedding", operator, model),
                 provider_class: ProviderClass::Cloud,
                 capabilities: vec![ModelCapability::Embedding],
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "dimensions": dimensions }),
+                metadata: serde_json::json!({ "dimensions": dimensions, "endpoint": "https://generativelanguage.googleapis.com/v1beta" }),
             },
-            client: reqwest::Client::new(),
-            api_key: zeroize::Zeroizing::new(api_key.into()),
+            client: HttpClient::default(),
+            api_key: CredentialBoundary::new(api_key.into()),
             max_response_bytes: None,
             max_request_bytes: None,
             dimensions,
+            #[cfg(test)]
+            test_endpoint: None,
         }
     }
 
-    /// Reuse a client with the deployment's timeout and redirect policy.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// Clients cannot be injected through the public API.
+    /// ```compile_fail
+    /// use symbiotic_model::GeminiEmbeddingProvider;
+    /// GeminiEmbeddingProvider::new("op", "model", "key", 2)
+    ///     .with_client(reqwest::Client::new());
+    /// ```
+    /// Set a finite timeout on a Foundation-owned redirect-free, direct client.
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Result<Self, ModelError> {
+        self.client = HttpClient(Ok(http_client(Some(timeout_seconds))?));
+        Ok(self)
     }
 
     /// Bound the complete encoded HTTP request body before transmission.
     pub fn with_request_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_request_bytes"] = serde_json::json!(max_bytes);
         self.max_request_bytes = Some(max_bytes);
         self
     }
 
     /// Bound response bodies before buffering, including provider error bodies.
     pub fn with_response_limit(mut self, max_bytes: usize) -> Self {
+        self.descriptor.metadata["max_response_bytes"] = serde_json::json!(max_bytes);
         self.max_response_bytes = Some(max_bytes);
         self
     }
@@ -3180,8 +3102,24 @@ impl ModelProvider for GeminiEmbeddingProvider {
         &self.descriptor
     }
 
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.client.get()?;
+        required_byte_limit(self.max_request_bytes)?;
+        required_byte_limit(self.max_response_bytes)?;
+        if self.dimensions == 0 {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::EmbeddingDimensionsMustBeNonzero,
+            ));
+        }
+        Ok(())
+    }
+
     fn credential_fingerprint(&self) -> Option<String> {
-        api_key_fingerprint(&self.api_key)
+        api_key_fingerprint(self.api_key.secret())
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        Some(&self.api_key)
     }
 }
 
@@ -3201,10 +3139,15 @@ struct GeminiEmbedding {
 }
 
 impl GeminiEmbedding {
-    fn into_values(self) -> Result<Vec<f32>, ModelError> {
+    fn into_values(self, dimensions: usize) -> Result<Vec<f32>, ModelError> {
+        if self.values.len() != dimensions {
+            return Err(ModelError::Provider(
+                symbiotic_core::DiagnosticCode::GeminiEmbeddingDimensionMismatch,
+            ));
+        }
         if self.values.iter().any(|value| !value.is_finite()) {
             return Err(ModelError::Provider(
-                "Gemini embedding contains non-finite components".into(),
+                symbiotic_core::DiagnosticCode::GeminiEmbeddingContainsNonFiniteComponents,
             ));
         }
         Ok(self.values)
@@ -3214,127 +3157,190 @@ impl GeminiEmbedding {
 #[async_trait]
 impl EmbeddingProvider for GeminiEmbeddingProvider {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
-        if request.inputs.is_empty() {
-            return Ok(EmbeddingResponse {
-                dimensions: self.dimensions,
-                vectors: Vec::new(),
-                trace: success_trace(
-                    &self.descriptor,
-                    request.sensitivity,
-                    request.role_binding.clone(),
-                    request.source.clone(),
-                    hash_json(&request)?,
-                    None,
-                ),
-                raw_provider_response: None,
-            });
-        }
-        let model = self
-            .descriptor
-            .identity
-            .model
-            .0
-            .trim_start_matches("models/");
-        let body =
-            wire::gemini_embedding_body(model, self.dimensions, &request, self.max_request_bytes)?;
-        let vectors = if request.inputs.len() == 1 {
-            let resp = self
-                .client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
-                ))
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = bounded_response_text(resp, self.max_response_bytes).await?;
-                return Err(status_error(status.as_u16(), body));
-            }
-            let raw: GeminiEmbedWireResponse =
-                bounded_response_json(resp, self.max_response_bytes).await?;
-            vec![
-                raw.embedding
-                    .ok_or_else(|| {
-                        ModelError::Provider("Gemini response missing embedding".to_string())
-                    })?
-                    .into_values()?,
-            ]
-        } else {
-            let resp = self
-                .client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
-                ))
-                .header("x-goog-api-key", self.api_key.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| ModelError::Unavailable(err.to_string()))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = bounded_response_text(resp, self.max_response_bytes).await?;
-                return Err(status_error(status.as_u16(), body));
-            }
-            let raw: GeminiBatchEmbedWireResponse =
-                bounded_response_json(resp, self.max_response_bytes).await?;
-            let embeddings = raw.embeddings.ok_or_else(|| {
-                ModelError::Provider("Gemini batch response missing embeddings".to_string())
-            })?;
-            if embeddings.len() != request.inputs.len() {
-                return Err(ModelError::Provider(format!(
-                    "Gemini batch returned {} embeddings for {} inputs",
-                    embeddings.len(),
-                    request.inputs.len()
-                )));
-            }
-            embeddings
-                .into_iter()
-                .map(GeminiEmbedding::into_values)
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(EmbeddingResponse {
-            dimensions: self.dimensions,
-            vectors,
-            trace: success_trace(
-                &self.descriptor,
-                request.sensitivity,
-                request.role_binding.clone(),
-                request.source.clone(),
-                hash_json(&request)?,
-                None,
-            ),
-            raw_provider_response: None,
-        })
+        secrets::credential_boundary(
+            (async {
+                self.validate_configuration()?;
+                wire::validate_gemini_options(self.dimensions, &request)?;
+                if request.inputs.is_empty() {
+                    return Ok(EmbeddingResponse {
+                        dimensions: self.dimensions,
+                        vectors: Vec::new(),
+                        trace: success_trace(
+                            &self.descriptor,
+                            request.sensitivity,
+                            request.role_binding.clone(),
+                            request.source.clone(),
+                            hash_json(&request)?,
+                            None,
+                        ),
+                        raw_provider_response: None,
+                    });
+                }
+                let model = self
+                    .descriptor
+                    .identity
+                    .model
+                    .0
+                    .trim_start_matches("models/");
+                let body = wire::gemini_embedding_body(
+                    model,
+                    self.dimensions,
+                    &request,
+                    self.max_request_bytes,
+                )?;
+                let raw_provider_response;
+                let vectors = if request.inputs.len() == 1 {
+                    let builder = self
+                        .client
+                        .get()?
+                        .post(format!("{}/models/{model}:embedContent", self.endpoint()))
+                        .header("x-goog-api-key", self.api_key.secret())
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body);
+                    let (raw, _) = provider_response_json(
+                        builder,
+                        self.max_response_bytes,
+                        ModelError::Unavailable,
+                    )
+                    .await?;
+                    raw_provider_response = Some(raw.clone());
+                    let raw: GeminiEmbedWireResponse =
+                        serde_json::from_value(raw).map_err(|_err| {
+                            ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable)
+                        })?;
+                    vec![
+                        raw.embedding
+                            .ok_or({
+                                ModelError::Provider(
+                                    symbiotic_core::DiagnosticCode::GeminiResponseMissingEmbedding,
+                                )
+                            })?
+                            .into_values(self.dimensions)?,
+                    ]
+                } else {
+                    let builder = self
+                        .client
+                        .get()?
+                        .post(format!(
+                            "{}/models/{model}:batchEmbedContents",
+                            self.endpoint()
+                        ))
+                        .header("x-goog-api-key", self.api_key.secret())
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body);
+                    let (raw, _) = provider_response_json(
+                        builder,
+                        self.max_response_bytes,
+                        ModelError::Unavailable,
+                    )
+                    .await?;
+                    raw_provider_response = Some(raw.clone());
+                    let raw: GeminiBatchEmbedWireResponse =
+                        serde_json::from_value(raw).map_err(|_err| {
+                            ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable)
+                        })?;
+                    let embeddings = raw.embeddings.ok_or({
+                        ModelError::Provider(
+                            symbiotic_core::DiagnosticCode::GeminiBatchResponseMissingEmbeddings,
+                        )
+                    })?;
+                    if embeddings.len() != request.inputs.len() {
+                        return Err(ModelError::Provider(
+                            symbiotic_core::DiagnosticCode::ProviderFailure,
+                        ));
+                    }
+                    embeddings
+                        .into_iter()
+                        .map(|embedding| embedding.into_values(self.dimensions))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(EmbeddingResponse {
+                    dimensions: self.dimensions,
+                    vectors,
+                    trace: success_trace(
+                        &self.descriptor,
+                        request.sensitivity,
+                        request.role_binding.clone(),
+                        request.source.clone(),
+                        hash_json(&request)?,
+                        None,
+                    ),
+                    raw_provider_response,
+                })
+            })
+            .await,
+            &self.api_key,
+        )
     }
+}
+
+// Keep infallible adapter constructors while surfacing client construction errors
+// during configuration validation, before a binding can dispatch.
+#[derive(Clone)]
+struct HttpClient(Result<reqwest::Client, ()>);
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self(http_client_builder().build().map_err(|_| ()))
+    }
+}
+
+impl HttpClient {
+    fn get(&self) -> Result<&reqwest::Client, ModelError> {
+        self.0.as_ref().map_err(|_| invalid_http_client())
+    }
+}
+
+fn invalid_http_client() -> ModelError {
+    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidHttpClientConfiguration)
+}
+
+fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+}
+
+/// Boundary-owned HTTP client construction; no public client injection.
+fn http_client(timeout_seconds: Option<u64>) -> Result<reqwest::Client, ModelError> {
+    let timeout = timeout_seconds.filter(|n| *n > 0).ok_or({
+        ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::FiniteTimeoutIsRequired)
+    })?;
+    http_client_builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build()
+        .map_err(|_| invalid_http_client())
+}
+
+fn required_byte_limit(limit: Option<usize>) -> Result<usize, ModelError> {
+    limit.filter(|n| *n > 0).ok_or({
+        ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::FiniteNonzeroRequestResponseByteLimitsAreRequired,
+        )
+    })
 }
 
 async fn bounded_response_bytes(
     mut response: reqwest::Response,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
-    let limit = max_bytes.unwrap_or(usize::MAX);
+    let limit = required_byte_limit(max_bytes)?;
     if response
         .content_length()
         .is_some_and(|len| len > limit as u64)
     {
         return Err(ModelError::Provider(
-            "provider response limit exceeded".into(),
+            symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded,
         ));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| ModelError::Unavailable(err.to_string()))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::ProviderResponseReadFailed)
+    })? {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(ModelError::Provider(
-                "provider response limit exceeded".into(),
+                symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded,
             ));
         }
         bytes.extend_from_slice(&chunk);
@@ -3342,30 +3348,43 @@ async fn bounded_response_bytes(
     Ok(bytes)
 }
 
-async fn bounded_response_text(
-    response: reqwest::Response,
+/// Bounded HTTP decoding. Credential policy belongs exclusively to the final
+/// adapter-result boundary, including errors raised after this helper returns.
+async fn provider_response_json(
+    builder: reqwest::RequestBuilder,
     max_bytes: Option<usize>,
-) -> Result<String, ModelError> {
+    invalid_json: fn(DiagnosticCode) -> ModelError,
+) -> Result<(Value, String), ModelError> {
+    let response = builder
+        .send()
+        .await
+        .map_err(|_err| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))?;
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(ModelError::Provider(
+            symbiotic_core::DiagnosticCode::ProviderRedirectRefused,
+        ));
+    }
+    if !status.is_success() {
+        return Err(status_error(status.as_u16()));
+    }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let text = String::from_utf8(bytes).map_err(|_| {
+        ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderResponseIsNotValidUtf8)
+    })?;
+    let raw: Value = serde_json::from_str(&text)
+        .map_err(|_err| invalid_json(DiagnosticCode::InvalidResponse))?;
+    Ok((raw, text))
 }
 
-async fn bounded_response_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-    max_bytes: Option<usize>,
-) -> Result<T, ModelError> {
-    let bytes = bounded_response_bytes(response, max_bytes).await?;
-    serde_json::from_slice(&bytes).map_err(|err| ModelError::Unavailable(err.to_string()))
-}
-
-fn status_error(status: u16, body: String) -> ModelError {
+fn status_error(status: u16) -> ModelError {
     match status {
-        401 | 403 => ModelError::Auth(body),
-        402 => ModelError::BudgetExhausted(body),
-        408 | 504 => ModelError::Timeout(body),
-        429 => ModelError::RateLimited(body),
-        500..=599 => ModelError::Unavailable(body),
-        _ => ModelError::Provider(format!("status={status}: {body}")),
+        401 | 403 => ModelError::Auth(DiagnosticCode::AuthenticationRejected),
+        402 => ModelError::BudgetExhausted(DiagnosticCode::HttpBudgetExhausted),
+        408 | 504 => ModelError::Timeout(DiagnosticCode::HttpTimeout),
+        429 => ModelError::RateLimited(DiagnosticCode::HttpRateLimited),
+        500..=599 => ModelError::Unavailable(DiagnosticCode::HttpUnavailable),
+        _ => ModelError::Provider(DiagnosticCode::HttpFailure),
     }
 }
 
@@ -3417,18 +3436,131 @@ mod tests {
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
 
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn regression_cooldown_wait_rereads_after_waking() {
+        let queue = std::sync::Arc::new(symbiotic_queue::MemoryQueue::new());
+        let queue_id = QueueId::new("extended-cooldown");
+        queue
+            .note_cooldown(&queue_id, Utc::now() + ChronoDuration::milliseconds(100))
+            .await
+            .unwrap();
+        let waiter = wait_for_model_cooldown(queue.as_ref(), &queue_id);
+        tokio::pin!(waiter);
+        // Poll through the initial read so the extension occurs while sleeping.
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        let extended = Utc::now() + ChronoDuration::milliseconds(250);
+        queue.note_cooldown(&queue_id, extended).await.unwrap();
+        waiter.await.unwrap();
+        assert!(Utc::now() >= extended);
+    }
+
+    #[test]
+    fn failed_http_client_construction_refuses_chat_and_embedding_configuration() {
+        let mut chat = OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "")
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        let mut embedding = GeminiEmbeddingProvider::new("op", "model", "", 2)
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        chat.client = HttpClient(Err(()));
+        embedding.client = HttpClient(Err(()));
+        for provider in [&chat as &dyn ModelProvider, &embedding] {
+            assert!(matches!(
+                provider.validate_configuration(),
+                Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::InvalidHttpClientConfiguration
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn gemini_single_vectors_require_exact_configured_dimensions() {
+        for length in [0, 1, 2, 4] {
+            let raw: GeminiEmbedWireResponse = serde_json::from_value(
+                serde_json::json!({"embedding": {"values": vec![0.5; length]}}),
+            )
+            .unwrap();
+            assert!(matches!(
+                raw.embedding.unwrap().into_values(3),
+                Err(ModelError::Provider(_))
+            ));
+        }
+        assert_eq!(
+            GeminiEmbedding {
+                values: vec![0.5; 3]
+            }
+            .into_values(3)
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+    #[test]
+    fn gemini_batch_checks_each_vectors_exact_length() {
+        for length in [0, 1, 2, 4] {
+            let raw: GeminiBatchEmbedWireResponse = serde_json::from_value(serde_json::json!({"embeddings": [{"values": [0.1, 0.2, 0.3]}, {"values": vec![0.5; length]}]})).unwrap();
+            let result: Result<Vec<_>, _> = raw
+                .embeddings
+                .unwrap()
+                .into_iter()
+                .map(|embedding| embedding.into_values(3))
+                .collect();
+            assert!(matches!(result, Err(ModelError::Provider(_))));
+        }
+    }
+    #[tokio::test]
+    async fn gemini_request_options_are_refused_even_for_empty_batches() {
+        let provider = GeminiEmbeddingProvider::new("gemini", "synthetic", "", 3)
+            .with_request_limit(1024)
+            .with_response_limit(1024);
+        let base = EmbeddingRequest {
+            inputs: vec![],
+            dimensions: None,
+            task: None,
+            sensitivity: Sensitivity::Shareable,
+            role_binding: None,
+            source: None,
+            metadata: Value::Null,
+        };
+        for dimensions in [Some(0), Some(2), Some(4)] {
+            let mut request = base.clone();
+            request.dimensions = dimensions;
+            assert!(matches!(
+                provider.embed(request).await,
+                Err(ModelError::InvalidRequest(_))
+            ));
+        }
+        let mut request = base.clone();
+        request.task = Some("retrieval_document".into());
+        assert!(matches!(
+            provider.embed(request).await,
+            Err(ModelError::InvalidRequest(_))
+        ));
+        let mut request = base;
+        request.dimensions = Some(3);
+        let result = provider.embed(request).await.unwrap();
+        assert_eq!(result.dimensions, 3);
+        assert!(result.vectors.is_empty());
+    }
+
     #[test]
     fn gemini_single_embedding_rejects_non_finite_components() {
         for number in ["1e39", "-1e39"] {
             let raw: GeminiEmbedWireResponse =
                 serde_json::from_str(&format!(r#"{{"embedding":{{"values":[0.25,{number}]}}}}"#))
                     .unwrap();
-            assert!(matches!(raw.embedding.unwrap().into_values(),
-                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+            assert!(matches!(
+                raw.embedding.unwrap().into_values(2),
+                Err(ModelError::Provider(
+                    symbiotic_core::DiagnosticCode::GeminiEmbeddingContainsNonFiniteComponents
+                ))
+            ));
         }
         let raw: GeminiEmbedWireResponse =
             serde_json::from_str(r#"{"embedding":{"values":[0.25,-0.5,3e38]}}"#).unwrap();
-        let values = raw.embedding.unwrap().into_values().unwrap();
+        let values = raw.embedding.unwrap().into_values(3).unwrap();
         assert_eq!(values.len(), 3);
         assert!(values.iter().all(|value| value.is_finite()));
     }
@@ -3444,10 +3576,14 @@ mod tests {
                 .embeddings
                 .unwrap()
                 .into_iter()
-                .map(GeminiEmbedding::into_values)
+                .map(|embedding| embedding.into_values(2))
                 .collect();
-            assert!(matches!(result,
-                Err(ModelError::Provider(message)) if message == "Gemini embedding contains non-finite components"));
+            assert!(matches!(
+                result,
+                Err(ModelError::Provider(
+                    symbiotic_core::DiagnosticCode::GeminiEmbeddingContainsNonFiniteComponents
+                ))
+            ));
         }
         let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(
             r#"{"embeddings":[{"values":[0.25,0.5]},{"values":[-0.5,3e38]}]}"#,
@@ -3457,7 +3593,7 @@ mod tests {
             .embeddings
             .unwrap()
             .into_iter()
-            .map(GeminiEmbedding::into_values)
+            .map(|embedding| embedding.into_values(2))
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(vectors.len(), 2);
@@ -3468,107 +3604,6 @@ mod tests {
     static TEST_QUEUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
     #[cfg(feature = "queue")]
     use symbiotic_trace::InMemoryTraceSink;
-
-    #[test]
-    fn current_deepseek_flash_name_preserves_shared_parallel_defaults() {
-        let current =
-            default_model_queue_config(&ModelIdentity::new("chat", "deepseek", "deepseek-flash"))
-                .expect("current Flash name must resolve shared queue settings");
-        let legacy = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        assert_eq!(current.max_in_flight, 2_000);
-        assert_eq!(
-            serde_json::to_value(current).unwrap(),
-            serde_json::to_value(legacy).unwrap()
-        );
-    }
-
-    #[test]
-    fn known_model_queue_defaults_live_in_catalog() {
-        let flash = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        let gemini = default_model_queue_config(&ModelIdentity::new(
-            "embedding",
-            "gemini",
-            "gemini-embedding-2",
-        ))
-        .unwrap();
-        let gemini_flash =
-            default_model_queue_config(&ModelIdentity::new("chat", "gemini", "gemini-3.5-flash"))
-                .unwrap();
-        let gemini_pro = default_model_queue_config(&ModelIdentity::new(
-            "chat",
-            "gemini",
-            "gemini-3.1-pro-preview",
-        ))
-        .unwrap();
-
-        assert_eq!(flash.max_in_flight, 2_000);
-        assert_eq!(flash.request_timeout_seconds, Some(600));
-        assert_eq!(gemini.max_in_flight, 1_000);
-        assert_eq!(gemini.requests_per_minute, Some(4_500));
-        assert_eq!(gemini.input_units_per_minute, Some(5_000_000));
-        let qwen_embedding = default_model_queue_config(&ModelIdentity::new(
-            "embedding",
-            "openrouter",
-            "qwen/qwen3-embedding-8b",
-        ))
-        .unwrap();
-        assert_eq!(qwen_embedding.max_in_flight, 2_000);
-        assert_eq!(qwen_embedding.requests_per_minute, None);
-        assert_eq!(gemini_flash.max_in_flight, 100);
-        assert_eq!(gemini_flash.requests_per_minute, Some(1_000));
-        assert_eq!(gemini_pro.max_in_flight, 500);
-        assert_eq!(gemini_pro.requests_per_minute, Some(100));
-    }
-
-    #[test]
-    fn known_model_capabilities_live_in_catalog() {
-        let flash = default_model_capabilities(&ModelIdentity::new(
-            "chat",
-            "deepseek",
-            "deepseek-v4-flash",
-        ))
-        .unwrap();
-        assert_eq!(flash.context_window, Some(128_000));
-        assert!(flash.tool_use);
-        assert!(flash.structured_output);
-        assert_eq!(flash.reasoning_tier, ReasoningTier::Standard);
-        assert_eq!(flash.cost_class, CostClass::Budget);
-
-        // Unknown models return None from the catalog; the descriptor method
-        // falls back to the conservative default profile.
-        let unknown = ModelIdentity::new("chat", "acme", "unknown-model");
-        assert!(default_model_capabilities(&unknown).is_none());
-        let descriptor = ProviderDescriptor {
-            identity: unknown,
-            provider_class: ProviderClass::Cloud,
-            capabilities: vec![ModelCapability::Chat],
-            auth_mode: ProviderAuthMode::None,
-            metadata: serde_json::json!({}),
-        };
-        assert_eq!(
-            descriptor.model_capabilities(),
-            ModelCapabilities::default()
-        );
-        assert_eq!(
-            ModelCapabilities::default().reasoning_tier,
-            ReasoningTier::None
-        );
-        assert_eq!(ModelCapabilities::default().cost_class, CostClass::Standard);
-
-        // Additive serde: a profile persisted before new fields existed still loads.
-        let sparse: ModelCapabilities = serde_json::from_str("{}").unwrap();
-        assert_eq!(sparse, ModelCapabilities::default());
-    }
 
     #[cfg(feature = "queue")]
     #[test]
@@ -3583,18 +3618,8 @@ mod tests {
             metadata: Value::Null,
         };
 
-        assert_eq!(request.input_budget_units(), 3);
+        assert_eq!(request.input_budget_units().unwrap(), 3);
         assert_eq!(estimate_token_budget_units([""]), 1);
-    }
-
-    #[test]
-    fn local_ollama_queue_defaults_are_conservative() {
-        let config =
-            default_model_queue_config(&ModelIdentity::new("chat", "ollama", "qwen-local"))
-                .unwrap();
-
-        assert_eq!(config.max_in_flight, 1);
-        assert_eq!(config.retry_attempts, 2);
     }
 
     #[cfg(feature = "queue")]
@@ -3716,7 +3741,9 @@ mod tests {
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                return Err(ModelError::Unavailable("temporary outage".to_string()));
+                return Err(ModelError::Unavailable(
+                    symbiotic_core::DiagnosticCode::HttpUnavailable,
+                ));
             }
             Ok(ChatResponse {
                 text: request
@@ -3780,7 +3807,9 @@ mod tests {
         async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            Err(ModelError::Unavailable("temporary outage".to_string()))
+            Err(ModelError::Unavailable(
+                symbiotic_core::DiagnosticCode::HttpUnavailable,
+            ))
         }
     }
 
@@ -4176,13 +4205,13 @@ mod tests {
 
         assert_eq!(response.text, "same request");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            dir.path()
-                .join("cache")
-                .join("chat")
-                .join(format!("{request_hash}.json"))
-                .is_file()
-        );
+        let scope = std::fs::read_dir(dir.path().join("cache/chat"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(scope.join(format!("{request_hash}.json")).is_file());
     }
 
     #[cfg(feature = "queue")]
@@ -4239,7 +4268,10 @@ mod tests {
 
         let err = provider.chat(chat_request("hello")).await.unwrap_err();
 
-        assert!(err.to_string().contains("exhausted after 2/2"));
+        assert!(matches!(
+            err,
+            ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -4361,16 +4393,17 @@ mod tests {
     #[test]
     fn every_error_class_survives_a_dead_item_and_exhaustion() {
         let errors = [
-            ModelError::Unavailable("x".into()),
-            ModelError::Auth("x".into()),
-            ModelError::RateLimited("x".into()),
-            ModelError::BudgetExhausted("x".into()),
-            ModelError::Timeout("x".into()),
+            ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable),
+            ModelError::Auth(symbiotic_core::DiagnosticCode::AuthenticationRejected),
+            ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
+            ModelError::BudgetExhausted(symbiotic_core::DiagnosticCode::HttpBudgetExhausted),
+            ModelError::Timeout(symbiotic_core::DiagnosticCode::HttpTimeout),
             ModelError::Unsupported(ModelCapability::Rerank),
-            ModelError::InvalidRequest("x".into()),
-            ModelError::Provider("x".into()),
-            ModelError::Queue("x".into()),
-            ModelError::Cache("x".into()),
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration),
+            ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure),
+            ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure),
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure),
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused),
         ];
         let now = Utc::now();
         for err in errors {
@@ -4386,12 +4419,13 @@ mod tests {
                 lease_owner: None,
                 lease_until: None,
                 idempotency_key: None,
-                last_error: Some(err.to_string()),
+                last_error: Some(err.code()),
                 last_error_class: Some(error_class(&err)),
                 created_at: now,
                 updated_at: now,
             };
             let replayed = dead_item_retry_error(&item);
+            assert_eq!(replayed.code(), err.code());
             assert_eq!(
                 std::mem::discriminant(&replayed),
                 std::mem::discriminant(&err),
@@ -4413,6 +4447,15 @@ mod tests {
             {
                 assert_eq!(expected, actual);
             }
+            let mut missing_class = item;
+            missing_class.last_error_class = None;
+            missing_class.last_error = Some(DiagnosticCode::ProviderFailure);
+            assert!(matches!(
+                dead_item_retry_error(&missing_class),
+                ModelError::Queue(
+                    symbiotic_core::DiagnosticCode::TerminalQueueItemIsMissingItsErrorClass
+                )
+            ));
         }
     }
 
@@ -4442,7 +4485,7 @@ mod tests {
     #[cfg(feature = "queue")]
     #[test]
     fn retry_jitter_spreads_same_attempt_failures_deterministically() {
-        let err = ModelError::Unavailable("connect timeout".to_string());
+        let err = ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable);
         let first = QueueItemId("item-a".to_string());
         let second = QueueItemId("item-b".to_string());
         let request_hash = "same-request-shape";
@@ -4479,6 +4522,7 @@ mod tests {
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
 
+        let state = ModelRateState::default();
         let cleared = |check: RateCheck| match check {
             RateCheck::Cleared(grant) => grant.expect("a rate-limited policy returns a grant"),
             RateCheck::Wait(wait) => panic!("budget is available, but asked to wait {wait:?}"),
@@ -4486,18 +4530,19 @@ mod tests {
         // Cleared without a claim: nothing is spent, and the next caller is
         // cleared at once.
         drop(cleared(
-            check_model_budget(&queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
                 .await
                 .unwrap(),
         ));
         cleared(
-            check_model_budget(&queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
                 .await
                 .unwrap(),
         )
-        .charge();
+        .charge()
+        .unwrap();
         // Spent: the next caller waits about a second for the refill.
-        match check_model_budget(&queue_id, &config, &chat_request("second"))
+        match check_model_budget(&state, &queue_id, &config, &chat_request("second"))
             .await
             .unwrap()
         {
@@ -4506,41 +4551,44 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "queue")]
     #[tokio::test]
-    async fn provider_catalog_filters_private_cloud_candidates() {
-        let catalog = ProviderCatalog::new(vec![
-            ProviderDescriptor {
-                identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-pro"),
-                provider_class: ProviderClass::Cloud,
-                capabilities: vec![ModelCapability::Chat],
-                auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({}),
-            },
-            ProviderDescriptor {
-                identity: ModelIdentity::new("chat", "ollama", "local-model"),
-                provider_class: ProviderClass::Local,
-                capabilities: vec![ModelCapability::Chat],
-                auth_mode: ProviderAuthMode::None,
-                metadata: serde_json::json!({}),
-            },
-        ]);
-        let selected = ModelSelector::select(
-            &catalog,
-            SelectionRequest {
-                capability: ModelCapability::Chat,
-                tier: Some(ModelTier::Deep),
-                sensitivity: Sensitivity::Private,
-                role_binding: Some(RoleBinding::new("agent.answer")),
-                source: Some(InvocationSource::new("unit-test")),
-                preferred: None,
-                allowed_classes: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].operator.0, "ollama");
+    async fn poisoned_rate_state_refuses_checks_and_charging() {
+        let policy = ModelQueueConfig {
+            requests_per_minute: Some(60),
+            ..ModelQueueConfig::default()
+        };
+        let request = chat_request("x");
+        let queue = QueueId::new("account");
+        let state = ModelRateState::default();
+        let RateCheck::Cleared(Some(grant)) = check_model_budget(&state, &queue, &policy, &request)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh budget");
+        };
+        let buckets = state.buckets.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = buckets.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(matches!(grant.charge(), Err(ModelError::Queue(_))));
+        assert!(matches!(
+            check_model_budget(&state, &queue, &policy, &request).await,
+            Err(ModelError::Queue(_))
+        ));
+        let state = ModelRateState::default();
+        let gates = state.gates.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = gates.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(matches!(
+            check_model_budget(&state, &queue, &policy, &request).await,
+            Err(ModelError::Queue(_))
+        ));
     }
 
     #[cfg(feature = "queue")]
@@ -4669,3 +4717,6 @@ mod tests {
         assert_eq!(records[1].cache.response_cache, CacheStatus::Hit);
     }
 }
+
+#[cfg(test)]
+mod credential_transport_tests;

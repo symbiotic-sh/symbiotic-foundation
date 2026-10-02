@@ -31,6 +31,8 @@ pub enum QueueStatus {
     Succeeded,
     Failed,
     Dead,
+    /// Explicit terminal refusal; automatic retries and budget renewal are forbidden.
+    Stopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,12 +82,12 @@ pub struct QueueItem {
     pub lease_owner: Option<String>,
     pub lease_until: Option<DateTime<Utc>>,
     pub idempotency_key: Option<String>,
-    pub last_error: Option<String>,
+    pub last_error: Option<symbiotic_core::DiagnosticCode>,
     /// Stable class of `last_error` (for example `rate_limited`), recorded
     /// by [`QueueBackend::fail_with`]; `None` for failures recorded without
     /// one.
     #[serde(default)]
-    pub last_error_class: Option<String>,
+    pub last_error_class: Option<symbiotic_core::FailureClass>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -108,16 +110,22 @@ pub struct QueueEvent {
     pub status: QueueStatus,
     pub attempt: u32,
     pub timestamp: DateTime<Utc>,
-    pub error: Option<String>,
+    pub error: Option<symbiotic_core::DiagnosticCode>,
 }
 
 /// A failed attempt as [`QueueBackend::fail_with`] records it.
+/// Provider or stored text cannot be attached to durable failure records.
+/// ```compile_fail
+/// use symbiotic_queue::Failure;
+/// let key = "synthetic-queue-key";
+/// let failure = Failure { error: format!("invalid key {key}"), error_class: None, run_after: None };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
-    pub error: String,
+    pub error: symbiotic_core::DiagnosticCode,
     /// Stable class of the error, kept on the item as `last_error_class`.
-    pub error_class: Option<String>,
-    /// Earliest time of the next attempt. `None` means one second from now.
+    pub error_class: Option<symbiotic_core::FailureClass>,
+    /// Earliest time of the next attempt. `None` stops the item permanently.
     pub run_after: Option<DateTime<Utc>>,
 }
 
@@ -126,22 +134,38 @@ pub struct Failure {
 pub enum FailOutcome {
     RetryScheduled,
     MovedToDead,
+    /// The failure has no retry deadline and the item is permanently stopped.
+    Stopped,
 }
 
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error("queue item not found: {0}")]
-    NotFound(String),
+    NotFound(symbiotic_core::DiagnosticCode),
     #[error("queue item is not leased by worker: {0}")]
-    LeaseMismatch(String),
+    LeaseMismatch(symbiotic_core::DiagnosticCode),
     #[error("queue item is not running: {0}")]
-    NotRunning(String),
+    NotRunning(symbiotic_core::DiagnosticCode),
     #[error("queue backend unavailable: {0}")]
-    Unavailable(String),
+    Unavailable(symbiotic_core::DiagnosticCode),
     #[error("queue backend rejected request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(symbiotic_core::DiagnosticCode),
     #[error("queue storage failed: {0}")]
-    Storage(String),
+    Storage(symbiotic_core::DiagnosticCode),
+}
+
+impl QueueError {
+    /// Static diagnostic for logs and runtime bookkeeping.
+    pub const fn code(&self) -> symbiotic_core::DiagnosticCode {
+        match self {
+            Self::NotFound(code)
+            | Self::LeaseMismatch(code)
+            | Self::NotRunning(code)
+            | Self::Unavailable(code)
+            | Self::InvalidRequest(code)
+            | Self::Storage(code) => *code,
+        }
+    }
 }
 
 #[async_trait]
@@ -188,26 +212,18 @@ pub trait QueueBackend: Send + Sync {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError>;
-    /// Like [`fail`](Self::fail), with the error's class and an exact retry
-    /// deadline. The default keeps neither: it rounds the deadline up to
-    /// whole seconds and drops the class. Both Foundation backends record
-    /// them exactly.
+    /// Record the error class and exact retry deadline. A failure without a
+    /// deadline must become [`QueueStatus::Stopped`], regardless of attempts
+    /// remaining. Backends must preserve this refusal for duplicate callers.
     async fn fail_with(
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
         failure: Failure,
-    ) -> Result<FailOutcome, QueueError> {
-        let retry_after_seconds = failure.run_after.map(|until| {
-            let millis = (until - Utc::now()).num_milliseconds().max(0) as u64;
-            millis.div_ceil(1_000)
-        });
-        self.fail(item_id, worker_id, &failure.error, retry_after_seconds)
-            .await
-    }
+    ) -> Result<FailOutcome, QueueError>;
     /// Return items whose lease expired to `Failed`, or to `Dead` when that
     /// lease was their last allowed attempt.
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError>;

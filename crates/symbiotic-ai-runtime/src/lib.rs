@@ -11,7 +11,7 @@
 //!     state_dir: Some("/var/lib/host/ai-runtime".into()),
 //!     ..RuntimeConfig::default()
 //! })?;
-//! let chat = runtime.chat(ModelBinding::new(raw_chat))?;
+//! let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(symbiotic_ai_runtime::BindingIdentity::new("tenant", "provider", "1", "account")).with_policy(symbiotic_ai_runtime::ModelQueueConfig::default()))?;
 //! # Ok(()) }
 //! ```
 //!
@@ -31,18 +31,18 @@
 //! cancel it: the call finishes, records its outcome, fills the cache and
 //! releases its queue item, and identical requests get its result.
 //!
-//! Every provider handed out for one model (`queue_id`) shares one
+//! Every provider bound to one configured account shares one
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
-//! or caller uses it. Two bindings of one model must agree on those limits.
+//! or caller uses it. Account bindings must agree on those limits.
 //!
 //! SQLite stays behind runtime/credential-process implementations; provider
 //! and egress contracts do not link it.
 
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+pub use symbiotic_core::{AccountSharingKey, BindingIdentity};
 use symbiotic_core::{QueueId, QueueItemId};
 use symbiotic_model::private_fs;
 use symbiotic_model::{
@@ -67,7 +67,7 @@ pub use symbiotic_model::{
     ClassifyRequest, ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest,
     EmbeddingResponse, InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig,
     ProviderDescriptor, QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus,
-    RerankProvider, RerankRequest, RerankResponse, ResponseCache, default_model_queue_config,
+    RerankProvider, RerankRequest, RerankResponse, ResponseCache,
 };
 
 /// File name of the persistent queue database inside `state_dir`.
@@ -78,6 +78,8 @@ pub const RESPONSES_DIR: &str = "responses";
 /// How the runtime is opened.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    /// Validated deployment registry; no provider is inferred when absent.
+    pub registry: Option<Arc<model::ModelRegistry>>,
     /// Private directory for persistent state. `None` keeps all state in
     /// memory. A missing directory is created owner-only.
     pub state_dir: Option<PathBuf>,
@@ -106,6 +108,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            registry: None,
             state_dir: None,
             worker_id: None,
             trace_sink: None,
@@ -121,28 +124,31 @@ impl Default for RuntimeConfig {
 #[derive(Clone, Default)]
 pub enum ResponseCacheMode {
     /// The runtime's own cache when it is persistent, scoped to the
-    /// provider's descriptor; no cache when it is in memory.
+    /// binding identity and effective transport; no cache when it is in memory.
     #[default]
     Default,
     /// No response cache: every call reaches the provider.
     Off,
-    /// A host cache, for example one that reads a layout that predates the
-    /// runtime. See [`ResponseCache`].
+    /// A host cache. Its hits must carry the runtime's matching result scope.
+    /// See [`ResponseCache`].
     Custom(Arc<dyn ResponseCache>),
 }
 
 /// A raw provider (the transport) plus how the runtime should run it.
 #[derive(Clone)]
 pub struct ModelBinding<P> {
+    /// Raw transport whose effective configuration is checked at binding.
     pub provider: P,
-    /// Queue whose limits and cooldown this binding shares. `None` uses the
-    /// model's own queue (`operation:operator:model`); set it to isolate a
-    /// role from its model's other callers, or to pool several models.
-    pub queue_id: Option<QueueId>,
-    /// Queue policy. `None` uses the catalog default for the provider's
-    /// model ([`default_model_queue_config`]), else [`ModelQueueConfig::default`].
+    /// Required tenant, provider, revision and concrete account.
+    pub identity: Option<BindingIdentity>,
+    /// Explicit quota pool. `None` isolates by tenant and concrete account.
+    /// The same key pools limits across bindings, models and tenants.
+    pub account_sharing_key: Option<AccountSharingKey>,
+    /// Explicit execution policy, or the configured registry account policy.
+    /// Without either, binding is refused.
     /// Its `response_cache_dir` is ignored: use [`ResponseCacheMode`].
     pub policy: Option<ModelQueueConfig>,
+    /// Select the runtime cache, disable caching or supply a custom cache.
     pub response_cache: ResponseCacheMode,
     /// Overrides the runtime's receipt sink for this binding.
     pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
@@ -151,10 +157,12 @@ pub struct ModelBinding<P> {
 }
 
 impl<P> ModelBinding<P> {
+    /// Create an unconfigured binding; supply identity and policy before installation.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
-            queue_id: None,
+            identity: None,
+            account_sharing_key: None,
             policy: None,
             response_cache: ResponseCacheMode::Default,
             receipt_sink: None,
@@ -162,33 +170,44 @@ impl<P> ModelBinding<P> {
         }
     }
 
-    pub fn with_queue_id(mut self, queue_id: QueueId) -> Self {
-        self.queue_id = Some(queue_id);
+    /// Set the tenant, provider principal, configuration revision and account.
+    pub fn with_identity(mut self, identity: BindingIdentity) -> Self {
+        self.identity = Some(identity);
         self
     }
 
+    /// Explicitly pool account limits with bindings using this same key.
+    pub fn with_account_sharing(mut self, key: AccountSharingKey) -> Self {
+        self.account_sharing_key = Some(key);
+        self
+    }
+
+    /// Set the account execution policy; registry bindings must match their configured policy.
     pub fn with_policy(mut self, policy: ModelQueueConfig) -> Self {
         self.policy = Some(policy);
         self
     }
 
+    /// Choose this binding's response cache behavior.
     pub fn with_response_cache(mut self, mode: ResponseCacheMode) -> Self {
         self.response_cache = mode;
         self
     }
 
+    /// Override the runtime receipt sink for this binding.
     pub fn with_receipt_sink(mut self, sink: Arc<dyn QueueReceiptSink>) -> Self {
         self.receipt_sink = Some(sink);
         self
     }
 
+    /// Override the runtime trace sink for this binding.
     pub fn with_trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
         self.trace_sink = Some(sink);
         self
     }
 }
 
-/// The limits every binding of one model shares.
+/// The limits every binding of one concrete account shares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SharedLimits {
     max_in_flight: usize,
@@ -211,12 +230,24 @@ impl SharedLimits {
 struct Inner {
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
+    rate_state: model::ModelRateState,
+    registry: Option<Arc<model::ModelRegistry>>,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
     response_max_age: Option<Duration>,
     worker_id: String,
     trace_sink: Option<Arc<dyn TraceSink>>,
     receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
+}
+
+/// Implemented configured operation. Unsupported operations are refused at registry validation.
+pub enum ConfiguredProvider {
+    /// A configured queued chat adapter.
+    Chat(Arc<dyn ChatProvider>),
+    /// A configured queued embedding adapter.
+    Embedding(Arc<dyn EmbeddingProvider>),
+    /// A configured queued probability classifier.
+    Classifier(Arc<dyn ClassifierProvider>),
 }
 
 /// One stateful AI runtime. Clones share all state.
@@ -243,6 +274,8 @@ impl Runtime {
             inner: Arc::new(Inner {
                 queue,
                 admission: ModelAdmission::new(),
+                rate_state: model::ModelRateState::default(),
+                registry: config.registry,
                 limits: Mutex::new(HashMap::new()),
                 state_dir: config.state_dir,
                 response_max_age: config.response_max_age,
@@ -281,15 +314,142 @@ impl Runtime {
         }
     }
 
+    /// Build a configured adapter after resolving its optional credential inside Foundation.
+    pub async fn configured_provider(
+        &self,
+        tenant: &symbiotic_core::TenantId,
+        principal: &symbiotic_core::ProviderPrincipalId,
+        resolver: &dyn model::CredentialResolver,
+    ) -> Result<ConfiguredProvider, ModelError> {
+        let registry = self.inner.registry.as_ref().ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ModelRegistryIsNotConfigured)
+        })?;
+        let resolved = registry.binding(tenant, principal)?;
+        let config = resolved.binding;
+        let auth_mode =
+            config
+                .secret_ref
+                .as_ref()
+                .map_or(model::ProviderAuthMode::None, |secret_ref| {
+                    model::ProviderAuthMode::ApiKey {
+                        secret_ref: secret_ref.clone(),
+                    }
+                });
+        let auth = if config.secret_ref.is_some() {
+            resolver.resolve_auth(&auth_mode).await?
+        } else {
+            model::ResolvedAuth::None
+        };
+        let key = match auth {
+            model::ResolvedAuth::None if config.secret_ref.is_none() => {
+                model::SecretValue::new(String::new())
+            }
+            model::ResolvedAuth::Bearer(key) | model::ResolvedAuth::ApiKey(key)
+                if !key.is_empty() =>
+            {
+                key
+            }
+            _ => {
+                return Err(ModelError::Auth(
+                    symbiotic_core::DiagnosticCode::ConfiguredCredentialModeIsUnsupportedOrEmpty,
+                ));
+            }
+        };
+        let timeout_seconds = resolved.account.policy.request_timeout_seconds.ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::FiniteTimeoutIsRequired)
+        })?;
+        let limits = &config.limits;
+        let settings = &config.settings;
+        match resolved.model.adapter {
+            model::ModelAdapter::OpenAiChat => {
+                let mut raw = model::OpenAiCompatibleChatProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    &config.endpoint,
+                    key,
+                )
+                .with_timeout(timeout_seconds)?
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes)
+                .with_output_limit(limits.max_output_tokens.ok_or({
+                    ModelError::InvalidRequest(
+                        symbiotic_core::DiagnosticCode::ChatOutputLimitRequired,
+                    )
+                })?)
+                .with_thinking(settings.thinking);
+                if let Some(effort) = &settings.reasoning_effort {
+                    raw = raw.with_reasoning_effort(effort);
+                }
+                Ok(ConfiguredProvider::Chat(
+                    self.chat(self.registry_binding(tenant, principal, raw)?)?,
+                ))
+            }
+            model::ModelAdapter::GeminiEmbedding => {
+                let raw = model::GeminiEmbeddingProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    key,
+                    settings.dimensions.ok_or({
+                        ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::EmbeddingDimensionsRequired,
+                        )
+                    })?,
+                )
+                .with_timeout(timeout_seconds)?
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes);
+                Ok(ConfiguredProvider::Embedding(self.embedding(
+                    self.registry_binding(tenant, principal, raw)?,
+                )?))
+            }
+            model::ModelAdapter::JevClassifier => {
+                let mut raw = model::JevClassifierProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    &config.endpoint,
+                    key,
+                )
+                .with_timeout(timeout_seconds)?
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes);
+                if let Some(served) = &settings.served_model {
+                    raw = raw.with_served_model(served);
+                }
+                Ok(ConfiguredProvider::Classifier(self.classifier(
+                    self.registry_binding(tenant, principal, raw)?,
+                )?))
+            }
+        }
+    }
+
+    /// Resolve identity and account policy for a raw Foundation adapter. `bind` verifies its effective settings.
+    pub fn registry_binding<P>(
+        &self,
+        tenant: &symbiotic_core::TenantId,
+        principal: &symbiotic_core::ProviderPrincipalId,
+        provider: P,
+    ) -> Result<ModelBinding<P>, ModelError> {
+        let registry = self.inner.registry.as_ref().ok_or({
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ModelRegistryIsNotConfigured)
+        })?;
+        let resolved = registry.binding(tenant, principal)?;
+        let mut binding =
+            ModelBinding::new(provider).with_identity(resolved.binding.identity.clone());
+        binding.account_sharing_key = resolved.binding.account_sharing_key.clone();
+        Ok(binding)
+    }
+
     /// A queued chat provider for `binding`.
     pub fn chat<C>(&self, binding: ModelBinding<C>) -> Result<Arc<dyn ChatProvider>, ModelError>
     where
         C: ChatProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedChatProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
-                .with_admission(self.inner.admission.clone());
+                .with_admission(self.inner.admission.clone())
+                .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_chat(provider)))
     }
 
@@ -301,6 +461,7 @@ impl Runtime {
     where
         E: EmbeddingProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider = QueuedEmbeddingProvider::new(
             binding.provider,
@@ -308,7 +469,8 @@ impl Runtime {
             bound.worker_id,
             bound.policy,
         )
-        .with_admission(self.inner.admission.clone());
+        .with_admission(self.inner.admission.clone())
+        .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_embedding(provider)))
     }
 
@@ -317,10 +479,12 @@ impl Runtime {
     where
         R: RerankProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider =
             QueuedRerankProvider::new(binding.provider, bound.queue, bound.worker_id, bound.policy)
-                .with_admission(self.inner.admission.clone());
+                .with_admission(self.inner.admission.clone())
+                .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_rerank(provider)))
     }
 
@@ -332,6 +496,7 @@ impl Runtime {
     where
         P: ClassifierProvider + Clone + 'static,
     {
+        binding.provider.validate_configuration()?;
         let bound = self.bind(binding.provider.descriptor(), &binding)?;
         let provider = QueuedClassifierProvider::new(
             binding.provider,
@@ -339,7 +504,8 @@ impl Runtime {
             bound.worker_id,
             bound.policy,
         )
-        .with_admission(self.inner.admission.clone());
+        .with_admission(self.inner.admission.clone())
+        .with_rate_state(self.inner.rate_state.clone());
         Ok(Arc::new(bound.sinks.apply_classifier(provider)))
     }
 
@@ -350,16 +516,122 @@ impl Runtime {
         descriptor: &ProviderDescriptor,
         binding: &ModelBinding<P>,
     ) -> Result<Bound, ModelError> {
-        let queue_id = binding
-            .queue_id
+        let identity = binding
+            .identity
             .clone()
-            .unwrap_or_else(|| descriptor.queue_id());
-        let mut policy = binding
-            .policy
-            .clone()
-            .or_else(|| default_model_queue_config(&descriptor.identity))
-            .unwrap_or_default();
-        policy.max_in_flight = policy.max_in_flight.max(1);
+            .filter(BindingIdentity::is_valid)
+            .ok_or({
+                ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::BindingIdentityIsRequired,
+                )
+            })?;
+        let account_scope = match &binding.account_sharing_key {
+            Some(key) if !key.0.trim().is_empty() => serde_json::json!({"shared": key}),
+            Some(_) => {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::AccountSharingKeyIsEmpty,
+                ));
+            }
+            None => serde_json::json!({"tenant": identity.tenant, "account": identity.account}),
+        };
+        let queue_id = QueueId::new(format!(
+            "account:{}",
+            model::configuration_revision(&account_scope)?.0
+        ));
+        let mut policy = if let Some(registry) = &self.inner.registry {
+            let resolved = registry.binding(&identity.tenant, &identity.provider)?;
+            if resolved.binding.identity != identity
+                || resolved.model.identity != descriptor.identity
+            {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::BindingDiffersFromConfiguredIdentityModel,
+                ));
+            }
+            if descriptor.capabilities != resolved.model.operations {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::AdapterCapabilitiesDifferFromConfiguredModel,
+                ));
+            }
+            if descriptor
+                .metadata
+                .get("max_request_bytes")
+                .and_then(serde_json::Value::as_u64)
+                != Some(resolved.binding.limits.max_request_bytes as u64)
+                || descriptor
+                    .metadata
+                    .get("max_response_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(resolved.binding.limits.max_response_bytes as u64)
+                || (resolved.model.adapter == model::ModelAdapter::OpenAiChat
+                    && descriptor
+                        .metadata
+                        .get("max_output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        != resolved.binding.limits.max_output_tokens.map(u64::from))
+            {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::AdapterBoundsDifferFromConfiguredBinding,
+                ));
+            }
+            let settings = &resolved.binding.settings;
+            if descriptor
+                .metadata
+                .get("endpoint")
+                .and_then(serde_json::Value::as_str)
+                != Some(resolved.binding.endpoint.as_str())
+                || descriptor
+                    .metadata
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    != settings.thinking.map(|mode| match mode {
+                        model::ThinkingMode::Enabled => "enabled",
+                        model::ThinkingMode::Disabled => "disabled",
+                    })
+                || descriptor
+                    .metadata
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str)
+                    != settings.reasoning_effort.as_deref()
+                || descriptor
+                    .metadata
+                    .get("dimensions")
+                    .and_then(serde_json::Value::as_u64)
+                    != settings.dimensions.map(|n| n as u64)
+                || (resolved.model.adapter == model::ModelAdapter::JevClassifier
+                    && descriptor
+                        .metadata
+                        .get("served_model")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(
+                            settings
+                                .served_model
+                                .as_deref()
+                                .unwrap_or(&resolved.model.identity.model.0),
+                        ))
+                || binding.account_sharing_key != resolved.binding.account_sharing_key
+            {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding,
+                ));
+            }
+            if let Some(policy) = &binding.policy
+                && serde_json::to_value(policy).map_err(|_e| {
+                    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })? != serde_json::to_value(&resolved.account.policy).map_err(|_e| {
+                    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })?
+            {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::BindingOverridesConfiguredAccountPolicy,
+                ));
+            }
+            resolved.account.policy.clone()
+        } else {
+            binding.policy.clone().ok_or({
+                ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::BindingRequiresAnExplicitExecutionPolicyOrConfiguredRegistry)
+            })?
+        };
+        policy.validate()?;
         policy.response_cache_dir = None;
         self.register_limits(&queue_id, &policy)?;
         let cache = match &binding.response_cache {
@@ -367,10 +639,8 @@ impl Runtime {
             ResponseCacheMode::Custom(cache) => Some(cache.clone()),
             ResponseCacheMode::Default => self.inner.state_dir.as_ref().map(|dir| {
                 Arc::new(
-                    DirResponseCache::new(
-                        dir.join(RESPONSES_DIR).join(descriptor_scope(descriptor)),
-                    )
-                    .with_max_age(self.inner.response_max_age),
+                    DirResponseCache::new(dir.join(RESPONSES_DIR))
+                        .with_max_age(self.inner.response_max_age),
                 ) as Arc<dyn ResponseCache>
             }),
         };
@@ -380,6 +650,7 @@ impl Runtime {
             policy,
             sinks: Sinks {
                 queue_id,
+                identity,
                 trace: binding
                     .trace_sink
                     .clone()
@@ -399,16 +670,13 @@ impl Runtime {
         policy: &ModelQueueConfig,
     ) -> Result<(), ModelError> {
         let limits = SharedLimits::of(policy);
-        let mut registered = self
-            .inner
-            .limits
-            .lock()
-            .map_err(|_| ModelError::Queue("runtime policy lock poisoned".to_string()))?;
+        let mut registered = self.inner.limits.lock().map_err(|_| {
+            ModelError::Queue(symbiotic_core::DiagnosticCode::RuntimePolicyLockPoisoned)
+        })?;
         match registered.get(&queue_id.0) {
-            Some(existing) if *existing != limits => Err(ModelError::InvalidRequest(format!(
-                "{} is already bound with limits {existing:?}; a binding asked for {limits:?}",
-                queue_id.0
-            ))),
+            Some(existing) if *existing != limits => Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            )),
             Some(_) => Ok(()),
             None => {
                 self.inner
@@ -430,6 +698,7 @@ struct Bound {
 
 struct Sinks {
     queue_id: QueueId,
+    identity: BindingIdentity,
     trace: Option<Arc<dyn TraceSink>>,
     receipt: Option<Arc<dyn QueueReceiptSink>>,
     cache: Option<Arc<dyn ResponseCache>>,
@@ -438,7 +707,9 @@ struct Sinks {
 macro_rules! apply_sinks {
     ($name:ident, $ty:ident) => {
         fn $name<P>(self, mut provider: $ty<P>) -> $ty<P> {
-            provider = provider.with_queue_id(self.queue_id);
+            provider = provider
+                .with_queue_id(self.queue_id)
+                .with_binding_identity(self.identity);
             if let Some(sink) = self.trace {
                 provider = provider.with_trace_sink(sink);
             }
@@ -458,14 +729,6 @@ impl Sinks {
     apply_sinks!(apply_embedding, QueuedEmbeddingProvider);
     apply_sinks!(apply_rerank, QueuedRerankProvider);
     apply_sinks!(apply_classifier, QueuedClassifierProvider);
-}
-
-/// Cache subdirectory of one provider: a hash of its descriptor (identity,
-/// class, auth mode, metadata), so two models never read each other's
-/// responses.
-fn descriptor_scope(descriptor: &ProviderDescriptor) -> String {
-    let bytes = serde_json::to_vec(descriptor).unwrap_or_default();
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn open_persistent_queue(
@@ -495,7 +758,8 @@ fn open_persistent_queue(
             private_fs::ensure_owned_file(&sidecar).map_err(|err| io_error(&sidecar, err))?;
         }
     }
-    let queue = SqliteQueue::open(&path).map_err(|err| ModelError::Queue(err.to_string()))?;
+    let queue = SqliteQueue::open(&path)
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
     let queue = MaintainedQueue::new(
         queue,
         config.retention,
@@ -509,6 +773,6 @@ fn open_persistent_queue(
     Ok(queue)
 }
 
-fn io_error(path: &Path, err: std::io::Error) -> ModelError {
-    ModelError::Queue(format!("runtime state {}: {err}", path.display()))
+fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {
+    ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
 }

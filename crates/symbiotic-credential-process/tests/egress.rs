@@ -115,6 +115,8 @@ impl Fixture {
             io_timeout_seconds: 2,
             routes: vec![RouteConfig {
                 tenant: "tenant".into(),
+                account: "account".into(),
+                account_sharing_key: None,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -1171,6 +1173,8 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     for field in ["concurrency", "requests", "input"] {
         let mut config = fixture.config.clone();
+        config.routes[0].account_sharing_key =
+            Some(symbiotic_ai_runtime::AccountSharingKey::new("shared"));
         let mut second = config.routes[0].clone();
         second.route = "second-route".into();
         second.tenant = "other-tenant".into();
@@ -1180,10 +1184,12 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
             _ => second.input_units_per_minute = Some(1000),
         }
         config.routes.push(second);
-        assert!(matches!(
-            CredentialProcess::open(config),
-            Err(EgressError::InvalidRequest)
-        ));
+        let opened = CredentialProcess::open(config);
+        assert!(
+            matches!(&opened, Err(EgressError::InvalidRequest)),
+            "{field}: unexpected startup result {:?}",
+            opened.err()
+        );
     }
     let mut config = fixture.config.clone();
     let mut second = config.routes[0].clone();
@@ -1191,6 +1197,98 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
     config.routes.push(second);
     assert!(CredentialProcess::open(config).is_ok());
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn conflicting_shared_route_limits_are_validated_before_state_in_every_order() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process();
+    let unopened = fixture.dir.path().join("unopened-state");
+    let blocked = fixture.dir.path().join("state-is-a-file");
+    std::fs::write(&blocked, b"untouched").unwrap();
+
+    // Exhaust all 24 permutations of four routes, including two unrelated
+    // account groups that must not hide the conflicting pair.
+    let mut orders = vec![Vec::new()];
+    for index in 0..4 {
+        orders = orders
+            .into_iter()
+            .flat_map(|order| {
+                (0..=order.len()).map(move |position| {
+                    let mut next = order.clone();
+                    next.insert(position, index);
+                    next
+                })
+            })
+            .collect();
+    }
+    assert_eq!(orders.len(), 24);
+    for explicitly_shared in [false, true] {
+        for field in ["concurrency", "requests", "input"] {
+            // Cover both unrestricted-versus-paced and two distinct paced limits.
+            for already_paced in [false, true] {
+                let mut first = fixture.config.routes[0].clone();
+                if explicitly_shared {
+                    first.account_sharing_key =
+                        Some(symbiotic_ai_runtime::AccountSharingKey::new("shared"));
+                }
+                if already_paced {
+                    first.requests_per_minute = Some(30);
+                    first.input_units_per_minute = Some(500);
+                }
+                let mut second = first.clone();
+                second.route = "conflicting-route".into();
+                if explicitly_shared {
+                    second.tenant = "other-tenant".into();
+                    second.account = "other-account".into();
+                }
+                match field {
+                    "concurrency" => second.max_in_flight += 1,
+                    "requests" => second.requests_per_minute = Some(60),
+                    _ => second.input_units_per_minute = Some(1000),
+                }
+                let mut independent = first.clone();
+                independent.route = "independent-route".into();
+                independent.account = "independent-account".into();
+                independent.account_sharing_key = None;
+                let mut other_pool = first.clone();
+                other_pool.route = "other-pool-route".into();
+                other_pool.account_sharing_key =
+                    Some(symbiotic_ai_runtime::AccountSharingKey::new("other-pool"));
+                let routes = [first, second, independent, other_pool];
+                for order in &orders {
+                    // Rebuilding the registry also varies its HashMaps' random seeds.
+                    for state_dir in [&fixture.config.state_dir, &unopened, &blocked] {
+                        let mut config = fixture.config.clone();
+                        config.routes = order.iter().map(|&i| routes[i].clone()).collect();
+                        config.state_dir = state_dir.clone();
+                        let opened = CredentialProcess::open(config);
+                        assert!(
+                            matches!(&opened, Err(EgressError::InvalidRequest)),
+                            "{field}, shared={explicitly_shared}, paced={already_paced}, \
+                             order={order:?}, state={state_dir:?}: {:?}",
+                            opened.err()
+                        );
+                        assert!(!unopened.exists(), "invalid routes created state");
+                        assert_eq!(std::fs::read(&blocked).unwrap(), b"untouched");
+                    }
+                }
+            }
+        }
+    }
+    // Valid configuration still reports actual lock/IO failures as state errors.
+    assert!(matches!(
+        CredentialProcess::open(fixture.config.clone()),
+        Err(EgressError::StateUnavailable)
+    ));
+    let mut config = fixture.config.clone();
+    config.state_dir = blocked;
+    assert!(matches!(
+        CredentialProcess::open(config),
+        Err(EgressError::StateUnavailable)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    drop(process);
 }
 
 #[tokio::test]
@@ -1551,4 +1649,17 @@ async fn recovery_disconnected_peer_does_not_stop_socket_server() {
     );
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn independent_tenant_routes_accept_different_account_policies() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let mut config = fixture.config.clone();
+    let mut second = config.routes[0].clone();
+    second.tenant = "other-tenant".into();
+    second.max_in_flight = 1;
+    second.requests_per_minute = Some(60);
+    config.routes.push(second);
+    assert!(CredentialProcess::open(config).is_ok());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }

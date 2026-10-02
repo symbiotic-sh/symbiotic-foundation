@@ -42,8 +42,11 @@ macro_rules! queue_backend_conformance {
             expired_lease_cannot_complete_and_is_reclaimed,
             an_expired_final_attempt_is_dead_not_claimable,
             fail_with_records_the_class_and_the_exact_deadline,
+            failure_without_retry_deadline_stops_with_attempts_remaining,
             enqueue_replacing_supersedes_only_the_current_item,
             cooldown_only_moves_forward,
+            regression_claims_observe_extended_cooldowns,
+            regression_unrepresentable_leases_are_refused,
             unknown_item_is_absent,
         );
     };
@@ -307,7 +310,12 @@ pub async fn lease_owner_and_running_state_are_enforced(queue: Arc<dyn QueueBack
     let err = queue.complete(&item.item_id, "other").await.unwrap_err();
     assert!(matches!(err, QueueError::LeaseMismatch(_)), "{err:?}");
     let err = queue
-        .fail(&item.item_id, "other", "boom", Some(0))
+        .fail(
+            &item.item_id,
+            "other",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, QueueError::LeaseMismatch(_)), "{err:?}");
@@ -345,13 +353,21 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
     let item = queue.enqueue(request("retry")).await.unwrap().item;
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     let outcome = queue
-        .fail(&item.item_id, "worker", "temporary", Some(0))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(failed.status, QueueStatus::Failed);
-    assert_eq!(failed.last_error.as_deref(), Some("temporary"));
+    assert_eq!(
+        failed.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
     assert!(failed.lease_owner.is_none() && failed.lease_until.is_none());
     // A failed item is still active for deduplication.
     let duplicate = queue.enqueue(request("retry")).await.unwrap();
@@ -359,21 +375,34 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
 
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     let outcome = queue
-        .fail(&item.item_id, "worker", "still failing", Some(0))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, FailOutcome::MovedToDead);
     let dead = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(dead.status, QueueStatus::Dead);
     assert_eq!(dead.attempt, 2);
-    assert_eq!(dead.last_error.as_deref(), Some("still failing"));
+    assert_eq!(
+        dead.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
     let terminal = queue.enqueue(request("retry")).await.unwrap();
     assert_eq!(terminal.disposition, EnqueueDisposition::TerminalDuplicate);
 
     let recovered = queue.enqueue(request("recovered")).await.unwrap().item;
     claim_one(queue.as_ref(), &recovered.item_id, 60).await;
     queue
-        .fail(&recovered.item_id, "worker", "blip", Some(0))
+        .fail(
+            &recovered.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(0),
+        )
         .await
         .unwrap();
     claim_one(queue.as_ref(), &recovered.item_id, 60).await;
@@ -388,7 +417,12 @@ pub async fn fail_schedules_the_retry_delay(queue: Arc<dyn QueueBackend>) {
     let item = queue.enqueue(request("delayed")).await.unwrap().item;
     claim_one(queue.as_ref(), &item.item_id, 60).await;
     queue
-        .fail(&item.item_id, "worker", "slow down", Some(3_600))
+        .fail(
+            &item.item_id,
+            "worker",
+            symbiotic_core::DiagnosticCode::QueueFailure,
+            Some(3_600),
+        )
         .await
         .unwrap();
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
@@ -427,7 +461,10 @@ pub async fn expired_lease_cannot_complete_and_is_reclaimed(queue: Arc<dyn Queue
     assert_eq!(queue.reclaim_expired_leases(&queue_id()).await.unwrap(), 0);
     let reclaimed = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(reclaimed.status, QueueStatus::Failed);
-    assert_eq!(reclaimed.last_error.as_deref(), Some("lease expired"));
+    assert_eq!(
+        reclaimed.last_error,
+        Some(symbiotic_core::DiagnosticCode::LeaseExpired)
+    );
     assert!(reclaimed.lease_owner.is_none() && reclaimed.lease_until.is_none());
 
     // Another worker can take it over; the attempt counter keeps counting.
@@ -509,8 +546,8 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
             &item.item_id,
             "worker",
             Failure {
-                error: "slow down".to_string(),
-                error_class: Some("rate_limited".to_string()),
+                error: symbiotic_core::DiagnosticCode::QueueFailure,
+                error_class: Some(symbiotic_core::FailureClass::RateLimited),
                 run_after: Some(deadline),
             },
         )
@@ -518,8 +555,14 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
         .unwrap();
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
-    assert_eq!(failed.last_error.as_deref(), Some("slow down"));
-    assert_eq!(failed.last_error_class.as_deref(), Some("rate_limited"));
+    assert_eq!(
+        failed.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    assert_eq!(
+        failed.last_error_class,
+        Some(symbiotic_core::FailureClass::RateLimited)
+    );
     assert!(
         (failed.run_after - deadline).num_milliseconds().abs() < 5,
         "{} vs {deadline}",
@@ -596,4 +639,117 @@ pub async fn enqueue_replacing_supersedes_only_the_current_item(queue: Arc<dyn Q
     }
     assert_eq!(inserted, 1);
     assert_eq!(ids.len(), 1, "both callers end on the same replacement");
+}
+
+/// A terminal refusal must never reenter the claimable work set.
+pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
+    queue: Arc<dyn QueueBackend>,
+) {
+    let item = queue.enqueue(request("stopped")).await.unwrap().item;
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    let outcome = queue
+        .fail_with(
+            &item.item_id,
+            "worker",
+            Failure {
+                error: symbiotic_core::DiagnosticCode::QueueFailure,
+                error_class: Some(symbiotic_core::FailureClass::Queue),
+                run_after: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, FailOutcome::Stopped);
+    let stopped = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(stopped.status, QueueStatus::Stopped);
+    assert!(stopped.attempt < stopped.max_attempts);
+    assert!(
+        queue
+            .claim_item(&item.item_id, "other", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queue
+            .claim(claim("other", 1, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(queue.reclaim_expired_leases(&queue_id()).await.unwrap(), 0);
+    let duplicate = queue.enqueue(request("stopped")).await.unwrap();
+    assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
+    assert_eq!(duplicate.item.item_id, item.item_id);
+    assert_eq!(
+        duplicate.item.last_error_class,
+        Some(symbiotic_core::FailureClass::Queue)
+    );
+}
+
+/// A cooldown extension accepted before a claim must keep both claim APIs pending.
+pub async fn regression_claims_observe_extended_cooldowns(queue: Arc<dyn QueueBackend>) {
+    let item = queue.enqueue(request("cooldown-claim")).await.unwrap().item;
+    let now = Utc::now();
+    queue
+        .note_cooldown(&queue_id(), now - ChronoDuration::seconds(1))
+        .await
+        .unwrap();
+    assert!(queue.cooldown_until(&queue_id()).await.unwrap().unwrap() < Utc::now());
+    // Simulate the extension between a caller's final read and claim acceptance.
+    queue
+        .note_cooldown(&queue_id(), now + ChronoDuration::seconds(60))
+        .await
+        .unwrap();
+    assert!(
+        queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queue
+            .claim(claim("worker", 1, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let item = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(item.status, QueueStatus::Pending);
+    assert_eq!(item.attempt, 0);
+}
+
+/// Invalid leases must fail without spending an attempt or poisoning the backend.
+pub async fn regression_unrepresentable_leases_are_refused(queue: Arc<dyn QueueBackend>) {
+    let item = queue.enqueue(request("invalid-lease")).await.unwrap().item;
+    for seconds in [u64::MAX, i64::MAX as u64 / 1000] {
+        assert!(matches!(
+            queue
+                .claim_item(&item.item_id, "worker", seconds, None)
+                .await,
+            Err(QueueError::InvalidRequest(_))
+        ));
+        let mut request = claim("worker", 1, None);
+        request.lease_seconds = seconds;
+        assert!(matches!(
+            queue.claim(request).await,
+            Err(QueueError::InvalidRequest(_))
+        ));
+    }
+    assert_eq!(
+        queue
+            .get_item(&item.item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        0
+    );
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    assert!(matches!(
+        queue.heartbeat(&item.item_id, "worker", u64::MAX).await,
+        Err(QueueError::InvalidRequest(_))
+    ));
+    queue.heartbeat(&item.item_id, "worker", 60).await.unwrap();
 }

@@ -228,16 +228,22 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 
 `ProcessConfig` version 2 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
-Each route requires all `RouteConfig` fields documented in the Rust type, including
+Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
+isolation, or explicitly pools execution across routes or tenants. Shared bindings
+must agree on account limits. Each route requires all `RouteConfig` fields documented in the Rust type, including
 finite field/input/response/token/concurrency/timeout settings. These are configured
 limits, not measured capacity; their labels and qualification follow
 [boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every
-route with the runtime and refuses conflicting concurrency or pacing limits for a
-shared model queue, including routes in different tenants. When those limits agree,
-the current backend pools those tenants' rate buckets and cooldowns. This is the
-accidental sharing forbidden by the
-[boundary contract](boundary.md#tenant-provider-bindings-and-data-access), not the
-target configuration; explicit tenant/account isolation remains implementation work.
+route with the runtime. Concurrency, rate buckets and cooldowns are grouped by
+`(tenant, account)` when `account_sharing_key` is null; matching model routes in
+independent tenant accounts remain isolated. The same non-null sharing key
+explicitly pools execution limits across routes, models and tenants. Bindings
+in one group must agree on concurrency and pacing limits or startup is refused.
+Route and registry validation runs before creating state, acquiring the process
+lock, loading the admission key or opening the runtime. Configuration conflicts
+return `InvalidRequest`; actual state/IO failures return `StateUnavailable`.
+Dropping the last process handle explicitly releases its lock so descriptors
+inherited by concurrently spawned children cannot delay a subsequent reopen.
 Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.
@@ -271,10 +277,21 @@ provider encoder runs before permit consumption/secret loading and at transmissi
 the adapters send its resulting bytes without re-serializing them. Oversized admission
 returns `LimitExceeded` without consuming the permit.
 
-The safe provider wrapper rejects a response containing the injected credential in
-any declared representation: exact bytes, JSON-escaped UTF-8, percent-encoded UTF-8
-(upper/lower hex), standard Base64 and URL-safe Base64 (padded/unpadded). It scans string
-values before forwarding and discards raw errors before the runtime can log them.
+The shared adapter-result boundary (`secrets::credential_boundary` in
+`symbiotic-model`) wraps every credential-bearing HTTP adapter's complete result,
+including typed decoding and answer validation, before runtime bookkeeping.
+Queued calls also require the credential owner's opaque guard before any result
+writes; raw adapters and chat-backed classification use that same boundary.
+Injected credential-bearing adapters without a Foundation-owned guard are refused.
+On
+success it refuses credential echoes in raw JSON and typed output: exact bytes,
+JSON-escaped UTF-8, numeric re-spellings (including `arbitrary_precision` numbers),
+percent-encoded UTF-8 (upper/lower hex), standard Base64 and URL-safe Base64
+(padded/unpadded). It discards raw provider JSON after checking it. On failure it
+preserves typed error classes with static messages, so provider text never reaches
+receipts, traces, queue storage or the response cache. All adapter clients are
+Foundation-owned, disable redirects and HTTP retries, and ignore ambient proxies;
+public client injection is unavailable.
 The shared Gemini adapter rejects non-finite embedding components in single and
 batch responses with a static provider failure; dispatch retains an unknown charge.
 Other transformations are outside that finite guarantee. Persistent response caching,

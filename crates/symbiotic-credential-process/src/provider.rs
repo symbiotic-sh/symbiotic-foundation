@@ -1,4 +1,4 @@
-//! Sanitize inside the raw provider, before runtime receipts/logging see any result.
+//! Track dispatch and project sanitized model output into credential-process replies.
 use crate::{RouteConfig, RouteProvider, secrets::Secret};
 use async_trait::async_trait;
 use std::sync::{
@@ -6,95 +6,67 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use symbiotic_ai_runtime::{
-    model::{GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
+    model::{CredentialBoundary, GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
     *,
 };
 use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, ProviderPayload};
 use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 
 #[derive(Clone)]
-struct SafeChat {
+struct DispatchedChat {
     inner: OpenAiCompatibleChatProvider,
-    secret: Arc<Secret>,
     started: Arc<AtomicBool>,
 }
 #[derive(Clone)]
-struct SafeEmbedding {
+struct DispatchedEmbedding {
     inner: GeminiEmbeddingProvider,
-    secret: Arc<Secret>,
     started: Arc<AtomicBool>,
 }
 
-fn safe_error(error: ModelError) -> ModelError {
-    // Preserve useful error classes without retaining any provider-controlled bytes.
-    let safe = "credential-process provider failure".to_owned();
-    match error {
-        ModelError::Auth(_) => ModelError::Auth(safe),
-        ModelError::RateLimited(_) => ModelError::RateLimited(safe),
-        ModelError::BudgetExhausted(_) => ModelError::BudgetExhausted(safe),
-        ModelError::Timeout(_) => ModelError::Timeout(safe),
-        ModelError::Unavailable(_) => ModelError::Unavailable(safe),
-        _ => ModelError::Provider(safe),
-    }
-}
-
-fn check_response(value: &impl serde::Serialize, secret: &Secret) -> Result<(), ModelError> {
-    fn contains(value: &serde_json::Value, secret: &Secret) -> bool {
-        match value {
-            serde_json::Value::String(text) => secret.contains(text.as_bytes()),
-            serde_json::Value::Array(values) => values.iter().any(|value| contains(value, secret)),
-            serde_json::Value::Object(values) => values
-                .iter()
-                .any(|(key, value)| secret.contains(key.as_bytes()) || contains(value, secret)),
-            _ => false,
-        }
-    }
-    let value = serde_json::to_value(value)
-        .map_err(|_| ModelError::Provider("invalid provider response".into()))?;
-    let wire = serde_json::to_vec(&value)
-        .map_err(|_| ModelError::Provider("invalid provider response".into()))?;
-    if contains(&value, secret) || secret.contains(&wire) {
-        return Err(ModelError::Provider(
-            "credential-bearing provider response refused".into(),
-        ));
-    }
-    Ok(())
-}
-
-impl ModelProvider for SafeChat {
+impl ModelProvider for DispatchedChat {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
+    }
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
     }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
+    }
 }
-impl ModelProvider for SafeEmbedding {
+impl ModelProvider for DispatchedEmbedding {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
+    fn validate_configuration(&self) -> Result<(), ModelError> {
+        self.inner.validate_configuration()
+    }
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
+    }
+
+    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
+        self.inner.credential_boundary()
     }
 }
 #[async_trait]
-impl ChatProvider for SafeChat {
+impl ChatProvider for DispatchedChat {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.chat(request).await.map_err(safe_error)?;
-        check_response(&response, &self.secret)?;
-        response.raw_provider_response = None;
+        let mut response = self.inner.chat(request).await?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
 }
 #[async_trait]
-impl EmbeddingProvider for SafeEmbedding {
+impl EmbeddingProvider for DispatchedEmbedding {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.embed(request).await.map_err(safe_error)?;
-        check_response(&response, &self.secret)?;
-        response.raw_provider_response = None;
+        let mut response = self.inner.embed(request).await?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -117,6 +89,103 @@ impl From<EgressError> for ExecuteError {
     }
 }
 
+fn route_binding<P>(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    provider: P,
+) -> Result<ModelBinding<P>, EgressError> {
+    runtime
+        .registry_binding(
+            &model::TenantId(route.tenant.clone()),
+            &model::ProviderPrincipalId(route.route.clone()),
+            provider,
+        )
+        .map_err(|_| EgressError::InvalidRequest)
+}
+
+/// Compile deployment routes into the same validated registry used by embedded runtimes.
+pub(crate) fn configured_registry(
+    routes: &[RouteConfig],
+) -> Result<model::ModelRegistry, EgressError> {
+    let mut models = std::collections::HashMap::new();
+    let mut accounts = std::collections::HashMap::new();
+    let mut bindings = Vec::new();
+    for route in routes {
+        let (adapter, operator, dimensions) = match &route.provider {
+            RouteProvider::OpenAiChat { operator } => {
+                (model::ModelAdapter::OpenAiChat, operator.as_str(), None)
+            }
+            RouteProvider::GeminiEmbedding { dimensions } => (
+                model::ModelAdapter::GeminiEmbedding,
+                "gemini",
+                Some(*dimensions),
+            ),
+        };
+        let operation = match adapter {
+            model::ModelAdapter::OpenAiChat => "chat",
+            _ => "embedding",
+        };
+        let identity = model::ModelIdentity::new(operation, operator, &route.model);
+        let model_id = model::configuration_revision(&identity)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .0;
+        models.entry(model_id.clone()).or_insert(model::ModelEntry {
+            id: model_id.clone(),
+            aliases: vec![],
+            identity,
+            adapter,
+            operations: vec![adapter.capability()],
+            capabilities: model::ModelCapabilities::default(),
+            pricing_provenance: None,
+        });
+        let policy = queue_policy(route);
+        let policy_id = model::configuration_revision(&policy)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .0;
+        accounts
+            .entry(policy_id.clone())
+            .or_insert(model::AccountExecutionPolicy {
+                id: policy_id.clone(),
+                policy,
+            });
+        bindings.push(model::TenantProviderBinding {
+            identity: BindingIdentity::new(
+                &route.tenant,
+                &route.route,
+                model::configuration_revision(route)
+                    .map_err(|_| EgressError::InvalidRequest)?
+                    .0,
+                &route.account,
+            ),
+            model: model_id,
+            endpoint: route.destination.clone(),
+            secret_ref: Some(route.secret_ref.clone()),
+            account_policy: policy_id,
+            account_sharing_key: route.account_sharing_key.clone(),
+            limits: model::ProviderLimits {
+                max_request_bytes: route.max_input_bytes,
+                max_response_bytes: route.max_response_bytes,
+                max_output_tokens: if adapter == model::ModelAdapter::OpenAiChat {
+                    Some(route.max_output_tokens)
+                } else {
+                    None
+                },
+            },
+            settings: model::TransportSettings {
+                dimensions,
+                ..model::TransportSettings::default()
+            },
+        });
+    }
+    model::ModelRegistry::new(model::RegistryConfig {
+        version: 1,
+        models: models.into_values().collect(),
+        bindings,
+        accounts: accounts.into_values().collect(),
+    })
+    .map_err(|_| EgressError::InvalidRequest)
+}
+
 fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
     // No hidden retry layer may spend a permit twice. Every retry must come back
     // through Memory's admission/barrier with its next ordinal.
@@ -135,25 +204,35 @@ fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
 /// Register all routes against the runtime's actual shared-limit rules without
 /// resolving a provider credential or submitting a request.
 pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result<(), EgressError> {
-    let policy = queue_policy(route);
     match &route.provider {
         RouteProvider::OpenAiChat { operator } => runtime
             .chat(
-                ModelBinding::new(OpenAiCompatibleChatProvider::new(
-                    operator,
-                    &route.model,
-                    &route.destination,
-                    "",
-                ))
-                .with_policy(policy)
+                route_binding(
+                    runtime,
+                    route,
+                    OpenAiCompatibleChatProvider::new(
+                        operator,
+                        &route.model,
+                        &route.destination,
+                        "",
+                    )
+                    .with_request_limit(route.max_input_bytes)
+                    .with_response_limit(route.max_response_bytes)
+                    .with_output_limit(route.max_output_tokens),
+                )?
                 .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
         RouteProvider::GeminiEmbedding { dimensions } => runtime
             .embedding(
-                ModelBinding::new(GeminiEmbeddingProvider::new(&route.model, "", *dimensions))
-                    .with_policy(policy)
-                    .with_response_cache(ResponseCacheMode::Off),
+                route_binding(
+                    runtime,
+                    route,
+                    GeminiEmbeddingProvider::new("gemini", &route.model, "", *dimensions)
+                        .with_request_limit(route.max_input_bytes)
+                        .with_response_limit(route.max_response_bytes),
+                )?
+                .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
     }
@@ -188,15 +267,6 @@ pub(crate) async fn execute(
     payload: ProviderPayload,
     attempt_digest: &str,
 ) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
-    // Ambient proxies must not reroute an admitted destination or receive its secret.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(std::time::Duration::from_secs(route.timeout_seconds))
-        .build()
-        .map_err(|_| EgressError::InvalidRequest)?;
-    let policy = queue_policy(route);
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
         (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(mut request)) => {
@@ -204,23 +274,23 @@ pub(crate) async fn execute(
             request.source = Some(attempt_digest.to_owned());
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
-            let provider = SafeChat {
+            let provider = DispatchedChat {
                 inner: OpenAiCompatibleChatProvider::new(
                     operator,
                     &route.model,
                     &route.destination,
                     secret.value(),
                 )
-                .with_client(client)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
                 .with_request_limit(route.max_input_bytes)
-                .with_response_limit(route.max_response_bytes),
-                secret,
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens),
                 started: started.clone(),
             };
             let provider = runtime
                 .chat(
-                    ModelBinding::new(provider)
-                        .with_policy(policy)
+                    route_binding(runtime, route, provider)?
                         .with_response_cache(ResponseCacheMode::Off),
                 )
                 .map_err(|_| EgressError::StateUnavailable)?;
@@ -246,18 +316,22 @@ pub(crate) async fn execute(
             request.source = Some(attempt_digest.to_owned());
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
-            let provider = SafeEmbedding {
-                inner: GeminiEmbeddingProvider::new(&route.model, secret.value(), *dimensions)
-                    .with_client(client)
-                    .with_request_limit(route.max_input_bytes)
-                    .with_response_limit(route.max_response_bytes),
-                secret,
+            let provider = DispatchedEmbedding {
+                inner: GeminiEmbeddingProvider::new(
+                    "gemini",
+                    &route.model,
+                    secret.value(),
+                    *dimensions,
+                )
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes),
                 started: started.clone(),
             };
             let provider = runtime
                 .embedding(
-                    ModelBinding::new(provider)
-                        .with_policy(policy)
+                    route_binding(runtime, route, provider)?
                         .with_response_cache(ResponseCacheMode::Off),
                 )
                 .map_err(|_| EgressError::StateUnavailable)?;
@@ -296,7 +370,7 @@ mod tests {
             _: ModelInvocationTrace,
         ) -> Result<(), symbiotic_trace::TraceError> {
             Err(symbiotic_trace::TraceError::Sink(
-                "private sink detail".into(),
+                model::DiagnosticCode::StorageFailure,
             ))
         }
     }
@@ -309,7 +383,11 @@ mod tests {
         })
         .unwrap();
         let provider = runtime
-            .embedding(ModelBinding::new(model::HashEmbeddingProvider::new(2)))
+            .embedding(
+                ModelBinding::new(model::HashEmbeddingProvider::new(2))
+                    .with_identity(BindingIdentity::new("test", "provider", "1", "account"))
+                    .with_policy(ModelQueueConfig::default()),
+            )
             .unwrap();
         let mut response = provider
             .embed(EmbeddingRequest {
@@ -328,7 +406,7 @@ mod tests {
                 .trace
                 .metadata
                 .to_string()
-                .contains("private sink detail")
+                .contains("storage_failure")
         );
         // Extra metadata and unknown diagnostic kinds must not cross this boundary.
         response.trace.metadata[RUNTIME_DIAGNOSTICS]
@@ -355,20 +433,5 @@ mod tests {
             r#"["trace_write_failed"]"#
         );
         assert!(serde_json::from_str::<DispatchDiagnostic>(r#""private unknown kind""#).is_err());
-    }
-
-    #[test]
-    fn invalid_embedding_error_is_sanitized_as_provider_failure() {
-        let error = safe_error(ModelError::Provider(
-            "Gemini embedding contains non-finite components".into(),
-        ));
-        assert!(matches!(error, ModelError::Provider(message)
-            if message == "credential-process provider failure"));
-    }
-
-    #[test]
-    fn numeric_provider_values_cannot_echo_credential_bytes() {
-        let secret = Secret::from_bytes(zeroize::Zeroizing::new(b"123456789".to_vec())).unwrap();
-        assert!(check_response(&serde_json::json!({"vectors": [[123456789]]}), &secret).is_err());
     }
 }

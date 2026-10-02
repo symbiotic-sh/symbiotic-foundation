@@ -23,13 +23,17 @@ impl Write for CappedBody {
     }
 }
 
-fn encode(value: &impl Serialize, max_bytes: Option<usize>) -> Result<Vec<u8>, ModelError> {
+pub(crate) fn encode(
+    value: &impl Serialize,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ModelError> {
     let mut body = CappedBody {
         bytes: Vec::new(),
         max_bytes: max_bytes.unwrap_or(usize::MAX),
     };
-    serde_json::to_writer(&mut body, value)
-        .map_err(|_| ModelError::InvalidRequest("provider request limit exceeded".into()))?;
+    serde_json::to_writer(&mut body, value).map_err(|_| {
+        ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded)
+    })?;
     Ok(body.bytes)
 }
 
@@ -59,6 +63,7 @@ pub fn openai_chat_body(
     reasoning_effort: Option<&str>,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
+    super::validate_chat_settings(thinking, reasoning_effort)?;
     encode(
         &OpenAiChatWireRequest {
             model,
@@ -70,11 +75,7 @@ pub fn openai_chat_body(
                 .as_deref()
                 .map(|format| serde_json::json!({ "type": format })),
             thinking: thinking.map(|mode| serde_json::json!({ "type": mode })),
-            reasoning_effort: if thinking == Some(ThinkingMode::Disabled) {
-                None
-            } else {
-                reasoning_effort
-            },
+            reasoning_effort,
             stream: false,
         },
         max_bytes,
@@ -103,6 +104,28 @@ struct GeminiPart<'a> {
     text: &'a str,
 }
 
+/// Refuse request options the installed Gemini adapter does not implement.
+pub fn validate_gemini_options(
+    dimensions: usize,
+    request: &EmbeddingRequest,
+) -> Result<(), ModelError> {
+    if dimensions == 0
+        || request
+            .dimensions
+            .is_some_and(|requested| requested != dimensions)
+    {
+        return Err(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::GeminiRequestDimensionsDifferFromConfiguredBinding,
+        ));
+    }
+    if request.task.is_some() {
+        return Err(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::GeminiTaskOptionIsUnsupported,
+        ));
+    }
+    Ok(())
+}
+
 /// Encode the complete Gemini single/batch HTTP body, refusing to buffer more
 /// than `max_bytes` when set, including repeated model names and JSON escaping.
 pub fn gemini_embedding_body(
@@ -111,6 +134,7 @@ pub fn gemini_embedding_body(
     request: &EmbeddingRequest,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
+    validate_gemini_options(dimensions, request)?;
     let model = format!("models/{}", model.trim_start_matches("models/"));
     let wire_request = |input| GeminiEmbedWireRequest {
         model: &model,
@@ -140,6 +164,24 @@ mod tests {
     use super::*;
     use symbiotic_core::Sensitivity;
 
+    #[test]
+    fn gemini_wire_refuses_unsupported_task_and_conflicting_dimensions() {
+        let mut request = EmbeddingRequest {
+            inputs: vec!["synthetic".into()],
+            dimensions: Some(3),
+            task: None,
+            sensitivity: Sensitivity::Shareable,
+            role_binding: None,
+            source: None,
+            metadata: Value::Null,
+        };
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_ok());
+        request.task = Some("retrieval_query".into());
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_err());
+        request.task = None;
+        request.dimensions = Some(4);
+        assert!(gemini_embedding_body("model", 3, &request, Some(1024)).is_err());
+    }
     #[test]
     fn gemini_wire_limit_covers_single_and_batch_expansion_at_exact_boundary() {
         for count in [1, 128] {

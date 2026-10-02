@@ -1403,6 +1403,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
+ "rusqlite",
  "serde_json",
  "sha2",
  "symbiotic-core",
@@ -1469,6 +1470,7 @@ name = "symbiotic-model"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "hex",

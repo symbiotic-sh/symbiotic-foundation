@@ -43,11 +43,13 @@ impl ModelAdmission {
     }
 
     /// The cap fixed for `queue_id`, if a provider was admitted for it.
-    pub fn cap(&self, queue_id: &QueueId) -> Option<usize> {
+    pub fn cap(&self, queue_id: &QueueId) -> Result<Option<usize>, ModelError> {
         self.gates
             .lock()
-            .ok()
-            .and_then(|gates| gates.get(&queue_id.0).map(|(cap, _)| *cap))
+            .map(|gates| gates.get(&queue_id.0).map(|(cap, _)| *cap))
+            .map_err(|_| {
+                ModelError::Queue(symbiotic_core::DiagnosticCode::ModelAdmissionLockPoisoned)
+            })
     }
 
     /// Fix the cap for `queue_id`, or check it matches the fixed one.
@@ -63,23 +65,21 @@ impl ModelAdmission {
         self.gate(queue_id, max_in_flight)?
             .acquire_owned()
             .await
-            .map_err(|err| ModelError::Queue(err.to_string()))
+            .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
     }
 
     fn gate(&self, queue_id: &QueueId, max_in_flight: usize) -> Result<Arc<Semaphore>, ModelError> {
         let max_in_flight = max_in_flight.max(1);
-        let mut gates = self
-            .gates
-            .lock()
-            .map_err(|_| ModelError::Queue("model admission lock poisoned".to_string()))?;
+        let mut gates = self.gates.lock().map_err(|_| {
+            ModelError::Queue(symbiotic_core::DiagnosticCode::ModelAdmissionLockPoisoned)
+        })?;
         let (cap, gate) = gates
             .entry(queue_id.0.clone())
             .or_insert_with(|| (max_in_flight, Arc::new(Semaphore::new(max_in_flight))));
         if *cap != max_in_flight {
-            return Err(ModelError::InvalidRequest(format!(
-                "{} is admitted with max_in_flight {cap}; a provider asked for {max_in_flight}",
-                queue_id.0
-            )));
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
         }
         Ok(gate.clone())
     }
@@ -117,6 +117,7 @@ pub enum ReceiptStatus {
 /// wait split. A cache hit repeats the original usage and costs nothing new.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueueReceipt {
+    pub binding: Option<symbiotic_core::BindingIdentity>,
     pub queue_id: QueueId,
     /// `chat`, `embedding`, `rerank` or `classify`.
     pub kind: String,
@@ -134,24 +135,13 @@ pub struct QueueReceipt {
     /// The provider's receipt metadata (response id, served model, reported
     /// cost, ...) as the provider put it on its trace.
     pub metadata: Value,
-    pub error: Option<String>,
+    pub error: Option<symbiotic_core::DiagnosticCode>,
     /// Wait for an in-process admission slot and a claimable item.
     pub queue_wait_ms: Option<u64>,
     /// Wait on cooldowns and rate buckets.
     pub throttle_wait_ms: Option<u64>,
     pub provider_ms: Option<u64>,
     pub timestamp: DateTime<Utc>,
-}
-
-impl QueueReceipt {
-    /// The receipt with provider error text replaced by a fixed note, for
-    /// logs that must not carry response bodies.
-    pub fn redacted(mut self) -> Self {
-        if self.error.is_some() {
-            self.error = Some("provider call failed; response details omitted".to_string());
-        }
-        self
-    }
 }
 
 /// Receives usage receipts. Best-effort: a sink cannot fail a call.
@@ -199,9 +189,8 @@ pub struct CacheEntry<'a> {
 /// Exact response cache consulted before a queued call and filled after a
 /// successful one. Values are serialized responses of the provider kind.
 ///
-/// Implement it to keep reading a cache whose layout or keys predate the
-/// runtime: return `Ok(None)` for requests it cannot answer and skip stores
-/// it does not keep.
+/// Store only the current response format and complete binding/request identity.
+/// Return `Ok(None)` for requests outside the cache's scope; legacy layouts are refused.
 pub trait ResponseCache: Send + Sync {
     fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError>;
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError>;
@@ -228,6 +217,7 @@ pub struct DirResponseCache {
 /// for, as recorded on its trace.
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
+    pub binding: Option<symbiotic_core::BindingIdentity>,
     /// The request's `source`.
     pub source: Option<String>,
     /// The request's `role_binding`.
@@ -301,7 +291,7 @@ impl DirResponseCache {
         for (path, meta) in self.entries()? {
             let raw = std::fs::read(&path).map_err(|err| cache_io(&path, err))?;
             let value: Value = serde_json::from_slice(&raw)
-                .map_err(|err| ModelError::Cache(format!("{}: {err}", path.display())))?;
+                .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))?;
             let trace = value.get("trace");
             let text = |key: &str| {
                 trace
@@ -309,12 +299,25 @@ impl DirResponseCache {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             };
+            let decode = |value: &Value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
+            };
             let response = CachedResponse {
+                binding: trace
+                    .and_then(|trace| trace.pointer("/metadata/binding"))
+                    .map(decode)
+                    .transpose()?,
                 source: text("source"),
                 role_binding: text("role_binding"),
                 model: trace
                     .and_then(|trace| trace.get("model"))
-                    .and_then(|model| serde_json::from_value(model.clone()).ok()),
+                    .map(|model| {
+                        serde_json::from_value(model.clone()).map_err(|_| {
+                            ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
+                        })
+                    })
+                    .transpose()?,
                 modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
                 bytes: meta.len(),
             };
@@ -373,8 +376,12 @@ fn remove_entry(path: &Path) -> Result<(), ModelError> {
     }
 }
 
-fn cache_io(path: &Path, err: std::io::Error) -> ModelError {
-    ModelError::Cache(format!("{}: {err}", path.display()))
+fn cache_io(_path: &Path, err: std::io::Error) -> ModelError {
+    ModelError::Cache(if crate::private_fs::is_path_refused(&err) {
+        symbiotic_core::DiagnosticCode::CachePathRefused
+    } else {
+        symbiotic_core::DiagnosticCode::CacheFailure
+    })
 }
 
 /// Whether a path the cache reads exists, refusing one that is a symlink or
@@ -383,20 +390,18 @@ fn owned_or_missing(path: &Path) -> Result<Option<std::fs::Metadata>, ModelError
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                return Err(ModelError::Cache(format!(
-                    "{} is a symlink; the response cache does not follow them",
-                    path.display()
-                )));
+                return Err(ModelError::Cache(
+                    symbiotic_core::DiagnosticCode::CachePathRefused,
+                ));
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
                 // SAFETY: `geteuid` has no preconditions and cannot fail.
                 if meta.uid() != unsafe { libc::geteuid() } {
-                    return Err(ModelError::Cache(format!(
-                        "{} is owned by another user",
-                        path.display()
-                    )));
+                    return Err(ModelError::Cache(
+                        symbiotic_core::DiagnosticCode::CachePathRefused,
+                    ));
                 }
             }
             Ok(Some(meta))
@@ -424,9 +429,9 @@ fn safe_component(value: &str) -> Result<&str, ModelError> {
     if safe {
         Ok(value)
     } else {
-        Err(ModelError::Cache(format!(
-            "response cache path component is not a safe file name: {value:?}"
-        )))
+        Err(ModelError::Cache(
+            symbiotic_core::DiagnosticCode::CachePathRefused,
+        ))
     }
 }
 
@@ -450,7 +455,7 @@ impl ResponseCache for DirResponseCache {
         let raw = std::fs::read(&file).map_err(|err| cache_io(&file, err))?;
         serde_json::from_slice(&raw)
             .map(Some)
-            .map_err(|err| ModelError::Cache(err.to_string()))
+            .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
     }
 
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError> {
@@ -462,8 +467,8 @@ impl ResponseCache for DirResponseCache {
         if owned_or_missing(&file)?.is_some() {
             crate::private_fs::ensure_owned_file(&file).map_err(|err| cache_io(&file, err))?;
         }
-        let bytes =
-            serde_json::to_vec(response).map_err(|err| ModelError::Cache(err.to_string()))?;
+        let bytes = serde_json::to_vec(response)
+            .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))?;
         crate::private_fs::write_private_file(&file, &bytes).map_err(|err| cache_io(&file, err))
     }
 }
@@ -475,9 +480,11 @@ pub(crate) struct QueueRuntime {
     pub(crate) trace_sink: Option<Arc<dyn TraceSink>>,
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
+    pub(crate) rate_state: crate::ModelRateState,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
     /// Queue identity override; `None` uses the descriptor's `queue_id`.
     pub(crate) queue_id: Option<QueueId>,
+    pub(crate) binding_identity: Option<symbiotic_core::BindingIdentity>,
     pub(crate) worker_id: String,
     pub(crate) config: crate::ModelQueueConfig,
 }
@@ -493,8 +500,10 @@ impl QueueRuntime {
             trace_sink: None,
             receipt_sink: None,
             admission: None,
+            rate_state: crate::ModelRateState::default(),
             response_cache: None,
             queue_id: None,
+            binding_identity: None,
             worker_id,
             config,
         }
@@ -526,16 +535,24 @@ macro_rules! queue_runtime_builders {
             self
         }
 
-        /// Share in-process admission (the model cap) with every provider
-        /// built from the same [`ModelAdmission`](crate::ModelAdmission).
+        /// Runtime-owned rate state, pooled by explicit account identity.
+        pub fn with_rate_state(mut self, state: $crate::ModelRateState) -> Self {
+            self.runtime.rate_state = state;
+            self
+        }
+        /// Share in-process admission with providers of the same runtime/account.
         pub fn with_admission(mut self, admission: $crate::ModelAdmission) -> Self {
             self.runtime.admission = Some(admission);
             self
         }
 
-        /// Run on `queue_id` instead of the model's own queue, so its limits
-        /// and cooldown are shared with (or isolated from) other providers by
-        /// that id.
+        /// Scope result reuse, queue items, traces and receipts to this binding.
+        pub fn with_binding_identity(mut self, identity: symbiotic_core::BindingIdentity) -> Self {
+            self.runtime.binding_identity = Some(identity);
+            self
+        }
+
+        /// Run on `queue_id` so limits and cooldown share the configured account.
         pub fn with_queue_id(mut self, queue_id: symbiotic_core::QueueId) -> Self {
             self.runtime.queue_id = Some(queue_id);
             self
@@ -552,6 +569,23 @@ pub(crate) use queue_runtime_builders;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_admission_state_refuses_visibly() {
+        let admission = super::ModelAdmission::new();
+        let id = symbiotic_core::QueueId::new("account");
+        let gate = admission.gate(&id, 1).unwrap();
+        gate.close();
+        assert!(admission.acquire(&id, 1).await.is_err());
+        let gates = admission.gates.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = gates.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(admission.cap(&id).is_err());
+        assert!(admission.register(&id, 1).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -560,7 +594,7 @@ mod tests {
         let queue_id = QueueId::new("chat:test:model");
         admission.register(&queue_id, 4).unwrap();
         admission.register(&queue_id, 4).unwrap();
-        assert_eq!(admission.cap(&queue_id), Some(4));
+        assert_eq!(admission.cap(&queue_id).unwrap(), Some(4));
         let err = admission.register(&queue_id, 2).unwrap_err();
         assert!(matches!(err, ModelError::InvalidRequest(_)), "{err:?}");
         // Other models are independent.
@@ -620,7 +654,19 @@ mod tests {
             request_hash: "abc123",
             request: &request,
         };
-        assert!(cache.load(&traversal).is_err());
+        assert!(matches!(
+            cache.load(&traversal),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        assert!(matches!(
+            cache.store(&traversal, &serde_json::json!({})),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        assert!(dir.path().join("chat/scope/abc123.json").is_file());
     }
 
     fn chat_entry<'a>(hash: &'a str, request: &'a Value) -> CacheEntry<'a> {
@@ -710,37 +756,50 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("cache/chat")).unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("cache/chat")).unwrap();
         let load = cache.load(&chat_entry("h", &request)).unwrap_err();
-        assert!(load.to_string().contains("symlink"), "{load}");
+        assert!(matches!(
+            load,
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused)
+        ));
         let store = cache
             .store(&chat_entry("h", &request), &serde_json::json!({}))
             .unwrap_err();
-        assert!(store.to_string().contains("symlink"), "{store}");
+        assert!(matches!(
+            store,
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused)
+        ));
     }
 
     #[test]
-    fn redacted_receipt_drops_error_text() {
-        let receipt = QueueReceipt {
-            queue_id: QueueId::new("chat:test:model"),
-            kind: "chat".into(),
-            item_id: None,
-            request_hash: "hash".into(),
-            status: ReceiptStatus::Failed,
-            attempt: 1,
-            request_units: 1,
-            input_units: 1,
-            usage: None,
-            cache: None,
-            metadata: Value::Null,
-            error: Some("401 body with details".into()),
-            queue_wait_ms: None,
-            throttle_wait_ms: None,
-            provider_ms: None,
-            timestamp: Utc::now(),
+    fn cache_io_failures_are_distinct_from_path_refusals() {
+        use symbiotic_core::DiagnosticCode;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"protected").unwrap();
+        let cache = DirResponseCache::new(&root);
+        let request = serde_json::json!({});
+        assert!(matches!(
+            cache.store(&chat_entry("h", &request), &request),
+            Err(ModelError::Cache(DiagnosticCode::CachePathRefused))
+        ));
+        assert_eq!(std::fs::read(&root).unwrap(), b"protected");
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(matches!(
+                cache_io(&root, std::io::Error::from(kind)),
+                ModelError::Cache(DiagnosticCode::CacheFailure)
+            ));
         }
-        .redacted();
-        assert_eq!(
-            receipt.error.as_deref(),
-            Some("provider call failed; response details omitted")
-        );
+        let cache = DirResponseCache::new(dir.path().join("cache"));
+        cache.store(&chat_entry("h", &request), &request).unwrap();
+        let file = cache.root().join("chat/h.json");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(matches!(
+            cache.load(&chat_entry("h", &request)),
+            Err(ModelError::Cache(DiagnosticCode::CacheFailure))
+        ));
     }
 }

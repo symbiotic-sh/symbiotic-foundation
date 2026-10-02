@@ -23,6 +23,7 @@ fn status_str(status: QueueStatus) -> &'static str {
         QueueStatus::Succeeded => "succeeded",
         QueueStatus::Failed => "failed",
         QueueStatus::Dead => "dead",
+        QueueStatus::Stopped => "stopped",
     }
 }
 
@@ -33,7 +34,10 @@ fn parse_status(value: &str) -> Result<QueueStatus, QueueError> {
         "succeeded" => Ok(QueueStatus::Succeeded),
         "failed" => Ok(QueueStatus::Failed),
         "dead" => Ok(QueueStatus::Dead),
-        other => Err(QueueError::Storage(format!("unknown queue status {other}"))),
+        "stopped" => Ok(QueueStatus::Stopped),
+        _other => Err(QueueError::Storage(
+            symbiotic_core::DiagnosticCode::StorageFailure,
+        )),
     }
 }
 
@@ -48,8 +52,8 @@ impl SqliteQueue {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(storage_error)?;
         }
-        let conn = Connection::open(path).map_err(storage_error)?;
-        configure(&conn)?;
+        let mut conn = Connection::open(path).map_err(storage_error)?;
+        configure(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             event_sink: None,
@@ -57,8 +61,8 @@ impl SqliteQueue {
     }
 
     pub fn in_memory() -> Result<Self, QueueError> {
-        let conn = Connection::open_in_memory().map_err(storage_error)?;
-        configure(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(storage_error)?;
+        configure(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             event_sink: None,
@@ -104,7 +108,7 @@ impl SqliteQueue {
         &self,
         queue_id: &QueueId,
         stale_before: DateTime<Utc>,
-        reason: &str,
+        reason: symbiotic_core::DiagnosticCode,
     ) -> Result<usize, QueueError> {
         self.mark_stale_active_dead_inner(Some(queue_id), stale_before, reason)
             .await
@@ -113,7 +117,7 @@ impl SqliteQueue {
     pub async fn mark_all_stale_active_dead(
         &self,
         stale_before: DateTime<Utc>,
-        reason: &str,
+        reason: symbiotic_core::DiagnosticCode,
     ) -> Result<usize, QueueError> {
         self.mark_stale_active_dead_inner(None, stale_before, reason)
             .await
@@ -123,13 +127,8 @@ impl SqliteQueue {
         &self,
         queue_id: Option<&QueueId>,
         stale_before: DateTime<Utc>,
-        reason: &str,
+        reason: symbiotic_core::DiagnosticCode,
     ) -> Result<usize, QueueError> {
-        if reason.trim().is_empty() {
-            return Err(QueueError::InvalidRequest(
-                "stale queue cleanup reason must not be empty".to_string(),
-            ));
-        }
         let now = Utc::now();
         let (updated, items) = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
@@ -148,7 +147,7 @@ impl SqliteQueue {
                            and status in ('pending', 'failed', 'running')
                            and updated_at < ?2
                            and (status != 'running' or lease_until is null or lease_until < ?4)",
-                        params![queue_id.0, ts(stale_before), reason, ts(now)],
+                        params![queue_id.0, ts(stale_before), reason.code(), ts(now)],
                     )
                     .map_err(storage_error)?,
                 None => tx
@@ -162,7 +161,7 @@ impl SqliteQueue {
                          where status in ('pending', 'failed', 'running')
                            and updated_at < ?1
                            and (status != 'running' or lease_until is null or lease_until < ?3)",
-                        params![ts(stale_before), reason, ts(now)],
+                        params![ts(stale_before), reason.code(), ts(now)],
                     )
                     .map_err(storage_error)?,
             };
@@ -170,9 +169,9 @@ impl SqliteQueue {
                 item.status = QueueStatus::Dead;
                 item.lease_owner = None;
                 item.lease_until = None;
-                item.last_error = Some(reason.to_string());
+                item.last_error = Some(reason);
                 item.updated_at = now;
-                insert_event(&tx, &item, Some(reason.to_string()))?;
+                insert_event(&tx, &item, Some(reason))?;
             }
             tx.commit().map_err(storage_error)?;
             (updated, items)
@@ -182,7 +181,7 @@ impl SqliteQueue {
                 item.status = QueueStatus::Dead;
                 item.lease_owner = None;
                 item.lease_until = None;
-                item.last_error = Some(reason.to_string());
+                item.last_error = Some(reason);
                 item.updated_at = now;
                 sink.record_queue_event(QueueEvent {
                     item_id: item.item_id,
@@ -191,7 +190,7 @@ impl SqliteQueue {
                     status: item.status,
                     attempt: item.attempt,
                     timestamp: Utc::now(),
-                    error: Some(reason.to_string()),
+                    error: Some(reason),
                 })
                 .await;
             }
@@ -206,13 +205,8 @@ impl SqliteQueue {
     pub fn retire_stale_active(
         &self,
         stale_before: DateTime<Utc>,
-        reason: &str,
+        reason: symbiotic_core::DiagnosticCode,
     ) -> Result<usize, QueueError> {
-        if reason.trim().is_empty() {
-            return Err(QueueError::InvalidRequest(
-                "stale queue cleanup reason must not be empty".to_string(),
-            ));
-        }
         let now = Utc::now();
         let mut conn = self.conn.lock().map_err(lock_error)?;
         let tx = conn.transaction().map_err(storage_error)?;
@@ -228,22 +222,22 @@ impl SqliteQueue {
                  where status in ('pending', 'failed', 'running')
                    and updated_at < ?1
                    and (status != 'running' or lease_until is null or lease_until < ?3)",
-                params![ts(stale_before), reason, ts(now)],
+                params![ts(stale_before), reason.code(), ts(now)],
             )
             .map_err(storage_error)?;
         for mut item in items {
             item.status = QueueStatus::Dead;
             item.lease_owner = None;
             item.lease_until = None;
-            item.last_error = Some(reason.to_string());
+            item.last_error = Some(reason);
             item.updated_at = now;
-            insert_event(&tx, &item, Some(reason.to_string()))?;
+            insert_event(&tx, &item, Some(reason))?;
         }
         tx.commit().map_err(storage_error)?;
         Ok(updated)
     }
 
-    /// Delete terminal items (succeeded or dead) last updated before
+    /// Delete terminal items (succeeded, dead or stopped) last updated before
     /// `before`, and queue events older than it. Active items are kept
     /// whatever their age. Returns the number of items deleted.
     ///
@@ -255,7 +249,7 @@ impl SqliteQueue {
         let deleted = tx
             .execute(
                 "delete from queue_items
-                 where status in ('succeeded', 'dead') and updated_at < ?1",
+                 where status in ('succeeded', 'dead', 'stopped') and updated_at < ?1",
                 params![ts(before)],
             )
             .map_err(storage_error)?;
@@ -278,7 +272,7 @@ impl SqliteQueue {
     ) -> Result<EnqueueOutcome, QueueError> {
         if request.kind.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "queue item kind must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::QueueItemKindMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
@@ -301,8 +295,10 @@ impl SqliteQueue {
                         existing.status,
                         QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed
                     );
-                    let terminal =
-                        matches!(existing.status, QueueStatus::Succeeded | QueueStatus::Dead);
+                    let terminal = matches!(
+                        existing.status,
+                        QueueStatus::Succeeded | QueueStatus::Dead | QueueStatus::Stopped
+                    );
                     let superseded = replacing.is_some_and(|current| existing.item_id != *current);
                     if active || (terminal && !request.force) || superseded {
                         tx.commit().map_err(storage_error)?;
@@ -375,14 +371,18 @@ impl SqliteQueue {
         Ok(EnqueueOutcome { item, disposition })
     }
 
-    fn record_event_sync(&self, item: &QueueItem, error: Option<String>) -> Result<(), QueueError> {
+    fn record_event_sync(
+        &self,
+        item: &QueueItem,
+        error: Option<symbiotic_core::DiagnosticCode>,
+    ) -> Result<(), QueueError> {
         let conn = self.conn.lock().map_err(lock_error)?;
         insert_event(&conn, item, error)?;
         Ok(())
     }
 
-    async fn emit(&self, item: QueueItem, error: Option<String>) {
-        let _ = self.record_event_sync(&item, error.clone());
+    async fn emit(&self, item: QueueItem, error: Option<symbiotic_core::DiagnosticCode>) {
+        let _ = self.record_event_sync(&item, error);
         if let Some(sink) = &self.event_sink {
             sink.record_queue_event(QueueEvent {
                 item_id: item.item_id,
@@ -416,15 +416,20 @@ impl QueueBackend for SqliteQueue {
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
         if request.worker_id.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "worker_id must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(request.lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, request.lease_seconds)?;
         let mut limit = request.limit.max(1);
         let claimed = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+            if cooldown_active(&tx, &request.queue_id)? {
+                return Ok(Vec::new());
+            }
             reclaim_expired_in_tx(&tx, &request.queue_id, now)?;
             if let Some(max_in_flight) = request.max_in_flight {
                 let running: i64 = tx
@@ -500,15 +505,20 @@ impl QueueBackend for SqliteQueue {
     ) -> Result<Option<QueueItem>, QueueError> {
         if worker_id.trim().is_empty() {
             return Err(QueueError::InvalidRequest(
-                "worker_id must not be empty".to_string(),
+                symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, lease_seconds)?;
         let claimed = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
             let item = get_required(&tx, item_id)?;
+            if cooldown_active(&tx, &item.queue_id)? {
+                return Ok(None);
+            }
             reclaim_expired_in_tx(&tx, &item.queue_id, now)?;
             if let Some(max_in_flight) = max_in_flight {
                 let running: i64 = tx
@@ -533,14 +543,14 @@ impl QueueBackend for SqliteQueue {
                 tx.execute(
                     "update queue_items
                      set status = 'dead',
-                         last_error = coalesce(last_error, 'attempt budget exhausted'),
+                         last_error = coalesce(last_error, 'attempt_budget_exhausted'),
                          updated_at = ?2
                      where item_id = ?1",
                     params![item_id.0, ts(now)],
                 )
                 .map_err(storage_error)?;
                 let dead = get_required(&tx, item_id)?;
-                insert_event(&tx, &dead, dead.last_error.clone())?;
+                insert_event(&tx, &dead, dead.last_error)?;
                 tx.commit().map_err(storage_error)?;
                 return Ok(None);
             }
@@ -588,7 +598,7 @@ impl QueueBackend for SqliteQueue {
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, lease_seconds)?;
         let item = update_running_item(&self.conn, item_id, worker_id, |conn| {
             conn.execute(
                 "update queue_items set lease_until = ?2, updated_at = ?3 where item_id = ?1",
@@ -626,7 +636,7 @@ impl QueueBackend for SqliteQueue {
         &self,
         item_id: &QueueItemId,
         worker_id: &str,
-        error: &str,
+        error: symbiotic_core::DiagnosticCode,
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         let run_after =
@@ -635,7 +645,7 @@ impl QueueBackend for SqliteQueue {
             item_id,
             worker_id,
             Failure {
-                error: error.to_string(),
+                error,
                 error_class: None,
                 run_after: Some(run_after),
             },
@@ -656,7 +666,9 @@ impl QueueBackend for SqliteQueue {
         let (item, outcome) = update_running_item(&self.conn, item_id, worker_id, |conn| {
             let item = get_required(conn, item_id)?;
             let exhausted = item.attempt >= item.max_attempts;
-            let status = if exhausted {
+            let status = if failure.run_after.is_none() {
+                QueueStatus::Stopped
+            } else if exhausted {
                 QueueStatus::Dead
             } else {
                 QueueStatus::Failed
@@ -675,14 +687,16 @@ impl QueueBackend for SqliteQueue {
                     item_id.0,
                     status_str(status),
                     ts(run_after),
-                    failure.error,
-                    failure.error_class,
+                    failure.error.code(),
+                    failure.error_class.map(|class| class.as_str()),
                     ts(now)
                 ],
             )
             .map_err(storage_error)?;
             let updated = get_required(conn, item_id)?;
-            let outcome = if exhausted {
+            let outcome = if failure.run_after.is_none() {
+                FailOutcome::Stopped
+            } else if exhausted {
                 FailOutcome::MovedToDead
             } else {
                 FailOutcome::RetryScheduled
@@ -711,9 +725,13 @@ impl QueueBackend for SqliteQueue {
                     item.lease_owner = None;
                     item.lease_until = None;
                     item.last_error
-                        .get_or_insert_with(|| "lease expired".to_string());
+                        .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
                     item.updated_at = now;
-                    insert_event(&tx, &item, Some("lease expired".to_string()))?;
+                    insert_event(
+                        &tx,
+                        &item,
+                        Some(symbiotic_core::DiagnosticCode::LeaseExpired),
+                    )?;
                     Ok(item)
                 })
                 .collect::<Result<Vec<_>, QueueError>>()?;
@@ -729,7 +747,7 @@ impl QueueBackend for SqliteQueue {
                     status: item.status,
                     attempt: item.attempt,
                     timestamp: Utc::now(),
-                    error: Some("lease expired".to_string()),
+                    error: Some(symbiotic_core::DiagnosticCode::LeaseExpired),
                 })
                 .await;
             }
@@ -750,8 +768,11 @@ impl QueueBackend for SqliteQueue {
             )
             .optional()
             .map_err(storage_error)?;
-        raw.map(|value| parse_ts(value).map_err(|err| QueueError::Storage(err.to_string())))
-            .transpose()
+        raw.map(|value| {
+            parse_ts(value)
+                .map_err(|_err| QueueError::Storage(symbiotic_core::DiagnosticCode::StorageFailure))
+        })
+        .transpose()
     }
 
     async fn note_cooldown(
@@ -778,14 +799,64 @@ impl QueueBackend for SqliteQueue {
     }
 }
 
-fn configure(conn: &Connection) -> Result<(), QueueError> {
+fn lease_deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, QueueError> {
+    i64::try_from(seconds.max(1))
+        .ok()
+        .and_then(ChronoDuration::try_seconds)
+        .and_then(|duration| now.checked_add_signed(duration))
+        .ok_or(QueueError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))
+}
+
+fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "select cooldown_until from queue_cooldowns where queue_id = ?1",
+            params![queue_id.0],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    raw.map(|value| {
+        parse_ts(value)
+            .map(|until| until > Utc::now())
+            .map_err(storage_error)
+    })
+    .transpose()
+    .map(|active| active.unwrap_or(false))
+}
+
+const QUEUE_SCHEMA_VERSION: u32 = 2;
+
+fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
         .map_err(storage_error)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(storage_error)?;
-    conn.execute_batch(
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    let schema_version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(storage_error)?;
+    // Under the no-migrations rule, initialization atomically stamps the current queue schema and other versions or unversioned queue layouts are refused.
+    if schema_version == i64::from(QUEUE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    // Before release, only an empty, unversioned queue can be initialized.
+    let existing_queue = tx
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns')")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(storage_error)?;
+    if schema_version != 0 || existing_queue {
+        return Err(QueueError::Storage(
+            symbiotic_core::DiagnosticCode::UnsupportedQueueSchema,
+        ));
+    }
+    tx.execute_batch(
         "
-        create table if not exists queue_items (
+        create table queue_items (
             item_id text primary key,
             queue_id text not null,
             kind text not null,
@@ -798,18 +869,19 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
             lease_until text,
             idempotency_key text,
             last_error text,
+            last_error_class text,
             created_at text not null,
             updated_at text not null
         );
-        create index if not exists idx_queue_claim
+        create index idx_queue_claim
             on queue_items(queue_id, status, run_after, created_at);
-        create index if not exists idx_queue_idempotency
+        create index idx_queue_idempotency
             on queue_items(queue_id, idempotency_key);
-        create unique index if not exists idx_queue_active_idempotency
+        create unique index idx_queue_active_idempotency
             on queue_items(queue_id, idempotency_key)
             where idempotency_key is not null
               and status in ('pending', 'running', 'failed');
-        create table if not exists queue_events (
+        create table queue_events (
             event_id integer primary key autoincrement,
             item_id text not null,
             queue_id text not null,
@@ -819,7 +891,7 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
             timestamp text not null,
             error text
         );
-        create table if not exists queue_cooldowns (
+        create table queue_cooldowns (
             queue_id text primary key,
             cooldown_until text not null,
             updated_at text not null
@@ -827,16 +899,24 @@ fn configure(conn: &Connection) -> Result<(), QueueError> {
         ",
     )
     .map_err(storage_error)?;
-    // Added after the first schema: queues created earlier gain the column.
-    let has_error_class = conn
-        .prepare("select 1 from pragma_table_info('queue_items') where name = 'last_error_class'")
-        .and_then(|mut stmt| stmt.exists([]))
+    tx.pragma_update(None, "user_version", QUEUE_SCHEMA_VERSION)
         .map_err(storage_error)?;
-    if !has_error_class {
-        conn.execute_batch("alter table queue_items add column last_error_class text")
-            .map_err(storage_error)?;
-    }
-    Ok(())
+    tx.commit().map_err(storage_error)
+}
+
+fn invalid_stored_code() -> rusqlite::Error {
+    queue_to_sql(QueueError::Storage(
+        symbiotic_core::DiagnosticCode::UnsupportedQueueSchema,
+    ))
+}
+
+fn read_code(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<symbiotic_core::DiagnosticCode>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|code| symbiotic_core::DiagnosticCode::parse(&code).ok_or_else(invalid_stored_code))
+        .transpose()
 }
 
 fn sqlite_busy_timeout_ms() -> u64 {
@@ -883,7 +963,9 @@ fn get_in_tx(conn: &Connection, item_id: &QueueItemId) -> Result<Option<QueueIte
 }
 
 fn get_required(conn: &Connection, item_id: &QueueItemId) -> Result<QueueItem, QueueError> {
-    get_in_tx(conn, item_id)?.ok_or_else(|| QueueError::NotFound(item_id.0.clone()))
+    get_in_tx(conn, item_id)?.ok_or(QueueError::NotFound(
+        symbiotic_core::DiagnosticCode::InvalidConfiguration,
+    ))
 }
 
 fn update_running_item<T>(
@@ -896,19 +978,22 @@ fn update_running_item<T>(
     let tx = conn.transaction().map_err(storage_error)?;
     let current = get_required(&tx, item_id)?;
     if current.status != QueueStatus::Running {
-        return Err(QueueError::NotRunning(item_id.0.clone()));
+        return Err(QueueError::NotRunning(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ));
     }
     if current.lease_owner.as_deref() != Some(worker_id) {
-        return Err(QueueError::LeaseMismatch(item_id.0.clone()));
+        return Err(QueueError::LeaseMismatch(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ));
     }
     if current
         .lease_until
         .is_none_or(|lease_until| lease_until < Utc::now())
     {
-        return Err(QueueError::LeaseMismatch(format!(
-            "{} lease expired",
-            item_id.0
-        )));
+        return Err(QueueError::LeaseMismatch(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ));
     }
     let value = update(&tx)?;
     tx.commit().map_err(storage_error)?;
@@ -999,7 +1084,7 @@ fn reclaim_expired_in_tx(
              lease_owner = null,
              lease_until = null,
              updated_at = ?2,
-             last_error = coalesce(last_error, 'lease expired')
+             last_error = coalesce(last_error, 'lease_expired')
          where queue_id = ?1
            and status = 'running'
            and lease_until is not null
@@ -1012,7 +1097,7 @@ fn reclaim_expired_in_tx(
 fn insert_event(
     conn: &Connection,
     item: &QueueItem,
-    error: Option<String>,
+    error: Option<symbiotic_core::DiagnosticCode>,
 ) -> Result<(), QueueError> {
     conn.execute(
         "insert into queue_events
@@ -1025,7 +1110,7 @@ fn insert_event(
             status_str(item.status),
             item.attempt,
             ts(Utc::now()),
-            error
+            error.map(|code| code.code())
         ],
     )
     .map_err(storage_error)?;
@@ -1051,8 +1136,13 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueItem> {
             .transpose()
             .map_err(queue_to_sql)?,
         idempotency_key: row.get(10)?,
-        last_error: row.get(11)?,
-        last_error_class: row.get(14)?,
+        last_error: read_code(row, 11)?,
+        last_error_class: row
+            .get::<_, Option<String>>(14)?
+            .map(|class| {
+                symbiotic_core::FailureClass::parse(&class).ok_or_else(invalid_stored_code)
+            })
+            .transpose()?,
         created_at: parse_ts(row.get::<_, String>(12)?).map_err(queue_to_sql)?,
         updated_at: parse_ts(row.get::<_, String>(13)?).map_err(queue_to_sql)?,
     })
@@ -1067,7 +1157,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEvent> {
         status: parse_status(&status).map_err(queue_to_sql)?,
         attempt: row.get(4)?,
         timestamp: parse_ts(row.get::<_, String>(5)?).map_err(queue_to_sql)?,
-        error: row.get(6)?,
+        error: read_code(row, 6)?,
     })
 }
 
@@ -1078,15 +1168,15 @@ fn ts(value: DateTime<Utc>) -> String {
 fn parse_ts(value: String) -> Result<DateTime<Utc>, QueueError> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|err| QueueError::Storage(err.to_string()))
+        .map_err(|_err| QueueError::Storage(symbiotic_core::DiagnosticCode::StorageFailure))
 }
 
-fn storage_error(error: impl std::fmt::Display) -> QueueError {
-    QueueError::Storage(error.to_string())
+fn storage_error(_error: impl std::fmt::Display) -> QueueError {
+    QueueError::Storage(symbiotic_core::DiagnosticCode::StorageFailure)
 }
 
 fn lock_error(_: std::sync::PoisonError<std::sync::MutexGuard<'_, Connection>>) -> QueueError {
-    QueueError::Unavailable("sqlite queue lock poisoned".to_string())
+    QueueError::Unavailable(symbiotic_core::DiagnosticCode::SqliteQueueLockPoisoned)
 }
 
 fn json_to_sql(error: serde_json::Error) -> rusqlite::Error {
@@ -1107,6 +1197,110 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_schema_initializes_and_reopens_at_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        drop(SqliteQueue::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            QUEUE_SCHEMA_VERSION
+        );
+        assert!(SqliteQueue::open(&path).is_ok());
+    }
+
+    #[test]
+    fn partial_queue_schema_is_refused_without_schema_writes() {
+        for table in [
+            "queue_items",
+            "queue_events",
+            "queue_cooldowns",
+            "QUEUE_EVENTS",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("queue.sqlite");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("create table {table} (foreign_column text)"))
+                .unwrap();
+            let error = match SqliteQueue::open(&path) {
+                Ok(_) => panic!("accepted partial schema with {table}"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
+            ));
+
+            assert_eq!(
+                conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "select count(*) from sqlite_master where type = 'table'",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn queue_schema_creation_and_version_stamp_roll_back_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        // Fail late in initialization, after queue_items and queue_events are created.
+        conn.execute_batch("create view queue_cooldowns as select 1")
+            .unwrap();
+        assert!(SqliteQueue::open(&path).is_err());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        conn.execute_batch("drop view queue_cooldowns").unwrap();
+        assert!(SqliteQueue::open(&path).is_ok());
+    }
+
+    #[test]
+    fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
+        for version in [-1, 0, 1, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+            for existing in [false, true] {
+                if version == 0 && !existing {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("queue.sqlite");
+                if existing {
+                    drop(SqliteQueue::open(&path).unwrap());
+                }
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "user_version", version).unwrap();
+                let error = match SqliteQueue::open(&path) {
+                    Ok(_) => panic!("accepted schema version {version}"),
+                    Err(error) => error,
+                };
+                assert!(matches!(
+                    error,
+                    QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
+                ));
+
+                assert_eq!(
+                    conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    version
+                );
+            }
+        }
+    }
+
     use super::*;
     use futures::future::join_all;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1344,7 +1538,7 @@ mod tests {
             .mark_stale_active_dead(
                 &queue_id,
                 Utc::now() - ChronoDuration::hours(1),
-                "orphaned queue item",
+                symbiotic_core::DiagnosticCode::StaleQueueItem,
             )
             .await
             .unwrap();
@@ -1374,7 +1568,7 @@ mod tests {
             .events()
             .unwrap()
             .into_iter()
-            .filter(|event| event.error.as_deref() == Some("orphaned queue item"))
+            .filter(|event| event.error == Some(symbiotic_core::DiagnosticCode::StaleQueueItem))
             .count();
         assert_eq!(cleanup_events, 3);
     }
@@ -1397,7 +1591,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             queue
-                .fail(&claimed[0].item_id, "worker", "timeout", Some(0))
+                .fail(
+                    &claimed[0].item_id,
+                    "worker",
+                    symbiotic_core::DiagnosticCode::QueueFailure,
+                    Some(0)
+                )
                 .await
                 .unwrap(),
             FailOutcome::RetryScheduled
@@ -1415,7 +1614,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             reopened
-                .fail(&claimed_again[0].item_id, "worker", "timeout", Some(0))
+                .fail(
+                    &claimed_again[0].item_id,
+                    "worker",
+                    symbiotic_core::DiagnosticCode::QueueFailure,
+                    Some(0)
+                )
                 .await
                 .unwrap(),
             FailOutcome::MovedToDead
@@ -1423,6 +1627,51 @@ mod tests {
         assert_eq!(
             reopened.get(&claimed[0].item_id).unwrap().unwrap().status,
             QueueStatus::Dead
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_failure_survives_reopen_with_attempts_remaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = SqliteQueue::open(&path).unwrap();
+        let item = queue.enqueue(request("stopped")).await.unwrap().item;
+        queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queue
+                .fail_with(
+                    &item.item_id,
+                    "worker",
+                    Failure {
+                        error: symbiotic_core::DiagnosticCode::QueueFailure,
+                        error_class: Some(symbiotic_core::FailureClass::Queue),
+                        run_after: None,
+                    }
+                )
+                .await
+                .unwrap(),
+            FailOutcome::Stopped
+        );
+        drop(queue);
+        let reopened = SqliteQueue::open(&path).unwrap();
+        let duplicate = reopened.enqueue(request("stopped")).await.unwrap();
+        assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
+        assert_eq!(duplicate.item.status, QueueStatus::Stopped);
+        assert_eq!(
+            duplicate.item.last_error_class,
+            Some(symbiotic_core::FailureClass::Queue)
+        );
+        assert!(duplicate.item.attempt < duplicate.item.max_attempts);
+        assert!(
+            reopened
+                .claim_item(&item.item_id, "later", 60, None)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1477,11 +1726,14 @@ mod tests {
         assert_eq!(reclaimed, 1);
         let item = queue.get(&claimed[0].item_id).unwrap().unwrap();
         assert_eq!(item.status, QueueStatus::Failed);
-        assert_eq!(item.last_error.as_deref(), Some("lease expired"));
+        assert_eq!(
+            item.last_error,
+            Some(symbiotic_core::DiagnosticCode::LeaseExpired)
+        );
         assert!(queue.events().unwrap().iter().any(|event| {
             event.item_id.0 == item.item_id.0
                 && event.status == QueueStatus::Failed
-                && event.error.as_deref() == Some("lease expired")
+                && event.error == Some(symbiotic_core::DiagnosticCode::LeaseExpired)
         }));
     }
 
@@ -1504,7 +1756,7 @@ mod tests {
                 .fail(
                     &claimed[0].item_id,
                     "worker",
-                    "temporary provider error",
+                    symbiotic_core::DiagnosticCode::QueueFailure,
                     Some(0)
                 )
                 .await
@@ -1589,48 +1841,6 @@ mod tests {
         let dead = reopened.get(&item.item_id).unwrap().unwrap();
         assert_eq!(dead.status, QueueStatus::Dead);
         assert_eq!(dead.attempt, 1);
-    }
-
-    #[tokio::test]
-    async fn a_queue_created_before_error_classes_gains_the_column() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "create table queue_items (
-                    item_id text primary key, queue_id text not null, kind text not null,
-                    payload_json text not null, status text not null, attempt integer not null,
-                    max_attempts integer not null, run_after text not null, lease_owner text,
-                    lease_until text, idempotency_key text, last_error text,
-                    created_at text not null, updated_at text not null
-                );",
-            )
-            .unwrap();
-        }
-        let queue = SqliteQueue::open(&path).unwrap();
-        let item = queue.enqueue(request("upgraded")).await.unwrap().item;
-        queue
-            .claim_item(&item.item_id, "worker", 60, None)
-            .await
-            .unwrap()
-            .unwrap();
-        queue
-            .fail_with(
-                &item.item_id,
-                "worker",
-                Failure {
-                    error: "timed out".to_string(),
-                    error_class: Some("timeout".to_string()),
-                    run_after: None,
-                },
-            )
-            .await
-            .unwrap();
-        let failed = queue.get(&item.item_id).unwrap().unwrap();
-        assert_eq!(failed.last_error_class.as_deref(), Some("timeout"));
-        // Opening again finds the column and changes nothing.
-        SqliteQueue::open(&path).unwrap();
     }
 
     struct CountingSink(AtomicUsize);

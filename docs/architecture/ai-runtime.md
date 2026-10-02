@@ -8,9 +8,8 @@ usage receipts and persistence.
 
 The [Foundation boundary contract](boundary.md) is authoritative for ownership,
 provider-principal authorization, spend, storage and supported modes. This page
-records current runtime behavior. Complete tenant/provider/configuration binding,
-explicit account isolation, canonical spend accounting and admission/maintenance
-bounds remain implementation work; this API alone supplies none of Memory's data
+records current runtime behavior. Typed tenant/provider/configuration binding scopes execution and result reuse.
+Canonical spend accounting and admission/maintenance bounds remain implementation work; this API alone supplies none of Memory's data
 authorization checks. The error-class retry gaps listed under
 [policy knobs](#policy-knobs) remain implementation work under the
 [spend contract](boundary.md#spend-ledger-and-budgets).
@@ -21,16 +20,18 @@ Design record: [docs/design/8-ai-runtime.md](../design/8-ai-runtime.md)
 ## Use
 
 ```rust
-use symbiotic_ai_runtime::{ModelBinding, Runtime, RuntimeConfig};
+use symbiotic_ai_runtime::{ModelBinding, ModelQueueConfig, Runtime, RuntimeConfig};
 
 let runtime = Runtime::open(RuntimeConfig {
     state_dir: Some(data_dir.join("ai-runtime")), // None: in memory
     ..RuntimeConfig::default()
 })?;
-let chat = runtime.chat(ModelBinding::new(raw_chat))?;          // Arc<dyn ChatProvider>
-let embed = runtime.embedding(ModelBinding::new(raw_embedder))?; // Arc<dyn EmbeddingProvider>
-let rerank = runtime.rerank(ModelBinding::new(raw_reranker))?;   // Arc<dyn RerankProvider>
-let classify = runtime.classifier(ModelBinding::new(raw))?;      // Arc<dyn ClassifierProvider>
+let policy = ModelQueueConfig::default(); // explicit, conservative policy for this account
+let identity = symbiotic_ai_runtime::BindingIdentity::new("tenant-a", "chat", "revision-1", "account-a");
+let chat = runtime.chat(ModelBinding::new(raw_chat).with_identity(identity.clone()).with_policy(policy.clone()))?;          // Arc<dyn ChatProvider>
+let embed = runtime.embedding(ModelBinding::new(raw_embedder).with_identity(identity.clone()).with_policy(policy.clone()))?; // Arc<dyn EmbeddingProvider>
+let rerank = runtime.rerank(ModelBinding::new(raw_reranker).with_identity(identity.clone()).with_policy(policy.clone()))?;   // Arc<dyn RerankProvider>
+let classify = runtime.classifier(ModelBinding::new(raw).with_identity(identity).with_policy(policy))?;      // Arc<dyn ClassifierProvider>
 ```
 
 This example shows current runtime assembly, not complete authorized credential
@@ -47,10 +48,59 @@ the same state.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `queue_id` | The model's own queue (`operation:operator:model`) | Queue whose limits and cooldown the binding shares: isolate a role, or pool models |
-| `policy` | Catalog default for the model (`default_model_queue_config`), else `ModelQueueConfig::default()` | Concurrency, rate limits, retries, timeout |
+| `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
+| `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
+| `policy` | Required explicit policy, or the configured registry account | Concurrency, rate limits, retries, timeout |
 | `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: every call reaches the provider. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
+
+## Configured registry
+
+`ModelRegistry::from_json` validates the entire current-version configuration before
+serving. Pass `Arc<ModelRegistry>` in `RuntimeConfig::registry`, then call
+`Runtime::configured_provider(tenant, principal, credential_resolver)`. It returns
+an installed chat, Gemini embedding or Jev classifier adapter. Keyless bindings do
+not call the credential resolver. Unknown tenants/principals and configuration,
+transport or policy overrides are refused.
+
+| Family | Required configuration |
+|---|---|
+| `models` | Unique ID and aliases, canonical model identity, installed adapter, supported operation, advisory capabilities; prices require provenance/date |
+| `bindings` | Typed tenant/provider/revision/account identity, model ID or alias, endpoint, optional secret reference, account policy, explicit sharing key or null, finite request/response bytes and chat output tokens, effective settings |
+| `accounts` | Named explicit execution policy: concurrency, timeout, attempts and optional pacing; no model-name fallback |
+
+The [example catalogue](../../examples/model-registry.json) contains one synthetic
+model with an alias and **no bindings or accounts**. It enables no provider.
+Aliases use the canonical model on the wire and resolve the same capabilities.
+Unsupported advertised operations/settings, ambiguous aliases, unusable limits,
+endpoint credentials and conflicting shared-account policies refuse startup.
+Credential-process deployment routes compile into this same validated registry;
+they retain their existing permit protocol and single-attempt policy.
+
+Every supported HTTP adapter requires finite nonzero encoded request and response
+byte limits for success bodies, including chunked bodies. Non-success HTTP bodies
+are discarded without decoding or retaining their bytes; the status determines the
+error class, including for invalid UTF-8 bodies. Chat also requires a
+finite output-token bound; requests above a configured bound are refused. Gemini
+requires the exact configured dimension for every returned vector. Its adapter
+refuses task options and conflicting per-request dimensions before dispatch.
+Provider credentials and derived secret buffers use the shared non-Debug,
+non-serializable `SecretValue` zeroizing container; `ResolvedAuth` is also non-Debug.
+
+Without a registry, raw Foundation bindings require an explicit execution policy.
+`default_model_queue_config` and `default_model_capabilities` are removed; consumers
+must configure accounts rather than infer limits from a model/operator name.
+Sensitivity remains a typed request/trace field pending protocol cleanup, but has
+no selection, cache or dispatch authority. Memory owns provider grants.
+
+## Errors and credential boundary
+
+`ModelError`, `QueueError` and `TraceError` carry closed `DiagnosticCode` values
+(or a typed unsupported capability), never free-form strings. Adapter validation,
+provider decoding, cache, storage and restored failures cannot attach provider or
+credential text to an error. Diagnostics and logs retain static codes only. The
+credential owner still checks successful raw and normalized outputs before results
+reach runtime bookkeeping, and discards raw provider JSON.
 
 ## Persistence
 
@@ -58,7 +108,7 @@ the same state.
 |---|---|---|
 | Queue backend | `MemoryQueue` (in-process, bounded terminal history) | `SqliteQueue` at `dir/queue.sqlite` |
 | Cooldowns, attempt budgets, deduplication | End with the process | Survive restarts |
-| Response cache (`Default` mode) | None | `dir/responses/<descriptor hash>/<kind>[/<scope>]/<request hash>.json` |
+| Response cache (`Default` mode) | None | `dir/responses/<kind>/<binding and transport hash>/<request hash>.json` |
 
 **Private state.** Cached responses and queue state can hold private text,
 so the state directory and everything in it are owner-only:
@@ -66,8 +116,8 @@ so the state directory and everything in it are owner-only:
 - A missing `state_dir` is created `0700`, with any missing parents.
 - An existing `state_dir` must be a directory owned by the current user,
   not a symlink, and closed to group and others. Otherwise `Runtime::open`
-  fails with a message naming the path, for example
-  `is open to group or others; make it owner-only (chmod 700)`.
+  fails with a static queue diagnostic. State paths and underlying filesystem
+  error text are never copied into runtime errors.
 - Inside it, the runtime creates directories `0700` and files `0600`: the
   database (SQLite gives its journal files the database's mode) and cache
   entries, written through a temporary file and a rename.
@@ -114,9 +164,8 @@ it refuses and removes nothing, so it can never reach outside the cache.
 responses whose recorded owner matches. It is the hook for erasure: when a
 source or tenant is erased, the host purges its responses. Each entry is
 matched by what its response's trace records: the request's `source` and
-`role_binding`, and the model (`CachedResponse`). A host that needs erasure
-by tenant or source puts that identity in the request's `source` or
-`role_binding`. The purge reads every entry once, so it suits erasure, not a
+`role_binding`, model, and typed binding identity (`CachedResponse::binding`).
+Tenant erasure matches `binding.tenant`, independently of free-text source labels. The purge reads every entry once, so it suits erasure, not a
 hot path.
 
 ## Calls in flight
@@ -158,14 +207,13 @@ the waiting caller; its lease is not renewed and expires after
 
 ## Current shared limits
 
-This describes current model/queue grouping, not the required tenant/account
-isolation. Explicit sharing and result identity follow
-[boundary.md](boundary.md#tenant-provider-bindings-and-data-access).
-
-Every provider handed out for one queue shares the limits below. By default a
-queue is one model (`queue_id`, e.g. `chat:deepseek:deepseek-v4-pro`); a
-binding's `queue_id` moves it to another queue. The providers of a queue
-share:
+Execution state belongs to the runtime. By default queues and rate state are
+keyed by typed tenant and concrete account; all models on that account share its
+policy. An explicit `AccountSharingKey` pools execution across bindings or tenants.
+Independent runtimes have separate in-process rate state. Persistent cooldowns
+belong to their queue backend, so deliberately sharing a state directory shares
+that durable account state. Poisoned rate/admission locks and closed gates return
+visible `ModelError::Queue` errors; they never bypass pacing. Accounts share:
 
 - one concurrency cap. Callers wait FIFO for a slot (`ModelAdmission`), and the
   backend enforces the same cap;
@@ -186,8 +234,9 @@ at most 250 ms. Between slices it looks at its item and the cache, so a
 duplicate whose answer has arrived returns at once and spends nothing.
 
 Pooling shares limits only. Deduplication, attempt budgets and results stay
-per provider: the idempotency key is the queue, the provider descriptor and
-the request hash.
+per provider: the idempotency key is the queue, the tenant/provider/revision/account identity, effective provider descriptor,
+credential generation and request hash. Endpoint, thinking and effort settings enter
+the descriptor; custom providers must describe their effective configuration.
 
 The key also includes the provider's credential generation,
 `ModelProvider::credential_fingerprint`. The HTTP providers derive it from
@@ -203,10 +252,11 @@ admission and recovery follow the
 [spend contract](boundary.md#spend-ledger-and-budgets). That integration remains
 a known implementation gap.
 
-Bindings of one model must agree on `max_in_flight`, `requests_per_minute`,
+Raw bindings without a registry must agree on `max_in_flight`, `requests_per_minute`,
 `input_units_per_minute` and `rate_burst_seconds`. A binding that disagrees
 fails with `ModelError::InvalidRequest`. Retry and timeout settings may differ
-per binding.
+per raw binding. Registry bindings of one account use an identical configured
+execution policy, including timeout and retries.
 
 ## Policy knobs
 
@@ -231,22 +281,23 @@ paths and remain implementation work.
   and sub-second delays hold.
 - `retry_provider_errors` (default `false`): also retry `ModelError::Provider`
   failures. `ModelQueueConfig::default()`
-  allows three attempts; DeepSeek catalogue policies allow four, and other catalogue
-  entries also permit multiple attempts. These settings expose the error-class
+  allows three attempts when explicitly chosen; registry account policies specify
+  their own finite total attempts. These settings expose the error-class
   retry gaps listed above. Provider errors
   never start a cooldown.
 - `request_debug_dir`: write each serialized request to
   `{dir}/{kind}[/{scope}]/{request_hash}.json` before it is queued. For
-  debugging only: requests can contain sensitive text.
+  development builds only (`debug_assertions`): requests can contain sensitive
+  text. Production builds refuse a policy containing this setting at bind time.
 - `logical_retry_attempts` / `retry_attempts`: the request's total provider
   attempts across every retry layer, and the attempts per queue item. The
   logical budget is a cap: an item runs at most
   `min(retry_attempts, logical_retry_attempts)` attempts, so
   `logical_retry_attempts = 1` makes exactly one provider call. When the
   budget runs out, the error keeps the class of the last failure and says
-  `exhausted after n/m`. The class is stored on the queue item
-  (`last_error_class`), so a later call or a restarted runtime reports the
-  same class.
+  `attempt budget exhausted`. Queue items store only a typed diagnostic code
+  (`last_error`) and typed class (`last_error_class`), so a later call or a
+  restarted runtime rebuilds the same class without stored text.
 - A lease that expires on an item's last allowed attempt, for example
   because the process crashed mid-call, ends the item as dead. A restarted
   runtime does not make another paid attempt from that item. On a non-final
@@ -287,8 +338,8 @@ A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
 These usage receipts support telemetry and cost reporting. They are not the
 canonical spend ledger or an enforceable monetary reservation. Accounting ownership
 and budget guarantees are specified in
-[boundary.md](boundary.md#spend-ledger-and-budgets). `QueueReceipt::redacted`
-replaces error text for logs that must not keep response bodies.
+[boundary.md](boundary.md#spend-ledger-and-budgets). Receipt errors carry only
+static diagnostic codes; they cannot contain provider response text.
 
 ## Current post-provider writes
 
@@ -312,9 +363,13 @@ these writes fails:
 - it is logged as a `tracing` warning.
 
 The same holds elsewhere. A cache hit whose trace write fails is still
-returned, with the diagnostic. A failed call keeps its own error when its
-failure trace or its cooldown cannot be written; those failures are logged,
-and any retry currently proceeds as scheduled. This does not establish safe retry
+returned, with the diagnostic. A failed failure-trace write is logged. A failed cooldown write returns a
+queue error and persists a stopped item, because execution without its account
+limiter is not allowed. Stopped items cannot be claimed, continued as logical retry
+chains or renewed by `budget_renewal_seconds`; identical waiters and later calls
+return the recorded refusal while the queue retains the item. Failures without a
+retry deadline also stop the item. Retryable failures with a deadline become failed
+or dead according to their attempt budget. This does not establish safe retry
 admission; the current policy's charge-certainty gap is described above.
 
 ## Custom response caches
@@ -328,7 +383,7 @@ contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access) 
 ## Backends and conformance
 
 `symbiotic-queue` ships `MemoryQueue`, the in-process backend with no storage
-dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 21
+dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 22
 checks of the `QueueBackend` contract. Both `MemoryQueue` and `SqliteQueue` run
 them in CI:
 
@@ -348,7 +403,12 @@ them in CI:
 - cooldown monotonicity;
 - unknown items.
 
-A new backend passes the same macro.
+A new backend passes the same macro. SQLite creates only the current schema;
+queue files require schema version 2 and the current queue table layouts.
+Other layouts are refused without migration. Unknown stored failure codes/classes
+are refused with a static error. Terminal items without a recorded error class
+return a queue error, without inferring a
+class from provider text.
 
 ## Lower-level types
 
