@@ -319,7 +319,10 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
         .chat(request("doomed"))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert!(matches!(
+        err,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(down.calls.load(Ordering::SeqCst), 1);
 
     // An in-memory runtime starts with a fresh budget.
@@ -475,7 +478,10 @@ async fn an_exhausted_error_keeps_its_class_after_a_restart() {
         .await
         .unwrap_err();
     assert!(matches!(again, ModelError::Provider(_)), "{again:?}");
-    assert!(again.to_string().contains("exhausted"), "{again}");
+    assert!(matches!(
+        again,
+        ModelError::Provider(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(broken.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -879,7 +885,10 @@ async fn logical_attempts_cap_provider_calls(runtime: Runtime) {
             .chat(request("capped"))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("exhausted"), "{err}");
+        assert!(matches!(
+            err,
+            ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+        ));
         assert_eq!(
             down.calls.load(Ordering::SeqCst),
             logical as usize,
@@ -1409,10 +1418,12 @@ fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
     let binding = runtime
         .registry_binding(&tenant, &principal, raw("http://127.0.0.1:10/v1"))
         .unwrap();
-    assert!(
-        matches!(runtime.chat(binding), Err(ModelError::InvalidRequest(message))
-        if message.as_str() == "effective transport differs from configured binding")
-    );
+    assert!(matches!(
+        runtime.chat(binding),
+        Err(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding
+        ))
+    ));
     let binding = runtime
         .registry_binding(&tenant, &principal, raw("http://127.0.0.1:9/v1"))
         .unwrap()
@@ -1527,7 +1538,8 @@ fn raw_and_registry_bindings_refuse_the_same_invalid_chat_settings() {
             Ok(_) => panic!("invalid raw binding was accepted"),
         };
         assert!(matches!(raw_error, ModelError::InvalidRequest(_)));
-        assert_eq!(raw_error.to_string(), configured_error.to_string());
+        assert!(matches!(raw_error, ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::UnsupportedChatSettingsReasoningEffortRequiresThinkingAndMustBeNonempty)));
+        assert!(matches!(configured_error, ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::UnsupportedChatSettingsReasoningEffortRequiresThinkingAndMustBeNonempty)));
     }
 }
 

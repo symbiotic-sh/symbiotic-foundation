@@ -11,10 +11,28 @@
 use std::io;
 use std::path::Path;
 
-fn refuse(path: &Path, why: &str) -> io::Error {
+#[derive(Debug, thiserror::Error)]
+#[error("{path} {why}")]
+struct PathRefused {
+    path: std::path::PathBuf,
+    why: &'static str,
+}
+
+/// Distinguish a policy refusal from an operating-system permission failure.
+#[cfg(any(feature = "queue", test))]
+pub(crate) fn is_path_refused(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PathRefused>())
+}
+
+fn refuse(path: &Path, why: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("{} {why}", path.display()),
+        PathRefused {
+            path: path.to_path_buf(),
+            why,
+        },
     )
 }
 
@@ -216,16 +234,14 @@ mod tests {
 
         std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o750)).unwrap();
         let err = ensure_private_dir(&nested).unwrap_err();
-        assert!(err.to_string().contains("group or others"), "{err}");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_path_refused(&err));
 
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(dir.path().join("a"), &link).unwrap();
-        assert!(
-            ensure_private_dir(&link)
-                .unwrap_err()
-                .to_string()
-                .contains("symlink")
-        );
+        let err = ensure_private_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_path_refused(&err));
     }
 
     #[test]
@@ -245,12 +261,9 @@ mod tests {
         assert_eq!(mode(&root.join("sub/file")), 0o600);
 
         std::os::unix::fs::symlink(dir.path(), root.join("sub/escape")).unwrap();
-        assert!(
-            ensure_owned_tree(&root)
-                .unwrap_err()
-                .to_string()
-                .contains("symlink")
-        );
+        let err = ensure_owned_tree(&root).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_path_refused(&err));
     }
 
     #[test]

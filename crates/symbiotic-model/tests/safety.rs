@@ -20,9 +20,12 @@ fn bystander() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, file)
 }
 
-fn assert_refused(result: Result<usize, symbiotic_model::ModelError>, file: &Path) {
+fn assert_refused<T: std::fmt::Debug>(result: Result<T, symbiotic_model::ModelError>, file: &Path) {
     let err = result.expect_err("a symlinked cache is refused");
-    assert!(err.to_string().contains("symlink"), "{err}");
+    assert!(matches!(
+        err,
+        symbiotic_model::ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused)
+    ));
     assert!(file.exists(), "a file behind the symlink was deleted");
 }
 
@@ -36,6 +39,15 @@ fn prune_and_purge_refuse_a_symlinked_cache_root() {
     let cache = DirResponseCache::new(&root);
     assert_refused(cache.prune(None, Some(0)), &file);
     assert_refused(cache.purge(|_| true), &file);
+    let request = json!({});
+    let entry = CacheEntry {
+        kind: "chat",
+        scope: None,
+        request_hash: "precious",
+        request: &request,
+    };
+    assert_refused(cache.load(&entry), &file);
+    assert_refused(cache.store(&entry, &request), &file);
 }
 
 #[cfg(unix)]
@@ -59,10 +71,41 @@ fn prune_and_purge_refuse_a_symlink_inside_the_cache() {
     std::os::unix::fs::symlink(target.path(), dir.path().join("cache/embedding")).unwrap();
     assert_refused(cache.prune(None, Some(0)), &file);
     assert_refused(cache.purge(|_| true), &file);
+    let entry = CacheEntry {
+        kind: "embedding",
+        scope: None,
+        request_hash: "precious",
+        request: &request,
+    };
+    assert_refused(cache.load(&entry), &file);
+    assert_refused(cache.store(&entry, &request), &file);
     assert!(
         dir.path().join("cache/chat/own.json").exists(),
         "a refused sweep deletes nothing"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_store_prune_and_purge_refuse_a_symlinked_cache_file() {
+    let (_target, file) = bystander();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = DirResponseCache::new(dir.path().join("cache"));
+    let request = json!({});
+    let entry = CacheEntry {
+        kind: "chat",
+        scope: None,
+        request_hash: "own",
+        request: &request,
+    };
+    cache.store(&entry, &request).unwrap();
+    let link = cache.root().join("chat/own.json");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert_refused(cache.load(&entry), &file);
+    assert_refused(cache.store(&entry, &request), &file);
+    assert_refused(cache.prune(None, Some(0)), &file);
+    assert_refused(cache.purge(|_| true), &file);
 }
 
 #[test]

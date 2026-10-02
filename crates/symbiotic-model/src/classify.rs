@@ -1795,7 +1795,9 @@ mod tests {
         provider.client = HttpClient(Err(()));
         assert!(matches!(
             provider.validate_configuration(),
-            Err(ModelError::InvalidRequest(message)) if message.as_str() == "invalid HTTP client configuration"
+            Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidHttpClientConfiguration
+            ))
         ));
     }
 

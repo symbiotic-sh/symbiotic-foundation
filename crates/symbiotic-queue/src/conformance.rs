@@ -364,7 +364,10 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(failed.status, QueueStatus::Failed);
-    assert_eq!(failed.last_error.as_deref(), Some("queue failure"));
+    assert_eq!(
+        failed.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
     assert!(failed.lease_owner.is_none() && failed.lease_until.is_none());
     // A failed item is still active for deduplication.
     let duplicate = queue.enqueue(request("retry")).await.unwrap();
@@ -384,7 +387,10 @@ pub async fn fail_retries_until_dead_and_complete_clears_the_error(queue: Arc<dy
     let dead = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(dead.status, QueueStatus::Dead);
     assert_eq!(dead.attempt, 2);
-    assert_eq!(dead.last_error.as_deref(), Some("queue failure"));
+    assert_eq!(
+        dead.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
     let terminal = queue.enqueue(request("retry")).await.unwrap();
     assert_eq!(terminal.disposition, EnqueueDisposition::TerminalDuplicate);
 
@@ -455,7 +461,10 @@ pub async fn expired_lease_cannot_complete_and_is_reclaimed(queue: Arc<dyn Queue
     assert_eq!(queue.reclaim_expired_leases(&queue_id()).await.unwrap(), 0);
     let reclaimed = queue.get_item(&item.item_id).await.unwrap().unwrap();
     assert_eq!(reclaimed.status, QueueStatus::Failed);
-    assert_eq!(reclaimed.last_error.as_deref(), Some("lease expired"));
+    assert_eq!(
+        reclaimed.last_error,
+        Some(symbiotic_core::DiagnosticCode::LeaseExpired)
+    );
     assert!(reclaimed.lease_owner.is_none() && reclaimed.lease_until.is_none());
 
     // Another worker can take it over; the attempt counter keeps counting.
@@ -546,8 +555,14 @@ pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn Q
         .unwrap();
     assert_eq!(outcome, FailOutcome::RetryScheduled);
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
-    assert_eq!(failed.last_error.as_deref(), Some("queue failure"));
-    assert_eq!(failed.last_error_class.as_deref(), Some("rate_limited"));
+    assert_eq!(
+        failed.last_error,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    assert_eq!(
+        failed.last_error_class,
+        Some(symbiotic_core::FailureClass::RateLimited)
+    );
     assert!(
         (failed.run_after - deadline).num_milliseconds().abs() < 5,
         "{} vs {deadline}",
@@ -666,7 +681,10 @@ pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
     let duplicate = queue.enqueue(request("stopped")).await.unwrap();
     assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
     assert_eq!(duplicate.item.item_id, item.item_id);
-    assert_eq!(duplicate.item.last_error_class.as_deref(), Some("queue"));
+    assert_eq!(
+        duplicate.item.last_error_class,
+        Some(symbiotic_core::FailureClass::Queue)
+    );
 }
 
 /// A cooldown extension accepted before a claim must keep both claim APIs pending.

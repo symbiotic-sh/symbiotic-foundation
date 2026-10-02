@@ -610,10 +610,10 @@ async fn exhausted_retries_keep_the_class_of_the_last_failure() {
         .await
         .unwrap_err();
     assert!(matches!(err, ModelError::Timeout(_)), "{err:?}");
-    assert!(
-        err.to_string().contains("attempt budget exhausted"),
-        "{err}"
-    );
+    assert!(matches!(
+        err,
+        ModelError::Timeout(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
 }
 
@@ -686,7 +686,10 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     let provider = queued(kept.clone(), Arc::new(MemoryQueue::new()), once.clone());
     provider.chat(request("same")).await.unwrap_err();
     let err = provider.chat(request("same")).await.unwrap_err();
-    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert!(matches!(
+        err,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(kept.calls.load(Ordering::SeqCst), 1, "no second paid call");
 
     let renewed = down();
@@ -862,7 +865,10 @@ async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
 
     backend.resume.notify_one();
     let err = delayed.await.unwrap().unwrap_err();
-    assert!(err.to_string().contains("exhausted"), "{err}");
+    assert!(matches!(
+        err,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(
         raw.calls.load(Ordering::SeqCst),
         2,
@@ -1153,8 +1159,8 @@ async fn an_abandoned_call_that_fails_records_its_class_and_releases_its_lease(
         "{backend}: its only attempt failed"
     );
     assert_eq!(
-        item.last_error_class.as_deref(),
-        Some("unavailable"),
+        item.last_error_class,
+        Some(symbiotic_core::FailureClass::Unavailable),
         "{backend}"
     );
     assert!(
@@ -1172,7 +1178,10 @@ async fn an_abandoned_call_that_fails_records_its_class_and_releases_its_lease(
         matches!(err, ModelError::Unavailable(_)),
         "{backend}: {err:?}"
     );
-    assert!(err.to_string().contains("exhausted"), "{backend}: {err}");
+    assert!(matches!(
+        err,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
 }
 
@@ -1470,13 +1479,13 @@ async fn a_slow_failure_receipt_keeps_the_lease_until_the_failure_is_recorded(
         .unwrap();
     assert_eq!(item.status, QueueStatus::Dead, "{backend}: {item:?}");
     assert_eq!(
-        item.last_error_class.as_deref(),
-        Some("unavailable"),
+        item.last_error_class,
+        Some(symbiotic_core::FailureClass::Unavailable),
         "{backend}: {item:?}"
     );
     assert_eq!(
-        item.last_error.as_deref(),
-        Some("HTTP unavailable"),
+        item.last_error,
+        Some(symbiotic_core::DiagnosticCode::HttpUnavailable),
         "{backend}: the provider's failure, not an expired lease"
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
@@ -1614,8 +1623,8 @@ async fn failed_cooldown_is_terminal(
         "{backend}: {item:?}"
     );
     assert_eq!(
-        item.last_error_class.as_deref(),
-        Some("queue"),
+        item.last_error_class,
+        Some(symbiotic_core::FailureClass::Queue),
         "{backend}: {item:?}"
     );
     assert!(
@@ -1817,7 +1826,10 @@ async fn a_failed_trace_write_keeps_the_providers_error(backend: &str, queue: Ar
 
     let err = provider.chat(request("rejected")).await.unwrap_err();
     assert!(
-        err.to_string().contains("provider failure"),
+        matches!(
+            err,
+            ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+        ),
         "{backend}: the provider's error, not the trace store's: {err}"
     );
 }

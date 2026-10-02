@@ -376,8 +376,12 @@ fn remove_entry(path: &Path) -> Result<(), ModelError> {
     }
 }
 
-fn cache_io(_path: &Path, _err: std::io::Error) -> ModelError {
-    ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
+fn cache_io(_path: &Path, err: std::io::Error) -> ModelError {
+    ModelError::Cache(if crate::private_fs::is_path_refused(&err) {
+        symbiotic_core::DiagnosticCode::CachePathRefused
+    } else {
+        symbiotic_core::DiagnosticCode::CacheFailure
+    })
 }
 
 /// Whether a path the cache reads exists, refusing one that is a symlink or
@@ -387,7 +391,7 @@ fn owned_or_missing(path: &Path) -> Result<Option<std::fs::Metadata>, ModelError
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 return Err(ModelError::Cache(
-                    symbiotic_core::DiagnosticCode::CacheFailure,
+                    symbiotic_core::DiagnosticCode::CachePathRefused,
                 ));
             }
             #[cfg(unix)]
@@ -396,7 +400,7 @@ fn owned_or_missing(path: &Path) -> Result<Option<std::fs::Metadata>, ModelError
                 // SAFETY: `geteuid` has no preconditions and cannot fail.
                 if meta.uid() != unsafe { libc::geteuid() } {
                     return Err(ModelError::Cache(
-                        symbiotic_core::DiagnosticCode::CacheFailure,
+                        symbiotic_core::DiagnosticCode::CachePathRefused,
                     ));
                 }
             }
@@ -426,7 +430,7 @@ fn safe_component(value: &str) -> Result<&str, ModelError> {
         Ok(value)
     } else {
         Err(ModelError::Cache(
-            symbiotic_core::DiagnosticCode::CacheFailure,
+            symbiotic_core::DiagnosticCode::CachePathRefused,
         ))
     }
 }
@@ -650,7 +654,19 @@ mod tests {
             request_hash: "abc123",
             request: &request,
         };
-        assert!(cache.load(&traversal).is_err());
+        assert!(matches!(
+            cache.load(&traversal),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        assert!(matches!(
+            cache.store(&traversal, &serde_json::json!({})),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        assert!(dir.path().join("chat/scope/abc123.json").is_file());
     }
 
     fn chat_entry<'a>(hash: &'a str, request: &'a Value) -> CacheEntry<'a> {
@@ -740,10 +756,50 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("cache/chat")).unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("cache/chat")).unwrap();
         let load = cache.load(&chat_entry("h", &request)).unwrap_err();
-        assert!(matches!(load, ModelError::Cache(_)));
+        assert!(matches!(
+            load,
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused)
+        ));
         let store = cache
             .store(&chat_entry("h", &request), &serde_json::json!({}))
             .unwrap_err();
-        assert!(matches!(store, ModelError::Cache(_)));
+        assert!(matches!(
+            store,
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused)
+        ));
+    }
+
+    #[test]
+    fn cache_io_failures_are_distinct_from_path_refusals() {
+        use symbiotic_core::DiagnosticCode;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"protected").unwrap();
+        let cache = DirResponseCache::new(&root);
+        let request = serde_json::json!({});
+        assert!(matches!(
+            cache.store(&chat_entry("h", &request), &request),
+            Err(ModelError::Cache(DiagnosticCode::CachePathRefused))
+        ));
+        assert_eq!(std::fs::read(&root).unwrap(), b"protected");
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(matches!(
+                cache_io(&root, std::io::Error::from(kind)),
+                ModelError::Cache(DiagnosticCode::CacheFailure)
+            ));
+        }
+        let cache = DirResponseCache::new(dir.path().join("cache"));
+        cache.store(&chat_entry("h", &request), &request).unwrap();
+        let file = cache.root().join("chat/h.json");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(matches!(
+            cache.load(&chat_entry("h", &request)),
+            Err(ModelError::Cache(DiagnosticCode::CacheFailure))
+        ));
     }
 }

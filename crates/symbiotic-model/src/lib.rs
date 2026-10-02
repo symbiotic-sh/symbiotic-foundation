@@ -3468,7 +3468,9 @@ mod tests {
         for provider in [&chat as &dyn ModelProvider, &embedding] {
             assert!(matches!(
                 provider.validate_configuration(),
-                Err(ModelError::InvalidRequest(message)) if message.as_str() == "invalid HTTP client configuration"
+                Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::InvalidHttpClientConfiguration
+                ))
             ));
         }
     }
@@ -3549,8 +3551,12 @@ mod tests {
             let raw: GeminiEmbedWireResponse =
                 serde_json::from_str(&format!(r#"{{"embedding":{{"values":[0.25,{number}]}}}}"#))
                     .unwrap();
-            assert!(matches!(raw.embedding.unwrap().into_values(2),
-                Err(ModelError::Provider(message)) if message.as_str() == "Gemini embedding contains non-finite components"));
+            assert!(matches!(
+                raw.embedding.unwrap().into_values(2),
+                Err(ModelError::Provider(
+                    symbiotic_core::DiagnosticCode::GeminiEmbeddingContainsNonFiniteComponents
+                ))
+            ));
         }
         let raw: GeminiEmbedWireResponse =
             serde_json::from_str(r#"{"embedding":{"values":[0.25,-0.5,3e38]}}"#).unwrap();
@@ -3572,8 +3578,12 @@ mod tests {
                 .into_iter()
                 .map(|embedding| embedding.into_values(2))
                 .collect();
-            assert!(matches!(result,
-                Err(ModelError::Provider(message)) if message.as_str() == "Gemini embedding contains non-finite components"));
+            assert!(matches!(
+                result,
+                Err(ModelError::Provider(
+                    symbiotic_core::DiagnosticCode::GeminiEmbeddingContainsNonFiniteComponents
+                ))
+            ));
         }
         let raw: GeminiBatchEmbedWireResponse = serde_json::from_str(
             r#"{"embeddings":[{"values":[0.25,0.5]},{"values":[-0.5,3e38]}]}"#,
@@ -4258,7 +4268,10 @@ mod tests {
 
         let err = provider.chat(chat_request("hello")).await.unwrap_err();
 
-        assert!(err.to_string().contains("attempt budget exhausted"));
+        assert!(matches!(
+            err,
+            ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -4390,6 +4403,7 @@ mod tests {
             ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure),
             ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure),
             ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure),
+            ModelError::Cache(symbiotic_core::DiagnosticCode::CachePathRefused),
         ];
         let now = Utc::now();
         for err in errors {
@@ -4411,6 +4425,7 @@ mod tests {
                 updated_at: now,
             };
             let replayed = dead_item_retry_error(&item);
+            assert_eq!(replayed.code(), err.code());
             assert_eq!(
                 std::mem::discriminant(&replayed),
                 std::mem::discriminant(&err),
@@ -4435,10 +4450,12 @@ mod tests {
             let mut missing_class = item;
             missing_class.last_error_class = None;
             missing_class.last_error = Some(DiagnosticCode::ProviderFailure);
-            assert!(
-                matches!(dead_item_retry_error(&missing_class), ModelError::Queue(message)
-                if message.as_str() == "terminal queue item is missing its error class")
-            );
+            assert!(matches!(
+                dead_item_retry_error(&missing_class),
+                ModelError::Queue(
+                    symbiotic_core::DiagnosticCode::TerminalQueueItemIsMissingItsErrorClass
+                )
+            ));
         }
     }
 

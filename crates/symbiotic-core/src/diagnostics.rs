@@ -60,6 +60,7 @@ closed_codes! {
         AuthenticationRejected => ("authentication_rejected", "authentication rejected"),
         BindingIdentityIsRequired => ("binding_identity_is_required", "binding identity is required"),
         CacheFailure => ("cache_failure", "cache failure"),
+        CachePathRefused => ("cache_path_refused", "cache path refused"),
         ChatOutputLimitRequired => ("chat_output_limit_required", "chat output limit required"),
         EmbeddingDimensionsMustBeNonzero => ("embedding_dimensions_must_be_nonzero", "embedding dimensions must be nonzero"),
         EmbeddingDimensionsRequired => ("embedding_dimensions_required", "embedding dimensions required"),

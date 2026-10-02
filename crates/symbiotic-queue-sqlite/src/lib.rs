@@ -1232,7 +1232,7 @@ mod tests {
                 error,
                 QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
             ));
-            assert!(error.to_string().contains("rebuild the queue database"));
+
             assert_eq!(
                 conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
@@ -1291,7 +1291,7 @@ mod tests {
                     error,
                     QueueError::Storage(symbiotic_core::DiagnosticCode::UnsupportedQueueSchema)
                 ));
-                assert!(error.to_string().contains("rebuild the queue database"));
+
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
@@ -1568,7 +1568,7 @@ mod tests {
             .events()
             .unwrap()
             .into_iter()
-            .filter(|event| event.error.as_deref() == Some("stale queue item"))
+            .filter(|event| event.error == Some(symbiotic_core::DiagnosticCode::StaleQueueItem))
             .count();
         assert_eq!(cleanup_events, 3);
     }
@@ -1661,7 +1661,10 @@ mod tests {
         let duplicate = reopened.enqueue(request("stopped")).await.unwrap();
         assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
         assert_eq!(duplicate.item.status, QueueStatus::Stopped);
-        assert_eq!(duplicate.item.last_error_class.as_deref(), Some("queue"));
+        assert_eq!(
+            duplicate.item.last_error_class,
+            Some(symbiotic_core::FailureClass::Queue)
+        );
         assert!(duplicate.item.attempt < duplicate.item.max_attempts);
         assert!(
             reopened
@@ -1723,11 +1726,14 @@ mod tests {
         assert_eq!(reclaimed, 1);
         let item = queue.get(&claimed[0].item_id).unwrap().unwrap();
         assert_eq!(item.status, QueueStatus::Failed);
-        assert_eq!(item.last_error.as_deref(), Some("lease expired"));
+        assert_eq!(
+            item.last_error,
+            Some(symbiotic_core::DiagnosticCode::LeaseExpired)
+        );
         assert!(queue.events().unwrap().iter().any(|event| {
             event.item_id.0 == item.item_id.0
                 && event.status == QueueStatus::Failed
-                && event.error.as_deref() == Some("lease expired")
+                && event.error == Some(symbiotic_core::DiagnosticCode::LeaseExpired)
         }));
     }
 
