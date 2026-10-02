@@ -239,6 +239,11 @@ route with the runtime. Concurrency, rate buckets and cooldowns are grouped by
 independent tenant accounts remain isolated. The same non-null sharing key
 explicitly pools execution limits across routes, models and tenants. Bindings
 in one group must agree on concurrency and pacing limits or startup is refused.
+Route and registry validation runs before creating state, acquiring the process
+lock, loading the admission key or opening the runtime. Configuration conflicts
+return `InvalidRequest`; actual state/IO failures return `StateUnavailable`.
+Dropping the last process handle explicitly releases its lock so descriptors
+inherited by concurrently spawned children cannot delay a subsequent reopen.
 Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.

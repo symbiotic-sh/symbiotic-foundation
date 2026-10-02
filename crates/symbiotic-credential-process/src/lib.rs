@@ -100,7 +100,7 @@ struct Inner {
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
     runtime: Runtime,
-    _process_lock: std::fs::File,
+    _process_lock: ProcessLock,
 }
 
 /// Cloneable process handle. Started dispatch work survives dropped caller futures.
@@ -123,10 +123,8 @@ impl CredentialProcess {
         {
             return Err(EgressError::InvalidRequest);
         }
-        symbiotic_ai_runtime::model::private_fs::ensure_private_dir(&config.state_dir)
-            .map_err(|_| EgressError::StateUnavailable)?;
-        let process_lock = lock_process(&config.state_dir)?;
-        let key = AdmissionKey::new(config.admission_key.load(config.max_secret_bytes)?.to_vec())?;
+        // Validate every route and shared account policy before touching state.
+        // A lock or IO failure must not mask invalid deployment configuration.
         let mut routes = HashMap::new();
         for route in &config.routes {
             validate_route(route, config.max_frame_bytes)?;
@@ -137,8 +135,13 @@ impl CredentialProcess {
                 return Err(EgressError::InvalidRequest);
             }
         }
+        let configured_registry = Arc::new(provider::configured_registry(&config.routes)?);
+        symbiotic_ai_runtime::model::private_fs::ensure_private_dir(&config.state_dir)
+            .map_err(|_| EgressError::StateUnavailable)?;
+        let process_lock = lock_process(&config.state_dir)?;
+        let key = AdmissionKey::new(config.admission_key.load(config.max_secret_bytes)?.to_vec())?;
         let runtime = Runtime::open(RuntimeConfig {
-            registry: Some(Arc::new(provider::configured_registry(&config.routes)?)),
+            registry: Some(configured_registry),
             state_dir: Some(config.state_dir.clone()),
             ..RuntimeConfig::default()
         })
@@ -514,7 +517,22 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
     }
 }
 
-fn lock_process(dir: &std::path::Path) -> Result<std::fs::File, EgressError> {
+struct ProcessLock(std::fs::File);
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Closing alone leaves the flock held while a concurrently spawned
+            // child retains an inherited descriptor, even with O_CLOEXEC.
+            // SAFETY: this guard owns the live descriptor; flock retains no pointer.
+            let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
     let path = dir.join("credential-process.lock");
     symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path)
         .map_err(|_| EgressError::StateUnavailable)?;
@@ -532,5 +550,30 @@ fn lock_process(dir: &std::path::Path) -> Result<std::fs::File, EgressError> {
     }
     #[cfg(not(unix))]
     return Err(EgressError::StateUnavailable);
-    Ok(file)
+    Ok(ProcessLock(file))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_process_lock_releases_it_with_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_process(dir.path()).unwrap();
+        // dup and a child inheriting the descriptor retain the same flock.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(matches!(
+            lock_process(dir.path()),
+            Err(EgressError::StateUnavailable)
+        ));
+        drop(lock);
+        let reopened = lock_process(dir.path());
+        assert!(reopened.is_ok(), "inherited descriptor retained the lock");
+        drop(inherited);
+        assert!(matches!(
+            lock_process(dir.path()),
+            Err(EgressError::StateUnavailable)
+        ));
+    }
 }
