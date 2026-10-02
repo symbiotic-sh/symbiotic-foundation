@@ -232,9 +232,40 @@ impl QueueTraceSink for InMemoryQueueTraceSink {
     }
 }
 
+/// Run synchronous work on the blocking pool, preserving panics and caller errors.
+async fn run_blocking<T: Send + 'static, E: Send + 'static>(
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
+    cancelled: E,
+) -> Result<T, E> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(output) => output,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(_) => Err(cancelled),
+    }
+}
+
+async fn append_jsonl(
+    file: Arc<Mutex<std::fs::File>>,
+    trace: impl Serialize + Send + 'static,
+) -> Result<(), TraceError> {
+    run_blocking(
+        move || {
+            use std::io::Write;
+            let failed = || TraceError::Sink(DiagnosticCode::StorageFailure);
+            let mut line = serde_json::to_vec(&trace).map_err(|_| failed())?;
+            line.push(b'\n');
+            let mut file = file.lock().map_err(|_| failed())?;
+            file.write_all(&line).map_err(|_| failed())?;
+            file.flush().map_err(|_| failed())
+        },
+        TraceError::Sink(DiagnosticCode::StorageFailure),
+    )
+    .await
+}
+
 pub struct JsonlTraceSink {
     path: PathBuf,
-    file: Mutex<std::fs::File>,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 impl JsonlTraceSink {
@@ -250,7 +281,7 @@ impl JsonlTraceSink {
             .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
         })
     }
 
@@ -277,28 +308,13 @@ impl JsonlTraceSink {
 #[async_trait]
 impl TraceSink for JsonlTraceSink {
     async fn record_model_invocation(&self, trace: ModelInvocationTrace) -> Result<(), TraceError> {
-        use std::io::Write;
-
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&trace)
-                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?
-        )
-        .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        file.flush()
-            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        Ok(())
+        append_jsonl(self.file.clone(), trace).await
     }
 }
 
 pub struct JsonlQueueTraceSink {
     path: PathBuf,
-    file: Mutex<std::fs::File>,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 impl JsonlQueueTraceSink {
@@ -314,7 +330,7 @@ impl JsonlQueueTraceSink {
             .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
         })
     }
 
@@ -341,22 +357,7 @@ impl JsonlQueueTraceSink {
 #[async_trait]
 impl QueueTraceSink for JsonlQueueTraceSink {
     async fn record_queue_event(&self, trace: QueueEventTrace) -> Result<(), TraceError> {
-        use std::io::Write;
-
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&trace)
-                .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?
-        )
-        .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        file.flush()
-            .map_err(|_| TraceError::Sink(symbiotic_core::DiagnosticCode::StorageFailure))?;
-        Ok(())
+        append_jsonl(self.file.clone(), trace).await
     }
 }
 
@@ -418,6 +419,80 @@ mod tests {
             metadata: serde_json::json!({}),
             timestamp: Utc::now(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jsonl_writes_leave_the_async_worker_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(JsonlTraceSink::open(dir.path().join("model.jsonl")).unwrap());
+        let queue = Arc::new(JsonlQueueTraceSink::open(dir.path().join("queue.jsonl")).unwrap());
+        for queue_write in [false, true] {
+            let model = model.clone();
+            let queue = queue.clone();
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let locker_model = model.clone();
+            let locker_queue = queue.clone();
+            let locker = std::thread::spawn(move || {
+                let _guard = if queue_write {
+                    locker_queue.file.lock().unwrap()
+                } else {
+                    locker_model.file.lock().unwrap()
+                };
+                locked_tx.send(()).unwrap();
+                // A watchdog releases the lock even when the old synchronous sink
+                // stalls this test's only async worker.
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok()
+            });
+            locked_rx.recv().unwrap();
+            let write = tokio::spawn(async move {
+                if queue_write {
+                    queue.record_queue_event(sample_queue_trace()).await
+                } else {
+                    model.record_model_invocation(sample_trace()).await
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = release_tx.send(());
+            assert!(
+                locker.join().unwrap(),
+                "JSONL write blocked the async worker"
+            );
+            write.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_jsonl_writes_produce_whole_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.jsonl");
+        let sink = Arc::new(JsonlTraceSink::open(&path).unwrap());
+        let mut writes = tokio::task::JoinSet::new();
+        for index in 0..64 {
+            let sink = sink.clone();
+            writes.spawn(async move {
+                let mut trace = sample_trace();
+                trace.request_hash = index.to_string();
+                sink.record_model_invocation(trace).await
+            });
+        }
+        while let Some(write) = writes.join_next().await {
+            write.unwrap().unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with('\n'));
+        let records: Vec<ModelInvocationTrace> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 64);
+        let ids: std::collections::HashSet<_> = records
+            .iter()
+            .map(|trace| trace.request_hash.as_str())
+            .collect();
+        assert_eq!(ids.len(), 64);
     }
 
     #[tokio::test]

@@ -2323,3 +2323,41 @@ async fn failed_settlement_keeps_typed_receipt_unknown_and_preserves_paid_output
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
 }
+
+#[tokio::test]
+async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response() {
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let response_bytes = fixture.config.routes[0].max_response_bytes;
+    let largest_field = (fixture.config.max_frame_bytes as usize - 4096 - 4 * response_bytes) / 18;
+    fixture.config.routes[0].max_field_bytes = largest_field;
+    let process = CredentialProcess::open(fixture.config.clone()).unwrap();
+    drop(process);
+    for field_bytes in [
+        largest_field + 1,
+        fixture.config.max_frame_bytes as usize,
+        usize::MAX,
+    ] {
+        fixture.config.routes[0].max_field_bytes = field_bytes;
+        let error = CredentialProcess::open(fixture.config.clone())
+            .err()
+            .expect("oversized route must be refused");
+        for setting in ["max_frame_bytes", "max_field_bytes", "max_response_bytes"] {
+            assert!(
+                error.to_string().contains(setting),
+                "missing {setting}: {error}"
+            );
+        }
+    }
+    fixture.config.routes[0].max_field_bytes = 1;
+    fixture.config.routes[0].max_response_bytes = 1;
+    fixture.config.routes[0].max_input_bytes = 1;
+    for frame_bytes in [4096, 4117] {
+        fixture.config.max_frame_bytes = frame_bytes;
+        let error = CredentialProcess::open(fixture.config.clone())
+            .err()
+            .expect("frame must fit envelope and one field");
+        assert!(error.to_string().contains("max_frame_bytes"));
+    }
+    fixture.config.max_frame_bytes = 4118;
+    CredentialProcess::open(fixture.config.clone()).unwrap();
+}
