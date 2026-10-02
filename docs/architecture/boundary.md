@@ -200,7 +200,10 @@ charge after uncertain raw-provider failures and stop retries regardless of erro
 or unused attempt allowance. A trusted adapter may explicitly establish KnownZero;
 only that evidence permits release and retry. Credential permit consumption and ledger reservation are
 one immediate SQLite transaction; completion and accounting settlement are also
-atomic. The Memory-facing receipt protocol remains unchanged pending PR 6b.
+atomic. The version-3 Memory-facing protocol returns the accepted attempt identity and a typed
+Foundation receipt reference. Its spend state is a ledger observation, never a consumer
+reservation or settlement instruction. The local backend orders authenticated grant
+revision publication with acceptance as described in [model egress](model-egress.md#revocation-replay-and-unknown-charges).
 
 For example, a request-bound invocation allows at most two provider requests. One
 attempt is accepted, then times out after transport starts. Foundation retains its

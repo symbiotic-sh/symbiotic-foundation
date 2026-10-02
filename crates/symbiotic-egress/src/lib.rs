@@ -1,13 +1,10 @@
-//! WP14 v2: Memory attests durable admission; Foundation owns credentials and dispatch.
-//! A signer must never sign an attempt until its K durability barrier has succeeded.
-//!
-//! These are the current v2 wire contracts. Memory-recorded reservations, processing
-//! markings and record-sequence route revocation reflect the existing implementation;
-//! canonical Foundation spend accounting and caller/provider grant-revision ordering
-//! remain implementation work under `docs/architecture/boundary.md`.
+//! Memory attests durable input authorization; Foundation owns dispatch and accounting.
+//! Sign admissions only after durability and ordered publication of the grant revision.
 
 pub use symbiotic_core::Sensitivity;
-pub use symbiotic_model::{ChatMessage, ChatRequest, EmbeddingRequest};
+pub use symbiotic_model::{
+    ChatMessage, ChatRequest, EmbeddingRequest, SpendReceiptRef, SpendState,
+};
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -19,7 +16,7 @@ use zeroize::Zeroizing;
 pub mod socket;
 
 /// Current wire and operation version. Unknown versions fail closed.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Static, safe-to-log errors. Never carry transport/provider bodies or credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -63,19 +60,6 @@ pub enum EgressError {
     Transport,
 }
 
-/// Trusted upper reservation. V2 supports provider requests, not inferred money.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReservedBudget {
-    /// Explicit unit; v2 dispatch supports `provider_requests` only.
-    pub unit: String,
-    /// Upper bound for this attempt; one request for the v2 adapters.
-    pub amount: u64,
-    /// Current v2 invocation limit attested by Memory across attempts; canonical
-    /// reservation enforcement belongs to Foundation under the boundary contract.
-    pub invocation_limit: u64,
-}
-
 /// Exact Memory K record, signed only after successful durability.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,7 +82,7 @@ pub struct DurableAttempt {
     pub recovery_expires_at: u64,
     /// Verified caller binding.
     pub caller_binding: String,
-    /// Approved route identifier.
+    /// Configured provider principal/route identifier.
     pub route: String,
     /// Exact configured destination (base URL for chat; service URL for Gemini).
     pub destination: String,
@@ -114,14 +98,8 @@ pub struct DurableAttempt {
     pub input_manifest_digest: String,
     /// Lowercase SHA-256 from [`ProviderPayload::digest`].
     pub input_digest: String,
-    /// Existing v2 processing markings; empty is valid. The boundary contract uses
-    /// caller/provider read grants instead; this field does not attest those checks.
-    pub markings: Vec<String>,
-    /// Configured total attempts for this invocation.
-    pub max_attempts: u32,
-    /// Current v2 reservation attested by Memory. This is not evidence of a
-    /// canonical Foundation spend-ledger reservation under the boundary contract.
-    pub reserved_budget: ReservedBudget,
+    /// Effective caller-and-provider input grant revision, checked at acceptance.
+    pub grant_revision: u64,
 }
 
 /// Durable attempt identity, independent of its signed contents.
@@ -173,7 +151,7 @@ pub enum ProviderPayload {
 }
 
 impl ProviderPayload {
-    /// Digest the exact version-2 typed JSON representation; Memory uses this helper.
+    /// Digest the exact version-3 typed JSON representation; Memory uses this helper.
     pub fn digest(&self) -> Result<String, EgressError> {
         digest(self)
     }
@@ -189,28 +167,26 @@ pub struct SignedAttempt {
     pub authentication: String,
 }
 
-/// Current v2 route restriction from Memory's serialization order.
-/// This API does not establish the boundary contract's caller/provider
-/// grant-revision ordering at dispatch acceptance.
+/// Ordered effective authorization revision for a tenant restore incarnation.
+/// Covers caller and provider input authorization, including group dependencies.
+/// Publish the initial revision before admissions and serialize updates with acceptance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RouteRevocation {
+pub struct GrantRevision {
     /// Tenant namespace.
     pub tenant: String,
     /// Restore incarnation.
     pub incarnation: String,
-    /// Restricted route.
-    pub route: String,
-    /// K position of the route removal.
-    pub record_sequence: u64,
+    /// Monotonically increasing effective revision; an exact replay is idempotent.
+    pub revision: u64,
 }
 
-/// Authenticated route restriction.
+/// Authenticated revision publication; never a spend or settlement instruction.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignedRevocation {
-    /// Restriction record.
-    pub revocation: RouteRevocation,
+pub struct SignedGrantRevision {
+    /// Effective revision to publish.
+    pub grant: GrantRevision,
     /// Domain-separated HMAC-SHA256.
     pub authentication: String,
 }
@@ -231,7 +207,7 @@ impl AdmissionKey {
 
     /// Attest an attempt after the Memory durability barrier (never before).
     pub fn sign_attempt(&self, attempt: DurableAttempt) -> Result<SignedAttempt, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v2/attempt\0", &attempt)?;
+        let authentication = self.sign(b"symbiotic-egress/v3/attempt\0", &attempt)?;
         Ok(SignedAttempt {
             attempt,
             authentication,
@@ -240,7 +216,7 @@ impl AdmissionKey {
 
     /// Authorize result recovery for an attempt identity.
     pub fn sign_attempt_id(&self, attempt_id: AttemptId) -> Result<SignedAttemptId, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v2/attempt-status\0", &attempt_id)?;
+        let authentication = self.sign(b"symbiotic-egress/v3/attempt-status\0", &attempt_id)?;
         Ok(SignedAttemptId {
             attempt_id,
             authentication,
@@ -250,20 +226,20 @@ impl AdmissionKey {
     /// Verify status authorization in constant time.
     pub fn verify_attempt_id(&self, signed: &SignedAttemptId) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v2/attempt-status\0",
+            b"symbiotic-egress/v3/attempt-status\0",
             &signed.attempt_id,
             &signed.authentication,
         )
     }
 
-    /// Authenticate a serialized route removal.
-    pub fn sign_revocation(
+    /// Publish a revision through the ordered trusted admission integration.
+    pub fn sign_grant_revision(
         &self,
-        revocation: RouteRevocation,
-    ) -> Result<SignedRevocation, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v2/revocation\0", &revocation)?;
-        Ok(SignedRevocation {
-            revocation,
+        grant: GrantRevision,
+    ) -> Result<SignedGrantRevision, EgressError> {
+        let authentication = self.sign(b"symbiotic-egress/v3/grant-revision\0", &grant)?;
+        Ok(SignedGrantRevision {
+            grant,
             authentication,
         })
     }
@@ -271,17 +247,17 @@ impl AdmissionKey {
     /// Verify a durable admission attestation in constant time.
     pub fn verify_attempt(&self, signed: &SignedAttempt) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v2/attempt\0",
+            b"symbiotic-egress/v3/attempt\0",
             &signed.attempt,
             &signed.authentication,
         )
     }
 
-    /// Verify a route restriction in constant time.
-    pub fn verify_revocation(&self, signed: &SignedRevocation) -> Result<(), EgressError> {
+    /// Verify a revision publication in constant time.
+    pub fn verify_grant_revision(&self, signed: &SignedGrantRevision) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v2/revocation\0",
-            &signed.revocation,
+            b"symbiotic-egress/v3/grant-revision\0",
+            &signed.grant,
             &signed.authentication,
         )
     }
@@ -370,16 +346,6 @@ where
     serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
-/// Charge settlement. Unknown means retain the entire reservation until reconciliation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ChargeReport {
-    /// Confirmed measured charge in the declared units.
-    Measured { unit: String, amount: u64 },
-    /// May have reached the provider; never release/reuse this reservation automatically.
-    Unknown { reserved: ReservedBudget },
-}
-
 /// Outcome of one attempted dispatch, safe to log (no provider error strings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -398,12 +364,16 @@ pub enum DispatchStatus {
 pub struct DispatchReceipt {
     /// Exact attempt binding.
     pub attempt_digest: String,
+    /// Accepted logical invocation and attempt identity.
+    pub attempt_id: AttemptId,
+    /// Canonical Foundation ledger reference retained in consumer provenance.
+    pub reference: SpendReceiptRef,
     /// Typed completion state.
     pub status: DispatchStatus,
     /// Reported token/media/cost measurements, never inferred prices.
     pub usage: symbiotic_trace::UsageTrace,
-    /// Reservation settlement instruction.
-    pub charge: ChargeReport,
+    /// Foundation accounting observation; never a consumer settlement instruction.
+    pub spend_state: SpendState,
 }
 
 /// Static runtime bookkeeping failures; never contain raw diagnostic text.
@@ -426,9 +396,9 @@ pub struct DispatchResult {
     pub error: Option<EgressError>,
     /// Runtime side effects that failed without discarding the paid answer or usage.
     pub diagnostics: Vec<DispatchDiagnostic>,
-    /// False if the receipt write failed; restart still reports the earlier unknown charge.
+    /// False if completion/settlement failed; accounting remains unknown until recovery.
     pub receipt_persisted: bool,
-    /// Status and accounting.
+    /// Accepted identity, receipt reference and accounting observation.
     pub receipt: DispatchReceipt,
     /// Present only on success; retained until the signed recovery deadline.
     pub output: Option<ProviderOutput>,
@@ -477,15 +447,15 @@ pub struct Request {
 #[serde(tag = "operation", content = "body", rename_all = "snake_case")]
 pub enum Operation {
     /// Verify durable admission and issue its single-use permit.
-    IssuePermit(SignedAttempt),
+    IssuePermit(Box<SignedAttempt>),
     /// Recover execution state/results using an authenticated durable identity.
     AttemptStatus(SignedAttemptId),
     /// Inject credential and execute exactly one attempt.
     InjectProviderCredential(Box<InjectProviderCredential>),
-    /// Publish a route restriction.
-    RevokeRoute(SignedRevocation),
+    /// Publish the effective revision, serialized with dispatch acceptance.
+    PublishGrantRevision(SignedGrantRevision),
     /// Query a consumed attempt's accounting; never replay its output.
-    Receipt(SignedAttempt),
+    Receipt(SignedAttemptId),
 }
 
 /// Versioned response envelope.
@@ -508,8 +478,8 @@ pub enum Reply {
     AttemptStatus(AttemptStatus),
     /// Provider answer and usage.
     Dispatched(DispatchResult),
-    /// Revocation recorded.
-    Revoked,
+    /// Effective grant revision durably published.
+    GrantRevisionPublished,
     /// Accounting only; absent while no handoff has occurred.
     Receipt(Option<DispatchReceipt>),
 }

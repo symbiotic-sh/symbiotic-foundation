@@ -134,6 +134,7 @@ impl Fixture {
                 account: "account".into(),
                 account_sharing_key: None,
                 provider_request_limit: None,
+                max_attempts: 3,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -157,8 +158,14 @@ impl Fixture {
         };
         Self { dir, config, calls }
     }
-    fn process(&self) -> CredentialProcess {
-        CredentialProcess::open(self.config.clone()).unwrap()
+    async fn process(&self) -> CredentialProcess {
+        let process = CredentialProcess::open(self.config.clone()).unwrap();
+        // Initial publication is explicit; restart cannot roll back a newer revision.
+        match exchange(&process, publish_revision(1)).await {
+            Ok(Reply::GrantRevisionPublished) | Err(EgressError::RouteRefused) => (),
+            _ => panic!("initial revision publication failed"),
+        }
+        process
     }
     fn attempt(
         &self,
@@ -197,13 +204,7 @@ impl Fixture {
             manifest_ref: "manifest".into(),
             input_manifest_digest: "a".repeat(64),
             input_digest: payload.digest().unwrap(),
-            markings: vec![],
-            max_attempts: 3,
-            reserved_budget: ReservedBudget {
-                unit: "provider_requests".into(),
-                amount: 1,
-                invocation_limit: 3,
-            },
+            grant_revision: 1,
         };
         (
             AdmissionKey::new(KEY.to_vec())
@@ -224,7 +225,7 @@ async fn exchange(process: &CredentialProcess, operation: Operation) -> Result<R
         .result
 }
 async fn permit(process: &CredentialProcess, admission: &SignedAttempt) -> DispatchPermit {
-    match exchange(process, Operation::IssuePermit(admission.clone()))
+    match exchange(process, Operation::IssuePermit(admission.clone().into()))
         .await
         .unwrap()
     {
@@ -246,28 +247,35 @@ fn dispatched(reply: Reply) -> DispatchResult {
         _ => panic!("wrong reply"),
     }
 }
-async fn revoke(process: &CredentialProcess, sequence: u64) {
-    let signed = AdmissionKey::new(KEY.to_vec())
+fn signed_id(admission: &SignedAttempt) -> SignedAttemptId {
+    AdmissionKey::new(KEY.to_vec())
         .unwrap()
-        .sign_revocation(RouteRevocation {
-            tenant: "tenant".into(),
-            incarnation: "incarnation".into(),
-            route: "chat".into(),
-            record_sequence: sequence,
-        })
-        .unwrap();
-    assert!(matches!(
-        exchange(process, Operation::RevokeRoute(signed))
-            .await
+        .sign_attempt_id(admission.attempt.attempt_id())
+        .unwrap()
+}
+fn publish_revision(revision: u64) -> Operation {
+    Operation::PublishGrantRevision(
+        AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_grant_revision(GrantRevision {
+                tenant: "tenant".into(),
+                incarnation: "incarnation".into(),
+                revision,
+            })
             .unwrap(),
-        Reply::Revoked
+    )
+}
+async fn revoke(process: &CredentialProcess, revision: u64) {
+    assert!(matches!(
+        exchange(process, publish_revision(revision)).await.unwrap(),
+        Reply::GrantRevisionPublished
     ));
 }
 
 #[tokio::test]
 async fn permit_replay_refused_concurrently_and_after_restart() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("replay", 1, 10);
     let permit = permit(&process, &admission).await;
     let request = inject(admission.clone(), payload, permit);
@@ -282,13 +290,13 @@ async fn permit_replay_refused_concurrently_and_after_restart() {
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     drop(process);
-    let process = fixture.process();
+    let process = fixture.process().await;
     assert!(matches!(
         exchange(&process, request).await,
         Err(EgressError::PermitRefused)
     ));
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(admission)).await,
+        exchange(&process, Operation::IssuePermit(admission.into())).await,
         Ok(Reply::Permit(PermitGrant {
             status: AttemptStatus::Completed { .. },
             ..
@@ -298,37 +306,46 @@ async fn permit_replay_refused_concurrently_and_after_restart() {
 }
 
 #[tokio::test]
-async fn revocation_orders_by_durable_record_not_barrier_completion_or_later_expiry() {
+async fn grant_updates_refuse_old_admissions_and_cannot_roll_back_after_restart() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     revoke(&process, 11).await;
-    let (early, payload) = fixture.attempt("early", 1, 10);
-    let granted = permit(&process, &early).await;
+    let (old, _) = fixture.attempt("old", 1, 10);
+    assert!(matches!(
+        exchange(&process, Operation::IssuePermit(old.into())).await,
+        Err(EgressError::RouteRefused)
+    ));
+    assert!(matches!(
+        exchange(&process, publish_revision(10)).await,
+        Err(EgressError::RouteRefused)
+    ));
+    let (mut current, payload) = fixture.attempt("current", 1, 12);
+    current.attempt.grant_revision = 11;
+    current = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(current.attempt)
+        .unwrap();
+    let granted = permit(&process, &current).await;
     let result = dispatched(
-        exchange(&process, inject(early, payload, granted))
+        exchange(&process, inject(current, payload, granted))
             .await
             .unwrap(),
     );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
-    let (late, _) = fixture.attempt("late", 1, 12);
+    drop(process);
+    let process = fixture.process().await;
+    let (old, _) = fixture.attempt("old-restart", 1, 12);
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(late)).await,
+        exchange(&process, Operation::IssuePermit(old.into())).await,
         Err(EgressError::RouteRefused)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-    drop(process);
-    let process = fixture.process();
-    let (late, _) = fixture.attempt("late-restart", 1, 12);
-    assert!(matches!(
-        exchange(&process, Operation::IssuePermit(late)).await,
-        Err(EgressError::RouteRefused)
-    ));
 }
 
 #[tokio::test]
-async fn revocation_between_issue_and_inject_refuses_unconsumed_later_records() {
+async fn grant_revocation_between_admission_and_dispatch_refuses_all_pending_admissions() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let mut process = fixture.process();
+    let mut process = fixture.process().await;
     let (early, early_payload) = fixture.attempt("early", 1, 10);
     let early_permit = permit(&process, &early).await;
     let mut refused = Vec::new();
@@ -341,7 +358,7 @@ async fn revocation_between_issue_and_inject_refuses_unconsumed_later_records() 
     for restart in [false, true] {
         if restart {
             drop(process);
-            process = fixture.process();
+            process = fixture.process().await;
         }
         for (admission, payload, granted) in &refused {
             assert!(matches!(
@@ -357,7 +374,7 @@ async fn revocation_between_issue_and_inject_refuses_unconsumed_later_records() 
                 AttemptStatus::Permitted
             ));
             assert!(matches!(
-                exchange(&process, Operation::Receipt(admission.clone())).await,
+                exchange(&process, Operation::Receipt(signed_id(admission))).await,
                 Ok(Reply::Receipt(None))
             ));
             let reattached = permit(&process, admission).await;
@@ -366,19 +383,17 @@ async fn revocation_between_issue_and_inject_refuses_unconsumed_later_records() 
         }
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     }
-    let result = dispatched(
-        exchange(&process, inject(early, early_payload, early_permit))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        exchange(&process, inject(early, early_payload, early_permit)).await,
+        Err(EgressError::RouteRefused)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn wrong_input_or_attempt_cannot_spend_a_permit() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("binding", 1, 10);
     let granted = permit(&process, &admission).await;
     let mut changed = payload.clone();
@@ -414,11 +429,11 @@ async fn wrong_input_or_attempt_cannot_spend_a_permit() {
 #[tokio::test]
 async fn unsigned_or_expired_at_record_authority_never_gets_a_permit() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (mut admission, _) = fixture.attempt("tamper", 1, 10);
     admission.attempt.route = "forged".into();
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(admission)).await,
+        exchange(&process, Operation::IssuePermit(admission.into())).await,
         Err(EgressError::Unauthorized)
     ));
     let (mut admission, _) = fixture.attempt("expired", 1, 10);
@@ -428,7 +443,7 @@ async fn unsigned_or_expired_at_record_authority_never_gets_a_permit() {
         .sign_attempt(admission.attempt)
         .unwrap();
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(admission)).await,
+        exchange(&process, Operation::IssuePermit(admission.into())).await,
         Err(EgressError::InvalidRequest)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
@@ -437,7 +452,7 @@ async fn unsigned_or_expired_at_record_authority_never_gets_a_permit() {
 #[tokio::test]
 async fn retry_is_a_new_attempt_same_invocation_without_response_cache() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let key_path = fixture.dir.path().join("provider");
     std::fs::remove_file(&key_path).unwrap();
     let (first, payload) = fixture.attempt("retry", 1, 1);
@@ -468,7 +483,7 @@ async fn retry_is_a_new_attempt_same_invocation_without_response_cache() {
     }
     let (completed, _) = fixture.attempt("retry", 3, 4);
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(completed)).await,
+        exchange(&process, Operation::IssuePermit(completed.into())).await,
         Err(EgressError::InvocationComplete)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
@@ -484,7 +499,7 @@ async fn retry_is_a_new_attempt_same_invocation_without_response_cache() {
 #[tokio::test]
 async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() {
     let fixture = Fixture::new(200, "late answer".into(), Duration::from_secs(2)).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("timeout", 1, 1);
     let granted = permit(&process, &admission).await;
     let result = dispatched(
@@ -494,29 +509,24 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
     );
     assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
     assert_eq!(result.error, Some(EgressError::Transport));
-    assert_eq!(
-        result.receipt.charge,
-        ChargeReport::Unknown {
-            reserved: admission.attempt.reserved_budget.clone()
-        }
-    );
+    assert_eq!(result.receipt.spend_state, SpendState::Unknown);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
     drop(process);
-    let process = fixture.process();
-    let receipt = exchange(&process, Operation::Receipt(admission))
+    let process = fixture.process().await;
+    let receipt = exchange(&process, Operation::Receipt(signed_id(&admission)))
         .await
         .unwrap();
     assert!(matches!(
         receipt,
         Reply::Receipt(Some(DispatchReceipt {
-            charge: ChargeReport::Unknown { .. },
+            spend_state: SpendState::Unknown,
             ..
         }))
     ));
     let (retry, _) = fixture.attempt("timeout", 2, 2);
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(retry)).await,
+        exchange(&process, Operation::IssuePermit(retry.into())).await,
         Err(EgressError::ReconciliationRequired)
     ));
 }
@@ -524,7 +534,7 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
 #[tokio::test]
 async fn caller_cancellation_does_not_cancel_started_dispatch() {
     let fixture = Fixture::new(200, "answer".into(), Duration::from_millis(80)).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("cancel", 1, 1);
     let granted = permit(&process, &admission).await;
     let cloned = process.clone();
@@ -541,7 +551,7 @@ async fn caller_cancellation_does_not_cancel_started_dispatch() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if matches!(
-                exchange(&process, Operation::Receipt(admission.clone()))
+                exchange(&process, Operation::Receipt(signed_id(&admission)))
                     .await
                     .unwrap(),
                 Reply::Receipt(Some(DispatchReceipt {
@@ -593,7 +603,7 @@ async fn credentials_and_declared_encodings_never_return_in_success_or_error() {
     for status in [200, 400] {
         for encoded in &encodings {
             let fixture = Fixture::new(status, format!("echo {encoded}"), Duration::ZERO).await;
-            let process = fixture.process();
+            let process = fixture.process().await;
             let (admission, payload) = fixture.attempt("isolation", 1, 1);
             let granted = permit(&process, &admission).await;
             let result = dispatched(
@@ -618,7 +628,7 @@ async fn credentials_and_declared_encodings_never_return_in_success_or_error() {
 async fn owner_only_socket_roundtrip_and_oversized_frame_refusal() {
     use symbiotic_egress::socket::UnixEgressClient;
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let listener = server::bind(&process).unwrap();
     assert_eq!(
         std::fs::metadata(&fixture.config.socket_path)
@@ -638,7 +648,7 @@ async fn owner_only_socket_roundtrip_and_oversized_frame_refusal() {
     let response = client
         .exchange(Request {
             version: PROTOCOL_VERSION,
-            operation: Operation::IssuePermit(admission.clone()),
+            operation: Operation::IssuePermit(admission.clone().into()),
         })
         .await
         .unwrap();
@@ -672,9 +682,9 @@ async fn owner_only_socket_roundtrip_and_oversized_frame_refusal() {
 }
 
 #[tokio::test]
-async fn missing_secret_is_a_known_zero_charge_and_strict_money_budget_is_refused() {
+async fn missing_secret_releases_foundation_reservation() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
     let (admission, payload) = fixture.attempt("missing", 1, 1);
     let granted = permit(&process, &admission).await;
@@ -684,23 +694,7 @@ async fn missing_secret_is_a_known_zero_charge_and_strict_money_budget_is_refuse
             .unwrap(),
     );
     assert_eq!(result.receipt.status, DispatchStatus::CredentialUnavailable);
-    assert_eq!(
-        result.receipt.charge,
-        ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 0
-        }
-    );
-    let (mut admission, _) = fixture.attempt("money", 1, 1);
-    admission.attempt.reserved_budget.unit = "micro_usd".into();
-    let admission = AdmissionKey::new(KEY.to_vec())
-        .unwrap()
-        .sign_attempt(admission.attempt)
-        .unwrap();
-    assert!(matches!(
-        exchange(&process, Operation::IssuePermit(admission)).await,
-        Err(EgressError::BudgetRefused)
-    ));
+    assert_eq!(result.receipt.spend_state, SpendState::Released);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -708,7 +702,7 @@ async fn missing_secret_is_a_known_zero_charge_and_strict_money_budget_is_refuse
 async fn redirects_and_oversized_provider_responses_fail_without_a_second_call() {
     for (status, body) in [(302, "redirect".to_owned()), (200, "x".repeat(40000))] {
         let fixture = Fixture::new(status, body, Duration::ZERO).await;
-        let process = fixture.process();
+        let process = fixture.process().await;
         let (admission, payload) = fixture.attempt("bounded", 1, 1);
         let granted = permit(&process, &admission).await;
         let result = dispatched(
@@ -724,9 +718,9 @@ async fn redirects_and_oversized_provider_responses_fail_without_a_second_call()
 }
 
 #[tokio::test]
-async fn immutable_invocation_limits_and_destination_cannot_change_on_retry() {
+async fn immutable_invocation_inputs_and_destination_cannot_change_on_retry() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("immutable", 1, 1);
     let granted = permit(&process, &admission).await;
     exchange(&process, inject(admission, payload, granted))
@@ -739,7 +733,7 @@ async fn immutable_invocation_limits_and_destination_cannot_change_on_retry() {
         .sign_attempt(retry.attempt)
         .unwrap();
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(retry)).await,
+        exchange(&process, Operation::IssuePermit(retry.into())).await,
         Err(EgressError::InvalidRequest)
     ));
     let (mut changed, _) = fixture.attempt("destination", 1, 1);
@@ -749,7 +743,7 @@ async fn immutable_invocation_limits_and_destination_cannot_change_on_retry() {
         .sign_attempt(changed.attempt)
         .unwrap();
     assert!(matches!(
-        exchange(&process, Operation::IssuePermit(changed)).await,
+        exchange(&process, Operation::IssuePermit(changed.into())).await,
         Err(EgressError::RouteRefused)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
@@ -787,7 +781,7 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
     let logs = CapturedLogs::default();
     tracing::subscriber::set_global_default(logs.clone()).unwrap();
     let fixture = Fixture::new(500, format!("backend failure: {SECRET}"), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("logs", 1, 1);
     let granted = permit(&process, &admission).await;
     let result = dispatched(
@@ -909,10 +903,22 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
         ready_status(&mut child, &client, &signed_id).await,
         AttemptStatus::NotIssued
     ));
+    assert!(matches!(
+        client
+            .exchange(Request {
+                version: PROTOCOL_VERSION,
+                operation: publish_revision(1),
+            })
+            .await
+            .unwrap()
+            .result
+            .unwrap(),
+        Reply::GrantRevisionPublished
+    ));
     // Never read the permit reply. Observe its commit via a separate connection
     // before dropping it, so this proves loss after commit rather than before accept.
     let lost_permit_reply =
-        send_without_reading(&client, Operation::IssuePermit(admission.clone())).await;
+        send_without_reading(&client, Operation::IssuePermit(admission.clone().into())).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if matches!(
@@ -930,7 +936,7 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
     let Reply::Permit(granted) = client
         .exchange(Request {
             version: PROTOCOL_VERSION,
-            operation: Operation::IssuePermit(admission.clone()),
+            operation: Operation::IssuePermit(admission.clone().into()),
         })
         .await
         .unwrap()
@@ -988,7 +994,7 @@ async fn embeddings_share_attempt_binding_and_credential_boundary() {
     fixture.config.routes[0].destination =
         "https://generativelanguage.googleapis.com/v1beta".into();
     fixture.config.routes[0].model = "gemini-embedding-001".into();
-    let process = fixture.process();
+    let process = fixture.process().await;
     std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
     let (mut admission, _) = fixture.attempt("embedding", 1, 1);
     let payload = ProviderPayload::Embedding(EmbeddingRequest {
@@ -1031,11 +1037,10 @@ async fn embeddings_share_attempt_binding_and_credential_boundary() {
 #[tokio::test]
 async fn known_zero_charge_releases_reservation_for_next_attempt() {
     let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
-    for ordinal in 1..=2 {
-        let (mut admission, payload) = fixture.attempt("zero-charge", ordinal, u64::from(ordinal));
-        admission.attempt.reserved_budget.invocation_limit = 1;
+    for ordinal in 1..=3 {
+        let (admission, payload) = fixture.attempt("zero-charge", ordinal, u64::from(ordinal));
         let admission = AdmissionKey::new(KEY.to_vec())
             .unwrap()
             .sign_attempt(admission.attempt)
@@ -1046,16 +1051,15 @@ async fn known_zero_charge_releases_reservation_for_next_attempt() {
                 .await
                 .unwrap(),
         );
-        assert_eq!(
-            result.receipt.charge,
-            ChargeReport::Measured {
-                unit: "provider_requests".into(),
-                amount: 0
-            }
-        );
+        assert_eq!(result.receipt.spend_state, SpendState::Released);
     }
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(ledger_totals(&fixture), (0, 2));
+    let (fourth, _) = fixture.attempt("zero-charge", 4, 4);
+    assert!(matches!(
+        exchange(&process, Operation::IssuePermit(fourth.into())).await,
+        Err(EgressError::BudgetRefused)
+    ));
+    assert_eq!(ledger_totals(&fixture), (0, 3));
 }
 
 #[tokio::test]
@@ -1091,7 +1095,7 @@ async fn expanded_wire_payload_is_refused(embedding: bool) {
         fixture.attempt("wire-limit", 1, 1).1
     };
     assert!(serde_json::to_vec(&payload).unwrap().len() < 1024);
-    let process = fixture.process();
+    let process = fixture.process().await;
     // A regression must stop before loading this missing secret, and cannot reach Google.
     std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
     let (mut admission, _) = fixture.attempt("wire-limit", 1, 1);
@@ -1108,7 +1112,7 @@ async fn expanded_wire_payload_is_refused(embedding: bool) {
         "oversized wire body accepted (embedding={embedding})"
     );
     assert!(matches!(
-        exchange(&process, Operation::Receipt(admission)).await,
+        exchange(&process, Operation::Receipt(signed_id(&admission))).await,
         Ok(Reply::Receipt(None))
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
@@ -1143,7 +1147,7 @@ async fn zero_input_pacing_is_refused_at_route_validation() {
 #[tokio::test]
 async fn runtime_bookkeeping_failure_retains_paid_output_and_safe_diagnostic() {
     let fixture = Fixture::new(200, "paid answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let db = rusqlite::Connection::open(fixture.config.state_dir.join("queue.sqlite")).unwrap();
     db.execute_batch(
         "CREATE TRIGGER refuse_completion BEFORE UPDATE OF status ON queue_items
@@ -1171,16 +1175,10 @@ async fn runtime_bookkeeping_failure_retains_paid_output_and_safe_diagnostic() {
     assert!(matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "paid answer"));
     assert_eq!(result.receipt.usage.input_tokens, Some(7));
     assert_eq!(result.receipt.usage.output_tokens, Some(3));
-    assert_eq!(
-        result.receipt.charge,
-        ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 1
-        }
-    );
+    assert_eq!(result.receipt.spend_state, SpendState::Settled);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     drop(process);
-    let process = fixture.process();
+    let process = fixture.process().await;
     let AttemptStatus::Completed { result } = status(&process, &admission).await else {
         panic!("missing completed result");
     };
@@ -1221,7 +1219,7 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
 #[tokio::test]
 async fn conflicting_shared_route_limits_are_validated_before_state_in_every_order() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let unopened = fixture.dir.path().join("unopened-state");
     let blocked = fixture.dir.path().join("state-is-a-file");
     std::fs::write(&blocked, b"untouched").unwrap();
@@ -1313,7 +1311,7 @@ async fn conflicting_shared_route_limits_are_validated_before_state_in_every_ord
 #[tokio::test]
 async fn failure_before_dispatch_returns_safe_error_and_releases_reservation() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let db = rusqlite::Connection::open(fixture.config.state_dir.join("queue.sqlite")).unwrap();
     // Inject a real queue write failure after permit consumption, before HTTP.
     db.execute_batch(
@@ -1335,22 +1333,18 @@ async fn failure_before_dispatch_returns_safe_error_and_releases_reservation() {
     assert!(!wire.to_string().contains(SECRET));
     assert!(result.output.is_none());
     assert!(result.receipt_persisted);
-    assert_eq!(
-        result.receipt.charge,
-        ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 0
-        }
-    );
+    assert_eq!(result.receipt.spend_state, SpendState::Released);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     drop(process);
     db.execute_batch("DROP TRIGGER refuse_queue").unwrap();
-    let process = fixture.process();
-    let stored = exchange(&process, Operation::Receipt(first)).await.unwrap();
+    let process = fixture.process().await;
+    let stored = exchange(&process, Operation::Receipt(signed_id(&first)))
+        .await
+        .unwrap();
     assert!(matches!(
         stored,
         Reply::Receipt(Some(DispatchReceipt {
-            charge: ChargeReport::Measured { amount: 0, .. },
+            spend_state: SpendState::Released,
             ..
         }))
     ));
@@ -1368,11 +1362,11 @@ async fn failure_before_dispatch_returns_safe_error_and_releases_reservation() {
 #[tokio::test]
 async fn recovery_lost_permit_reply_reattaches_after_restart() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("lost-permit", 1, 10);
     let committed = permit(&process, &admission).await;
     drop(process);
-    let process = fixture.process();
+    let process = fixture.process().await;
     let recovered = permit(&process, &admission).await;
     assert_eq!(committed.token, recovered.token);
     assert_eq!(committed.attempt_digest, recovered.attempt_digest);
@@ -1420,7 +1414,7 @@ async fn status(process: &CredentialProcess, admission: &SignedAttempt) -> Attem
 #[tokio::test]
 async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage() {
     let fixture = Fixture::new(200, "retained answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("lost-completion", 1, 10);
     let granted = permit(&process, &admission).await;
     let result = dispatched(
@@ -1437,12 +1431,9 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
         "0.00001234567890123456789"
     );
     assert_eq!(result.receipt.usage.cost_micro_usd, None);
-    assert!(matches!(
-        result.receipt.charge,
-        ChargeReport::Measured { amount: 1, .. }
-    ));
+    assert!(matches!(result.receipt.spend_state, SpendState::Settled));
     drop(process);
-    let process = fixture.process();
+    let process = fixture.process().await;
     let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {
         panic!("missing result");
     };
@@ -1450,7 +1441,7 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
         serde_json::to_value(&result).unwrap(),
         serde_json::to_value(recovered).unwrap()
     );
-    let Reply::Permit(reattached) = exchange(&process, Operation::IssuePermit(admission))
+    let Reply::Permit(reattached) = exchange(&process, Operation::IssuePermit(admission.into()))
         .await
         .unwrap()
     else {
@@ -1465,7 +1456,7 @@ async fn recovery_lost_completion_reply_survives_restart_with_output_and_usage()
 #[tokio::test]
 async fn recovery_same_identity_with_different_signed_digest_is_refused() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, _) = fixture.attempt("digest-mismatch", 1, 10);
     permit(&process, &admission).await;
     let key = AdmissionKey::new(KEY.to_vec()).unwrap();
@@ -1479,7 +1470,7 @@ async fn recovery_same_identity_with_different_signed_digest_is_refused() {
         assert!(matches!(
             exchange(
                 &process,
-                Operation::IssuePermit(key.sign_attempt(changed).unwrap())
+                Operation::IssuePermit(key.sign_attempt(changed).unwrap().into())
             )
             .await,
             Err(EgressError::InvalidRequest)
@@ -1488,7 +1479,11 @@ async fn recovery_same_identity_with_different_signed_digest_is_refused() {
     let mut signed_id = key.sign_attempt_id(admission.attempt.attempt_id()).unwrap();
     signed_id.attempt_id.tenant = "other".into();
     assert!(matches!(
-        exchange(&process, Operation::AttemptStatus(signed_id)).await,
+        exchange(&process, Operation::AttemptStatus(signed_id.clone())).await,
+        Err(EgressError::Unauthorized)
+    ));
+    assert!(matches!(
+        exchange(&process, Operation::Receipt(signed_id)).await,
         Err(EgressError::Unauthorized)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
@@ -1497,7 +1492,7 @@ async fn recovery_same_identity_with_different_signed_digest_is_refused() {
 #[tokio::test]
 async fn recovery_failed_status_preserves_safe_error_and_charge() {
     let fixture = Fixture::new(500, SECRET.into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("failed-status", 1, 10);
     let granted = permit(&process, &admission).await;
     exchange(&process, inject(admission.clone(), payload, granted))
@@ -1508,17 +1503,14 @@ async fn recovery_failed_status_preserves_safe_error_and_charge() {
     };
     assert!(result.error.is_some());
     assert!(result.output.is_none());
-    assert!(matches!(
-        result.receipt.charge,
-        ChargeReport::Unknown { .. }
-    ));
+    assert!(matches!(result.receipt.spend_state, SpendState::Unknown));
     assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
 }
 
 #[tokio::test]
 async fn recovery_expired_status_does_not_retain_late_completion() {
     let fixture = Fixture::new(200, "expired answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (mut admission, payload) = fixture.attempt("expired-status", 1, 10);
     admission.attempt.recovery_expires_at = 102; // Declared window already elapsed.
     admission = AdmissionKey::new(KEY.to_vec())
@@ -1537,18 +1529,18 @@ async fn recovery_expired_status_does_not_retain_late_completion() {
         AttemptStatus::Expired
     ));
     drop(process);
-    let process = fixture.process();
+    let process = fixture.process().await;
     assert!(matches!(
         status(&process, &admission).await,
         AttemptStatus::Expired
     ));
     assert!(matches!(
-        exchange(&process, Operation::Receipt(admission.clone()))
+        exchange(&process, Operation::Receipt(signed_id(&admission)))
             .await
             .unwrap(),
         Reply::Receipt(Some(_))
     ));
-    let Reply::Permit(grant) = exchange(&process, Operation::IssuePermit(admission))
+    let Reply::Permit(grant) = exchange(&process, Operation::IssuePermit(admission.into()))
         .await
         .unwrap()
     else {
@@ -1577,7 +1569,7 @@ async fn recovery_expired_status_does_not_retain_late_completion() {
 #[tokio::test]
 async fn recovery_idle_server_purges_completed_results_at_deadline() {
     let fixture = Fixture::new(200, "short-lived answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("idle-expiry", 1, 10);
     let granted = permit(&process, &admission).await;
     exchange(&process, inject(admission.clone(), payload, granted))
@@ -1630,7 +1622,7 @@ async fn recovery_idle_server_purges_completed_results_at_deadline() {
 #[tokio::test]
 async fn recovery_concurrent_permit_requests_share_one_capability() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (admission, _) = fixture.attempt("concurrent-issue", 1, 10);
     let (first, second) = tokio::join!(permit(&process, &admission), permit(&process, &admission));
     assert_eq!(first.token, second.token);
@@ -1641,7 +1633,7 @@ async fn recovery_concurrent_permit_requests_share_one_capability() {
     ));
     let request = Request {
         version: 1,
-        operation: Operation::IssuePermit(admission),
+        operation: Operation::IssuePermit(admission.into()),
     };
     assert!(matches!(
         process.handle(request).await.result,
@@ -1653,7 +1645,7 @@ async fn recovery_concurrent_permit_requests_share_one_capability() {
 #[tokio::test]
 async fn recovery_disconnected_peer_does_not_stop_socket_server() {
     let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
-    let process = fixture.process();
+    let process = fixture.process().await;
     let listener = server::bind(&process).unwrap();
     // Disconnect before accept/peer authentication, as can happen with a lost reply.
     let stream = tokio::net::UnixStream::connect(&fixture.config.socket_path)
@@ -1708,7 +1700,7 @@ fn ledger_totals(fixture: &Fixture) -> (u64, u64) {
 async fn spend_concurrent_dispatches_on_one_account_share_one_durable_budget() {
     let mut fixture = Fixture::new(200, "answer".into(), Duration::from_millis(30)).await;
     fixture.config.routes[0].provider_request_limit = Some(1);
-    let process = fixture.process();
+    let process = fixture.process().await;
     let (a, pa) = fixture.attempt("first-account-call", 1, 1);
     let (b, pb) = fixture.attempt("second-account-call", 1, 2);
     let ap = permit(&process, &a).await;
@@ -1798,7 +1790,7 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                     collision.routes.push(other);
                     assert!(CredentialProcess::open(collision).is_err());
                 }
-                let process = fixture.process();
+                let process = fixture.process().await;
                 let (admission, _) = fixture.attempt("retrieval", 1, 10);
                 let payload = if rerank {
                     ProviderPayload::Rerank(RerankRequest {
@@ -1863,16 +1855,11 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                 let result = dispatched(exchange(&process, operation.clone()).await.unwrap());
                 assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
                 assert_eq!(
-                    result.receipt.charge,
+                    result.receipt.spend_state,
                     if measured_usage {
-                        ChargeReport::Measured {
-                            unit: "provider_requests".into(),
-                            amount: 1,
-                        }
+                        SpendState::Settled
                     } else {
-                        ChargeReport::Unknown {
-                            reserved: admission.attempt.reserved_budget.clone(),
-                        }
+                        SpendState::Unknown
                     }
                 );
                 assert!(result.error.is_none());
@@ -1896,12 +1883,7 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                 )
                 .unwrap();
                 use symbiotic_ai_runtime::model::SpendLedger;
-                let canonical = ledger
-                    .receipt(&symbiotic_credential_process::spend_receipt_reference(
-                        &result.receipt,
-                    ))
-                    .unwrap()
-                    .unwrap();
+                let canonical = ledger.receipt(&result.receipt.reference).unwrap().unwrap();
                 assert_eq!(
                     canonical.state,
                     if measured_usage {
@@ -1924,7 +1906,7 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                 assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(ledger_totals(&fixture), (1, 1));
                 drop(process);
-                let reopened = fixture.process();
+                let reopened = fixture.process().await;
                 let AttemptStatus::Completed { result: recovered } =
                     status(&reopened, &admission).await
                 else {
@@ -1939,4 +1921,116 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
             }
         }
     }
+}
+
+#[tokio::test]
+async fn grant_revocation_preserves_accepted_handoff_and_accounting() {
+    let fixture = Fixture::new(200, "accepted answer".into(), Duration::from_millis(250)).await;
+    let process = fixture.process().await;
+    let (admission, payload) = fixture.attempt("accepted-before-revocation", 1, 10);
+    let granted = permit(&process, &admission).await;
+    let operation = inject(admission.clone(), payload, granted);
+    let worker = process.clone();
+    let task = tokio::spawn(async move { dispatched(exchange(&worker, operation).await.unwrap()) });
+    let retained = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let AttemptStatus::Dispatched { receipt } = status(&process, &admission).await {
+                break receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(retained.attempt_id, admission.attempt.attempt_id());
+    assert_eq!(retained.spend_state, SpendState::Unknown);
+    revoke(&process, 11).await;
+    let result = task.await.unwrap();
+    assert_eq!(result.receipt.reference, retained.reference);
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert_eq!(result.receipt.spend_state, SpendState::Settled);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+    drop(process);
+    let process = fixture.process().await;
+    let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {
+        panic!("accepted handoff lost after revision change");
+    };
+    assert_eq!(recovered.receipt.reference, retained.reference);
+    let Reply::Receipt(Some(receipt)) =
+        exchange(&process, Operation::Receipt(signed_id(&admission)))
+            .await
+            .unwrap()
+    else {
+        panic!("accepted receipt lost");
+    };
+    assert_eq!(receipt.reference, retained.reference);
+    assert_eq!(receipt.spend_state, SpendState::Settled);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
+#[tokio::test]
+async fn grant_revision_requires_authenticated_initial_publication() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let process = CredentialProcess::open(fixture.config.clone()).unwrap();
+    let (admission, _) = fixture.attempt("no-publication", 1, 10);
+    assert!(matches!(
+        exchange(&process, Operation::IssuePermit(admission.clone().into())).await,
+        Err(EgressError::RouteRefused)
+    ));
+    let Operation::PublishGrantRevision(mut signed) = publish_revision(1) else {
+        unreachable!()
+    };
+    signed.grant.revision = 2;
+    assert!(matches!(
+        exchange(&process, Operation::PublishGrantRevision(signed)).await,
+        Err(EgressError::Unauthorized)
+    ));
+    revoke(&process, 1).await;
+    revoke(&process, 1).await;
+    permit(&process, &admission).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 0));
+}
+
+#[tokio::test]
+async fn failed_settlement_keeps_typed_receipt_unknown_and_preserves_paid_output() {
+    let fixture = Fixture::new(200, "paid answer".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let (admission, payload) = fixture.attempt("failed-settlement", 1, 10);
+    let permit = permit(&process, &admission).await;
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_completion BEFORE UPDATE OF finished ON egress_permits
+        BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;",
+    )
+    .unwrap();
+    let operation = inject(admission.clone(), payload, permit);
+    let result = dispatched(exchange(&process, operation.clone()).await.unwrap());
+    assert!(result.output.is_some());
+    assert_eq!(result.receipt.usage.input_tokens, Some(7));
+    assert!(!result.receipt_persisted);
+    assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+    let reference = result.receipt.reference;
+    drop(conn);
+    drop(process);
+    let process = fixture.process().await;
+    let AttemptStatus::Dispatched { receipt } = status(&process, &admission).await else {
+        panic!("failed settlement lost its accepted receipt");
+    };
+    assert_eq!(receipt.reference, reference);
+    assert_eq!(receipt.spend_state, SpendState::Unknown);
+    assert!(matches!(
+        exchange(&process, operation).await,
+        Err(EgressError::PermitRefused)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
 }

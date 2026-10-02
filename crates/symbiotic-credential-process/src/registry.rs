@@ -1,6 +1,6 @@
 //! Durable permit replay protection and bounded result recovery; no provider credentials.
 use rusqlite::{Connection, OptionalExtension, params};
-use symbiotic_ai_runtime::{SpendState, model::AcceptedSpendHandoff, spend::SqliteSpendLedger};
+use symbiotic_ai_runtime::{model::AcceptedSpendHandoff, spend::SqliteSpendLedger};
 use symbiotic_egress::*;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -56,9 +56,9 @@ impl Registry {
             );
             CREATE INDEX IF NOT EXISTS egress_result_expiry
                 ON egress_permits(recovery_expires_at) WHERE result IS NOT NULL;
-            CREATE TABLE IF NOT EXISTS egress_revocations (
-                route_key TEXT PRIMARY KEY,
-                sequence INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS egress_grant_revisions (
+                grant_key TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL
             ); COMMIT;",
         )
         .map_err(state)?;
@@ -67,29 +67,22 @@ impl Registry {
         Ok(registry)
     }
 
-    pub(crate) fn issue(&mut self, a: &DurableAttempt) -> Result<PermitGrant, EgressError> {
+    pub(crate) fn issue(
+        &mut self,
+        a: &DurableAttempt,
+        max_attempts: u32,
+    ) -> Result<PermitGrant, EgressError> {
         if let Some(grant) = self.existing(a)? {
             return Ok(grant);
         }
         let attempt_digest = digest(a)?;
         let invocation_key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
-        let route_key = digest(&(&a.tenant, &a.incarnation, &a.route))?;
         let binding = crate::invocation_binding(a)?;
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        let revoked: Option<u64> = tx
-            .query_row(
-                "SELECT sequence FROM egress_revocations WHERE route_key=?1",
-                [&route_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(state)?;
-        if revoked.is_some_and(|sequence| a.record_sequence >= sequence) {
-            return Err(EgressError::RouteRefused);
-        }
+        Self::check_revision(&tx, a)?;
         let previous: Option<(String, u32, Option<String>, u64)> = tx.query_row(
             "SELECT invocation_binding, ordinal, receipt, record_sequence FROM egress_permits WHERE invocation_key=?1 ORDER BY ordinal DESC LIMIT 1", [&invocation_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional().map_err(state)?;
@@ -115,7 +108,7 @@ impl Registry {
             let ledger_state: Option<String> = tx
                 .query_row(
                     "SELECT state FROM spend_receipts WHERE reference=?1",
-                    [crate::spend_receipt_reference(&receipt).0],
+                    [&receipt.reference.0],
                     |row| row.get(0),
                 )
                 .optional()
@@ -127,9 +120,7 @@ impl Registry {
             return Err(EgressError::InvalidRequest);
         }
         // Only the current reservation can spend: prior attempts were zero.
-        if a.reserved_budget.amount > a.reserved_budget.invocation_limit
-            || a.attempt_ordinal > a.max_attempts
-        {
+        if a.attempt_ordinal > max_attempts {
             return Err(EgressError::BudgetRefused);
         }
         let token = Uuid::new_v4().to_string();
@@ -145,13 +136,29 @@ impl Registry {
         })
     }
 
-    pub(crate) fn revoke(&mut self, revocation: &RouteRevocation) -> Result<(), EgressError> {
-        let key = digest(&(
-            &revocation.tenant,
-            &revocation.incarnation,
-            &revocation.route,
-        ))?;
-        self.0.execute("INSERT INTO egress_revocations (route_key, sequence) VALUES (?1, ?2) ON CONFLICT(route_key) DO UPDATE SET sequence=MIN(sequence, excluded.sequence)", params![key, revocation.record_sequence]).map_err(state)?;
+    pub(crate) fn publish_revision(&mut self, grant: &GrantRevision) -> Result<(), EgressError> {
+        let key = digest(&(&grant.tenant, &grant.incarnation))?;
+        // A stale update can never roll back authorization, including after restart.
+        let changed = self.0.execute("INSERT INTO egress_grant_revisions (grant_key, revision) VALUES (?1, ?2) ON CONFLICT(grant_key) DO UPDATE SET revision=excluded.revision WHERE revision<=excluded.revision", params![key, grant.revision]).map_err(state)?;
+        if changed != 1 {
+            return Err(EgressError::RouteRefused);
+        }
+        Ok(())
+    }
+
+    fn check_revision(conn: &Connection, attempt: &DurableAttempt) -> Result<(), EgressError> {
+        let key = digest(&(&attempt.tenant, &attempt.incarnation))?;
+        let current: Option<u64> = conn
+            .query_row(
+                "SELECT revision FROM egress_grant_revisions WHERE grant_key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(state)?;
+        if current != Some(attempt.grant_revision) {
+            return Err(EgressError::RouteRefused);
+        }
         Ok(())
     }
 
@@ -169,32 +176,24 @@ impl Registry {
             attempt_digest: attempt_digest.clone(),
             status: DispatchStatus::ProviderFailed,
             usage: Default::default(),
-            charge: ChargeReport::Unknown {
-                reserved: attempt.reserved_budget.clone(),
-            },
+            attempt_id: attempt.attempt_id(),
+            reference: handoff.reservation.reference.clone(),
+            spend_state: SpendState::Unknown,
         };
         let json = serde_json::to_string(&receipt).map_err(|_| EgressError::StateUnavailable)?;
-        let route_key = digest(&(&attempt.tenant, &attempt.incarnation, &attempt.route))?;
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        // Recheck record order at consumption: revocation can arrive after issue.
-        // Consumed or invalid capabilities retain the normal replay refusal.
-        let revoked: Option<u64> = tx
-            .query_row(
-                "SELECT sequence FROM egress_revocations WHERE route_key=?1 AND EXISTS (
-                    SELECT 1 FROM egress_permits
-                    WHERE attempt_digest=?2 AND token=?3 AND consumed=0
-                )",
-                params![route_key, attempt_digest, permit.token],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(state)?;
-        if revoked.is_some_and(|sequence| attempt.record_sequence >= sequence) {
-            return Err(EgressError::RouteRefused);
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM egress_permits WHERE attempt_digest=?1 AND token=?2 AND consumed=0)",
+            params![attempt_digest, permit.token], |r| r.get(0)).map_err(state)?;
+        if !pending {
+            return Err(EgressError::PermitRefused);
         }
+        // The immediate transaction orders current authority with revision publication
+        // and the durable replay/reservation acceptance point.
+        Self::check_revision(&tx, attempt)?;
         let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
         if changed != 1 {
             return Err(EgressError::PermitRefused);
@@ -225,18 +224,6 @@ impl Registry {
         if changed != 1 {
             return Err(EgressError::StateUnavailable);
         }
-        let ledger_state = match result.receipt.charge {
-            ChargeReport::Measured {
-                ref unit,
-                amount: 0,
-            } if unit == "provider_requests" => SpendState::Released,
-            ChargeReport::Measured { .. }
-                if symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage) =>
-            {
-                SpendState::Settled
-            }
-            _ => SpendState::Unknown,
-        };
         let usage = if symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage) {
             Some(result.receipt.usage.clone())
         } else {
@@ -244,8 +231,8 @@ impl Registry {
         };
         SqliteSpendLedger::finish_in(
             &tx,
-            &crate::spend_receipt_reference(&result.receipt),
-            ledger_state,
+            &result.receipt.reference,
+            result.receipt.spend_state,
             usage,
             // Output bytes live only in bounded egress recovery. The ledger keeps
             // completion evidence so commit refusal cannot release missing-usage spend.
@@ -363,7 +350,7 @@ impl Registry {
             .0
             .query_row(
                 "SELECT state, usage FROM spend_receipts WHERE reference=?1",
-                [crate::spend_receipt_reference(&receipt).0],
+                [&receipt.reference.0],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(state)?;
@@ -372,34 +359,17 @@ impl Registry {
             .transpose()
             .map_err(|_| EgressError::StateUnavailable)?
             .unwrap_or_default();
-        match ledger_state.as_str() {
-            "released" => {
-                receipt.charge = ChargeReport::Measured {
-                    unit: "provider_requests".into(),
-                    amount: 0,
-                }
-            }
-            "settled" => {
-                receipt.charge = ChargeReport::Measured {
-                    unit: "provider_requests".into(),
-                    amount: 1,
-                }
-            }
-            "unknown" => (),
-            _ => return Err(EgressError::StateUnavailable),
-        }
+        receipt.spend_state = serde_json::from_value(serde_json::Value::String(ledger_state))
+            .map_err(|_| EgressError::StateUnavailable)?;
         Ok(receipt)
     }
 
-    pub(crate) fn receipt(
-        &self,
-        attempt: &DurableAttempt,
-    ) -> Result<Option<DispatchReceipt>, EgressError> {
+    pub(crate) fn receipt(&self, id: &AttemptId) -> Result<Option<DispatchReceipt>, EgressError> {
         let json: Option<String> = self
             .0
             .query_row(
-                "SELECT receipt FROM egress_permits WHERE attempt_digest=?1 AND consumed=1",
-                [digest(attempt)?],
+                "SELECT receipt FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2 AND consumed=1",
+                params![digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?, id.attempt_ordinal],
                 |row| row.get(0),
             )
             .optional()
@@ -437,7 +407,13 @@ mod tests {
 
     fn open(path: &std::path::Path) -> Registry {
         symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
-        Registry::open(path).unwrap()
+        let mut registry = Registry::open(path).unwrap();
+        let _ = registry.publish_revision(&GrantRevision {
+            tenant: "tenant".into(),
+            incarnation: "incarnation".into(),
+            revision: 1,
+        });
+        registry
     }
     fn reservation(a: &DurableAttempt) -> AcceptedSpendHandoff {
         AcceptedSpendHandoff {
@@ -459,8 +435,7 @@ mod tests {
             "recovery_expires_at": 4000000000u64, "caller_binding": "caller", "route": "chat", "destination": "https://example.test",
             "model": "model", "method": "POST", "secret_ref": "key", "manifest_ref": "manifest",
             "input_manifest_digest": "a".repeat(64), "input_digest": "b".repeat(64),
-            "markings": [], "max_attempts": 20000,
-            "reserved_budget": { "unit": "provider_requests", "amount": 1, "invocation_limit": 1 }
+            "grant_revision": 1
         }))
         .unwrap()
     }
@@ -472,16 +447,15 @@ mod tests {
         let mut registry = open(&path);
         let mut attempt = attempt();
         attempt.record_sequence = 12;
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         let receipt = registry
             .consume(&attempt, &grant.permit, &reservation(&attempt))
             .unwrap();
         registry
-            .revoke(&RouteRevocation {
+            .publish_revision(&GrantRevision {
                 tenant: attempt.tenant.clone(),
                 incarnation: attempt.incarnation.clone(),
-                route: attempt.route.clone(),
-                record_sequence: 11,
+                revision: 11,
             })
             .unwrap();
         for restart in [false, true] {
@@ -489,7 +463,7 @@ mod tests {
                 drop(registry);
                 registry = open(&path);
             }
-            let reattached = registry.issue(&attempt).unwrap();
+            let reattached = registry.issue(&attempt, 20000).unwrap();
             assert_eq!(reattached.permit.token, grant.permit.token);
             let AttemptStatus::Dispatched { receipt: retained } = reattached.status else {
                 panic!("consumed handoff was withdrawn");
@@ -503,7 +477,8 @@ mod tests {
                 Err(EgressError::PermitRefused)
             ));
             assert_eq!(
-                serde_json::to_value(registry.receipt(&attempt).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(registry.receipt(&attempt.attempt_id()).unwrap().unwrap())
+                    .unwrap(),
                 serde_json::to_value(&receipt).unwrap()
             );
         }
@@ -514,7 +489,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = open(&dir.path().join("registry.sqlite"));
         let attempt = attempt();
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         let receipt = registry
             .consume(&attempt, &grant.permit, &reservation(&attempt))
             .unwrap();
@@ -567,7 +542,7 @@ mod tests {
                 .unwrap(),
             AttemptStatus::Expired
         ));
-        assert!(registry.receipt(&attempt).unwrap().is_some());
+        assert!(registry.receipt(&attempt.attempt_id()).unwrap().is_some());
         assert!(matches!(
             registry.consume(&attempt, &grant.permit, &reservation(&attempt)),
             Err(EgressError::PermitRefused)
@@ -594,15 +569,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = open(&dir.path().join("registry.sqlite"));
         let mut attempt = attempt();
-        let permit = registry.issue(&attempt).unwrap().permit;
+        let permit = registry.issue(&attempt, 20000).unwrap().permit;
         let mut receipt = registry
             .consume(&attempt, &permit, &reservation(&attempt))
             .unwrap();
         receipt.status = DispatchStatus::CredentialUnavailable;
-        receipt.charge = ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 0,
-        };
+        receipt.spend_state = SpendState::Released;
         registry
             .finish(&DispatchResult {
                 diagnostics: Vec::new(),
@@ -631,7 +603,7 @@ mod tests {
         // Interrupt any admission needing 1,000 VM instructions. An indexed
         // predecessor lookup fits; an aggregate over 10,000 receipts cannot.
         registry.0.progress_handler(1000, Some(|| true));
-        assert!(registry.issue(&attempt).is_ok());
+        assert!(registry.issue(&attempt, 20000).is_ok());
     }
 
     #[test]
@@ -640,15 +612,12 @@ mod tests {
         let mut registry = open(&dir.path().join("registry.sqlite"));
         let mut attempt = attempt();
         let first_handoff = reservation(&attempt);
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         let mut receipt = registry
             .consume(&attempt, &grant.permit, &first_handoff)
             .unwrap();
         receipt.status = DispatchStatus::CredentialUnavailable;
-        receipt.charge = ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 0,
-        };
+        receipt.spend_state = SpendState::Released;
         registry
             .finish(&DispatchResult {
                 diagnostics: Vec::new(),
@@ -661,6 +630,14 @@ mod tests {
         attempt.attempt_ordinal += 1;
         attempt.record_sequence += 1;
         attempt.recorded_at += 1;
+        attempt.grant_revision = 2;
+        registry
+            .publish_revision(&GrantRevision {
+                tenant: attempt.tenant.clone(),
+                incarnation: attempt.incarnation.clone(),
+                revision: 2,
+            })
+            .unwrap();
         let second_handoff = reservation(&attempt);
         assert_eq!(
             first_handoff.reservation.binding,
@@ -670,7 +647,7 @@ mod tests {
             first_handoff.reservation.reference,
             second_handoff.reservation.reference
         );
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         registry
             .consume(&attempt, &grant.permit, &second_handoff)
             .unwrap();
@@ -682,7 +659,7 @@ mod tests {
         let path = dir.path().join("registry.sqlite");
         let mut registry = open(&path);
         let attempt = attempt();
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         let receipt = registry
             .consume(&attempt, &grant.permit, &reservation(&attempt))
             .unwrap();
@@ -697,7 +674,7 @@ mod tests {
             .unwrap();
         SqliteSpendLedger::finish_in(
             &tx,
-            &crate::spend_receipt_reference(&receipt),
+            &receipt.reference,
             SpendState::Settled,
             Some(usage.clone()),
             None,
@@ -706,13 +683,13 @@ mod tests {
         tx.commit().unwrap();
         drop(registry);
         let mut registry = open(&path);
-        let retained = registry.receipt(&attempt).unwrap().unwrap();
+        let retained = registry.receipt(&attempt.attempt_id()).unwrap().unwrap();
         assert_eq!(
             serde_json::to_value(&retained.usage).unwrap(),
             serde_json::to_value(&usage).unwrap()
         );
         let AttemptStatus::Dispatched { receipt: projected } =
-            registry.issue(&attempt).unwrap().status
+            registry.issue(&attempt, 20000).unwrap().status
         else {
             panic!("expected accepted attempt");
         };
@@ -733,26 +710,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_requires_a_zero_charge_predecessor_in_the_reserved_unit() {
-        for charge in [
-            ChargeReport::Measured {
-                unit: "provider_requests".into(),
-                amount: 1,
-            },
-            ChargeReport::Measured {
-                unit: "other".into(),
-                amount: 0,
-            },
-        ] {
+    fn retry_requires_a_released_foundation_ledger_predecessor() {
+        for charge in [SpendState::Settled, SpendState::Unknown] {
             let dir = tempfile::tempdir().unwrap();
             let mut registry = open(&dir.path().join("registry.sqlite"));
             let mut attempt = attempt();
-            attempt.reserved_budget.invocation_limit = 10;
-            let permit = registry.issue(&attempt).unwrap().permit;
+            let permit = registry.issue(&attempt, 20000).unwrap().permit;
             let mut receipt = registry
                 .consume(&attempt, &permit, &reservation(&attempt))
                 .unwrap();
-            receipt.charge = charge;
+            receipt.spend_state = charge;
+            if charge == SpendState::Settled {
+                receipt.usage.input_tokens = Some(1);
+            }
             registry
                 .finish(&DispatchResult {
                     diagnostics: Vec::new(),
@@ -765,7 +735,7 @@ mod tests {
             attempt.attempt_ordinal += 1;
             attempt.record_sequence += 1;
             assert!(matches!(
-                registry.issue(&attempt),
+                registry.issue(&attempt, 20000),
                 Err(EgressError::ReconciliationRequired)
             ));
         }
@@ -775,7 +745,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = open(&dir.path().join("registry.sqlite"));
         let attempt = attempt();
-        let grant = registry.issue(&attempt).unwrap();
+        let grant = registry.issue(&attempt, 20000).unwrap();
         assert!(matches!(
             registry
                 .attempt_status(&attempt.attempt_id(), now().unwrap())
@@ -791,16 +761,14 @@ mod tests {
                 .unwrap(),
             AttemptStatus::Dispatched {
                 receipt: DispatchReceipt {
-                    charge: ChargeReport::Unknown { .. },
+                    spend_state: SpendState::Unknown,
                     ..
                 }
             }
         ));
         receipt.status = DispatchStatus::Succeeded;
-        receipt.charge = ChargeReport::Measured {
-            unit: "provider_requests".into(),
-            amount: 1,
-        };
+        receipt.spend_state = SpendState::Settled;
+        receipt.usage.input_tokens = Some(1);
         registry
             .finish(&DispatchResult {
                 diagnostics: Vec::new(),
@@ -837,7 +805,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(registry.receipt(&attempt).unwrap().is_some());
+        assert!(registry.receipt(&attempt.attempt_id()).unwrap().is_some());
         assert!(matches!(
             registry.consume(&attempt, &grant.permit, &reservation(&attempt)),
             Err(EgressError::PermitRefused)
@@ -845,14 +813,28 @@ mod tests {
     }
 
     #[test]
-    fn recovery_v1_registry_is_refused_without_migration() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("registry.sqlite");
-        symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE egress_permits (attempt_digest TEXT PRIMARY KEY);")
+    fn obsolete_registry_versions_are_refused_without_migration() {
+        for version in [1, 2, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("registry.sqlite");
+            symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE egress_permits (attempt_digest TEXT PRIMARY KEY);
+                CREATE TABLE egress_schema (version INTEGER NOT NULL);",
+            )
             .unwrap();
-        drop(conn);
-        assert!(matches!(Registry::open(&path), Err(EgressError::Version)));
+            conn.execute("INSERT INTO egress_schema VALUES (?1)", [version])
+                .unwrap();
+            drop(conn);
+            assert!(matches!(Registry::open(&path), Err(EgressError::Version)));
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT version FROM egress_schema", [], |r| r
+                    .get::<_, u16>(0))
+                    .unwrap(),
+                version
+            );
+        }
     }
 }

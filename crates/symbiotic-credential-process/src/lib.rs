@@ -67,7 +67,9 @@ pub struct RouteConfig {
     /// Absolute durable request allowance for this account; no monetary ceiling.
     #[serde(default)]
     pub provider_request_limit: Option<u64>,
-    /// Route identifier.
+    /// Foundation-owned finite attempt allowance per invocation.
+    pub max_attempts: u32,
+    /// Provider route identifier.
     pub route: String,
     /// Opaque reference scoped to this tenant; empty only for `secret.backend: none`.
     pub secret_ref: String,
@@ -103,7 +105,7 @@ pub struct RouteConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
-    /// Must equal protocol version 2.
+    /// Must equal protocol version 3.
     pub version: u16,
     /// Owner-only runtime directory (queue plus permit replay metadata).
     pub state_dir: PathBuf,
@@ -225,13 +227,13 @@ impl CredentialProcess {
                 {
                     return Ok(Reply::Permit(grant));
                 }
-                self.validate_attempt(&signed.attempt)?;
+                let max_attempts = self.validate_attempt(&signed.attempt)?.max_attempts;
                 let permit = self
                     .inner
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .issue(&signed.attempt)?;
+                    .issue(&signed.attempt, max_attempts)?;
                 Ok(Reply::Permit(permit))
             }
             Operation::AttemptStatus(signed) => {
@@ -244,10 +246,13 @@ impl CredentialProcess {
                     .attempt_status(&signed.attempt_id, registry::now()?)?;
                 Ok(Reply::AttemptStatus(status))
             }
-            Operation::RevokeRoute(signed) => {
-                self.inner.key.verify_revocation(&signed)?;
-                if signed.revocation.record_sequence == 0
-                    || signed.revocation.record_sequence > i64::MAX as u64
+            Operation::PublishGrantRevision(signed) => {
+                self.inner.key.verify_grant_revision(&signed)?;
+                let grant = &signed.grant;
+                if grant.tenant.is_empty()
+                    || grant.incarnation.is_empty()
+                    || grant.revision == 0
+                    || grant.revision > i64::MAX as u64
                 {
                     return Err(EgressError::InvalidRequest);
                 }
@@ -255,17 +260,17 @@ impl CredentialProcess {
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .revoke(&signed.revocation)?;
-                Ok(Reply::Revoked)
+                    .publish_revision(grant)?;
+                Ok(Reply::GrantRevisionPublished)
             }
             Operation::Receipt(signed) => {
-                self.inner.key.verify_attempt(&signed)?;
+                self.inner.key.verify_attempt_id(&signed)?;
                 let receipt = self
                     .inner
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .receipt(&signed.attempt)?;
+                    .receipt(&signed.attempt_id)?;
                 Ok(Reply::Receipt(receipt))
             }
             Operation::InjectProviderCredential(request) => {
@@ -334,15 +339,9 @@ impl CredentialProcess {
             .iter()
             .any(|field| field.is_empty() || field.len() > route.max_field_bytes)
             || a.secret_ref.len() > route.max_field_bytes
-            || a.markings.len() > 128
-            || a.markings.iter().any(|marking| {
-                marking.is_empty()
-                    || marking.len() > route.max_field_bytes
-                    || marking == "unclassified"
-            })
             || a.attempt_ordinal == 0
-            || a.max_attempts == 0
-            || a.attempt_ordinal > a.max_attempts
+            || a.grant_revision == 0
+            || a.grant_revision > i64::MAX as u64
             || a.record_sequence == 0
             || a.record_sequence > i64::MAX as u64
             || a.recorded_at >= a.expires_at
@@ -360,10 +359,7 @@ impl CredentialProcess {
         {
             return Err(EgressError::RouteRefused);
         }
-        if a.reserved_budget.unit != "provider_requests"
-            || a.reserved_budget.amount != 1
-            || a.reserved_budget.invocation_limit == 0
-        {
+        if a.attempt_ordinal > route.max_attempts {
             return Err(EgressError::BudgetRefused);
         }
         Ok(route)
@@ -402,20 +398,14 @@ impl CredentialProcess {
                         receipt.status = DispatchStatus::Succeeded;
                         receipt.usage = usage;
                         if symbiotic_ai_runtime::model::has_measured_usage(&receipt.usage) {
-                            receipt.charge = ChargeReport::Measured {
-                                unit: "provider_requests".into(),
-                                amount: 1,
-                            };
+                            receipt.spend_state = SpendState::Settled;
                         }
                         output = Some(answer);
                     }
                     Err(failure) => {
                         error = Some(failure.code);
                         if !failure.may_have_dispatched {
-                            receipt.charge = ChargeReport::Measured {
-                                unit: "provider_requests".into(),
-                                amount: 0,
-                            };
+                            receipt.spend_state = SpendState::Released;
                         }
                     }
                 }
@@ -423,10 +413,7 @@ impl CredentialProcess {
             _ => {
                 error = Some(EgressError::CredentialUnavailable);
                 receipt.status = DispatchStatus::CredentialUnavailable;
-                receipt.charge = ChargeReport::Measured {
-                    unit: "provider_requests".into(),
-                    amount: 0,
-                };
+                receipt.spend_state = SpendState::Released;
             }
         }
         // A paid answer is returned even if its bookkeeping write fails. The
@@ -443,6 +430,11 @@ impl CredentialProcess {
             .registry
             .lock()
             .is_ok_and(|mut registry| registry.finish(&result).is_ok());
+        if !result.receipt_persisted {
+            // Observed usage and output remain useful, but cannot claim a durable
+            // settlement or release when the atomic completion transaction failed.
+            result.receipt.spend_state = SpendState::Unknown;
+        }
         result
     }
 }
@@ -467,6 +459,7 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         || route.max_in_flight == 0
         || route.requests_per_minute == Some(0)
         || route.input_units_per_minute == Some(0)
+        || route.max_attempts == 0
         || route.timeout_seconds == 0
         || route.max_response_bytes > max_frame as usize / 4
         || route.max_input_bytes > max_frame as usize / 2
@@ -620,15 +613,12 @@ fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
     Ok(ProcessLock(file))
 }
 
-/// Typed internal receipt reference; the Memory-facing wire conversion belongs to PR 6b.
-pub fn spend_receipt_reference(receipt: &DispatchReceipt) -> symbiotic_ai_runtime::SpendReceiptRef {
-    symbiotic_ai_runtime::SpendReceiptRef(format!("egress:{}", receipt.attempt_digest))
-}
 fn invocation_binding(a: &DurableAttempt) -> Result<String, EgressError> {
     let mut immutable = a.clone();
     immutable.attempt_ordinal = 0;
     immutable.record_sequence = 0;
     immutable.recorded_at = 0;
+    immutable.grant_revision = 0;
     digest(&immutable)
 }
 
