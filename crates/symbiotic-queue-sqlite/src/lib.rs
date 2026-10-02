@@ -828,7 +828,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 4;
+pub const QUEUE_SCHEMA_VERSION: u32 = 5;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -851,7 +851,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     // Before release, only an empty, unversioned queue can be initialized.
     let existing_queue = tx
-        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')")
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_cached_invocations')")
         .and_then(|mut stmt| stmt.exists([]))
         .map_err(storage_error)?;
     if schema_version != 0 || existing_queue {
@@ -871,6 +871,12 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
         );
         create unique index spend_active_invocation on spend_receipts(account, invocation)
             where state != 'released';
+        create index spend_invocation_lookup on spend_receipts(account, invocation);
+        create table spend_cached_invocations (
+            account text not null, invocation text not null, binding text not null,
+            reference text not null references spend_receipts(reference), output text not null,
+            primary key (account, invocation)
+        );
         create table queue_items (
             item_id text primary key,
             queue_id text not null,
@@ -1233,6 +1239,9 @@ mod tests {
             "queue_events",
             "queue_cooldowns",
             "QUEUE_EVENTS",
+            "spend_accounts",
+            "spend_receipts",
+            "spend_cached_invocations",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("queue.sqlite");
@@ -1279,14 +1288,14 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_cached_invocations')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
     }
 
     #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
-        for version in [-1, 0, 1, 2, 3, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+        for version in [-1, 0, 1, 2, 3, 4, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
             for existing in [false, true] {
                 if version == 0 && !existing {
                     continue;

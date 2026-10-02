@@ -987,6 +987,7 @@ on_both_backends!(
     restored_account_allowance_reconsiders_refusals_without_spending_attempts,
     a_joined_waiter_recovers_durable_output_from_every_queue_state,
     uncertain_charge_cooldown_failure_is_visible_and_terminal,
+    settlement_failure_is_visible_retains_unknown_and_refuses_redispatch,
     a_failed_cooldown_write_refuses_retry_and_records_the_failure,
     a_failed_cooldown_write_stops_logical_chain_continuation,
     a_failed_trace_write_keeps_the_providers_error,
@@ -2262,6 +2263,7 @@ struct ObservedSpend {
     inner: Arc<dyn symbiotic_model::SpendLedger>,
     reservations: Mutex<Vec<symbiotic_model::SpendReservation>>,
     delay: Duration,
+    fail_settlement: std::sync::atomic::AtomicBool,
 }
 
 impl ObservedSpend {
@@ -2270,6 +2272,7 @@ impl ObservedSpend {
             inner: test_spend::ledger(),
             reservations: Mutex::new(Vec::new()),
             delay,
+            fail_settlement: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2331,6 +2334,17 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         self.inner.invocation(account, invocation)
     }
 
+    fn bind_cached(
+        &self,
+        account: &str,
+        invocation: &str,
+        binding: &str,
+        reference: &symbiotic_model::SpendReceiptRef,
+        output: serde_json::Value,
+    ) -> Result<symbiotic_model::SpendReceipt, ModelError> {
+        self.inner
+            .bind_cached(account, invocation, binding, reference, output)
+    }
     fn finish(
         &self,
         reference: &symbiotic_model::SpendReceiptRef,
@@ -2338,6 +2352,11 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         usage: Option<UsageTrace>,
         output: Option<Value>,
     ) -> Result<(), ModelError> {
+        if self.fail_settlement.load(Ordering::SeqCst) && output.is_some() {
+            return Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            ));
+        }
         self.inner.finish(reference, state, usage, output)
     }
 }
@@ -2759,5 +2778,53 @@ async fn a_reclaimed_unknown_attempt_does_not_spend_a_second_attempt_on_refusal(
         spend.reservations.lock().unwrap().len(),
         2,
         "{backend}: one crashed and one successful accepted attempt"
+    );
+}
+
+async fn settlement_failure_is_visible_retains_unknown_and_refuses_redispatch(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    use symbiotic_model::SpendLedger;
+    let raw = Loopback::new(unique_identity());
+    let spend = ObservedSpend::new(Duration::ZERO);
+    spend.fail_settlement.store(true, Ordering::SeqCst);
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), config())
+        .with_spend_ledger(spend.clone(), None)
+        .with_receipt_sink(receipts.clone());
+    let error = provider
+        .chat(request("settlement fails"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable)
+        ),
+        "{backend}: {error:?}"
+    );
+    let receipt = spend.receipt(&spend.last_reference()).unwrap().unwrap();
+    assert_eq!(
+        receipt.state,
+        symbiotic_model::SpendState::Unknown,
+        "{backend}"
+    );
+    assert!(receipt.output.is_none(), "{backend}");
+    spend.fail_settlement.store(false, Ordering::SeqCst);
+    assert!(
+        provider.chat(request("settlement fails")).await.is_err(),
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+    let item_id = receipts
+        .receipts()
+        .into_iter()
+        .find_map(|r| r.item_id)
+        .unwrap();
+    assert_eq!(
+        queue.get_item(&item_id).await.unwrap().unwrap().status,
+        QueueStatus::Stopped,
+        "{backend}"
     );
 }

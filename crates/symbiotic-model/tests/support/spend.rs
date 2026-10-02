@@ -9,19 +9,30 @@ use symbiotic_trace::UsageTrace;
 struct Fixture {
     ledger: sqlite::SqliteSpendLedger,
     _state: tempfile::TempDir,
+    after_reserve: Option<Box<dyn Fn() + Send + Sync>>,
 }
 pub fn ledger() -> Arc<dyn SpendLedger> {
+    ledger_with_after_reserve(None)
+}
+pub fn ledger_with_after_reserve(
+    after_reserve: Option<Box<dyn Fn() + Send + Sync>>,
+) -> Arc<dyn SpendLedger> {
     let state = tempfile::tempdir().unwrap();
     let path = state.path().join("queue.sqlite");
     symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
     Arc::new(Fixture {
         ledger: sqlite::SqliteSpendLedger::open(&path).unwrap(),
         _state: state,
+        after_reserve,
     })
 }
 impl SpendLedger for Fixture {
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
-        self.ledger.reserve(r)
+        let accepted = self.ledger.reserve(r)?;
+        if accepted && let Some(hook) = &self.after_reserve {
+            hook();
+        }
+        Ok(accepted)
     }
     fn acquire_handoff(
         &self,
@@ -38,6 +49,17 @@ impl SpendLedger for Fixture {
     }
     fn invocation(&self, a: &str, i: &str) -> Result<Option<SpendReceipt>, ModelError> {
         self.ledger.invocation(a, i)
+    }
+    fn bind_cached(
+        &self,
+        account: &str,
+        invocation: &str,
+        binding: &str,
+        reference: &symbiotic_model::SpendReceiptRef,
+        output: serde_json::Value,
+    ) -> Result<symbiotic_model::SpendReceipt, ModelError> {
+        self.ledger
+            .bind_cached(account, invocation, binding, reference, output)
     }
     fn finish(
         &self,

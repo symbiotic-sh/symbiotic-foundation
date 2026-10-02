@@ -175,6 +175,11 @@ identity (including `source`). Consumer commit refusal never releases spend.
 counts against the absolute account request allowance until reconciliation; unknown
 replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
 
+Ledger receipts and saved runtime outputs are retained indefinitely. Cache expiry,
+byte sweeps and source purge do not erase those outputs. Output erasure requires a
+separate lifecycle policy that preserves accounting and replay protection; that
+policy remains deferred with lifecycle/bounds work.
+
 **Current retention settings.** At open, and after every 10,000 finished calls, a persistent
 runtime retires state older than `RuntimeConfig::retention` (seven days by
 default):
@@ -306,7 +311,10 @@ now enforce charge certainty across the shared queued chat, embedding, rerank an
 paths; timeout or unknown charge requires reconciliation.
 
 `provider_request_limit` (default `None`) is an absolute account request allowance
-with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporting.
+with no implicit reset/window; `Some(0)` refuses dispatch. The first reservation fixes
+this allowance in the persistent account state, including `None`. A different
+allowance after restart is refused as `InvalidConfiguration`; no account-limit update
+API is currently defined. Money remains reporting.
 
 `ModelQueueConfig` fields:
 
@@ -370,7 +378,9 @@ using the same binding identity, account sharing configuration and invocation.
 These APIs require no telemetry sink. Caller invocation identities are scoped to
 the full tenant/provider/configuration binding, including when accounts share quota.
 Within that binding, reusing an invocation with different inputs or a changed
-provider descriptor is refused.
+provider descriptor is refused. A cache hit durably binds the invocation to its exact
+inputs and selected output, referencing the original receipt without another request
+reservation.
 
 Credential acceptance records a handoff bound to the complete reservation,
 account, operation, provider binding and exact queued input. Dispatch validates
@@ -402,6 +412,9 @@ The behavior below describes runtime cache/trace/queue writes. Foundation ledger
 reservation, settlement and unknown-charge recovery are durable obligations under
 [boundary.md](boundary.md#spend-ledger-and-budgets), not optional telemetry.
 
+A ledger settlement-write failure returns an error and stops the queue item,
+retaining its unknown charge for reconciliation.
+
 Once the provider has answered, the call has been paid for, and the runtime
 returns the answer. The writes that follow are best-effort: the response
 cache, the trace, and the queue item's completion. The cache is an
@@ -414,7 +427,7 @@ these writes fails:
   `RUNTIME_DIAGNOSTICS` (`"runtime_diagnostics"`), as
   `{"kind": ..., "error": ...}` entries, and the receipt's `metadata` carries
   the same list. The kinds are `response_cache_write_failed`,
-  `trace_write_failed`, `queue_complete_failed` and `spend_settlement_failed`;
+  `trace_write_failed` and `queue_complete_failed`;
 - it is logged as a `tracing` warning.
 
 The same holds elsewhere. A cache hit whose trace write fails is still
@@ -464,7 +477,7 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 4 and the current queue table layouts.
+queue files require schema version 5 and the current queue table layouts.
 Other layouts are refused without migration. Unknown stored failure codes/classes
 are refused with a static error. Terminal items without a recorded error class
 return a queue error, without inferring a

@@ -882,6 +882,7 @@ struct QueuedCall<Req> {
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
+    explicit_invocation: bool,
     attempt_binding: String,
     attempt_context: Option<ExecutionAttemptContext>,
     worker_id: String,
@@ -1116,9 +1117,35 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         // added. The receipt repeats the original usage; its metadata is the
         // returned response's.
         let mut receipted = cached.trace().clone();
-        let response = self
+        let mut response = self
             .traced_cache_hit(cached, item.map(|item| item.item_id.clone()))
             .await;
+        if self.explicit_invocation {
+            let reference: SpendReceiptRef =
+                serde_json::from_value(response.trace().metadata["spend_receipt"].clone())
+                    .map_err(|_| spend::reconciliation())?;
+            let output = serde_json::to_value(&response).map_err(|_| spend::storage())?;
+            let call = self.clone();
+            let receipt = run_blocking(move || {
+                call.spend.bind_cached(
+                    &call.queue_id.0,
+                    &call.invocation,
+                    &call.attempt_binding,
+                    &reference,
+                    output,
+                )
+            })
+            .await?;
+            if let Some(context) = &self.attempt_context {
+                context.capture(&receipt.reservation.reference)?;
+            }
+            // A concurrent caller may already have durably selected its result.
+            response = secrets::composed_result(
+                self.result_owner.as_ref(),
+                serde_json::from_value(receipt.output.ok_or_else(spend::reconciliation)?)
+                    .map_err(|_| spend::storage()),
+            )?;
+        }
         receipted.metadata = response.trace().metadata.clone();
         self.receipts
             .record(
@@ -1334,7 +1361,9 @@ where
         &runtime.binding_identity,
         provider.credential_fingerprint(),
     ))?;
-    let attempt_binding = hash_json(&(&provider_identity, &request_hash))?;
+    // Credential generations partition queue/cache state, not charge recovery.
+    let attempt_binding =
+        hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?;
     let invocation = match &runtime.invocation {
         Some(invocation) => execution_invocation_identity(
             runtime
@@ -1357,6 +1386,7 @@ where
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         invocation,
+        explicit_invocation: runtime.invocation.is_some(),
         attempt_binding,
         attempt_context: runtime.attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
@@ -1805,7 +1835,15 @@ where
                     .await?;
                 }
                 queue
-                    .fail(&item.item_id, worker_id, err.code(), None)
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: err.code(),
+                            error_class: Some(error_class(&err)),
+                            run_after: None,
+                        },
+                    )
                     .await
                     .map_err(queue_error)?;
                 return Err(err);
@@ -2059,12 +2097,18 @@ where
                 })
                 .await;
                 if let Err(err) = saved {
-                    note_side_effect(
-                        &mut response,
-                        &this.queue_id,
-                        "spend_settlement_failed",
-                        err.code(),
-                    );
+                    let failed = queue
+                        .fail_with(
+                            &item.item_id,
+                            worker_id,
+                            Failure {
+                                error: err.code(),
+                                error_class: Some(error_class(&err)),
+                                run_after: None,
+                            },
+                        )
+                        .await;
+                    return Settled::Failed { err, failed };
                 }
             }
             let response = this.record_success(response).await;
@@ -4991,6 +5035,79 @@ mod tests {
         {
             RateCheck::Wait(wait) => assert!(wait >= Duration::from_millis(900), "{wait:?}"),
             RateCheck::Cleared(_) => panic!("the budget was spent"),
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn rate_charge_failure_releases_reservation_and_stops_dispatch() {
+        for queue in [
+            Arc::new(symbiotic_queue::MemoryQueue::new()) as Arc<dyn QueueBackend>,
+            Arc::new(SqliteQueue::in_memory().unwrap()) as Arc<dyn QueueBackend>,
+        ] {
+            let rate_state = ModelRateState::default();
+            let buckets = rate_state.buckets.clone();
+            let spend = test_spend::ledger_with_after_reserve(Some(Box::new(move || {
+                buckets.lock().unwrap().clear();
+            })));
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let raw = SlowCountingChat::new(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                calls.clone(),
+            );
+            let config = ModelQueueConfig {
+                requests_per_minute: Some(60),
+                rate_burst_seconds: 60,
+                logical_retry_attempts: 3,
+                retry_attempts: 3,
+                ..ModelQueueConfig::default()
+            };
+            let install = |rate| {
+                QueuedChatProvider::new(raw.clone(), queue.clone(), "worker", config.clone())
+                    .with_rate_state(rate)
+                    .with_spend_ledger(spend.clone(), None)
+                    .with_receipt_sink(receipts.clone())
+            };
+            let error = install(rate_state)
+                .chat(chat_request("rate failure"))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ModelError::Queue(DiagnosticCode::RateBucketDisappeared)
+            ));
+            let receipt = receipts.receipts().into_iter().next().unwrap();
+            let item = queue
+                .get_item(receipt.item_id.as_ref().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(item.status, QueueStatus::Stopped);
+            let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+            let accounted = spend.receipt(&reference).unwrap().unwrap();
+            assert_eq!(accounted.state, SpendState::Released);
+            assert!(
+                install(ModelRateState::default())
+                    .chat(chat_request("rate failure"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(
+                queue
+                    .claim(symbiotic_queue::ClaimRequest {
+                        queue_id: item.queue_id,
+                        worker_id: "later".into(),
+                        limit: 1,
+                        lease_seconds: 60,
+                        max_in_flight: None
+                    })
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

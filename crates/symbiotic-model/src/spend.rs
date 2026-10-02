@@ -108,6 +108,17 @@ pub trait SpendLedger: Send + Sync {
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError>;
+    /// Durably select a cached result for an invocation without reserving a request.
+    /// The receipt must already belong to this account. Concurrent selections recover
+    /// the existing matching result or refuse conflicting inputs/unfinished attempts.
+    fn bind_cached(
+        &self,
+        account: &str,
+        invocation: &str,
+        binding: &str,
+        reference: &SpendReceiptRef,
+        output: Value,
+    ) -> Result<SpendReceipt, ModelError>;
     fn finish(
         &self,
         reference: &SpendReceiptRef,
@@ -144,6 +155,16 @@ impl SpendLedger for UnavailableSpendLedger {
         Err(storage())
     }
     fn invocation(&self, _: &str, _: &str) -> Result<Option<SpendReceipt>, ModelError> {
+        Err(storage())
+    }
+    fn bind_cached(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &SpendReceiptRef,
+        _: Value,
+    ) -> Result<SpendReceipt, ModelError> {
         Err(storage())
     }
     fn finish(
