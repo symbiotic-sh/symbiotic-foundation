@@ -29,6 +29,9 @@ pub fn ledger_with_after_reserve(
     })
 }
 impl SpendLedger for Fixture {
+    fn attempt_limit(&self, account: &str, invocation: &str) -> Result<Option<u32>, ModelError> {
+        self.ledger.attempt_limit(account, invocation)
+    }
     fn attempts(
         &self,
         account: &str,

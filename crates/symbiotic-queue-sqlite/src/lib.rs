@@ -787,7 +787,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 8;
+pub const QUEUE_SCHEMA_VERSION: u32 = 9;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -830,7 +830,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
             pre_dispatch_released integer not null default 0
         );
         create unique index spend_active_invocation on spend_receipts(account, invocation)
-            where state != 'released';
+            where state = 'unknown';
         create index spend_invocation_lookup on spend_receipts(account, invocation);
         create table queue_items (
             item_id text primary key,
@@ -1222,18 +1222,9 @@ mod tests {
 
     #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
-        for version in [
-            -1,
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7,
-            i64::from(QUEUE_SCHEMA_VERSION) + 1,
-        ] {
+        for version in (-1..=i64::from(QUEUE_SCHEMA_VERSION) + 1)
+            .filter(|version| *version != i64::from(QUEUE_SCHEMA_VERSION))
+        {
             for existing in [false, true] {
                 if version == 0 && !existing {
                     continue;

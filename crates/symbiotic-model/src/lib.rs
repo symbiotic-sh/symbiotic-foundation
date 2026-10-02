@@ -1052,6 +1052,23 @@ impl<Req> QueuedCall<Req> {
         run_blocking(move || spend.attempts(&account, &invocation, prefix.as_deref())).await
     }
 
+    async fn logical_retry_state(&self, item: &QueueItem) -> Result<LogicalRetryState, ModelError> {
+        let ceiling = if self.explicit_invocation && self.accepted_spend.is_none() {
+            let spend = self.spend.clone();
+            let account = self.queue_id.0.clone();
+            let invocation = self.invocation.clone();
+            Some(
+                run_blocking(move || spend.attempt_limit(&account, &invocation))
+                    .await?
+                    .unwrap_or_else(|| logical_max_attempts(&self.config)),
+            )
+        } else {
+            self.explicit_invocation
+                .then(|| logical_max_attempts(&self.config))
+        };
+        logical_retry_state(&item.payload, ceiling)
+    }
+
     // Reconsider accounting refusals and proven pre-dispatch storage/ownership
     // aborts. Other stopped failures, including rate failures, remain terminal.
     async fn reconsider_stopped(
@@ -1089,7 +1106,7 @@ impl<Req> QueuedCall<Req> {
             }
             _ => return Ok(None),
         }
-        let state = logical_retry_state(&item.payload, &self.config, self.explicit_invocation)?;
+        let state = self.logical_retry_state(item).await?;
         let attempts_used = state
             .attempts_used
             .checked_add(self.provider_attempts(item).await?)
@@ -1148,6 +1165,7 @@ impl<Req> QueuedCall<Req> {
             &self.config,
             err,
             self.provider_attempts(dead).await?,
+            self.logical_retry_state(dead).await?,
             self.explicit_invocation,
         )
         .await
@@ -1390,18 +1408,8 @@ where
         provider.credential_fingerprint(),
     ))?;
     // Credential generations partition queue/cache state, not charge recovery.
-    // Explicit replay must retain its original total provider-attempt ceiling.
-    // Implicit queue items retain their existing budget-renewal policy.
-    let attempt_binding = match &runtime.invocation {
-        Some(_) => hash_json(&(
-            kind,
-            &descriptor,
-            &runtime.binding_identity,
-            &request_hash,
-            logical_max_attempts(&runtime.config),
-        ))?,
-        None => hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?,
-    };
+    let attempt_binding =
+        hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?;
     let invocation = match &runtime.invocation {
         Some(invocation) => execution_invocation_identity(
             runtime
@@ -2633,13 +2641,12 @@ fn model_queue_payload(
 #[cfg(feature = "queue")]
 fn logical_retry_state(
     payload: &Value,
-    config: &ModelQueueConfig,
-    explicit: bool,
+    explicit_ceiling: Option<u32>,
 ) -> Result<LogicalRetryState, ModelError> {
-    if explicit {
+    if let Some(max_attempts) = explicit_ceiling {
         return Ok(LogicalRetryState {
             attempts_used: 0,
-            max_attempts: logical_max_attempts(config),
+            max_attempts,
         });
     }
     let state: LogicalRetryState = serde_json::from_value(
@@ -2670,9 +2677,9 @@ async fn reenqueue_dead_item(
     config: &ModelQueueConfig,
     err: &ModelError,
     provider_attempts: u32,
+    state: LogicalRetryState,
     explicit_invocation: bool,
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
-    let state = logical_retry_state(&item.payload, config, explicit_invocation)?;
     let attempts_used = state
         .attempts_used
         .checked_add(provider_attempts)

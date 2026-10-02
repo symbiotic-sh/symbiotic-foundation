@@ -357,7 +357,7 @@ fn invocation_attempt_ceiling_counts_known_zero_but_not_pre_dispatch_releases() 
     ledger.release_before_dispatch(&aborted.reference).unwrap();
     assert_eq!(ledger.attempts("account", "bounded", None).unwrap(), 0);
     let dispatched = reservation("runtime:item:2", "bounded", "account");
-    assert!(ledger.reserve(&dispatched, Some(1)).unwrap());
+    assert!(ledger.reserve(&dispatched, Some(3)).unwrap());
     ledger
         .finish(&dispatched.reference, SpendState::Released, None, None)
         .unwrap();
@@ -377,7 +377,7 @@ fn invocation_attempt_ceiling_counts_known_zero_but_not_pre_dispatch_releases() 
         0
     );
     assert!(matches!(
-        ledger.reserve(&reservation("retry", "bounded", "account"), Some(1)),
+        ledger.reserve(&reservation("retry", "bounded", "account"), Some(3)),
         Err(ModelError::BudgetExhausted(
             DiagnosticCode::AttemptBudgetExhausted
         ))
@@ -397,4 +397,68 @@ fn invocation_attempt_ceiling_counts_known_zero_but_not_pre_dispatch_releases() 
             )
             .unwrap()
     );
+}
+
+#[test]
+fn settled_receipts_still_block_explicit_runtime_and_handoff_reservations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let ledger = open(&path);
+    let mut first = reservation("first", "invocation", "account");
+    first.request_limit = None;
+    ledger.reserve(&first, Some(2)).unwrap();
+    ledger
+        .finish(
+            &first.reference,
+            SpendState::Settled,
+            Some(UsageTrace {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            Some(symbiotic_ai_runtime::SpendReceipt::completion_evidence()),
+        )
+        .unwrap();
+    let mut next = first.clone();
+    next.reference = SpendReceiptRef("next".into());
+    assert!(matches!(
+        ledger.reserve(&next, Some(3)),
+        Err(ModelError::Queue(
+            DiagnosticCode::SpendReconciliationRequired
+        ))
+    ));
+
+    // A trusted handoff has no runtime ceiling but retains the same blocking rule.
+    first.invocation = "handoff".into();
+    first.reference = SpendReceiptRef("handoff-first".into());
+    let mut conn = rusqlite::Connection::open(path).unwrap();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut handoff = symbiotic_ai_runtime::AcceptedSpendHandoff {
+        reservation: first,
+        input_identity: "exact-input".into(),
+    };
+    assert!(SqliteSpendLedger::reserve_handoff_in(&tx, &handoff).unwrap());
+    tx.commit().unwrap();
+    ledger
+        .finish(
+            &handoff.reservation.reference,
+            SpendState::Settled,
+            Some(UsageTrace {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            Some(symbiotic_ai_runtime::SpendReceipt::completion_evidence()),
+        )
+        .unwrap();
+    handoff.reservation.reference = SpendReceiptRef("handoff-next".into());
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        SqliteSpendLedger::reserve_handoff_in(&tx, &handoff),
+        Err(ModelError::Queue(
+            DiagnosticCode::SpendReconciliationRequired
+        ))
+    ));
 }

@@ -49,7 +49,7 @@ the same state.
 | `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
 | `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
 | `policy` | Required explicit policy, or the configured registry account | Concurrency, rate limits, retries, timeout |
-| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: no response cache; same-attempt ledger recovery still applies. `Custom(cache)`: a host `ResponseCache` |
+| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: implicit calls reach the provider on every call; explicit invocations retain same-attempt ledger recovery. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
 
 ## Configured registry
@@ -179,11 +179,6 @@ reconsider a pre-dispatch storage failure once the ledger is available again.
 `Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
 counts against the absolute account request allowance until reconciliation; unknown
 replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
-
-Ledger receipts and saved runtime outputs are retained indefinitely. Cache expiry,
-byte sweeps and source purge do not erase those outputs. Output erasure requires a
-separate lifecycle policy that preserves accounting and replay protection; that
-policy remains deferred with lifecycle/bounds work.
 
 **Current retention settings.** At open, and after every 10,000 finished calls, a persistent
 runtime retires state older than `RuntimeConfig::retention` (seven days by
@@ -358,7 +353,8 @@ with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporti
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
   `Some(0)` gives every call its own budget. These are current queue mechanics;
   renewal does not prove zero charge or authorize resending an uncertain attempt.
-  Ledger recovery still returns a completed same attempt even with caching off.
+  Explicit invocation recovery returns its completed same attempt even with caching
+  off; implicit calls with caching off reach the provider on every call.
   Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a

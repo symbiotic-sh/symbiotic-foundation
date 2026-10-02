@@ -91,21 +91,28 @@ impl SqliteSpendLedger {
         r: &SpendReservation,
         attempt_limit: Option<u32>,
     ) -> Result<bool, ModelError> {
-        // All reservation paths fix the invocation's input binding in this same
-        // immediate transaction. Released predecessors never erase the binding.
-        let binding: Option<String> = conn
-            .query_row(
-                "SELECT binding FROM spend_receipts WHERE account=?1 AND invocation=?2 LIMIT 1",
-                params![r.account, r.invocation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        if binding
+        Self::reserve_with_policy_in(conn, r, attempt_limit, attempt_limit.is_some())
+    }
+
+    fn reserve_with_policy_in(
+        conn: &rusqlite::Transaction<'_>,
+        r: &SpendReservation,
+        attempt_limit: Option<u32>,
+        explicit: bool,
+    ) -> Result<bool, ModelError> {
+        // The first row fixes input binding and any explicit attempt ceiling.
+        // rowid order is reservation acceptance order within this transaction.
+        // Released predecessors never erase either invocation invariant.
+        let first = first_reservation_in(conn, &r.account, &r.invocation)?;
+        if first
             .as_ref()
-            .is_some_and(|binding| binding != &r.binding)
+            .is_some_and(|(first, _)| first.binding != r.binding)
         {
             return Err(conflict());
+        }
+        let stored_limit = first.as_ref().map_or(attempt_limit, |(_, limit)| *limit);
+        if first.is_some() && attempt_limit.is_some() && stored_limit.is_none() {
+            return Err(storage(()));
         }
         if let Some(old) = receipt_in(conn, &r.reference)? {
             return if old.reservation == *r {
@@ -124,11 +131,11 @@ impl SqliteSpendLedger {
             [&r.account],
         )
         .map_err(storage)?;
-        let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE account=?1 AND invocation=?2 AND state!='released')", params![r.account, r.invocation], |row| row.get(0)).map_err(storage)?;
+        let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE account=?1 AND invocation=?2 AND (state='unknown' OR (?3 AND state!='released')))", params![r.account, r.invocation, explicit || stored_limit.is_some()], |row| row.get(0)).map_err(storage)?;
         if active {
             return Err(conflict());
         }
-        if let Some(limit) = attempt_limit
+        if let Some(limit) = stored_limit
             && attempts_in(conn, &r.account, &r.invocation, None)? >= limit
         {
             return Err(ModelError::BudgetExhausted(
@@ -141,7 +148,13 @@ impl SqliteSpendLedger {
                 DiagnosticCode::SpendBudgetExhausted,
             ));
         }
-        let json = serde_json::to_string(r).map_err(storage)?;
+        let mut reservation = serde_json::to_value(r).map_err(storage)?;
+        if first.is_none()
+            && let Some(limit) = stored_limit
+        {
+            reservation["attempt_limit"] = serde_json::json!(limit);
+        }
+        let json = serde_json::to_string(&reservation).map_err(storage)?;
         conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown')", params![r.reference.0, r.account, r.invocation, r.binding, json]).map_err(storage)?;
         Ok(true)
     }
@@ -154,7 +167,7 @@ impl SqliteSpendLedger {
         if handoff.input_identity.is_empty() {
             return Err(conflict());
         }
-        if !Self::reserve_in(conn, &handoff.reservation, None)? {
+        if !Self::reserve_with_policy_in(conn, &handoff.reservation, None, true)? {
             let input: Option<String> = conn
                 .query_row(
                     "SELECT handoff_input FROM spend_receipts WHERE reference=?1",
@@ -327,6 +340,35 @@ fn invocation_in(
         .map(Option::flatten)
 }
 
+fn first_reservation_in(
+    conn: &Connection,
+    account: &str,
+    invocation: &str,
+) -> Result<Option<(SpendReservation, Option<u32>)>, ModelError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT reservation FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid ASC LIMIT 1",
+            params![account, invocation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    json.map(|json| {
+        let value: serde_json::Value = serde_json::from_str(&json).map_err(storage)?;
+        let limit: Option<u32> = value
+            .get("attempt_limit")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(storage)?;
+        if limit == Some(0) {
+            return Err(storage(()));
+        }
+        Ok((serde_json::from_value(value).map_err(storage)?, limit))
+    })
+    .transpose()
+}
+
 fn attempts_in(
     conn: &Connection,
     account: &str,
@@ -344,6 +386,12 @@ fn attempts_in(
 }
 
 impl SpendLedger for SqliteSpendLedger {
+    fn attempt_limit(&self, account: &str, invocation: &str) -> Result<Option<u32>, ModelError> {
+        let conn = self.connection.lock().map_err(storage)?;
+        first_reservation_in(&conn, account, invocation)?
+            .map(|(_, limit)| limit.ok_or_else(|| storage(())))
+            .transpose()
+    }
     fn attempts(
         &self,
         account: &str,

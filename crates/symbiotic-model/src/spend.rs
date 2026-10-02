@@ -51,7 +51,6 @@ pub struct SpendReservation {
     pub account: String,
     pub invocation: String,
     /// Immutable input/provider-binding digest for the logical invocation.
-    /// Explicit runtime invocations also bind their original total attempt ceiling.
     /// Individual attempt identity belongs to `reference`.
     pub binding: String,
     /// Absolute account request allowance; no time window or monetary ceiling.
@@ -123,6 +122,9 @@ pub trait SpendLedger: Send + Sync {
         reservation: &SpendReservation,
         attempt_limit: Option<u32>,
     ) -> Result<bool, ModelError>;
+    /// Original explicit invocation ceiling, read from its first reservation JSON.
+    /// Returns None before reservation; an existing reservation without a ceiling errs.
+    fn attempt_limit(&self, account: &str, invocation: &str) -> Result<Option<u32>, ModelError>;
     /// Count canonical provider attempts, excluding confirmed pre-dispatch releases.
     /// A reference prefix scopes implicit calls to their current queue item.
     fn attempts(
@@ -179,6 +181,9 @@ pub(crate) fn reconciliation() -> ModelError {
 pub struct UnavailableSpendLedger;
 impl SpendLedger for UnavailableSpendLedger {
     fn reserve(&self, _: &SpendReservation, _: Option<u32>) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn attempt_limit(&self, _: &str, _: &str) -> Result<Option<u32>, ModelError> {
         Err(storage())
     }
     fn attempts(&self, _: &str, _: &str, _: Option<&str>) -> Result<u32, ModelError> {

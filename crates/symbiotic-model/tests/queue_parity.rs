@@ -2313,6 +2313,9 @@ impl ObservedSpend {
 }
 
 impl symbiotic_model::SpendLedger for ObservedSpend {
+    fn attempt_limit(&self, account: &str, invocation: &str) -> Result<Option<u32>, ModelError> {
+        self.inner.attempt_limit(account, invocation)
+    }
     fn attempts(
         &self,
         account: &str,
