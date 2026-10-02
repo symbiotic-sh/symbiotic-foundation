@@ -371,7 +371,7 @@ async fn grant_revocation_between_admission_and_dispatch_refuses_all_pending_adm
             ));
             assert!(matches!(
                 status(&process, admission).await,
-                AttemptStatus::Permitted
+                AttemptStatus::Invalidated
             ));
             assert!(matches!(
                 exchange(&process, Operation::Receipt(signed_id(admission))).await,
@@ -388,6 +388,118 @@ async fn grant_revocation_between_admission_and_dispatch_refuses_all_pending_adm
         Err(EgressError::RouteRefused)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn invalidated_permit_allows_reauthorized_handoff_at_max_attempts_one() {
+    for restart in [false, true] {
+        let mut fixture = Fixture::new(200, "reauthorized answer".into(), Duration::ZERO).await;
+        fixture.config.routes[0].max_attempts = 1;
+        let mut process = fixture.process().await;
+        let (first, payload) = fixture.attempt("reauthorized", 1, 10);
+        let first_permit = permit(&process, &first).await;
+        revoke(&process, 2).await;
+        assert!(matches!(
+            status(&process, &first).await,
+            AttemptStatus::Invalidated
+        ));
+        assert!(matches!(
+            exchange(
+                &process,
+                inject(first.clone(), payload.clone(), first_permit.clone())
+            )
+            .await,
+            Err(EgressError::RouteRefused)
+        ));
+        assert_eq!(ledger_totals(&fixture), (0, 0));
+        if restart {
+            drop(process);
+            process = fixture.process().await;
+        }
+        let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+        let mut second = first.attempt.clone();
+        second.grant_revision = 2;
+        // Reauthorization cannot mutate an existing attempt identity.
+        assert!(matches!(
+            exchange(
+                &process,
+                Operation::IssuePermit(key.sign_attempt(second.clone()).unwrap().into())
+            )
+            .await,
+            Err(EgressError::InvalidRequest)
+        ));
+        second.attempt_ordinal = 2;
+        second.record_sequence = 11;
+        let second = key.sign_attempt(second).unwrap();
+        let second_permit = permit(&process, &second).await;
+        assert_ne!(second_permit.token, first_permit.token);
+        assert!(matches!(
+            status(&process, &first).await,
+            AttemptStatus::Invalidated
+        ));
+        assert!(matches!(
+            exchange(&process, Operation::Receipt(signed_id(&first))).await,
+            Ok(Reply::Receipt(None))
+        ));
+        let reattached = permit(&process, &first).await;
+        assert_eq!(reattached.token, first_permit.token);
+        assert!(matches!(
+            exchange(&process, inject(first, payload.clone(), reattached)).await,
+            Err(EgressError::RouteRefused)
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        let result = dispatched(
+            exchange(&process, inject(second.clone(), payload, second_permit))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.receipt.attempt_id, second.attempt.attempt_id());
+        assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger_totals(&fixture), (1, 1));
+    }
+}
+
+#[tokio::test]
+async fn invalidated_permits_preserve_accepted_attempt_allowance_after_restart() {
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.routes[0].max_attempts = 2;
+    fixture.config.routes[0].secret = SecretSource::OwnerOnlyFile {
+        path: fixture.dir.path().join("missing-provider"),
+    };
+    let mut process = fixture.process().await;
+    let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+    for (ordinal, revision, consume) in [(1, 1, true), (2, 1, false), (3, 2, false), (4, 3, true)] {
+        let (mut admission, payload) = fixture.attempt("allowance", ordinal, u64::from(ordinal));
+        admission.attempt.grant_revision = revision;
+        let admission = key.sign_attempt(admission.attempt).unwrap();
+        let granted = permit(&process, &admission).await;
+        if consume {
+            let result = dispatched(
+                exchange(&process, inject(admission, payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result.receipt.spend_state, SpendState::Released);
+        } else {
+            revoke(&process, revision + 1).await;
+            assert!(matches!(
+                exchange(&process, inject(admission, payload, granted)).await,
+                Err(EgressError::RouteRefused)
+            ));
+        }
+        drop(process);
+        process = fixture.process().await;
+    }
+    let (mut excess, _) = fixture.attempt("allowance", 5, 5);
+    excess.attempt.grant_revision = 3;
+    let excess = key.sign_attempt(excess.attempt).unwrap();
+    assert!(matches!(
+        exchange(&process, Operation::IssuePermit(excess.into())).await,
+        Err(EgressError::BudgetRefused)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 2));
 }
 
 #[tokio::test]

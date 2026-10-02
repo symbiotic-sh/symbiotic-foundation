@@ -67,7 +67,7 @@ pub struct RouteConfig {
     /// Absolute durable request allowance for this account; no monetary ceiling.
     #[serde(default)]
     pub provider_request_limit: Option<u64>,
-    /// Foundation-owned finite attempt allowance per invocation.
+    /// Foundation-owned finite accepted-handoff allowance per invocation.
     pub max_attempts: u32,
     /// Provider route identifier.
     pub route: String,
@@ -292,7 +292,12 @@ impl CredentialProcess {
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .consume(&request.admission.attempt, &request.permit, &handoff)?;
+                    .consume(
+                        &request.admission.attempt,
+                        &request.permit,
+                        &handoff,
+                        route.max_attempts,
+                    )?;
                 // Spawning occurs immediately after consumption with no await in
                 // between. Client cancellation cannot leave a consumed-but-cancelled
                 // live task; a process crash leaves the durable unknown receipt.
@@ -358,9 +363,6 @@ impl CredentialProcess {
             || a.secret_ref != route.secret_ref
         {
             return Err(EgressError::RouteRefused);
-        }
-        if a.attempt_ordinal > route.max_attempts {
-            return Err(EgressError::BudgetRefused);
         }
         Ok(route)
     }

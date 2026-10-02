@@ -15,6 +15,16 @@ fn v3_refusal_has_the_documented_wire_shape() {
     assert!(matches!(decoded.result, Err(EgressError::PermitRefused)));
 }
 
+#[test]
+fn invalidated_status_has_a_distinct_wire_state() {
+    let json = serde_json::to_string(&AttemptStatus::Invalidated).unwrap();
+    assert_eq!(json, r#"{"state":"invalidated"}"#);
+    assert!(matches!(
+        serde_json::from_str::<AttemptStatus>(&json).unwrap(),
+        AttemptStatus::Invalidated
+    ));
+}
+
 #[tokio::test]
 async fn memory_can_use_a_trait_object_test_double_without_the_credential_process() {
     struct Double;

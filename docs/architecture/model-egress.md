@@ -53,9 +53,10 @@ implementation.
 ## Same-attempt recovery (v3)
 
 V3 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version, egress registry stamp and HMAC domains are 3. Opening an older egress registry
-fails with `Version`; no migration or reset is performed. Operators must reconcile any
-old live attempts before provisioning fresh v3 state; never delete active replay history.
+versions, configuration version and HMAC domains are 3; the egress registry schema stamp is 4.
+Opening a registry with a different stamp fails with `Version`; no migration or reset is
+performed. Operators must reconcile any old live attempts before provisioning fresh state;
+never delete active replay history.
 The crate package version remains 0.2.0 on this unreleased branch.
 
 The exact public API is:
@@ -86,7 +87,8 @@ requests converge on one permit, and concurrent injections admit at most one han
 | State | Fields / meaning |
 | --- | --- |
 | `NotIssued` | No permit for this identity; lookup does not issue one |
-| `Permitted` | Committed permit has not been consumed |
+| `Permitted` | Unconsumed permit under the published revision |
+| `Invalidated` | Unconsumed permit superseded by publication; see [revocation rules](#revocation-replay-and-unknown-charges) |
 | `Dispatched { receipt }` | Consumed, with no durable completion; receipt retains unknown reservation |
 | `Completed { result }` | `DispatchResult` with typed `ProviderOutput`, measured usage/charge, no error |
 | `Failed { result }` | `DispatchResult` with static `EgressError`, no output, and known-zero or unknown charge |
@@ -162,15 +164,23 @@ Publication durably advances the revision and refuses rollback; an exact replay
 is idempotent. Permit issuance checks the published revision but reserves nothing.
 Dispatch acceptance rechecks exact equality in the same immediate transaction as
 permit consumption and ledger reservation. That transaction is the acceptance
-point and is serialized with publication. Older pending admissions are refused,
-even if their K records preceded the grant change. A mismatch requires a newly
-authorized admission; it cannot mutate an existing signed attempt.
-Accepted handoffs retain execution, accounting, status and receipt recovery after
-publication. A retry is a new handoff and must match the current revision.
+point and is serialized with publication.
+
+A permit invalidated by a grant-revision change before handoff has status
+`Invalidated`: it is not a charge, does not occupy the invocation and does not consume
+`max_attempts`. Its capability remains refused, even if its K record preceded the change.
+After Memory reauthorizes both principals, the next admission under the published revision
+is a new handoff for the same invocation, with the following ordinal and a higher record
+sequence; it cannot mutate an existing signed attempt. For example, ordinal 1 issued
+under revision 10 and invalidated by revision 11 permits a newly signed ordinal 2 under
+revision 11 even with `max_attempts = 1`. Accepted handoffs retain execution, accounting,
+status and receipt recovery after publication; any retry must match the current revision.
 
 The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_grant_revisions` replay-protection tables. They store hashes, ordinal/sequence,
-consumption status, recoverable permit tokens and accounting receipts. V3 also stores
+grant-revision bindings, accepted-handoff counts, consumption status, recoverable permit
+tokens and accounting receipts. Pending status is projected from the stored permit revision
+and the durably published revision, so publication needs no permit-history scan. V3 also stores
 safe typed results until the signed recovery deadline, never prompts or provider credentials.
 The owner-only database and same-UID authenticated IPC protect these recovery values.
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede
@@ -185,8 +195,8 @@ Memory retains the reference and cannot reserve, release or settle through this 
 
 Before handoff the consumed permit has durable `SpendState::Unknown` and its
 Foundation-owned one-request reservation. Timeout, uncertain provider failure or crash leaves it reserved.
-`Receipt(SignedAttemptId)` returns accounting only, never a cached output. An absent receipt means no
-consumption record exists, not permission to reuse an already refused permit.
+`Receipt(SignedAttemptId)` returns accounting only, never a cached output; it returns
+`None` when no consumption record exists. Capability reuse follows the revocation rules above.
 A lost issue-permit reply is recovered by replaying the exact signed `IssuePermit`:
 it returns the same capability and current state without allocating another attempt.
 A lost dispatch reply is recovered with `AttemptStatus`; never resend a consumed permit.
@@ -205,9 +215,12 @@ its receipt (`None` on success). Credential-loading and setup/queue failures bef
 transport handoff report `SpendState::Released` and release that reservation for a
 subsequent admitted attempt, while the attempt-count limit still applies. Once the
 raw transport starts, failures conservatively retain the unknown reservation.
-Retry admission checks only the latest receipt using the invocation/ordinal index:
-its canonical ledger state must be Released. Success is terminal,
-and other charges require reconciliation, so earlier history needs no aggregate scan.
+Admission checks only the latest attempt using the invocation/ordinal index. For a
+consumed predecessor, its receipt's canonical ledger state must be Released;
+an unconsumed predecessor follows the revocation rule above. Success is terminal,
+and other charges require reconciliation. The latest row carries the cumulative accepted
+handoff count, incremented only with atomic consumption/reservation and copied to the next
+row; earlier history needs no aggregate scan.
 If the atomic final result/receipt write fails, the paid output still returns with
 `receipt_persisted = false` and `SpendState::Unknown`; restart retains the earlier reservation and
 `Dispatched` state. Receipt reconciliation and references follow the
@@ -221,7 +234,8 @@ registry write succeeds. Raw runtime diagnostic strings are never forwarded.
 Memory supplies no budget unit, reservation, invocation spend limit, attempt
 allowance or settlement instruction. The route owner configures a finite positive
 `max_attempts` and an optional absolute account `provider_request_limit`.
-Foundation reserves one provider request per accepted attempt. A logical invocation
+Foundation reserves one provider request per accepted attempt and applies `max_attempts`
+to accepted handoffs, rather than raw ordinals. After an accepted handoff, a logical invocation
 is terminal on success; uncertain attempts stop retries, and only a known-zero
 failure permits a new attempt within Foundation's allowance. HTTP protocol retries,
 redirects and ambient proxies are disabled; runtime retry budgets are one.

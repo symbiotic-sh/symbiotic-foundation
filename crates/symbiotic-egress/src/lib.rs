@@ -410,8 +410,10 @@ pub struct DispatchResult {
 pub enum AttemptStatus {
     /// No permit has been issued for this identity.
     NotIssued,
-    /// Permit committed, but not consumed.
+    /// Permit committed, not consumed, and still under the published grant revision.
     Permitted,
+    /// Grant revision changed before handoff; no charge or attempt allowance consumed.
+    Invalidated,
     /// Permit consumed; completion is not durably known (including a process crash).
     Dispatched { receipt: DispatchReceipt },
     /// Recoverable typed output, usage and settlement.
