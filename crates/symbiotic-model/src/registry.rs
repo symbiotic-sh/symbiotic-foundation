@@ -14,6 +14,12 @@ pub enum ModelAdapter {
     OpenAiChat,
     /// Gemini single and batch embedding requests.
     GeminiEmbedding,
+    /// OpenAI/OpenRouter compatible batch embeddings, including Qwen.
+    OpenAiEmbedding,
+    /// Ollama's single-input `/api/embeddings` protocol.
+    OllamaEmbedding,
+    /// Cohere/OpenRouter compatible reranking.
+    CohereRerank,
     /// System One probability classification requests.
     JevClassifier,
 }
@@ -22,14 +28,18 @@ impl ModelAdapter {
     pub fn capability(self) -> ModelCapability {
         match self {
             Self::OpenAiChat => ModelCapability::Chat,
-            Self::GeminiEmbedding => ModelCapability::Embedding,
+            Self::GeminiEmbedding | Self::OpenAiEmbedding | Self::OllamaEmbedding => {
+                ModelCapability::Embedding
+            }
+            Self::CohereRerank => ModelCapability::Rerank,
             Self::JevClassifier => ModelCapability::Classify,
         }
     }
     fn operation(self) -> &'static str {
         match self {
             Self::OpenAiChat => "chat",
-            Self::GeminiEmbedding => "embedding",
+            Self::GeminiEmbedding | Self::OpenAiEmbedding | Self::OllamaEmbedding => "embedding",
+            Self::CohereRerank => "rerank",
             Self::JevClassifier => "classify",
         }
     }
@@ -82,8 +92,15 @@ pub struct TransportSettings {
     pub thinking: Option<ThinkingMode>,
     /// Optional nonempty chat effort; refused when thinking is disabled.
     pub reasoning_effort: Option<String>,
-    /// Required nonzero Gemini embedding dimension count.
+    /// Required nonzero default output dimension count for embeddings.
     pub dimensions: Option<usize>,
+    /// Required full-vector ceiling for compatible embeddings; reduced output
+    /// dimensions must not exceed it. No model-name defaults are inferred.
+    pub embedding_full_dimensions: Option<usize>,
+    /// Required hard sum of query and candidate UTF-8 bytes for reranking.
+    pub rerank_input_bytes: Option<usize>,
+    /// Required hard candidate count for reranking, checked before encoding.
+    pub rerank_candidates: Option<usize>,
     /// Optional expected System One served model name.
     pub served_model: Option<String>,
 }
@@ -152,6 +169,34 @@ fn invalid(_message: &str) -> ModelError {
 }
 fn nonempty(value: &str) -> bool {
     !value.trim().is_empty()
+}
+
+impl TransportSettings {
+    pub(crate) fn validate_retrieval(&self, adapter: ModelAdapter) -> Result<(), ModelError> {
+        let embedding = matches!(
+            adapter,
+            ModelAdapter::OpenAiEmbedding | ModelAdapter::OllamaEmbedding
+        );
+        let rerank = adapter == ModelAdapter::CohereRerank;
+        if (!embedding && self.embedding_full_dimensions.is_some())
+            || (!rerank && (self.rerank_input_bytes.is_some() || self.rerank_candidates.is_some()))
+            || (embedding
+                && (self.dimensions.is_none_or(|n| n == 0)
+                    || self.embedding_full_dimensions.is_none_or(|n| n == 0)
+                    || self.dimensions > self.embedding_full_dimensions))
+            || (rerank
+                && (self.dimensions.is_some()
+                    || self.rerank_input_bytes.is_none_or(|n| n == 0)
+                    || self.rerank_candidates.is_none_or(|n| n == 0)))
+            || ((embedding || rerank)
+                && (self.thinking.is_some()
+                    || self.reasoning_effort.is_some()
+                    || self.served_model.is_some()))
+        {
+            return Err(invalid("invalid retrieval settings"));
+        }
+        Ok(())
+    }
 }
 
 /// Validate endpoints before they can enter public provider descriptors.
@@ -283,6 +328,7 @@ impl ModelRegistry {
                 ));
             }
             let settings = &binding.settings;
+            settings.validate_retrieval(model.adapter)?;
             if settings
                 .served_model
                 .as_deref()

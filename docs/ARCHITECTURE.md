@@ -105,7 +105,8 @@ Owns provider-neutral model contracts:
 - provider-neutral errors.
 
 Current implementations include hash/test providers, OpenAI-compatible chat,
-Gemini embedding, TypeSafe System One classification (`JevClassifierProvider`),
+Gemini and OpenAI/Ollama compatible embeddings, Cohere-compatible rerank,
+TypeSafe System One classification (`JevClassifierProvider`),
 chat-backed classification (`ChatClassifierProvider`), a static test
 classifier, exact response cache, queue-bound chat/embedding/rerank/classifier
 wrappers, and retry classification. Codex CLI/session and optional `genai` adapters are still

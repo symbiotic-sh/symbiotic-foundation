@@ -8,6 +8,8 @@ use symbiotic_egress::EgressError;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretSource {
+    /// Keyless provider. Must never be used for an admission MAC key.
+    None,
     /// Exact owner-only file, opened without following its final symlink.
     OwnerOnlyFile { path: PathBuf },
     /// Existing macOS generic password; no shell invocation or environment fallback.
@@ -20,6 +22,11 @@ pub(crate) struct Secret {
 }
 
 impl Secret {
+    pub(crate) fn keyless() -> Self {
+        Self {
+            value: SecretValue::new(String::new()),
+        }
+    }
     pub(crate) fn value(&self) -> &str {
         &self.value
     }
@@ -44,6 +51,7 @@ impl SecretSource {
             return Err(EgressError::CredentialUnavailable);
         }
         let bytes = match self {
+            Self::None => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
             Self::MacosKeychain { service, account } => keychain(service, account)?,
         };

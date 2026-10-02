@@ -246,6 +246,8 @@ pub enum ConfiguredProvider {
     Chat(Arc<dyn ChatProvider>),
     /// A configured queued embedding adapter.
     Embedding(Arc<dyn EmbeddingProvider>),
+    /// A configured queued rerank adapter.
+    Rerank(Arc<dyn RerankProvider>),
     /// A configured queued probability classifier.
     Classifier(Arc<dyn ClassifierProvider>),
 }
@@ -314,6 +316,11 @@ impl Runtime {
         }
     }
 
+    /// Inspect the immutable deployment registry without resolving credentials.
+    pub fn registry(&self) -> Option<&model::ModelRegistry> {
+        self.inner.registry.as_deref()
+    }
+
     /// Build a configured adapter after resolving its optional credential inside Foundation.
     pub async fn configured_provider(
         &self,
@@ -361,6 +368,18 @@ impl Runtime {
         let limits = &config.limits;
         let settings = &config.settings;
         match resolved.model.adapter {
+            model::ModelAdapter::OpenAiEmbedding | model::ModelAdapter::OllamaEmbedding => {
+                let raw = model::CompatibleEmbeddingProvider::from_binding(&resolved, key)?;
+                Ok(ConfiguredProvider::Embedding(self.embedding(
+                    self.registry_binding(tenant, principal, raw)?,
+                )?))
+            }
+            model::ModelAdapter::CohereRerank => {
+                let raw = model::CohereRerankProvider::from_binding(&resolved, key)?;
+                Ok(ConfiguredProvider::Rerank(
+                    self.rerank(self.registry_binding(tenant, principal, raw)?)?,
+                ))
+            }
             model::ModelAdapter::OpenAiChat => {
                 let mut raw = model::OpenAiCompatibleChatProvider::new(
                     &resolved.model.identity.operator.0,
@@ -574,6 +593,26 @@ impl Runtime {
                 ));
             }
             let settings = &resolved.binding.settings;
+            if matches!(
+                resolved.model.adapter,
+                model::ModelAdapter::OpenAiEmbedding
+                    | model::ModelAdapter::OllamaEmbedding
+                    | model::ModelAdapter::CohereRerank
+            ) && (descriptor.metadata.get("retrieval_settings")
+                != Some(&serde_json::to_value(settings).map_err(|_| {
+                    ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
+                })?)
+                || descriptor.metadata.get("adapter")
+                    != Some(&serde_json::to_value(resolved.model.adapter).map_err(|_| {
+                        ModelError::InvalidRequest(
+                            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+                        )
+                    })?))
+            {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding,
+                ));
+            }
             if descriptor
                 .metadata
                 .get("endpoint")

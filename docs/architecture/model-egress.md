@@ -213,8 +213,9 @@ distinction between request bounds and money are specified in
 
 This section applies to the supported Unix same-UID local backend. It is one
 option within the [mode contract](boundary.md#supported-modes-and-trusted-channels).
-The current backend requires secret sources even for loopback bindings; keyless
-binding support remains implementation work.
+Keyless routes use `secret: {"backend":"none"}` and an empty `secret_ref` in
+configuration and admission. No credential is loaded or Authorization header sent.
+The admission MAC key still requires a real secret source.
 
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
 must be an owner-only regular file. Before reading configuration or secrets, the executable
@@ -264,8 +265,13 @@ Keychain reads use Security.framework's generic-password API; non-macOS keychain
 configuration fails closed. No command-line keychain tool, remote backend or credential
 creation/rotation is performed. Secret buffers and adapter key storage zeroize on drop.
 
-Configured providers are `open_ai_chat { operator }` and
-`gemini_embedding { dimensions }`. Chat uses its configured base URL; Gemini is pinned
+Configured providers include `open_ai_chat { operator }`,
+`gemini_embedding { dimensions }`, `compatible_embedding { adapter, operator,
+dimensions, embedding_full_dimensions }` (adapter `open_ai_embedding` or
+`ollama_embedding`), and `cohere_rerank { operator, rerank_input_bytes,
+rerank_candidates }`. They compile into the same validated registry as embedded
+calls. Compatible transports use the configured base URL and preserve one HTTP
+request per permit; Ollama batching is refused. Chat uses its configured base URL; Gemini is pinned
 to `https://generativelanguage.googleapis.com/v1beta` and safe model-name characters.
 HTTPS is required except explicitly enabled loopback HTTP. Userinfo, URL queries,
 fragments, caller-controlled hosts and redirects are refused. The credential process ignores

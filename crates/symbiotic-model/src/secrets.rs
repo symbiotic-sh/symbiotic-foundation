@@ -238,6 +238,7 @@ macro_rules! credential_response {
 credential_response!(
     crate::ChatResponse,
     crate::EmbeddingResponse,
+    crate::RerankResponse,
     crate::ClassifyResponse
 );
 

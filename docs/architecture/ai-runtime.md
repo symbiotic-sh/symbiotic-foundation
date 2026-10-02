@@ -59,7 +59,7 @@ the same state.
 `ModelRegistry::from_json` validates the entire current-version configuration before
 serving. Pass `Arc<ModelRegistry>` in `RuntimeConfig::registry`, then call
 `Runtime::configured_provider(tenant, principal, credential_resolver)`. It returns
-an installed chat, Gemini embedding or Jev classifier adapter. Keyless bindings do
+an installed chat, Gemini/OpenAI/Ollama embedding, Cohere rerank or Jev classifier adapter. Keyless bindings do
 not call the credential resolver. Unknown tenants/principals and configuration,
 transport or policy overrides are refused.
 
@@ -84,6 +84,19 @@ error class, including for invalid UTF-8 bodies. Chat also requires a
 finite output-token bound; requests above a configured bound are refused. Gemini
 requires the exact configured dimension for every returned vector. Its adapter
 refuses task options and conflicting per-request dimensions before dispatch.
+Compatible embeddings require explicit `dimensions` and `embedding_full_dimensions`.
+For Memory's Qwen3-Embedding-8B profile, configure both as 1,024; reduced dimensions
+are configurable per binding or OpenAI-compatible request, within the full ceiling.
+OpenAI/OpenRouter uses `/embeddings` with `input`, `dimensions` and optional `input_type`
+from request `task`; it restores batch input order and validates every vector.
+Ollama uses `/api/embeddings` with `prompt`; batch, task and dimension overrides
+are refused before HTTP. Foundation never splits one invocation into multiple calls.
+Cohere/OpenRouter uses `/rerank` with `query`, `documents` and `top_n`. Required
+`rerank_input_bytes` (sum of query/candidate UTF-8 bytes) and `rerank_candidates`
+are hard admission limits, separate from encoded request/response bytes. Invalid,
+duplicate or non-finite hits refuse the whole response; valid hits are sorted by score.
+These adapters use the same queue, credential boundary and receipt/accounting hook.
+No provider binding, model default, separate scheduler or spend ledger is added.
 Provider credentials and derived secret buffers use the shared non-Debug,
 non-serializable `SecretValue` zeroizing container; `ResolvedAuth` is also non-Debug.
 
