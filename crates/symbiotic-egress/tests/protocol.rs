@@ -25,6 +25,53 @@ fn invalidated_status_has_a_distinct_wire_state() {
     ));
 }
 
+#[test]
+fn authority_expired_refusal_has_a_typed_v3_wire_error() {
+    let response = Response {
+        version: PROTOCOL_VERSION,
+        result: Err(EgressError::AuthorityExpired),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert_eq!(
+        json,
+        r#"{"version":3,"result":{"Err":"authority_expired"}}"#
+    );
+    assert!(matches!(
+        serde_json::from_str::<Response>(&json).unwrap().result,
+        Err(EgressError::AuthorityExpired)
+    ));
+}
+
+#[test]
+fn authority_deadline_is_required_signed_and_digested_in_v3() {
+    let attempt = protocol_attempt();
+    let key = AdmissionKey::new(vec![42; 32]).unwrap();
+    let signed = key.sign_attempt(attempt.clone()).unwrap();
+    let request = Request {
+        version: PROTOCOL_VERSION,
+        operation: Operation::IssuePermit(signed.clone().into()),
+    };
+    let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let Operation::IssuePermit(decoded) = decoded.operation else {
+        panic!("missing signed attempt");
+    };
+    assert_eq!(decoded.attempt.expires_at, 200);
+    key.verify_attempt(&decoded).unwrap();
+    let mut tampered = signed;
+    tampered.attempt.expires_at += 1;
+    assert_ne!(
+        digest(&attempt).unwrap(),
+        digest(&tampered.attempt).unwrap()
+    );
+    assert_eq!(
+        key.verify_attempt(&tampered),
+        Err(EgressError::Unauthorized)
+    );
+    let mut missing = serde_json::to_value(attempt).unwrap();
+    missing.as_object_mut().unwrap().remove("expires_at");
+    assert!(serde_json::from_value::<DurableAttempt>(missing).is_err());
+}
+
 #[tokio::test]
 async fn memory_can_use_a_trait_object_test_double_without_the_credential_process() {
     struct Double;
@@ -170,9 +217,8 @@ fn accepted_receipt_identity_and_reference_round_trip_without_consumer_spend_fie
     assert_eq!(value.as_object().unwrap().len(), 6);
 }
 
-#[test]
-fn admissions_reject_removed_consumer_spend_and_marking_fields() {
-    let attempt = serde_json::json!({
+fn protocol_attempt() -> DurableAttempt {
+    serde_json::from_value(serde_json::json!({
         "tenant": "tenant", "incarnation": "incarnation", "invocation_id": "invocation",
         "attempt_ordinal": 1, "record_sequence": 1, "recorded_at": 100, "expires_at": 200,
         "recovery_expires_at": 300, "caller_binding": "caller", "route": "provider",
@@ -180,8 +226,13 @@ fn admissions_reject_removed_consumer_spend_and_marking_fields() {
         "secret_ref": "secret", "manifest_ref": "manifest",
         "input_manifest_digest": "a".repeat(64), "input_digest": "b".repeat(64),
         "grant_revision": 10,
-    });
-    serde_json::from_value::<DurableAttempt>(attempt.clone()).unwrap();
+    }))
+    .unwrap()
+}
+
+#[test]
+fn admissions_reject_removed_consumer_spend_and_marking_fields() {
+    let attempt = serde_json::to_value(protocol_attempt()).unwrap();
     for (field, value) in [
         (
             "reserved_budget",
