@@ -26,7 +26,6 @@ The central event is `ModelInvocationTrace`:
 - `model` identity
 - `role_binding`, such as `memory.distill` or `agent.plan`
 - `source`, such as `recall`, `intake`, `benchmark`, or `cli`
-- `sensitivity` (current required Rust field, obsolete and pending removal; no data authority)
 - request and response hashes
 - cache status
 - token/media/cost usage

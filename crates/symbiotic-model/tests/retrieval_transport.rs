@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
 };
-use symbiotic_core::{ProviderPrincipalId, Sensitivity, TenantId};
+use symbiotic_core::{ProviderPrincipalId, TenantId};
 use symbiotic_model::*;
 
 const KEY: &str = "synthetic-retrieval-key";
@@ -38,7 +38,6 @@ fn embed_request() -> EmbeddingRequest {
         inputs: vec!["synthetic input".into()],
         dimensions: None,
         task: None,
-        sensitivity: Sensitivity::Private,
         role_binding: None,
         source: None,
         metadata: Value::Null,
@@ -49,7 +48,6 @@ fn rerank_request() -> RerankRequest {
         query: "synthetic query".into(),
         documents: vec!["first".into(), "second".into()],
         top_k: Some(1),
-        sensitivity: Sensitivity::Private,
         role_binding: None,
         source: None,
         metadata: Value::Null,

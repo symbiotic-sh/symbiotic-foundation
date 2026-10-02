@@ -27,7 +27,7 @@ use std::time::Instant;
 pub use symbiotic_core::{
     DiagnosticCode, FailureClass, ModelIdentity, ProviderPrincipalId, TenantId,
 };
-use symbiotic_core::{ModelName, Operation, Operator, QueueId, Sensitivity, TraceId};
+use symbiotic_core::{ModelName, Operation, Operator, QueueId, TraceId};
 use symbiotic_trace::{
     CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
@@ -221,7 +221,6 @@ pub struct ChatRequest {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub response_format: Option<String>,
-    pub sensitivity: Sensitivity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
     pub metadata: Value,
@@ -240,7 +239,6 @@ pub struct EmbeddingRequest {
     pub inputs: Vec<String>,
     pub dimensions: Option<usize>,
     pub task: Option<String>,
-    pub sensitivity: Sensitivity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
     pub metadata: Value,
@@ -259,7 +257,6 @@ pub struct RerankRequest {
     pub query: String,
     pub documents: Vec<String>,
     pub top_k: Option<usize>,
-    pub sensitivity: Sensitivity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
     pub metadata: Value,
@@ -900,7 +897,6 @@ struct QueuedCall<Req> {
     request: Req,
     request_hash: String,
     request_value: Value,
-    sensitivity: Sensitivity,
     idempotency_key: Option<String>,
 }
 
@@ -1296,7 +1292,6 @@ impl<Req> QueuedCall<Req> {
                 model: self.descriptor.identity.clone(),
                 role_binding: None,
                 source: None,
-                sensitivity: self.sensitivity,
                 request_hash: self.request_hash.clone(),
                 response_hash: None,
                 cache: CacheTrace::default(),
@@ -1450,7 +1445,6 @@ where
             None
         },
         trace_sink: runtime.trace_sink.clone(),
-        sensitivity: request.sensitivity(),
         request,
         request_hash,
         request_value,
@@ -2767,14 +2761,10 @@ pub struct ModelRateState {
 #[cfg(feature = "queue")]
 trait BudgetedModelRequest {
     fn input_budget_units(&self) -> Result<u64, ModelError>;
-    fn sensitivity(&self) -> Sensitivity;
 }
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for ChatRequest {
-    fn sensitivity(&self) -> Sensitivity {
-        self.sensitivity
-    }
     fn input_budget_units(&self) -> Result<u64, ModelError> {
         Ok(estimate_token_budget_units(
             self.messages.iter().map(|message| message.content.as_str()),
@@ -2784,9 +2774,6 @@ impl BudgetedModelRequest for ChatRequest {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for EmbeddingRequest {
-    fn sensitivity(&self) -> Sensitivity {
-        self.sensitivity
-    }
     fn input_budget_units(&self) -> Result<u64, ModelError> {
         Ok(estimate_token_budget_units(
             self.inputs.iter().map(String::as_str),
@@ -2796,9 +2783,6 @@ impl BudgetedModelRequest for EmbeddingRequest {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for RerankRequest {
-    fn sensitivity(&self) -> Sensitivity {
-        self.sensitivity
-    }
     fn input_budget_units(&self) -> Result<u64, ModelError> {
         Ok(estimate_token_budget_units(
             std::iter::once(self.query.as_str()).chain(self.documents.iter().map(String::as_str)),
@@ -3103,7 +3087,6 @@ impl EmbeddingProvider for HashEmbeddingProvider {
         }
         let trace = success_trace(
             &self.descriptor,
-            request.sensitivity,
             request.role_binding.clone(),
             request.source.clone(),
             hash_json(&request)?,
@@ -3151,7 +3134,6 @@ impl ChatProvider for StaticChatProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         let trace = success_trace(
             &self.descriptor,
-            request.sensitivity,
             request.role_binding.clone(),
             request.source.clone(),
             hash_json(&request)?,
@@ -3478,7 +3460,6 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     .unwrap_or_default();
                 let mut trace = success_trace(
                     &self.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -3688,7 +3669,6 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                         vectors: Vec::new(),
                         trace: success_trace(
                             &self.descriptor,
-                            request.sensitivity,
                             request.role_binding.clone(),
                             request.source.clone(),
                             hash_json(&request)?,
@@ -3780,7 +3760,6 @@ impl EmbeddingProvider for GeminiEmbeddingProvider {
                     vectors,
                     trace: success_trace(
                         &self.descriptor,
-                        request.sensitivity,
                         request.role_binding.clone(),
                         request.source.clone(),
                         hash_json(&request)?,
@@ -3911,7 +3890,6 @@ fn status_error(status: u16) -> ModelError {
 
 fn success_trace(
     descriptor: &ProviderDescriptor,
-    sensitivity: Sensitivity,
     role_binding: Option<String>,
     source: Option<String>,
     request_hash: String,
@@ -3923,7 +3901,6 @@ fn success_trace(
         model: descriptor.identity.clone(),
         role_binding,
         source,
-        sensitivity,
         request_hash,
         response_hash: response.map(hash_text),
         cache: CacheTrace {
@@ -4046,7 +4023,6 @@ mod tests {
             inputs: vec![],
             dimensions: None,
             task: None,
-            sensitivity: Sensitivity::Shareable,
             role_binding: None,
             source: None,
             metadata: Value::Null,
@@ -4139,7 +4115,6 @@ mod tests {
             inputs: vec!["abcd".to_string(), "abcde".to_string()],
             dimensions: None,
             task: None,
-            sensitivity: Sensitivity::Private,
             role_binding: None,
             source: None,
             metadata: Value::Null,
@@ -4220,7 +4195,6 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 trace: success_trace(
                     &self.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -4284,7 +4258,6 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 trace: success_trace(
                     &self.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -4389,7 +4362,6 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 trace: success_trace(
                     &self.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -4410,7 +4382,6 @@ mod tests {
             max_output_tokens: Some(32),
             temperature: Some(0.0),
             response_format: None,
-            sensitivity: Sensitivity::Shareable,
             role_binding: Some("memory.answer".to_string()),
             source: Some("test".to_string()),
             metadata: serde_json::json!({}),
@@ -4568,7 +4539,20 @@ mod tests {
     #[cfg(feature = "queue")]
     #[tokio::test]
     async fn queued_chat_rate_budget_wait_does_not_hold_running_slot() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        #[derive(Default)]
+        struct Events(Mutex<Vec<symbiotic_queue::QueueEvent>>);
+        #[async_trait]
+        impl symbiotic_queue::QueueEventSink for Events {
+            async fn record_queue_event(&self, event: symbiotic_queue::QueueEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let events = Arc::new(Events::default());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_event_sink(events.clone()),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4608,7 +4592,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut statuses = Vec::new();
-        for event in queue.events().unwrap() {
+        for event in events.0.lock().unwrap().iter() {
             if statuses
                 .iter()
                 .any(|(item_id, _): &(QueueItemId, QueueStatus)| *item_id == event.item_id)
@@ -5266,7 +5250,6 @@ mod tests {
                 hits,
                 trace: success_trace(
                     &self.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -5287,7 +5270,6 @@ mod tests {
                 "medium length".to_string(),
             ],
             top_k: Some(2),
-            sensitivity: Sensitivity::Shareable,
             role_binding: Some("memory.rerank".to_string()),
             source: Some("test".to_string()),
             metadata: serde_json::json!({}),

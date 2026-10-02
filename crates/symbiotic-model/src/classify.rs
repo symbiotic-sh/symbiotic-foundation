@@ -189,7 +189,6 @@ pub struct ClassifyRequest {
     /// System One models read only `state` and `questions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_description: Option<String>,
-    pub sensitivity: Sensitivity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
     pub metadata: Value,
@@ -202,7 +201,6 @@ impl ClassifyRequest {
             state,
             questions,
             state_description: None,
-            sensitivity: Sensitivity::Shareable,
             role_binding: None,
             source: None,
             metadata: serde_json::json!({}),
@@ -487,9 +485,6 @@ impl TraceCarrier for ClassifyResponse {
 
 #[cfg(feature = "queue")]
 impl BudgetedModelRequest for ClassifyRequest {
-    fn sensitivity(&self) -> Sensitivity {
-        self.sensitivity
-    }
     fn input_budget_units(&self) -> Result<u64, ModelError> {
         let state = Value::Object(self.state.clone()).to_string();
         let questions = serde_json::to_string(&self.questions).map_err(|_| {
@@ -807,7 +802,6 @@ fn classify_trace(
 ) -> Result<ModelInvocationTrace, ModelError> {
     let mut trace = success_trace(
         descriptor,
-        request.sensitivity,
         request.role_binding.clone(),
         request.source.clone(),
         hash_json(request)?,
@@ -1545,7 +1539,6 @@ impl ClassifierProvider for ChatClassifierProvider {
                     max_output_tokens: self.max_output_tokens,
                     temperature: Some(0.0),
                     response_format: Some("json_object".to_string()),
-                    sensitivity: request.sensitivity,
                     role_binding: request.role_binding.clone(),
                     source: request.source.clone(),
                     metadata: request.metadata.clone(),
@@ -1890,7 +1883,6 @@ mod tests {
             served_model: "m".into(),
             trace: success_trace(
                 StaticClassifierProvider::new([]).descriptor(),
-                Sensitivity::Shareable,
                 None,
                 None,
                 String::new(),
@@ -2251,7 +2243,6 @@ mod tests {
             served_model: "m".into(),
             trace: success_trace(
                 StaticClassifierProvider::new([]).descriptor(),
-                Sensitivity::Shareable,
                 None,
                 None,
                 String::new(),
@@ -2719,7 +2710,6 @@ mod tests {
             self.requests.lock().unwrap().push(request.clone());
             let mut trace = success_trace(
                 &self.descriptor,
-                request.sensitivity,
                 None,
                 None,
                 hash_json(&request)?,
@@ -2785,15 +2775,13 @@ mod tests {
         );
         let classifier =
             ChatClassifierProvider::new(Arc::new(chat.clone())).with_max_output_tokens(512);
-        let mut request = chat_request_fixture();
-        request.sensitivity = Sensitivity::Private;
+        let request = chat_request_fixture();
         let response = classifier.classify(request.clone()).await.unwrap();
 
         let sent = chat.requests.lock().unwrap()[0].clone();
         assert_eq!(sent.response_format.as_deref(), Some("json_object"));
         assert_eq!(sent.max_output_tokens, Some(512));
         assert_eq!(sent.temperature, Some(0.0));
-        assert_eq!(sent.sensitivity, Sensitivity::Private);
         assert_eq!(sent.messages[0].role, "system");
         assert_eq!(
             sent.messages[0].content,

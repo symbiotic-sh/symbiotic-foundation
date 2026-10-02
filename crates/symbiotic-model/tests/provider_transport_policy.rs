@@ -2,7 +2,6 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use symbiotic_core::Sensitivity;
 use symbiotic_model::{
     ChatMessage, ChatProvider, ChatRequest, ClassifierProvider, ClassifierQuestion,
     ClassifyRequest, JevClassifierProvider, ModelError, OpenAiCompatibleChatProvider,
@@ -17,7 +16,6 @@ fn chat_request() -> ChatRequest {
         max_output_tokens: Some(16),
         temperature: None,
         response_format: None,
-        sensitivity: Sensitivity::Shareable,
         role_binding: None,
         source: None,
         metadata: serde_json::Value::Null,

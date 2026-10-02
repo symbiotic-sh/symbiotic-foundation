@@ -6,10 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use symbiotic_core::{
-    DiagnosticCode, FailureClass, ModelIdentity, QueueId, QueueItemId, Sensitivity, TraceId,
-};
-use symbiotic_queue::{QueueEvent, QueueEventSink, QueueStatus};
+use symbiotic_core::{DiagnosticCode, FailureClass, ModelIdentity, QueueId, QueueItemId, TraceId};
+use symbiotic_queue::{QueueEvent, QueueStatus};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +71,6 @@ pub struct ModelInvocationTrace {
     pub model: ModelIdentity,
     pub role_binding: Option<String>,
     pub source: Option<String>,
-    pub sensitivity: Sensitivity,
     pub request_hash: String,
     pub response_hash: Option<String>,
     pub cache: CacheTrace,
@@ -190,42 +187,6 @@ impl QueueTraceSink for FanoutQueueTraceSink {
         for sink in &self.sinks {
             sink.record_queue_event(trace.clone()).await?;
         }
-        Ok(())
-    }
-}
-
-pub struct BestEffortTraceSink {
-    sink: Box<dyn TraceSink>,
-}
-
-impl BestEffortTraceSink {
-    pub fn new(sink: Box<dyn TraceSink>) -> Self {
-        Self { sink }
-    }
-}
-
-#[async_trait]
-impl TraceSink for BestEffortTraceSink {
-    async fn record_model_invocation(&self, trace: ModelInvocationTrace) -> Result<(), TraceError> {
-        let _ = self.sink.record_model_invocation(trace).await;
-        Ok(())
-    }
-}
-
-pub struct BestEffortQueueTraceSink {
-    sink: Box<dyn QueueTraceSink>,
-}
-
-impl BestEffortQueueTraceSink {
-    pub fn new(sink: Box<dyn QueueTraceSink>) -> Self {
-        Self { sink }
-    }
-}
-
-#[async_trait]
-impl QueueTraceSink for BestEffortQueueTraceSink {
-    async fn record_queue_event(&self, trace: QueueEventTrace) -> Result<(), TraceError> {
-        let _ = self.sink.record_queue_event(trace).await;
         Ok(())
     }
 }
@@ -399,32 +360,15 @@ impl QueueTraceSink for JsonlQueueTraceSink {
     }
 }
 
-pub struct QueueEventTraceAdapter {
-    sink: Arc<dyn QueueTraceSink>,
-}
-
-impl QueueEventTraceAdapter {
-    pub fn new(sink: Arc<dyn QueueTraceSink>) -> Self {
-        Self { sink }
-    }
-}
-
-#[async_trait]
-impl QueueEventSink for QueueEventTraceAdapter {
-    async fn record_queue_event(&self, event: QueueEvent) {
-        let _ = self.sink.record_queue_event(event.into()).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use symbiotic_core::{
-        DiagnosticCode, FailureClass, ModelIdentity, QueueId, QueueItemId, Sensitivity, TraceId,
+        DiagnosticCode, FailureClass, ModelIdentity, QueueId, QueueItemId, TraceId,
     };
-    use symbiotic_queue::{QueueEvent, QueueEventSink, QueueStatus};
+    use symbiotic_queue::QueueStatus;
 
     use super::*;
 
@@ -450,7 +394,6 @@ mod tests {
             model: ModelIdentity::new("chat", "codex", "gpt-5.5-codex"),
             role_binding: Some("agent.plan".to_string()),
             source: Some("test".to_string()),
-            sensitivity: Sensitivity::Shareable,
             request_hash: "req".to_string(),
             response_hash: Some("res".to_string()),
             cache: CacheTrace::default(),
@@ -516,26 +459,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn best_effort_sink_swallows_errors() {
-        struct FailingSink;
-
-        #[async_trait]
-        impl TraceSink for FailingSink {
-            async fn record_model_invocation(
-                &self,
-                _trace: ModelInvocationTrace,
-            ) -> Result<(), TraceError> {
-                Err(TraceError::Sink(
-                    symbiotic_core::DiagnosticCode::StorageFailure,
-                ))
-            }
-        }
-
-        let sink = BestEffortTraceSink::new(Box::new(FailingSink));
-        sink.record_model_invocation(sample_trace()).await.unwrap();
-    }
-
     #[test]
     fn jsonl_readers_refuse_unknown_diagnostics_without_returning_stored_text() {
         let dir = tempfile::tempdir().unwrap();
@@ -581,28 +504,5 @@ mod tests {
         assert_eq!(records[0].kind, "chat");
         assert_eq!(records[0].status, QueueStatus::Failed);
         assert_eq!(records[0].error, Some(DiagnosticCode::HttpRateLimited));
-    }
-
-    #[tokio::test]
-    async fn queue_event_adapter_records_queue_events() {
-        let sink = Arc::new(InMemoryQueueTraceSink::default());
-        let adapter = QueueEventTraceAdapter::new(sink.clone());
-
-        adapter
-            .record_queue_event(QueueEvent {
-                item_id: QueueItemId::new(),
-                queue_id: QueueId::new("model:gemini:embedding"),
-                kind: "embedding".to_string(),
-                status: QueueStatus::Failed,
-                attempt: 1,
-                timestamp: Utc::now(),
-                error: Some(DiagnosticCode::HttpRateLimited),
-            })
-            .await;
-
-        let records = sink.records();
-        assert_eq!(records[0].error, Some(DiagnosticCode::HttpRateLimited));
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].queue_id.0, "model:gemini:embedding");
     }
 }

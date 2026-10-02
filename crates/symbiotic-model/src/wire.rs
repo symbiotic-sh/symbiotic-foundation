@@ -163,7 +163,6 @@ pub fn gemini_embedding_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symbiotic_core::Sensitivity;
 
     #[test]
     fn gemini_wire_refuses_unsupported_task_and_conflicting_dimensions() {
@@ -171,7 +170,6 @@ mod tests {
             inputs: vec!["synthetic".into()],
             dimensions: Some(3),
             task: None,
-            sensitivity: Sensitivity::Shareable,
             role_binding: None,
             source: None,
             metadata: Value::Null,
@@ -190,7 +188,6 @@ mod tests {
                 inputs: vec!["\\\"\n\té".into(); count],
                 dimensions: Some(8),
                 task: None,
-                sensitivity: Sensitivity::Private,
                 role_binding: None,
                 source: None,
                 metadata: Value::Null,

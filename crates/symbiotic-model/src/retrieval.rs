@@ -314,7 +314,6 @@ impl EmbeddingProvider for CompatibleEmbeddingProvider {
                 let (raw, text) = transport.send(path, body).await?;
                 let mut trace = success_trace(
                     &transport.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,
@@ -404,7 +403,6 @@ impl RerankProvider for CohereRerankProvider {
                 hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index)));
                 let mut trace = success_trace(
                     &transport.descriptor,
-                    request.sensitivity,
                     request.role_binding.clone(),
                     request.source.clone(),
                     hash_json(&request)?,

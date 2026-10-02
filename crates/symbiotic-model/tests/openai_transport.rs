@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use symbiotic_core::Sensitivity;
 use symbiotic_model::{
     ChatMessage, ChatProvider, ChatRequest, OpenAiCompatibleChatProvider, ThinkingMode,
     prompt_cache_counts,
@@ -56,7 +55,6 @@ fn request() -> ChatRequest {
         max_output_tokens: Some(128),
         temperature: Some(0.0),
         response_format: None,
-        sensitivity: Sensitivity::Shareable,
         role_binding: None,
         source: None,
         metadata: serde_json::json!({}),

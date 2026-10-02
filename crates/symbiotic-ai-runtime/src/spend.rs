@@ -52,18 +52,18 @@ impl SqliteSpendLedger {
     ) -> Result<bool, ModelError> {
         // All reservation paths fix the invocation's input binding in this same
         // immediate transaction. Released predecessors never erase the binding.
-        conn.execute(
-            "INSERT OR IGNORE INTO spend_invocation_bindings(account, invocation, binding) VALUES (?1, ?2, ?3)",
-            params![r.account, r.invocation, r.binding],
-        ).map_err(storage)?;
-        let binding: String = conn
+        let binding: Option<String> = conn
             .query_row(
-                "SELECT binding FROM spend_invocation_bindings WHERE account=?1 AND invocation=?2",
+                "SELECT binding FROM spend_receipts WHERE account=?1 AND invocation=?2 LIMIT 1",
                 params![r.account, r.invocation],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(storage)?;
-        if binding != r.binding {
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding != &r.binding)
+        {
             return Err(conflict());
         }
         if let Some(old) = receipt_in(conn, &r.reference)? {
@@ -79,27 +79,15 @@ impl SqliteSpendLedger {
             .transpose()
             .map_err(storage)?;
         conn.execute(
-            "INSERT OR IGNORE INTO spend_accounts(account, request_limit) VALUES (?1, ?2)",
-            params![r.account, limit],
+            "INSERT OR IGNORE INTO spend_accounts(account) VALUES (?1)",
+            [&r.account],
         )
         .map_err(storage)?;
-        let configured: Option<i64> = conn
-            .query_row(
-                "SELECT request_limit FROM spend_accounts WHERE account=?1",
-                [&r.account],
-                |row| row.get(0),
-            )
-            .map_err(storage)?;
-        if configured != limit {
-            return Err(ModelError::InvalidRequest(
-                DiagnosticCode::InvalidConfiguration,
-            ));
-        }
         let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE account=?1 AND invocation=?2 AND state!='released')", params![r.account, r.invocation], |row| row.get(0)).map_err(storage)?;
         if active {
             return Err(conflict());
         }
-        let changed = conn.execute("UPDATE spend_accounts SET used=used+1 WHERE account=?1 AND used<9223372036854775807 AND (request_limit IS NULL OR used<request_limit)", [&r.account]).map_err(storage)?;
+        let changed = conn.execute("UPDATE spend_accounts SET used=used+1 WHERE account=?1 AND used<9223372036854775807 AND (?2 IS NULL OR used<?2)", params![r.account, limit]).map_err(storage)?;
         if changed != 1 {
             return Err(ModelError::BudgetExhausted(
                 DiagnosticCode::SpendBudgetExhausted,

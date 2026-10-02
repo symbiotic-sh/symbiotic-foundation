@@ -89,21 +89,6 @@ impl SqliteQueue {
             .map_err(storage_error)
     }
 
-    pub fn events(&self) -> Result<Vec<QueueEvent>, QueueError> {
-        let conn = self.conn.lock().map_err(lock_error)?;
-        let mut stmt = conn
-            .prepare(
-                "select item_id, queue_id, kind, status, attempt, timestamp, error
-                 from queue_events
-                 order by event_id asc",
-            )
-            .map_err(storage_error)?;
-        stmt.query_map([], row_to_event)
-            .map_err(storage_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(storage_error)
-    }
-
     pub async fn mark_stale_active_dead(
         &self,
         queue_id: &QueueId,
@@ -167,14 +152,6 @@ impl SqliteQueue {
                     )
                     .map_err(storage_error)?,
             };
-            for mut item in items.clone() {
-                item.status = QueueStatus::Dead;
-                item.lease_owner = None;
-                item.lease_until = None;
-                item.last_error = Some(reason);
-                item.updated_at = now;
-                insert_event(&tx, &item, Some(reason))?;
-            }
             tx.commit().map_err(storage_error)?;
             (updated, items)
         };
@@ -214,7 +191,6 @@ impl SqliteQueue {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        let items = stale_active_items_in_tx(&tx, None, stale_before, now)?;
         let updated = tx
             .execute(
                 "update queue_items
@@ -229,20 +205,12 @@ impl SqliteQueue {
                 params![ts(stale_before), reason.code(), ts(now)],
             )
             .map_err(storage_error)?;
-        for mut item in items {
-            item.status = QueueStatus::Dead;
-            item.lease_owner = None;
-            item.lease_until = None;
-            item.last_error = Some(reason);
-            item.updated_at = now;
-            insert_event(&tx, &item, Some(reason))?;
-        }
         tx.commit().map_err(storage_error)?;
         Ok(updated)
     }
 
     /// Delete terminal items (succeeded, dead or stopped) last updated before
-    /// `before`, and queue events older than it. Active items are kept
+    /// `before`. Active items are kept
     /// whatever their age. Returns the number of items deleted.
     ///
     /// A deleted terminal item no longer deduplicates its idempotency key:
@@ -259,11 +227,6 @@ impl SqliteQueue {
                 params![ts(before)],
             )
             .map_err(storage_error)?;
-        tx.execute(
-            "delete from queue_events where timestamp < ?1",
-            params![ts(before)],
-        )
-        .map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         Ok(deleted)
     }
@@ -383,18 +346,7 @@ impl SqliteQueue {
         Ok(EnqueueOutcome { item, disposition })
     }
 
-    fn record_event_sync(
-        &self,
-        item: &QueueItem,
-        error: Option<symbiotic_core::DiagnosticCode>,
-    ) -> Result<(), QueueError> {
-        let conn = self.conn.lock().map_err(lock_error)?;
-        insert_event(&conn, item, error)?;
-        Ok(())
-    }
-
     async fn emit(&self, item: QueueItem, error: Option<symbiotic_core::DiagnosticCode>) {
-        let _ = self.record_event_sync(&item, error);
         if let Some(sink) = &self.event_sink {
             sink.record_queue_event(QueueEvent {
                 item_id: item.item_id,
@@ -561,8 +513,6 @@ impl QueueBackend for SqliteQueue {
                     params![item_id.0, ts(now)],
                 )
                 .map_err(storage_error)?;
-                let dead = get_required(&tx, item_id)?;
-                insert_event(&tx, &dead, dead.last_error)?;
                 tx.commit().map_err(storage_error)?;
                 return Ok(None);
             }
@@ -741,14 +691,9 @@ impl QueueBackend for SqliteQueue {
                     item.last_error
                         .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
                     item.updated_at = now;
-                    insert_event(
-                        &tx,
-                        &item,
-                        Some(symbiotic_core::DiagnosticCode::LeaseExpired),
-                    )?;
-                    Ok(item)
+                    item
                 })
-                .collect::<Result<Vec<_>, QueueError>>()?;
+                .collect::<Vec<_>>();
             tx.commit().map_err(storage_error)?;
             (reclaimed, events)
         };
@@ -842,7 +787,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 7;
+pub const QUEUE_SCHEMA_VERSION: u32 = 8;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -865,7 +810,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     // Before release, only an empty, unversioned queue can be initialized.
     let existing_queue = tx
-        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_invocation_bindings', 'spend_cached_invocations')")
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')")
         .and_then(|mut stmt| stmt.exists([]))
         .map_err(storage_error)?;
     if schema_version != 0 || existing_queue {
@@ -876,7 +821,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     tx.execute_batch(
         "
         create table spend_accounts (
-            account text primary key, request_limit integer, used integer not null default 0
+            account text primary key, used integer not null default 0
         );
         create table spend_receipts (
             reference text primary key, account text not null, invocation text not null,
@@ -887,10 +832,6 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
         create unique index spend_active_invocation on spend_receipts(account, invocation)
             where state != 'released';
         create index spend_invocation_lookup on spend_receipts(account, invocation);
-        create table spend_invocation_bindings (
-            account text not null, invocation text not null, binding text not null,
-            primary key (account, invocation)
-        );
         create table queue_items (
             item_id text primary key,
             queue_id text not null,
@@ -916,16 +857,6 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
             on queue_items(queue_id, idempotency_key)
             where idempotency_key is not null
               and status in ('pending', 'running', 'failed');
-        create table queue_events (
-            event_id integer primary key autoincrement,
-            item_id text not null,
-            queue_id text not null,
-            kind text not null,
-            status text not null,
-            attempt integer not null,
-            timestamp text not null,
-            error text
-        );
         create table queue_cooldowns (
             queue_id text primary key,
             cooldown_until text not null,
@@ -1132,29 +1063,6 @@ fn reclaim_expired_in_tx(
     .map_err(storage_error)
 }
 
-fn insert_event(
-    conn: &Connection,
-    item: &QueueItem,
-    error: Option<symbiotic_core::DiagnosticCode>,
-) -> Result<(), QueueError> {
-    conn.execute(
-        "insert into queue_events
-         (item_id, queue_id, kind, status, attempt, timestamp, error)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            item.item_id.0,
-            item.queue_id.0,
-            item.kind,
-            status_str(item.status),
-            item.attempt,
-            ts(Utc::now()),
-            error.map(|code| code.code())
-        ],
-    )
-    .map_err(storage_error)?;
-    Ok(())
-}
-
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueItem> {
     let payload_json: String = row.get(3)?;
     let status: String = row.get(4)?;
@@ -1183,19 +1091,6 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueItem> {
             .transpose()?,
         created_at: parse_ts(row.get::<_, String>(12)?).map_err(queue_to_sql)?,
         updated_at: parse_ts(row.get::<_, String>(13)?).map_err(queue_to_sql)?,
-    })
-}
-
-fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEvent> {
-    let status: String = row.get(3)?;
-    Ok(QueueEvent {
-        item_id: QueueItemId(row.get(0)?),
-        queue_id: QueueId(row.get(1)?),
-        kind: row.get(2)?,
-        status: parse_status(&status).map_err(queue_to_sql)?,
-        attempt: row.get(4)?,
-        timestamp: parse_ts(row.get::<_, String>(5)?).map_err(queue_to_sql)?,
-        error: read_code(row, 6)?,
     })
 }
 
@@ -1236,6 +1131,24 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn schema_keeps_only_canonical_spend_and_queue_state() {
+        let queue = SqliteQueue::in_memory().unwrap();
+        let conn = queue.conn.lock().unwrap();
+        for table in ["queue_events", "spend_invocation_bindings"] {
+            assert!(
+                !conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                        [table],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('spend_accounts') WHERE name='request_limit'", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
+    }
+
+    #[test]
     fn queue_schema_initializes_and_reopens_at_the_current_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.sqlite");
@@ -1252,14 +1165,10 @@ mod tests {
     #[test]
     fn partial_queue_schema_is_refused_without_schema_writes() {
         for table in [
-            "queue_items",
-            "queue_events",
+            "QUEUE_ITEMS",
             "queue_cooldowns",
-            "QUEUE_EVENTS",
             "spend_accounts",
             "spend_receipts",
-            "spend_invocation_bindings",
-            "spend_cached_invocations",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("queue.sqlite");
@@ -1297,7 +1206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.sqlite");
         let conn = Connection::open(&path).unwrap();
-        // Fail late in initialization, after queue_items and queue_events are created.
+        // Fail late in initialization, after queue_items is created.
         conn.execute_batch("create view queue_cooldowns as select 1")
             .unwrap();
         assert!(SqliteQueue::open(&path).is_err());
@@ -1306,14 +1215,25 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_events', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'spend_invocation_bindings')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
     }
 
     #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
-        for version in [-1, 0, 1, 2, 3, 4, 5, 6, i64::from(QUEUE_SCHEMA_VERSION) + 1] {
+        for version in [
+            -1,
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            i64::from(QUEUE_SCHEMA_VERSION) + 1,
+        ] {
             for existing in [false, true] {
                 if version == 0 && !existing {
                     continue;
@@ -1606,13 +1526,6 @@ mod tests {
             queue.get(&live_running.item_id).unwrap().unwrap().status,
             QueueStatus::Running
         );
-        let cleanup_events = queue
-            .events()
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.error == Some(symbiotic_core::DiagnosticCode::StaleQueueItem))
-            .count();
-        assert_eq!(cleanup_events, 3);
     }
 
     #[tokio::test]
@@ -1772,11 +1685,6 @@ mod tests {
             item.last_error,
             Some(symbiotic_core::DiagnosticCode::LeaseExpired)
         );
-        assert!(queue.events().unwrap().iter().any(|event| {
-            event.item_id.0 == item.item_id.0
-                && event.status == QueueStatus::Failed
-                && event.error == Some(symbiotic_core::DiagnosticCode::LeaseExpired)
-        }));
     }
 
     #[tokio::test]
@@ -1823,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_removes_old_terminal_items_and_events_only() {
+    async fn prune_removes_old_terminal_items_only() {
         let queue = SqliteQueue::in_memory().unwrap();
         let done = queue.enqueue(request("done")).await.unwrap().item;
         let active = queue.enqueue(request("active")).await.unwrap().item;
@@ -1838,8 +1746,6 @@ mod tests {
             let old = ts(Utc::now() - ChronoDuration::days(30));
             conn.execute("update queue_items set updated_at = ?1", params![old])
                 .unwrap();
-            conn.execute("update queue_events set timestamp = ?1", params![old])
-                .unwrap();
         }
 
         let deleted = queue
@@ -1848,7 +1754,6 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(queue.get(&done.item_id).unwrap().is_none());
         assert!(queue.get(&active.item_id).unwrap().is_some());
-        assert!(queue.events().unwrap().is_empty());
         let again = queue.enqueue(request("done")).await.unwrap();
         assert_eq!(again.disposition, EnqueueDisposition::Inserted);
     }
