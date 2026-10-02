@@ -980,6 +980,8 @@ on_both_backends!(
     a_failed_trace_write_still_completes_the_item,
     a_slow_reservation_renews_its_lease_before_dispatch,
     lease_loss_during_reservation_refuses_dispatch,
+    reservation_storage_failure_preserves_the_last_provider_attempt,
+    lease_loss_at_transport_boundary_preserves_unused_provider_attempts,
     reconciliation_reopens_an_unknown_attempt_within_its_budget,
     reconciliation_preserves_exhausted_attempt_limits,
     reconciliation_permits_an_explicit_budget_renewal,
@@ -2264,6 +2266,7 @@ struct ObservedSpend {
     reservations: Mutex<Vec<symbiotic_model::SpendReservation>>,
     delay: Duration,
     fail_settlement: std::sync::atomic::AtomicBool,
+    fail_reserve: std::sync::atomic::AtomicBool,
 }
 
 impl ObservedSpend {
@@ -2273,6 +2276,7 @@ impl ObservedSpend {
             reservations: Mutex::new(Vec::new()),
             delay,
             fail_settlement: std::sync::atomic::AtomicBool::new(false),
+            fail_reserve: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2301,6 +2305,11 @@ impl ObservedSpend {
 impl symbiotic_model::SpendLedger for ObservedSpend {
     fn reserve(&self, reservation: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
         std::thread::sleep(self.delay);
+        if self.fail_reserve.load(Ordering::SeqCst) {
+            return Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            ));
+        }
         let accepted = self.inner.reserve(reservation)?;
         if accepted {
             self.reservations.lock().unwrap().push(reservation.clone());
@@ -2334,16 +2343,11 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         self.inner.invocation(account, invocation)
     }
 
-    fn bind_cached(
+    fn abort_before_dispatch(
         &self,
-        account: &str,
-        invocation: &str,
-        binding: &str,
         reference: &symbiotic_model::SpendReceiptRef,
-        output: serde_json::Value,
-    ) -> Result<symbiotic_model::SpendReceipt, ModelError> {
-        self.inner
-            .bind_cached(account, invocation, binding, reference, output)
+    ) -> Result<(), ModelError> {
+        self.inner.abort_before_dispatch(reference)
     }
     fn finish(
         &self,
@@ -2417,6 +2421,20 @@ async fn lease_loss_during_reservation_refuses_dispatch(backend: &str, queue: Ar
         symbiotic_model::SpendState::Released,
         "{backend}: no transport incurred a charge"
     );
+    queue.fail_heartbeats.store(false, Ordering::SeqCst);
+    queue
+        .reclaim_expired_leases(&raw.descriptor.queue_id())
+        .await
+        .unwrap();
+    let response = provider
+        .chat(request("lost reservation lease"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.text, "lost reservation lease",
+        "{backend}: an aborted claim must preserve the last provider attempt"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
 }
 
 async fn reconciliation_reopens_an_unknown_attempt_within_its_budget(
@@ -2492,6 +2510,7 @@ async fn restored_account_allowance_reconsiders_refusals_without_spending_attemp
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
+    let receipts = Arc::new(InMemoryReceiptSink::default());
     let provider = queued(
         raw.clone(),
         queue,
@@ -2500,7 +2519,8 @@ async fn restored_account_allowance_reconsiders_refusals_without_spending_attemp
             ..leased()
         },
     )
-    .with_spend_ledger(spend.clone(), None);
+    .with_spend_ledger(spend.clone(), None)
+    .with_receipt_sink(receipts.clone());
     provider
         .chat(request("holds account allowance"))
         .await
@@ -2517,6 +2537,14 @@ async fn restored_account_allowance_reconsiders_refusals_without_spending_attemp
         );
     }
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+    assert!(
+        receipts
+            .receipts()
+            .iter()
+            .filter(|r| r.status == ReceiptStatus::Queued)
+            .all(|r| r.spend_receipt.is_none()),
+        "{backend}: denied claims must not invent receipt references"
+    );
     spend.release_last();
     assert_eq!(
         provider
@@ -2827,4 +2855,86 @@ async fn settlement_failure_is_visible_retains_unknown_and_refuses_redispatch(
         QueueStatus::Stopped,
         "{backend}"
     );
+}
+
+async fn reservation_storage_failure_preserves_the_last_provider_attempt(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    let raw = Loopback::new(unique_identity());
+    let spend = ObservedSpend::new(Duration::ZERO);
+    spend.fail_reserve.store(true, Ordering::SeqCst);
+    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
+    let error = provider.chat(request("busy ledger")).await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 0, "{backend}");
+    assert!(spend.reservations.lock().unwrap().is_empty());
+    spend.fail_reserve.store(false, Ordering::SeqCst);
+    assert_eq!(
+        provider.chat(request("busy ledger")).await.unwrap().text,
+        "busy ledger",
+        "{backend}"
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+}
+
+struct AbortAtRunning(Arc<CountsRenewals>);
+#[async_trait]
+impl symbiotic_model::QueueReceiptSink for AbortAtRunning {
+    async fn record_receipt(&self, receipt: symbiotic_model::QueueReceipt) {
+        if receipt.status == symbiotic_model::ReceiptStatus::Running
+            && !self.0.fail_heartbeats.swap(true, Ordering::SeqCst)
+        {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+        }
+    }
+}
+async fn lease_loss_at_transport_boundary_preserves_unused_provider_attempts(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    for attempts in [1, 2] {
+        queue.fail_heartbeats.store(false, Ordering::SeqCst);
+        let raw = Loopback::new(unique_identity());
+        let spend = ObservedSpend::new(Duration::ZERO);
+        let policy = ModelQueueConfig {
+            lease_seconds: 1,
+            logical_retry_attempts: attempts,
+            retry_attempts: attempts,
+            ..leased()
+        };
+        let provider = queued(raw.clone(), queue.clone(), policy.clone())
+            .with_spend_ledger(spend.clone(), None)
+            .with_receipt_sink(Arc::new(AbortAtRunning(queue.clone())));
+        provider
+            .chat(request("aborted transport"))
+            .await
+            .unwrap_err();
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0, "{backend}");
+        use symbiotic_model::SpendLedger;
+        assert!(
+            spend
+                .receipt(&spend.last_reference())
+                .unwrap()
+                .unwrap()
+                .dispatch_aborted
+        );
+        queue.fail_heartbeats.store(false, Ordering::SeqCst);
+        // Retry without the aborting telemetry hook; runtime itself reclaims the lease.
+        let provider = queued(raw.clone(), queue.clone(), policy).with_spend_ledger(spend, None);
+        assert_eq!(
+            provider
+                .chat(request("aborted transport"))
+                .await
+                .unwrap()
+                .text,
+            "aborted transport",
+            "{backend}: budget {attempts}"
+        );
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+    }
 }

@@ -624,6 +624,14 @@ fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
 pub fn spend_receipt_reference(receipt: &DispatchReceipt) -> symbiotic_ai_runtime::SpendReceiptRef {
     symbiotic_ai_runtime::SpendReceiptRef(format!("egress:{}", receipt.attempt_digest))
 }
+fn invocation_binding(a: &DurableAttempt) -> Result<String, EgressError> {
+    let mut immutable = a.clone();
+    immutable.attempt_ordinal = 0;
+    immutable.record_sequence = 0;
+    immutable.recorded_at = 0;
+    digest(&immutable)
+}
+
 fn spend_reservation(
     a: &DurableAttempt,
     route: &RouteConfig,
@@ -641,7 +649,7 @@ fn spend_reservation(
         )
         .map_err(|_| EgressError::InvalidRequest)?,
         invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?,
-        binding: digest(a)?,
+        binding: invocation_binding(a)?,
         request_limit: route.provider_request_limit,
     })
 }

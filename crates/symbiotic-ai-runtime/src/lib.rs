@@ -197,6 +197,7 @@ impl<P> ModelBinding<P> {
 
     /// Set a caller-selected logical invocation for durable recovery.
     /// Scope it to this binding account and reuse it only for the same inputs.
+    /// Explicit invocations bypass the response cache and recover only their own output.
     pub fn with_invocation(mut self, invocation: impl Into<String>) -> Self {
         self.invocation = Some(invocation.into());
         self

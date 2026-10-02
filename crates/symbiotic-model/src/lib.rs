@@ -757,7 +757,7 @@ where
 /// Usage receipts of one queued call.
 #[cfg(feature = "queue")]
 struct CallReceipts {
-    accepted_spend: Option<AcceptedSpendHandoff>,
+    attempt_context: ExecutionAttemptContext,
     sink: Option<Arc<dyn QueueReceiptSink>>,
     binding: Option<symbiotic_core::BindingIdentity>,
     queue_id: QueueId,
@@ -796,14 +796,14 @@ impl CallReceipts {
             return;
         };
         sink.record_receipt(QueueReceipt {
-            spend_receipt: item.filter(|i| i.attempt > 0).map(|i| {
-                self.accepted_spend
-                    .as_ref()
-                    .map(|h| h.reservation.reference.clone())
-                    .unwrap_or_else(|| {
-                        SpendReceiptRef(format!("runtime:{}:{}", i.item_id.0, i.attempt))
-                    })
-            }),
+            spend_receipt: self
+                .attempt_context
+                .reference()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(code = error.code().code(), "receipt context unavailable");
+                    None
+                })
+                .filter(|_| item.is_some_and(|i| i.attempt > 0)),
             binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
@@ -882,9 +882,8 @@ struct QueuedCall<Req> {
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
-    explicit_invocation: bool,
     attempt_binding: String,
-    attempt_context: Option<ExecutionAttemptContext>,
+    attempt_context: ExecutionAttemptContext,
     worker_id: String,
     config: ModelQueueConfig,
     queue_id: QueueId,
@@ -927,7 +926,7 @@ impl<Req> QueuedCall<Req> {
                 return Err(spend::reconciliation());
             }
             if let Some(receipt) = &receipt
-                && let Some(context) = context
+                && receipt.output.is_some()
             {
                 context.capture(&receipt.reservation.reference)?;
             }
@@ -997,35 +996,81 @@ impl<Req> QueuedCall<Req> {
         if self.accepted_spend.is_none() {
             let spend = self.spend.clone();
             let reference = reference.clone();
-            run_blocking(move || spend.finish(&reference, SpendState::Released, None, None))
-                .await?;
+            run_blocking(move || spend.abort_before_dispatch(&reference)).await?;
         }
         Ok(())
     }
 
-    // A later handoff may reconsider accounting refusals after reconciliation
-    // or restored account allowance. Other stopped failures remain terminal.
+    async fn abort_dispatch(
+        &self,
+        item: &QueueItem,
+        reference: &SpendReceiptRef,
+    ) -> Result<(), ModelError> {
+        self.release_before_dispatch(reference).await?;
+        match self
+            .queue
+            .fail_with(
+                &item.item_id,
+                &self.worker_id,
+                Failure {
+                    error: DiagnosticCode::QueueFailure,
+                    error_class: Some(FailureClass::Queue),
+                    run_after: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // A new owner may already hold the item. The durable abort proof
+            // survives reclaim, so the old worker must not alter the new lease.
+            Err(
+                symbiotic_queue::QueueError::LeaseMismatch(_)
+                | symbiotic_queue::QueueError::NotRunning(_),
+            ) => Ok(()),
+            Err(error) => Err(queue_error(error)),
+        }
+    }
+
+    // Reconsider accounting refusals and claims with durable proof that no
+    // transport started. Provider failures retain their spent attempt budget.
     async fn reconsider_stopped(
         &self,
         item: &QueueItem,
     ) -> Result<Option<EnqueueOutcome>, ModelError> {
-        let mut denied = item.last_error == Some(DiagnosticCode::SpendBudgetExhausted);
-        if !denied {
-            if item.last_error != Some(DiagnosticCode::SpendReconciliationRequired) {
-                return Ok(None);
+        if self.accepted_spend.is_some() {
+            return Ok(None);
+        }
+        let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+        let spend = self.spend.clone();
+        let current = run_blocking(move || spend.receipt(&reference)).await?;
+        let aborted = current
+            .as_ref()
+            .is_some_and(|r| r.dispatch_aborted && r.state == SpendState::Released);
+        let denied = if aborted {
+            true
+        } else {
+            match item.last_error {
+                Some(DiagnosticCode::SpendBudgetExhausted) => true,
+                Some(DiagnosticCode::SpendLedgerUnavailable | DiagnosticCode::LeaseExpired) => {
+                    current.is_none()
+                }
+                Some(DiagnosticCode::QueueFailure) => false,
+                Some(DiagnosticCode::SpendReconciliationRequired) => {
+                    let spend = self.spend.clone();
+                    let account = self.queue_id.0.clone();
+                    let invocation = self.invocation.clone();
+                    let receipt =
+                        run_blocking(move || spend.invocation(&account, &invocation)).await?;
+                    if !receipt.is_some_and(|r| r.state == SpendState::Released) {
+                        return Ok(None);
+                    }
+                    current.is_none()
+                }
+                _ => return Ok(None),
             }
-            let spend = self.spend.clone();
-            let account = self.queue_id.0.clone();
-            let invocation = self.invocation.clone();
-            let receipt = run_blocking(move || spend.invocation(&account, &invocation)).await?;
-            let Some(receipt) = receipt.filter(|r| r.state == SpendState::Released) else {
-                return Ok(None);
-            };
-            // A reclaimed queue claim may itself have been denied while an
-            // earlier accepted attempt was still unknown. That claim never
-            // consumed a provider attempt either.
-            denied = receipt.reservation.reference
-                != SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+        };
+        if !denied && item.last_error != Some(DiagnosticCode::SpendReconciliationRequired) {
+            return Ok(None);
         }
         let state = logical_retry_state(&item.payload, logical_max_attempts(&self.config));
         // Reservation denial is a queue claim, never a provider attempt.
@@ -1117,35 +1162,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         // added. The receipt repeats the original usage; its metadata is the
         // returned response's.
         let mut receipted = cached.trace().clone();
-        let mut response = self
+        let response = self
             .traced_cache_hit(cached, item.map(|item| item.item_id.clone()))
             .await;
-        if self.explicit_invocation {
-            let reference: SpendReceiptRef =
-                serde_json::from_value(response.trace().metadata["spend_receipt"].clone())
-                    .map_err(|_| spend::reconciliation())?;
-            let output = serde_json::to_value(&response).map_err(|_| spend::storage())?;
-            let call = self.clone();
-            let receipt = run_blocking(move || {
-                call.spend.bind_cached(
-                    &call.queue_id.0,
-                    &call.invocation,
-                    &call.attempt_binding,
-                    &reference,
-                    output,
-                )
-            })
-            .await?;
-            if let Some(context) = &self.attempt_context {
-                context.capture(&receipt.reservation.reference)?;
-            }
-            // A concurrent caller may already have durably selected its result.
-            response = secrets::composed_result(
-                self.result_owner.as_ref(),
-                serde_json::from_value(receipt.output.ok_or_else(spend::reconciliation)?)
-                    .map_err(|_| spend::storage()),
-            )?;
-        }
         receipted.metadata = response.trace().metadata.clone();
         self.receipts
             .record(
@@ -1167,14 +1186,6 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
         let mut response = response;
-        let mut trace = response.trace().clone();
-        if !trace.metadata.is_object() {
-            trace.metadata = serde_json::json!({ "value": trace.metadata });
-        }
-        trace.metadata["result_scope"] = serde_json::json!(self.cache_scope);
-        trace.metadata["binding"] =
-            serde_json::to_value(&self.binding_identity).expect("binding identity serializes");
-        response.set_trace(trace);
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
             let shared = Arc::new(response);
@@ -1381,18 +1392,18 @@ where
         queue_id.0,
         hash_json(&invocation)?
     ));
+    let attempt_context = runtime.attempt_context.clone().unwrap_or_default();
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         invocation,
-        explicit_invocation: runtime.invocation.is_some(),
         attempt_binding,
-        attempt_context: runtime.attempt_context.clone(),
+        attempt_context: attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
         config: runtime.config.clone(),
         receipts: CallReceipts {
-            accepted_spend: runtime.accepted_spend.clone(),
+            attempt_context,
             sink: runtime.receipt_sink.clone(),
             binding: runtime.binding_identity.clone(),
             queue_id: queue_id.clone(),
@@ -1407,7 +1418,11 @@ where
         kind: kind.to_string(),
         binding_identity: runtime.binding_identity.clone(),
         cache_scope: Some(provider_identity),
-        cache: runtime.cache(),
+        cache: if runtime.invocation.is_none() {
+            runtime.cache()
+        } else {
+            None
+        },
         trace_sink: runtime.trace_sink.clone(),
         sensitivity: request.sensitivity(),
         request,
@@ -1428,18 +1443,11 @@ where
     }
     // Ordinary cache hits retain their cache provenance and need no dispatch
     // store. Explicit invocation replay must validate its exact binding first.
-    if runtime.invocation.is_none()
-        && let Some(cached) = call_state.cached::<Res>(None).await?
-    {
+    if let Some(cached) = call_state.cached::<Res>(None).await? {
         return Ok(cached);
     }
     if let Some(output) = this.recovered::<Res>().await? {
         return Ok(output);
-    }
-    if runtime.invocation.is_some()
-        && let Some(cached) = call_state.cached::<Res>(None).await?
-    {
-        return Ok(cached);
     }
     let queued_at = std::time::Instant::now();
     // Cooldown + rate-bucket wait accumulated across loop iterations, so the
@@ -1456,6 +1464,12 @@ where
             AttemptTiming::NONE,
         )
         .await;
+    if enqueue.disposition == EnqueueDisposition::TerminalDuplicate
+        && enqueue.item.status == QueueStatus::Dead
+        && let Some(next) = this.reconsider_stopped(&enqueue.item).await?
+    {
+        enqueue = next;
+    }
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
             QueueStatus::Stopped => {
@@ -1624,6 +1638,13 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         if let Some(output) = self.recovered::<Res>().await? {
             return Ok(Followed::Answer(output));
         }
+        if matches!(current.status, QueueStatus::Dead | QueueStatus::Failed)
+            && current.last_error == Some(DiagnosticCode::LeaseExpired)
+            && let Some(next) = self.reconsider_stopped(&current).await?
+        {
+            *enqueue = next;
+            return Ok(Followed::Moved);
+        }
         match current.status {
             QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
             QueueStatus::Dead if budget_renewed(&current, config)? => {
@@ -1724,6 +1745,26 @@ where
     let queue = this.queue.as_ref();
     let config = &this.config;
     let worker_id = this.worker_id.as_str();
+    // Inspect expired claims before claiming them again: a queue claim that
+    // never dispatched must retain its provider-attempt allowance.
+    let mut current = queue.get_item(&item_id).await.map_err(queue_error)?;
+    if current.as_ref().is_some_and(|item| {
+        item.status == QueueStatus::Running
+            && item.lease_until.is_some_and(|until| until < Utc::now())
+    }) {
+        queue
+            .reclaim_expired_leases(&this.queue_id)
+            .await
+            .map_err(queue_error)?;
+        current = queue.get_item(&item_id).await.map_err(queue_error)?;
+    }
+    if let Some(current) = current
+        && matches!(current.status, QueueStatus::Failed | QueueStatus::Dead)
+        && current.last_error == Some(DiagnosticCode::LeaseExpired)
+        && let Some(next) = this.reconsider_stopped(&current).await?
+    {
+        return Ok(AttemptEnd::Retry(Some(Box::new(next))));
+    }
     let item = match queue
         .claim_item(
             &item_id,
@@ -1738,6 +1779,7 @@ where
         Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
         Err(err) => return Err(queue_error(err)),
     };
+    this.attempt_context.clear()?;
     let reference = this
         .accepted_spend
         .as_ref()
@@ -1785,10 +1827,8 @@ where
                 }
             })
             .await;
-            if matches!(reserve, Ok(true))
-                && let Some(context) = &this.attempt_context
-            {
-                context.capture(&reference)?;
+            if matches!(reserve, Ok(true)) {
+                this.attempt_context.capture(&reference)?;
             }
             // A blocking reservation can finish after ownership was lost. It
             // must never authorize a provider call under that stale claim.
@@ -1802,7 +1842,7 @@ where
             };
             if let Err(err) = ownership {
                 if matches!(reserve, Ok(true)) {
-                    this.release_before_dispatch(&reference).await?;
+                    this.abort_dispatch(&item, &reference).await?;
                 }
                 return Err(err);
             }
@@ -1826,14 +1866,7 @@ where
             if let Some(rate) = rate
                 && let Err(err) = rate.charge()
             {
-                if this.accepted_spend.is_none() {
-                    let spend = this.spend.clone();
-                    let reference = reference.clone();
-                    run_blocking(move || {
-                        spend.finish(&reference, SpendState::Released, None, None)
-                    })
-                    .await?;
-                }
+                this.release_before_dispatch(&reference).await?;
                 queue
                     .fail_with(
                         &item.item_id,
@@ -1991,7 +2024,7 @@ where
     // the actual transport boundary; after dispatch retain its outcome.
     if ownership_lost.load(std::sync::atomic::Ordering::SeqCst) {
         let err = this
-            .release_before_dispatch(reference)
+            .abort_dispatch(item, reference)
             .await
             .err()
             .unwrap_or(ModelError::Queue(DiagnosticCode::QueueFailure));
@@ -2005,7 +2038,7 @@ where
         .await
     {
         let err = this
-            .release_before_dispatch(reference)
+            .abort_dispatch(item, reference)
             .await
             .err()
             .unwrap_or_else(|| queue_error(err));
@@ -2070,6 +2103,9 @@ where
                 trace.metadata = serde_json::json!({"value": trace.metadata});
             }
             trace.metadata["spend_receipt"] = serde_json::json!(reference);
+            trace.metadata["result_scope"] = serde_json::json!(this.cache_scope);
+            trace.metadata["binding"] =
+                serde_json::to_value(&this.binding_identity).expect("binding identity serializes");
             response.set_trace(trace);
             if this.accepted_spend.is_none() {
                 let usage = response.trace().usage.clone();

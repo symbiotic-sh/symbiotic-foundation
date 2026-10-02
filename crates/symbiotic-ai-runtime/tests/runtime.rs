@@ -1978,7 +1978,10 @@ async fn execution_success_returns_durable_receipt_and_same_invocation_recovers_
         .execute_chat(configured, "explicit-success", request("paid output"))
         .await
         .unwrap();
-    assert_eq!(recovered.output.text, first.output.text);
+    assert_eq!(
+        serde_json::to_value(&recovered.output).unwrap(),
+        serde_json::to_value(&first.output).unwrap()
+    );
     assert_eq!(recovered.attempt.unwrap().unwrap(), status);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -2043,7 +2046,7 @@ async fn execution_reusing_explicit_invocation_with_changed_inputs_is_refused() 
         error.source,
         ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
     ));
-    assert!(error.attempt.unwrap().unwrap().output_available);
+    assert!(error.attempt.unwrap().is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -2196,13 +2199,15 @@ async fn execution_explicit_invocations_are_isolated_by_binding_inside_a_shared_
 }
 
 #[tokio::test]
-async fn execution_cache_hit_binds_inputs_and_recovers_selected_output_after_restart() {
+async fn execution_explicit_invocations_bypass_cache_and_recover_their_own_output_after_restart() {
     let dir = private_tempdir();
     let runtime = persistent(dir.path());
     let raw = Loopback::new(unique_identity());
     let configured = binding(raw.clone()).with_policy(policy());
     let primer = runtime
-        .execute_chat(configured.clone(), "primer", request("X"))
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
         .await
         .unwrap();
     let selected = runtime
@@ -2211,11 +2216,14 @@ async fn execution_cache_hit_binds_inputs_and_recovers_selected_output_after_res
         .unwrap();
     assert_eq!(
         selected.output.trace.cache.response_cache,
-        symbiotic_trace::CacheStatus::Hit
+        symbiotic_trace::CacheStatus::NotApplicable
     );
-    assert_eq!(
+    assert_ne!(
         selected.attempt.unwrap().unwrap().reference,
-        primer.attempt.unwrap().unwrap().reference
+        serde_json::from_value::<symbiotic_ai_runtime::SpendReceiptRef>(
+            primer.trace.metadata["spend_receipt"].clone()
+        )
+        .unwrap()
     );
     let identity = configured.identity.as_ref().unwrap();
     assert!(
@@ -2233,7 +2241,7 @@ async fn execution_cache_hit_binds_inputs_and_recovers_selected_output_after_res
         error.source,
         ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
     ));
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
     runtime.purge_responses(|_| true).unwrap();
     drop(runtime);
     let restarted = persistent(dir.path());
@@ -2245,20 +2253,20 @@ async fn execution_cache_hit_binds_inputs_and_recovers_selected_output_after_res
         serde_json::to_value(recovered.output).unwrap(),
         serde_json::to_value(selected.output).unwrap()
     );
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
     let conn =
         rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
     assert_eq!(
         conn.query_row("SELECT used FROM spend_accounts", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
 }
 
@@ -2307,4 +2315,122 @@ async fn spend_credential_rotation_cannot_bypass_an_unknown_timeout() {
         "{error:?}"
     );
     assert_eq!(original.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_reconciled_invocation_retries_despite_a_warm_cache() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let configured = binding(raw.clone()).with_policy(ModelQueueConfig {
+        logical_retry_attempts: 2,
+        retry_attempts: 2,
+        ..policy()
+    });
+    let error = runtime
+        .execute_chat(configured.clone(), "A", request("X"))
+        .await
+        .unwrap_err();
+    let first = error.attempt.unwrap().unwrap();
+    runtime
+        .reconcile_spend(
+            &first.reference,
+            symbiotic_ai_runtime::SpendState::Released,
+            None,
+        )
+        .unwrap();
+    raw.fail = None;
+    let configured = binding(raw.clone()).with_policy(ModelQueueConfig {
+        logical_retry_attempts: 2,
+        retry_attempts: 2,
+        ..policy()
+    });
+    // An implicit invocation warms the cache for exactly the same binding and input.
+    runtime
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    let retried = runtime
+        .execute_chat(configured, "A", request("X"))
+        .await
+        .unwrap();
+    assert_ne!(retried.attempt.unwrap().unwrap().reference, first.reference);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+}
+
+struct RefuseCacheAccess;
+impl symbiotic_ai_runtime::ResponseCache for RefuseCacheAccess {
+    fn load(
+        &self,
+        _: &symbiotic_ai_runtime::model::CacheEntry<'_>,
+    ) -> Result<Option<serde_json::Value>, ModelError> {
+        panic!("explicit invocations must never read result cache");
+    }
+    fn store(
+        &self,
+        _: &symbiotic_ai_runtime::model::CacheEntry<'_>,
+        _: &serde_json::Value,
+    ) -> Result<(), ModelError> {
+        panic!("explicit invocations must never write result cache");
+    }
+}
+
+#[tokio::test]
+async fn execution_with_invocation_never_accesses_custom_result_cache() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let configured = binding(raw.clone())
+        .with_policy(policy())
+        .with_invocation("A")
+        .with_response_cache(ResponseCacheMode::Custom(Arc::new(RefuseCacheAccess)));
+    let first = runtime
+        .chat(configured.clone())
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    let recovered = runtime
+        .chat(configured)
+        .unwrap()
+        .chat(request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Auth(
+        symbiotic_core::DiagnosticCode::InvalidConfiguration,
+    ));
+    let configured = binding(raw.clone()).with_policy(policy());
+    let first = runtime
+        .execute_chat(configured.clone(), "A", request("X"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        first.attempt.unwrap().unwrap().state,
+        symbiotic_ai_runtime::SpendState::Released
+    );
+    let refused = runtime
+        .execute_chat(configured, "A", request("Y"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.source.code(),
+        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+    );
+    assert!(refused.attempt.unwrap().is_none());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }

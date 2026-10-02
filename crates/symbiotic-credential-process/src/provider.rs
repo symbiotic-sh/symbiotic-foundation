@@ -17,6 +17,17 @@ struct Dispatched<P> {
     inner: P,
     started: Arc<AtomicBool>,
 }
+impl<P: ModelProvider> Dispatched<P> {
+    fn outcome<T>(&self, result: Result<T, ModelError>) -> Result<T, ModelError> {
+        if result.as_ref().err().is_some_and(|error| {
+            !matches!(error, ModelError::Timeout(_))
+                && self.inner.failure_charge(error) == model::FailureCharge::KnownZero
+        }) {
+            self.started.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+}
 impl<P: ModelProvider> ModelProvider for Dispatched<P> {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
@@ -27,6 +38,9 @@ impl<P: ModelProvider> ModelProvider for Dispatched<P> {
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
+    fn failure_charge(&self, error: &ModelError) -> model::FailureCharge {
+        self.inner.failure_charge(error)
+    }
     fn credential_boundary(&self) -> Option<&CredentialBoundary> {
         self.inner.credential_boundary()
     }
@@ -35,7 +49,7 @@ impl<P: ModelProvider> ModelProvider for Dispatched<P> {
 impl<P: ChatProvider> ChatProvider for Dispatched<P> {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.chat(request).await?;
+        let mut response = self.outcome(self.inner.chat(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -44,7 +58,7 @@ impl<P: ChatProvider> ChatProvider for Dispatched<P> {
 impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.embed(request).await?;
+        let mut response = self.outcome(self.inner.embed(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -53,15 +67,15 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
 impl<P: RerankProvider> RerankProvider for Dispatched<P> {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.inner.rerank(request).await?;
+        let mut response = self.outcome(self.inner.rerank(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
 }
 
-// Once the raw adapter starts, conservatively retain the reservation even if
-// it fails while building/sending the request. Queue/setup failures before that
-// boundary are known not to have reached HTTP.
+// Once the raw adapter starts, retain the reservation unless it establishes
+// trusted KnownZero evidence. Queue/setup failures before that boundary are
+// known not to have reached HTTP.
 pub(crate) struct ExecuteError {
     pub(crate) code: EgressError,
     pub(crate) may_have_dispatched: bool,
@@ -506,6 +520,69 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct RejectBeforeTransport {
+        descriptor: ProviderDescriptor,
+        error: ModelError,
+    }
+    impl ModelProvider for RejectBeforeTransport {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+        fn failure_charge(&self, _: &ModelError) -> model::FailureCharge {
+            model::FailureCharge::KnownZero
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for RejectBeforeTransport {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse, ModelError> {
+            Err(self.error)
+        }
+    }
+    #[tokio::test]
+    async fn dispatched_wrapper_preserves_trusted_zero_charge_without_releasing_timeouts() {
+        for (error, started_after) in [
+            (
+                ModelError::Auth(model::DiagnosticCode::InvalidConfiguration),
+                false,
+            ),
+            (
+                ModelError::Timeout(model::DiagnosticCode::HttpTimeout),
+                true,
+            ),
+        ] {
+            let provider = Dispatched {
+                inner: RejectBeforeTransport {
+                    descriptor: ProviderDescriptor {
+                        identity: model::ModelIdentity::new("test", "synthetic", "1"),
+                        provider_class: model::ProviderClass::Local,
+                        capabilities: vec![model::ModelCapability::Chat],
+                        auth_mode: model::ProviderAuthMode::None,
+                        metadata: serde_json::Value::Null,
+                    },
+                    error,
+                },
+                started: Arc::new(AtomicBool::new(false)),
+            };
+            let request = ChatRequest {
+                messages: vec![],
+                response_format: None,
+                max_output_tokens: None,
+                temperature: None,
+                sensitivity: symbiotic_egress::Sensitivity::Private,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            };
+            let error = provider.chat(request).await.unwrap_err();
+            assert_eq!(
+                provider.failure_charge(&error),
+                model::FailureCharge::KnownZero
+            );
+            assert_eq!(provider.started.load(Ordering::SeqCst), started_after);
+        }
+    }
 
     struct FailingTrace;
     #[async_trait]

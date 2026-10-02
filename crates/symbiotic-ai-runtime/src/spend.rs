@@ -50,19 +50,28 @@ impl SqliteSpendLedger {
         conn: &rusqlite::Transaction<'_>,
         r: &SpendReservation,
     ) -> Result<bool, ModelError> {
+        // All reservation paths fix the invocation's input binding in this same
+        // immediate transaction. Released predecessors never erase the binding.
+        conn.execute(
+            "INSERT OR IGNORE INTO spend_invocation_bindings(account, invocation, binding) VALUES (?1, ?2, ?3)",
+            params![r.account, r.invocation, r.binding],
+        ).map_err(storage)?;
+        let binding: String = conn
+            .query_row(
+                "SELECT binding FROM spend_invocation_bindings WHERE account=?1 AND invocation=?2",
+                params![r.account, r.invocation],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if binding != r.binding {
+            return Err(conflict());
+        }
         if let Some(old) = receipt_in(conn, &r.reference)? {
             return if old.reservation == *r {
                 Ok(false)
             } else {
                 Err(conflict())
             };
-        }
-        let cached: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM spend_cached_invocations WHERE account=?1 AND invocation=?2)",
-            params![r.account, r.invocation], |row| row.get(0),
-        ).map_err(storage)?;
-        if cached {
-            return Err(conflict());
         }
         let limit = r
             .request_limit
@@ -110,7 +119,18 @@ impl SqliteSpendLedger {
             return Err(conflict());
         }
         if !Self::reserve_in(conn, &handoff.reservation)? {
-            return Ok(false);
+            let input: Option<String> = conn
+                .query_row(
+                    "SELECT handoff_input FROM spend_receipts WHERE reference=?1",
+                    [&handoff.reservation.reference.0],
+                    |row| row.get(0),
+                )
+                .map_err(storage)?;
+            return if input.as_deref() == Some(handoff.input_identity.as_str()) {
+                Ok(false)
+            } else {
+                Err(conflict())
+            };
         }
         conn.execute(
             "UPDATE spend_receipts SET handoff_input=?2 WHERE reference=?1",
@@ -184,7 +204,7 @@ fn receipt_in(
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let row = conn
         .query_row(
-            "SELECT reservation, state, usage, output FROM spend_receipts WHERE reference=?1",
+            "SELECT reservation, state, usage, output, dispatch_aborted FROM spend_receipts WHERE reference=?1",
             [&reference.0],
             |r| {
                 Ok((
@@ -192,14 +212,16 @@ fn receipt_in(
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, bool>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(storage)?;
-    row.map(|(r, state, usage, output)| {
+    row.map(|(r, state, usage, output, dispatch_aborted)| {
         Ok(SpendReceipt {
             reservation: serde_json::from_str(&r).map_err(storage)?,
+            dispatch_aborted,
             state: match state.as_str() {
                 "unknown" => SpendState::Unknown,
                 "released" => SpendState::Released,
@@ -223,18 +245,6 @@ fn invocation_in(
     account: &str,
     invocation: &str,
 ) -> Result<Option<SpendReceipt>, ModelError> {
-    let cached = conn.query_row(
-        "SELECT reference, binding, output FROM spend_cached_invocations WHERE account=?1 AND invocation=?2",
-        params![account, invocation],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
-    ).optional().map_err(storage)?;
-    if let Some((reference, binding, output)) = cached {
-        let mut receipt = receipt_in(conn, &SpendReceiptRef(reference))?.ok_or_else(conflict)?;
-        receipt.reservation.invocation = invocation.into();
-        receipt.reservation.binding = binding;
-        receipt.output = Some(serde_json::from_str(&output).map_err(storage)?);
-        return Ok(Some(receipt));
-    }
     let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
     reference
         .map(|r| receipt_in(conn, &SpendReceiptRef(r)))
@@ -296,43 +306,18 @@ impl SpendLedger for SqliteSpendLedger {
         let conn = self.0.lock().map_err(storage)?;
         invocation_in(&conn, account, invocation)
     }
-    fn bind_cached(
-        &self,
-        account: &str,
-        invocation: &str,
-        binding: &str,
-        reference: &SpendReceiptRef,
-        output: serde_json::Value,
-    ) -> Result<SpendReceipt, ModelError> {
+    fn abort_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        // Serialize selection with reservation and other cache-hit callers.
-        if let Some(existing) = invocation_in(&tx, account, invocation)? {
-            if existing.reservation.binding != binding || existing.output.is_none() {
-                return Err(conflict());
-            }
-            return Ok(existing);
-        }
-        let mut receipt = receipt_in(&tx, reference)?.ok_or_else(conflict)?;
-        if receipt.reservation.account != account
-            || receipt.reservation.binding != binding
-            || receipt.state == SpendState::Released
-            || receipt.output.is_none()
-        {
-            return Err(conflict());
-        }
-        let encoded = serde_json::to_string(&output).map_err(storage)?;
+        Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
         tx.execute(
-            "INSERT INTO spend_cached_invocations(account, invocation, binding, reference, output) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![account, invocation, binding, reference.0, encoded],
-        ).map_err(storage)?;
-        tx.commit().map_err(storage)?;
-        receipt.reservation.invocation = invocation.into();
-        receipt.reservation.binding = binding.into();
-        receipt.output = Some(output);
-        Ok(receipt)
+            "UPDATE spend_receipts SET dispatch_aborted=1 WHERE reference=?1",
+            [&reference.0],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)
     }
     fn finish(
         &self,
@@ -347,156 +332,5 @@ impl SpendLedger for SqliteSpendLedger {
             .map_err(storage)?;
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Barrier};
-
-    fn accepted(path: &Path) -> AcceptedSpendHandoff {
-        symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
-        let handoff = AcceptedSpendHandoff {
-            reservation: SpendReservation {
-                reference: SpendReceiptRef("accepted:attempt-1".into()),
-                account: "account-a".into(),
-                invocation: "invocation-1".into(),
-                binding: "exact-attempt-1".into(),
-                request_limit: Some(1),
-            },
-            input_identity: "exact-input-1".into(),
-        };
-        let mut conn = Connection::open(path).unwrap();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        assert!(SqliteSpendLedger::reserve_handoff_in(&tx, &handoff).unwrap());
-        tx.commit().unwrap();
-        handoff
-    }
-
-    #[test]
-    fn accepted_handoff_refuses_other_accounts_attempts_and_inputs_before_consuming() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.sqlite");
-        let handoff = accepted(&path);
-        let ledger = SqliteSpendLedger::open(&path).unwrap();
-        assert!(
-            ledger
-                .acquire_handoff(&handoff, "account-b", "exact-input-1", "owner")
-                .is_err()
-        );
-        assert!(
-            ledger
-                .acquire_handoff(&handoff, "account-a", "other-input", "owner")
-                .is_err()
-        );
-        let mut changed = handoff.clone();
-        changed.reservation.binding = "other-attempt".into();
-        assert!(
-            ledger
-                .acquire_handoff(&changed, "account-a", "exact-input-1", "owner")
-                .is_err()
-        );
-        changed = handoff.clone();
-        changed.reservation.invocation = "other-invocation".into();
-        assert!(
-            ledger
-                .acquire_handoff(&changed, "account-a", "exact-input-1", "owner")
-                .is_err()
-        );
-        changed = handoff.clone();
-        changed.input_identity = "forged-input".into();
-        assert!(
-            ledger
-                .acquire_handoff(&changed, "account-a", "forged-input", "owner")
-                .is_err()
-        );
-        ledger
-            .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
-            .unwrap();
-        assert!(
-            ledger
-                .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn accepted_handoff_has_one_atomic_dispatch_owner_across_handles() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.sqlite");
-        let handoff = accepted(&path);
-        let barrier = Arc::new(Barrier::new(2));
-        let joins: Vec<_> = (0..2)
-            .map(|i| {
-                let ledger = SqliteSpendLedger::open(&path).unwrap();
-                let handoff = handoff.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    ledger
-                        .acquire_handoff(
-                            &handoff,
-                            "account-a",
-                            "exact-input-1",
-                            &format!("owner-{i}"),
-                        )
-                        .is_ok()
-                })
-            })
-            .collect();
-        assert_eq!(
-            joins
-                .into_iter()
-                .map(|join| usize::from(join.join().unwrap()))
-                .sum::<usize>(),
-            1
-        );
-        let ledger = SqliteSpendLedger::open(&path).unwrap();
-        assert_eq!(
-            ledger
-                .receipt(&handoff.reservation.reference)
-                .unwrap()
-                .unwrap()
-                .state,
-            SpendState::Unknown
-        );
-        assert!(
-            ledger
-                .acquire_handoff(&handoff, "account-a", "exact-input-1", "after-restart")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn ordinary_or_released_reservations_do_not_authorize_an_accepted_handoff() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.sqlite");
-        let handoff = accepted(&path);
-        let ledger = SqliteSpendLedger::open(&path).unwrap();
-        ledger
-            .finish(
-                &handoff.reservation.reference,
-                SpendState::Released,
-                None,
-                None,
-            )
-            .unwrap();
-        assert!(
-            ledger
-                .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
-                .is_err()
-        );
-        let mut ordinary = handoff;
-        ordinary.reservation.reference = SpendReceiptRef("ordinary".into());
-        ordinary.reservation.invocation = "ordinary".into();
-        ledger.reserve(&ordinary.reservation).unwrap();
-        assert!(
-            ledger
-                .acquire_handoff(&ordinary, "account-a", "exact-input-1", "owner")
-                .is_err()
-        );
     }
 }

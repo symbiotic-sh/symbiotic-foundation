@@ -212,93 +212,41 @@ fn spend_invocation_lookup_uses_an_index_for_retained_history_and_latest_release
 }
 
 #[test]
-fn spend_cached_selection_is_single_durable_selection_without_new_reservations() {
+fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
     let ledger = open(&path);
-    let mut primer = reservation("primer", "primer", "account");
-    primer.binding = "X".into();
-    ledger.reserve(&primer).unwrap();
+    let original = reservation("first", "invocation", "account");
+    // Both callers observed no reservation before X's transaction won.
+    assert!(
+        ledger
+            .invocation("account", "invocation")
+            .unwrap()
+            .is_none()
+    );
+    let delayed = open(&path);
+    assert!(
+        delayed
+            .invocation("account", "invocation")
+            .unwrap()
+            .is_none()
+    );
+    ledger.reserve(&original).unwrap();
     ledger
-        .finish(
-            &primer.reference,
-            SpendState::Settled,
-            Some(UsageTrace {
-                input_tokens: Some(1),
-                ..Default::default()
-            }),
-            Some(serde_json::json!("source")),
-        )
+        .finish(&original.reference, SpendState::Released, None, None)
         .unwrap();
-    assert!(
-        ledger
-            .bind_cached(
-                "other-account",
-                "selected",
-                "X",
-                &primer.reference,
-                serde_json::json!("forged")
-            )
-            .is_err()
-    );
-    assert!(
-        ledger
-            .bind_cached(
-                "account",
-                "forged-binding",
-                "Y",
-                &primer.reference,
-                serde_json::json!("unrelated input")
-            )
-            .is_err()
-    );
-    let barrier = Arc::new(Barrier::new(2));
-    let workers: Vec<_> = (0..2)
-        .map(|i| {
-            let ledger = open(&path);
-            let barrier = barrier.clone();
-            let reference = primer.reference.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                ledger
-                    .bind_cached("account", "selected", "X", &reference, serde_json::json!(i))
-                    .unwrap()
-            })
-        })
-        .collect();
-    let selected: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
-    assert_eq!(selected[0].output, selected[1].output);
-    assert_eq!(selected[0].reservation.reference, primer.reference);
-    assert!(
-        ledger
-            .bind_cached(
-                "account",
-                "selected",
-                "Y",
-                &primer.reference,
-                serde_json::json!("changed input")
-            )
-            .is_err()
-    );
-    assert!(
-        ledger
-            .reserve(&reservation("redispatch", "selected", "account"))
-            .is_err()
-    );
-    drop(ledger);
-    let recovered = open(&path)
-        .invocation("account", "selected")
-        .unwrap()
-        .unwrap();
-    assert_eq!(recovered.output, selected[0].output);
-    assert_eq!(recovered.reservation.binding, "X");
-    let conn = rusqlite::Connection::open(path).unwrap();
-    assert_eq!(
-        conn.query_row("SELECT used FROM spend_accounts", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
+    let mut changed = original.clone();
+    changed.reference = SpendReceiptRef("delayed".into());
+    changed.binding = "changed-input".into();
+    assert!(matches!(
+        delayed.reserve(&changed),
+        Err(ModelError::Queue(
+            DiagnosticCode::SpendReconciliationRequired
+        ))
+    ));
+    assert!(delayed.receipt(&changed.reference).unwrap().is_none());
+    changed.binding = original.binding;
+    assert!(delayed.reserve(&changed).unwrap());
 }
 
 #[test]

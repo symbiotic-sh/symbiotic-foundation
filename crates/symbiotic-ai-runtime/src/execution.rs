@@ -73,7 +73,7 @@ macro_rules! execute {
             P: $trait + Clone + 'static,
         {
             let invocation = invocation.into();
-            let identity = binding
+            binding
                 .identity
                 .clone()
                 .filter(BindingIdentity::is_valid)
@@ -87,7 +87,6 @@ macro_rules! execute {
                     attempt: Ok(None),
                 });
             }
-            let sharing = binding.account_sharing_key.clone();
             let attempt_context = crate::model::ExecutionAttemptContext::default();
             let result = match self.$bind(
                 binding
@@ -97,8 +96,7 @@ macro_rules! execute {
                 Ok(provider) => provider.$call(request).await,
                 Err(error) => Err(error),
             };
-            self.execution_result(identity, sharing, invocation, attempt_context, result)
-                .await
+            self.execution_result(attempt_context, result).await
         }
     };
 }
@@ -165,23 +163,22 @@ impl Runtime {
 
     async fn execution_result<T>(
         &self,
-        identity: BindingIdentity,
-        sharing: Option<AccountSharingKey>,
-        invocation: String,
         context: crate::model::ExecutionAttemptContext,
         result: Result<T, ModelError>,
     ) -> Result<ExecutionResult<T>, ExecutionError> {
         let runtime = self.clone();
-        let attempt = tokio::task::spawn_blocking(move || match context.reference()? {
+        let attempt = match tokio::task::spawn_blocking(move || match context.reference()? {
             Some(reference) => runtime
                 .spend_receipt(&reference)
                 .map(|r| r.map(ExecutionAttemptStatus::from)),
-            None => runtime.invocation_status(&identity, sharing.as_ref(), &invocation),
+            None => Ok(None),
         })
         .await
-        .unwrap_or(Err(ModelError::Queue(
-            DiagnosticCode::SpendLedgerUnavailable,
-        )));
+        {
+            Ok(attempt) => attempt,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => Err(ModelError::Queue(DiagnosticCode::SpendLedgerUnavailable)),
+        };
         match result {
             Ok(output) => Ok(ExecutionResult { output, attempt }),
             Err(source) => Err(ExecutionError { source, attempt }),

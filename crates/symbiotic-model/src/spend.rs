@@ -20,6 +20,10 @@ impl ExecutionAttemptContext {
             .map(|reference| reference.clone())
             .map_err(|_| storage())
     }
+    pub(crate) fn clear(&self) -> Result<(), ModelError> {
+        *self.0.lock().map_err(|_| storage())? = None;
+        Ok(())
+    }
     pub(crate) fn capture(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         *self.0.lock().map_err(|_| storage())? = Some(reference.clone());
         Ok(())
@@ -44,7 +48,8 @@ pub struct SpendReservation {
     pub reference: SpendReceiptRef,
     pub account: String,
     pub invocation: String,
-    /// Exact binding/input identity; reattachment must match it.
+    /// Immutable input/provider-binding digest for the logical invocation.
+    /// Individual attempt identity belongs to `reference`.
     pub binding: String,
     /// Absolute account request allowance; no time window or monetary ceiling.
     pub request_limit: Option<u64>,
@@ -82,6 +87,8 @@ pub fn handoff_input_identity(
 pub struct SpendReceipt {
     pub reservation: SpendReservation,
     pub state: SpendState,
+    /// Durable proof that this reservation was released before provider transport.
+    pub dispatch_aborted: bool,
     pub usage: Option<UsageTrace>,
     /// Same-attempt runtime result, or credential completion evidence; egress
     /// output bytes stay in its authenticated, deadline-bounded recovery store.
@@ -108,17 +115,8 @@ pub trait SpendLedger: Send + Sync {
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError>;
-    /// Durably select a cached result for an invocation without reserving a request.
-    /// The receipt must already belong to this account. Concurrent selections recover
-    /// the existing matching result or refuse conflicting inputs/unfinished attempts.
-    fn bind_cached(
-        &self,
-        account: &str,
-        invocation: &str,
-        binding: &str,
-        reference: &SpendReceiptRef,
-        output: Value,
-    ) -> Result<SpendReceipt, ModelError>;
+    /// Release a reservation with durable evidence that provider transport never started.
+    fn abort_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError>;
     fn finish(
         &self,
         reference: &SpendReceiptRef,
@@ -157,14 +155,7 @@ impl SpendLedger for UnavailableSpendLedger {
     fn invocation(&self, _: &str, _: &str) -> Result<Option<SpendReceipt>, ModelError> {
         Err(storage())
     }
-    fn bind_cached(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &SpendReceiptRef,
-        _: Value,
-    ) -> Result<SpendReceipt, ModelError> {
+    fn abort_before_dispatch(&self, _: &SpendReceiptRef) -> Result<(), ModelError> {
         Err(storage())
     }
     fn finish(

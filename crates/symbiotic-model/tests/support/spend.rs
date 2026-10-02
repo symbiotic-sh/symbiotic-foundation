@@ -1,4 +1,6 @@
 // Reuse the production SQLite implementation without linking SQLite into model contracts.
+// The embedded implementation also exports credential-only transaction APIs.
+#[allow(dead_code)]
 #[path = "../../../symbiotic-ai-runtime/src/spend.rs"]
 mod sqlite;
 use std::sync::Arc;
@@ -50,16 +52,11 @@ impl SpendLedger for Fixture {
     fn invocation(&self, a: &str, i: &str) -> Result<Option<SpendReceipt>, ModelError> {
         self.ledger.invocation(a, i)
     }
-    fn bind_cached(
+    fn abort_before_dispatch(
         &self,
-        account: &str,
-        invocation: &str,
-        binding: &str,
         reference: &symbiotic_model::SpendReceiptRef,
-        output: serde_json::Value,
-    ) -> Result<symbiotic_model::SpendReceipt, ModelError> {
-        self.ledger
-            .bind_cached(account, invocation, binding, reference, output)
+    ) -> Result<(), ModelError> {
+        self.ledger.abort_before_dispatch(reference)
     }
     fn finish(
         &self,

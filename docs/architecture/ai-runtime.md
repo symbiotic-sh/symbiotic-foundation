@@ -378,9 +378,21 @@ using the same binding identity, account sharing configuration and invocation.
 These APIs require no telemetry sink. Caller invocation identities are scoped to
 the full tenant/provider/configuration binding, including when accounts share quota.
 Within that binding, reusing an invocation with different inputs or a changed
-provider descriptor is refused. A cache hit durably binds the invocation to its exact
-inputs and selected output, referencing the original receipt without another request
-reservation.
+provider descriptor is refused. Explicit invocations, including bindings made with
+`ModelBinding::with_invocation`, never read or write the response cache. They recover
+only their own accepted attempt's durable ledger output. Implicit calls retain caching.
+
+One immutable `(account, invocation) -> input/binding digest` record is created or
+validated inside every reservation transaction, including credential acceptance.
+Released predecessors retain this binding, so concurrent delayed reservations cannot
+change an invocation's inputs. Credential retries retain this invocation binding while
+their ordinal and signed record establish distinct attempt identities.
+
+For example, invocation `A` reserves input `X`, then is reconciled to Released.
+A delayed reservation for `A` with `Y` is refused inside its transaction. Retrying
+`A` with `X` may reserve a new attempt within its remaining budget, even if an
+implicit call or invocation `P` has already completed `X`. That retry dispatches
+under `A`; a later repeat of `A` recovers only `A`'s own saved output.
 
 Credential acceptance records a handoff bound to the complete reservation,
 account, operation, provider binding and exact queued input. Dispatch validates
@@ -436,8 +448,13 @@ queue error and persists a stopped item, because execution without its account
 limiter is not allowed. Stopped items cannot be claimed directly. Genuine terminal refusals, including
 cooldown-storage failures, cannot be continued or renewed. A later handoff may
 reconsider an account-budget refusal or an uncertain-charge refusal whose receipt
-has been reconciled to Released. Accepted attempts still count toward the logical
-attempt limit; account reservation denials do not consume provider attempts.
+has been reconciled to Released. Provider attempts still count toward the logical
+attempt limit. Account reservation
+denials and reservation storage errors that leave no receipt do not consume provider
+attempts. A pre-transport release records durable dispatch-aborted evidence and stops
+the queue claim when ownership permits; a later call can reopen that claim, including
+an expired final claim. Reconciled provider attempts keep counting, and Unknown or
+Settled accounting never restores an attempt.
 Existing waiters return the recorded refusal. Durable successful output is checked
 in every queue state and before dispatch, so interrupted queue completion cannot
 hide a paid result. Failures without a
@@ -456,7 +473,7 @@ contract in [boundary.md](boundary.md#tenant-provider-bindings-and-data-access) 
 ## Backends and conformance
 
 `symbiotic-queue` ships `MemoryQueue`, the in-process backend with no storage
-dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 22
+dependency. Its `conformance` feature exposes `queue_backend_conformance!`: 24
 checks of the `QueueBackend` contract. Both `MemoryQueue` and `SqliteQueue` run
 them in CI:
 
@@ -477,8 +494,10 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 5 and the current queue table layouts.
-Other layouts are refused without migration. Unknown stored failure codes/classes
+queue files require schema version 6 and the current queue table layouts.
+Other layouts are refused without migration. Queue and ledger mutations acquire
+the SQLite write lock before reading state, so concurrent writers do not require
+a read-to-write transaction upgrade. Unknown stored failure codes/classes
 are refused with a static error. Terminal items without a recorded error class
 return a queue error, without inferring a
 class from provider text.
