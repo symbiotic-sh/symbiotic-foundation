@@ -1,4 +1,5 @@
 //! Provider request encoding shared by admission checks and HTTP transmission.
+pub use crate::retrieval::{cohere_rerank_body, compatible_embedding_body};
 use crate::{ChatMessage, ChatRequest, EmbeddingRequest, ModelError, ThinkingMode};
 use serde::Serialize;
 use serde_json::Value;

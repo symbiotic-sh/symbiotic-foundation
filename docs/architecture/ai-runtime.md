@@ -59,7 +59,7 @@ the same state.
 `ModelRegistry::from_json` validates the entire current-version configuration before
 serving. Pass `Arc<ModelRegistry>` in `RuntimeConfig::registry`, then call
 `Runtime::configured_provider(tenant, principal, credential_resolver)`. It returns
-an installed chat, Gemini embedding or Jev classifier adapter. Keyless bindings do
+an installed chat, Gemini/OpenAI/Ollama embedding, Cohere rerank or Jev classifier adapter. Keyless bindings do
 not call the credential resolver. Unknown tenants/principals and configuration,
 transport or policy overrides are refused.
 
@@ -84,6 +84,44 @@ error class, including for invalid UTF-8 bodies. Chat also requires a
 finite output-token bound; requests above a configured bound are refused. Gemini
 requires the exact configured dimension for every returned vector. Its adapter
 refuses task options and conflicting per-request dimensions before dispatch.
+Compatible embeddings require explicit `dimensions`, `embedding_full_dimensions`
+and `embedding_input_tokens`. The last is the deployed model's usable per-input
+token capacity after reserving special/template/task tokens. Each input's UTF-8
+byte count must fit it, using the same conservative byte-level tokenizer bound
+described for reranking below. This prevents silent context truncation, including
+on compatible endpoints backed by Ollama. Unsupported tokenizers require another
+adapter; byte transport limits alone do not establish complete-input processing.
+For Memory's Qwen3-Embedding-8B profile, configure both as 1,024; reduced dimensions
+are configurable per binding or OpenAI-compatible request, within the full ceiling.
+OpenAI/OpenRouter uses `/embeddings` with `input`, `dimensions` and optional `input_type`
+from request `task`; it restores batch input order and validates every vector.
+Ollama uses `/api/embeddings` with `prompt`; batch, task and dimension overrides
+are refused before HTTP. Foundation never splits one invocation into multiple calls.
+Cohere/OpenRouter uses `/rerank` with `query`, `documents` and `top_n`. Required
+`rerank_input_bytes` (sum of query/candidate UTF-8 bytes) and `rerank_candidates`
+are hard admission limits, separate from encoded request/response bytes. Candidate
+count is checked before scanning text. Required `rerank_context_tokens` is the
+deployed provider/model's usable query-plus-document token capacity after reserving
+special/template tokens; `rerank_query_tokens` is its query capacity and must not
+exceed the usable context. Configure both from the deployed tokenizer and model,
+not from HTTP byte limits. This adapter supports byte-level text tokenizers with at
+most one token per UTF-8 byte: admission conservatively charges one token per byte
+of each query/document pair and separately bounds the query. Deployments with other
+tokenizers must not use this adapter. Over-capacity input is refused before HTTP,
+never shortened, and the usable capacity is sent explicitly as `max_tokens_per_doc`
+to avoid Cohere's default truncation. For Cohere rerank-v3.5, a usable budget no
+larger than 4,093 tokens and query budget no larger than 2,048 reserve its three
+special tokens; other models need their own configured capacities. See
+[Cohere's API](https://docs.cohere.com/reference/rerank) and
+[model limits](https://docs.cohere.com/docs/reranking-best-practices).
+The response must contain exactly `min(top_k.unwrap_or(candidate_count),
+candidate_count)` hits. Missing, extra, duplicate, invalid or non-finite hits refuse
+the whole response; valid hits are sorted by score. OpenAI embedding batches also
+require one uniquely indexed vector per input; Gemini requires one vector per input
+and Ollama admits only one input and requires one vector. Provider-reported rerank
+cost is retained in the usage trace before raw JSON is discarded.
+These adapters use the same queue, credential boundary and receipt/accounting hook.
+No provider binding, model default, separate scheduler or spend ledger is added.
 Provider credentials and derived secret buffers use the shared non-Debug,
 non-serializable `SecretValue` zeroizing container; `ResolvedAuth` is also non-Debug.
 

@@ -166,8 +166,10 @@ pub struct SignedAttemptId {
 pub enum ProviderPayload {
     /// Chat through a configured OpenAI-compatible route.
     Chat(symbiotic_model::ChatRequest),
-    /// Embeddings through a configured Gemini route.
+    /// Embeddings through a configured embedding adapter.
     Embedding(symbiotic_model::EmbeddingRequest),
+    /// Reranking through a configured Cohere-compatible adapter.
+    Rerank(symbiotic_model::RerankRequest),
 }
 
 impl ProviderPayload {
@@ -347,6 +349,10 @@ pub enum ProviderOutput {
     Embedding {
         vectors: Vec<Vec<f32>>,
         dimensions: usize,
+    },
+    /// Validated candidate indices and finite relevance scores.
+    Rerank {
+        hits: Vec<symbiotic_model::RerankHit>,
     },
 }
 

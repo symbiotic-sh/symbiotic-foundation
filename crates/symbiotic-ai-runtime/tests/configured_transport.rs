@@ -559,3 +559,135 @@ async fn non_success_invalid_utf8_preserves_status_class() {
         }
     }
 }
+
+#[tokio::test]
+async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistence() {
+    use model::{EmbeddingRequest, ModelAdapter, RerankRequest};
+    for adapter in [
+        ModelAdapter::OpenAiEmbedding,
+        ModelAdapter::OllamaEmbedding,
+        ModelAdapter::CohereRerank,
+    ] {
+        for (echo, incomplete) in [(false, false), (true, false), (false, true)] {
+            if incomplete && adapter == ModelAdapter::OllamaEmbedding {
+                continue;
+            }
+            let body = match adapter {
+                ModelAdapter::CohereRerank => {
+                    json!({"results":[{"index":0,"relevance_score":0.7}]})
+                }
+                ModelAdapter::OllamaEmbedding => json!({"embedding":[1,2]}),
+                _ => json!({"data":[{"index":0,"embedding":[1,2]}],"usage":{"prompt_tokens":7}}),
+            };
+            let mut body = body;
+            if echo {
+                body["ignored"] = json!(KEY);
+            }
+            let (endpoint, server) = fixture(200, body.to_string(), None);
+            let mut config: Value =
+                serde_json::from_slice(include_bytes!("../../../examples/model-registry.json"))
+                    .unwrap();
+            let rerank = adapter == ModelAdapter::CohereRerank;
+            config["models"][0]["adapter"] = json!(adapter);
+            config["models"][0]["operations"] = json!([adapter.capability()]);
+            config["models"][0]["identity"]["operation"] =
+                json!(if rerank { "rerank" } else { "embedding" });
+            config["accounts"] = json!([{"id":"policy","policy": ModelQueueConfig {
+                retry_attempts:1, logical_retry_attempts:1, request_timeout_seconds:Some(2), ..Default::default()
+            }}]);
+            config["bindings"] = json!([{
+                "identity":{"tenant":"tenant","provider":"provider","revision":"1","account":"account"},
+                "model":"example-chat","endpoint":endpoint,"secret_ref":"synthetic","account_policy":"policy","account_sharing_key":null,
+                "limits":{"max_request_bytes":4096,"max_response_bytes":4096,"max_output_tokens":null},
+                "settings": if rerank {json!({"rerank_candidates":2,"rerank_input_bytes":64,"rerank_context_tokens":4093,"rerank_query_tokens":2048})} else {json!({"dimensions":2,"embedding_full_dimensions":1024,"embedding_input_tokens":8192})}
+            }]);
+            let state = tempfile::tempdir().unwrap();
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let traces = Arc::new(InMemoryTraceSink::default());
+            let runtime = Runtime::open(RuntimeConfig {
+                state_dir: Some(state.path().join("state")),
+                registry: Some(Arc::new(
+                    model::ModelRegistry::from_json(&serde_json::to_vec(&config).unwrap()).unwrap(),
+                )),
+                receipt_sink: Some(receipts.clone()),
+                trace_sink: Some(traces.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            let provider = runtime
+                .configured_provider(
+                    &TenantId("tenant".into()),
+                    &ProviderPrincipalId("provider".into()),
+                    &Credentials(KEY),
+                )
+                .await
+                .unwrap();
+            let result = match provider {
+                ConfiguredProvider::Embedding(provider) => provider
+                    .embed(EmbeddingRequest {
+                        inputs: vec!["input".into(); if incomplete { 2 } else { 1 }],
+                        dimensions: None,
+                        task: None,
+                        sensitivity: symbiotic_core::Sensitivity::Private,
+                        role_binding: None,
+                        source: None,
+                        metadata: Value::Null,
+                    })
+                    .await
+                    .map(|response| {
+                        assert!(response.raw_provider_response.is_none());
+                        response.trace
+                    }),
+                ConfiguredProvider::Rerank(provider) => provider
+                    .rerank(RerankRequest {
+                        query: "query".into(),
+                        documents: vec!["candidate".into(); if incomplete { 2 } else { 1 }],
+                        top_k: None,
+                        sensitivity: symbiotic_core::Sensitivity::Private,
+                        role_binding: None,
+                        source: None,
+                        metadata: Value::Null,
+                    })
+                    .await
+                    .map(|response| {
+                        assert!(response.raw_provider_response.is_none());
+                        response.trace
+                    }),
+                _ => panic!("wrong adapter"),
+            };
+            server.join().unwrap();
+            if echo || incomplete {
+                assert!(matches!(result, Err(ModelError::Provider(_))));
+                assert!(
+                    !receipts
+                        .receipts()
+                        .iter()
+                        .any(|r| r.status == symbiotic_ai_runtime::ReceiptStatus::Succeeded)
+                );
+            } else {
+                let trace = result.unwrap();
+                assert!(trace.queue_item_id.is_some());
+                if adapter == ModelAdapter::OpenAiEmbedding {
+                    assert_eq!(trace.usage.input_tokens, Some(7));
+                }
+                assert!(
+                    receipts
+                        .receipts()
+                        .iter()
+                        .any(|r| r.status == symbiotic_ai_runtime::ReceiptStatus::Succeeded)
+                );
+            }
+            assert!(
+                !serde_json::to_string(&receipts.receipts())
+                    .unwrap()
+                    .contains(KEY)
+            );
+            assert!(
+                !serde_json::to_string(&traces.records())
+                    .unwrap()
+                    .contains(KEY)
+            );
+            assert_no_secret_files(state.path());
+        }
+    }
+}
