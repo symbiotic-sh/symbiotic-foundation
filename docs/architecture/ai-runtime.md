@@ -171,6 +171,12 @@ charge after crash, timeout or missing usage; success settles measured usage.
 `Runtime::spend_receipt` even after queue retention. Same-attempt output recovery is
 independent of cache purge/expiry; callers identify new invocations through request
 identity (including `source`). Consumer commit refusal never releases spend.
+Queue claims that fail before reservation, or whose reservations are atomically
+released before transport, do not consume the provider-attempt allowance. The
+ledger records pre-dispatch release separately from ordinary `Released` accounting:
+a known-zero provider failure still consumes an attempt. Followers use this evidence
+even after lease reclaim marks the queue item dead. A later identical call can
+reconsider a pre-dispatch storage failure once the ledger is available again.
 `Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
 counts against the absolute account request allowance until reconciliation; unknown
 replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
@@ -464,7 +470,7 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 4 and the current queue table layouts.
+queue files require schema version 5 and the current queue table layouts.
 Other layouts are refused without migration. Unknown stored failure codes/classes
 are refused with a static error. Terminal items without a recorded error class
 return a queue error, without inferring a

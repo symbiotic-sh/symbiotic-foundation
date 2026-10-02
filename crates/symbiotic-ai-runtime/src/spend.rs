@@ -177,7 +177,7 @@ fn receipt_in(
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let row = conn
         .query_row(
-            "SELECT reservation, state, usage, output FROM spend_receipts WHERE reference=?1",
+            "SELECT reservation, state, usage, output, pre_dispatch_released FROM spend_receipts WHERE reference=?1",
             [&reference.0],
             |r| {
                 Ok((
@@ -185,14 +185,16 @@ fn receipt_in(
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, bool>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(storage)?;
-    row.map(|(r, state, usage, output)| {
+    row.map(|(r, state, usage, output, pre_dispatch_released)| {
         Ok(SpendReceipt {
             reservation: serde_json::from_str(&r).map_err(storage)?,
+            pre_dispatch_released,
             state: match state.as_str() {
                 "unknown" => SpendState::Unknown,
                 "released" => SpendState::Released,
@@ -212,6 +214,23 @@ fn receipt_in(
     .transpose()
 }
 impl SpendLedger for SqliteSpendLedger {
+    fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let old = receipt_in(&tx, reference)?.ok_or_else(conflict)?;
+        if old.state != SpendState::Unknown && !old.pre_dispatch_released {
+            return Err(conflict());
+        }
+        Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
+        tx.execute(
+            "UPDATE spend_receipts SET pre_dispatch_released=1 WHERE reference=?1",
+            [&reference.0],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn

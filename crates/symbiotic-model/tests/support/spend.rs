@@ -20,6 +20,9 @@ pub fn ledger() -> Arc<dyn SpendLedger> {
     })
 }
 impl SpendLedger for Fixture {
+    fn release_before_dispatch(&self, r: &SpendReceiptRef) -> Result<(), ModelError> {
+        self.ledger.release_before_dispatch(r)
+    }
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
         self.ledger.reserve(r)
     }
