@@ -20,10 +20,12 @@ impl ExecutionAttemptContext {
             .map(|reference| reference.clone())
             .map_err(|_| storage())
     }
+    #[cfg(feature = "queue")]
     pub(crate) fn clear(&self) -> Result<(), ModelError> {
         *self.0.lock().map_err(|_| storage())? = None;
         Ok(())
     }
+    #[cfg(feature = "queue")]
     pub(crate) fn capture(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         *self.0.lock().map_err(|_| storage())? = Some(reference.clone());
         Ok(())
@@ -132,6 +134,7 @@ pub trait SpendLedger: Send + Sync {
 pub(crate) fn storage() -> ModelError {
     ModelError::Queue(DiagnosticCode::SpendLedgerUnavailable)
 }
+#[cfg(feature = "queue")]
 pub(crate) fn reconciliation() -> ModelError {
     ModelError::Queue(DiagnosticCode::SpendReconciliationRequired)
 }

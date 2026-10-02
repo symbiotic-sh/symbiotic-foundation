@@ -62,9 +62,9 @@ pub use queue_runtime::{
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
 
-#[cfg(feature = "queue")]
+// Spend receipt and state types are part of the provider contract that
+// protocol clients (symbiotic-egress) use without the queue runtime.
 mod spend;
-#[cfg(feature = "queue")]
 pub use spend::*;
 
 mod secrets;
