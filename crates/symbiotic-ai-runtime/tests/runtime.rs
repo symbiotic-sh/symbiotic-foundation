@@ -1487,7 +1487,9 @@ async fn configured_embedding_and_classifier_apply_finite_transport_limits() {
         let descriptor = match &installed {
             ConfiguredProvider::Embedding(provider) => provider.descriptor(),
             ConfiguredProvider::Classifier(provider) => provider.descriptor(),
-            ConfiguredProvider::Chat(_) => panic!("wrong installed adapter"),
+            ConfiguredProvider::Chat(_) | ConfiguredProvider::Rerank(_) => {
+                panic!("wrong installed adapter")
+            }
         };
         assert_eq!(descriptor.metadata["max_request_bytes"], 65536);
         assert_eq!(descriptor.metadata["max_response_bytes"], 65536);

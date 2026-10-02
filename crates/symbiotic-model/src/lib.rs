@@ -71,6 +71,8 @@ mod secrets;
 pub use secrets::{CredentialBoundary, SecretValue};
 mod registry;
 pub use registry::*;
+mod retrieval;
+pub use retrieval::{CohereRerankProvider, CompatibleEmbeddingProvider};
 mod classify;
 pub mod wire;
 #[cfg(feature = "queue")]

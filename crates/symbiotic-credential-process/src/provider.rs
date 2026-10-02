@@ -13,17 +13,11 @@ use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, Provider
 use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 
 #[derive(Clone)]
-struct DispatchedChat {
-    inner: OpenAiCompatibleChatProvider,
+struct Dispatched<P> {
+    inner: P,
     started: Arc<AtomicBool>,
 }
-#[derive(Clone)]
-struct DispatchedEmbedding {
-    inner: GeminiEmbeddingProvider,
-    started: Arc<AtomicBool>,
-}
-
-impl ModelProvider for DispatchedChat {
+impl<P: ModelProvider> ModelProvider for Dispatched<P> {
     fn descriptor(&self) -> &ProviderDescriptor {
         self.inner.descriptor()
     }
@@ -33,28 +27,12 @@ impl ModelProvider for DispatchedChat {
     fn credential_fingerprint(&self) -> Option<String> {
         self.inner.credential_fingerprint()
     }
-
-    fn credential_boundary(&self) -> Option<&CredentialBoundary> {
-        self.inner.credential_boundary()
-    }
-}
-impl ModelProvider for DispatchedEmbedding {
-    fn descriptor(&self) -> &ProviderDescriptor {
-        self.inner.descriptor()
-    }
-    fn validate_configuration(&self) -> Result<(), ModelError> {
-        self.inner.validate_configuration()
-    }
-    fn credential_fingerprint(&self) -> Option<String> {
-        self.inner.credential_fingerprint()
-    }
-
     fn credential_boundary(&self) -> Option<&CredentialBoundary> {
         self.inner.credential_boundary()
     }
 }
 #[async_trait]
-impl ChatProvider for DispatchedChat {
+impl<P: ChatProvider> ChatProvider for Dispatched<P> {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.chat(request).await?;
@@ -63,10 +41,19 @@ impl ChatProvider for DispatchedChat {
     }
 }
 #[async_trait]
-impl EmbeddingProvider for DispatchedEmbedding {
+impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
         let mut response = self.inner.embed(request).await?;
+        response.trace.metadata = serde_json::Value::Null;
+        Ok(response)
+    }
+}
+#[async_trait]
+impl<P: RerankProvider> RerankProvider for Dispatched<P> {
+    async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
+        self.started.store(true, Ordering::SeqCst);
+        let mut response = self.inner.rerank(request).await?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -103,6 +90,83 @@ fn route_binding<P>(
         .map_err(|_| EgressError::InvalidRequest)
 }
 
+fn accepted_route_binding<P>(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    provider: P,
+    handoff: model::AcceptedSpendHandoff,
+) -> Result<ModelBinding<P>, EgressError> {
+    let mut binding = route_binding(runtime, route, provider)?;
+    binding.accepted_spend = Some(handoff);
+    Ok(binding.with_response_cache(ResponseCacheMode::Off))
+}
+
+fn resolved_route<'a>(
+    runtime: &'a Runtime,
+    route: &RouteConfig,
+) -> Result<model::RegistryBinding<'a>, EgressError> {
+    runtime
+        .registry()
+        .ok_or(EgressError::InvalidRequest)?
+        .binding(
+            &model::TenantId(route.tenant.clone()),
+            &model::ProviderPrincipalId(route.route.clone()),
+        )
+        .map_err(|_| EgressError::InvalidRequest)
+}
+
+pub(crate) fn route_settings(
+    route: &RouteConfig,
+) -> (model::ModelAdapter, &str, model::TransportSettings) {
+    let mut settings = model::TransportSettings::default();
+    let (adapter, operator) = match &route.provider {
+        RouteProvider::OpenAiChat { operator } => {
+            (model::ModelAdapter::OpenAiChat, operator.as_str())
+        }
+        RouteProvider::GeminiEmbedding { dimensions } => {
+            settings.dimensions = Some(*dimensions);
+            (model::ModelAdapter::GeminiEmbedding, "gemini")
+        }
+        RouteProvider::CompatibleEmbedding {
+            adapter,
+            operator,
+            dimensions,
+            embedding_full_dimensions,
+            embedding_input_tokens,
+        } => {
+            settings.dimensions = Some(*dimensions);
+            settings.embedding_full_dimensions = Some(*embedding_full_dimensions);
+            settings.embedding_input_tokens = Some(*embedding_input_tokens);
+            (*adapter, operator.as_str())
+        }
+        RouteProvider::CohereRerank {
+            operator,
+            rerank_input_bytes,
+            rerank_candidates,
+            rerank_context_tokens,
+            rerank_query_tokens,
+        } => {
+            settings.rerank_input_bytes = Some(*rerank_input_bytes);
+            settings.rerank_candidates = Some(*rerank_candidates);
+            settings.rerank_context_tokens = Some(*rerank_context_tokens);
+            settings.rerank_query_tokens = Some(*rerank_query_tokens);
+            (model::ModelAdapter::CohereRerank, operator.as_str())
+        }
+    };
+    (adapter, operator, settings)
+}
+
+fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
+    ExecuteError {
+        code: match error {
+            ModelError::Queue(_) => EgressError::StateUnavailable,
+            ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
+            _ => EgressError::Transport,
+        },
+        may_have_dispatched: started.load(Ordering::SeqCst),
+    }
+}
+
 /// Compile deployment routes into the same validated registry used by embedded runtimes.
 pub(crate) fn configured_registry(
     routes: &[RouteConfig],
@@ -111,25 +175,17 @@ pub(crate) fn configured_registry(
     let mut accounts = std::collections::HashMap::new();
     let mut bindings = Vec::new();
     for route in routes {
-        let (adapter, operator, dimensions) = match &route.provider {
-            RouteProvider::OpenAiChat { operator } => {
-                (model::ModelAdapter::OpenAiChat, operator.as_str(), None)
-            }
-            RouteProvider::GeminiEmbedding { dimensions } => (
-                model::ModelAdapter::GeminiEmbedding,
-                "gemini",
-                Some(*dimensions),
-            ),
-        };
-        let operation = match adapter {
-            model::ModelAdapter::OpenAiChat => "chat",
+        let (adapter, operator, settings) = route_settings(route);
+        let operation = match adapter.capability() {
+            model::ModelCapability::Chat => "chat",
+            model::ModelCapability::Rerank => "rerank",
             _ => "embedding",
         };
         let identity = model::ModelIdentity::new(operation, operator, &route.model);
         let model_id = model::configuration_revision(&identity)
             .map_err(|_| EgressError::InvalidRequest)?
             .0;
-        models.entry(model_id.clone()).or_insert(model::ModelEntry {
+        let entry = models.entry(model_id.clone()).or_insert(model::ModelEntry {
             id: model_id.clone(),
             aliases: vec![],
             identity,
@@ -138,6 +194,9 @@ pub(crate) fn configured_registry(
             capabilities: model::ModelCapabilities::default(),
             pricing_provenance: None,
         });
+        if entry.adapter != adapter {
+            return Err(EgressError::InvalidRequest);
+        }
         let policy = queue_policy(route);
         let policy_id = model::configuration_revision(&policy)
             .map_err(|_| EgressError::InvalidRequest)?
@@ -159,7 +218,7 @@ pub(crate) fn configured_registry(
             ),
             model: model_id,
             endpoint: route.destination.clone(),
-            secret_ref: Some(route.secret_ref.clone()),
+            secret_ref: (!route.secret_ref.is_empty()).then(|| route.secret_ref.clone()),
             account_policy: policy_id,
             account_sharing_key: route.account_sharing_key.clone(),
             limits: model::ProviderLimits {
@@ -171,10 +230,7 @@ pub(crate) fn configured_registry(
                     None
                 },
             },
-            settings: model::TransportSettings {
-                dimensions,
-                ..model::TransportSettings::default()
-            },
+            settings,
         });
     }
     model::ModelRegistry::new(model::RegistryConfig {
@@ -206,6 +262,26 @@ fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
 /// resolving a provider credential or submitting a request.
 pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result<(), EgressError> {
     match &route.provider {
+        RouteProvider::CompatibleEmbedding { .. } => {
+            let resolved = resolved_route(runtime, route)?;
+            let raw = model::CompatibleEmbeddingProvider::from_binding(&resolved, "")
+                .map_err(|_| EgressError::InvalidRequest)?;
+            runtime
+                .embedding(
+                    route_binding(runtime, route, raw)?.with_response_cache(ResponseCacheMode::Off),
+                )
+                .map(|_| ())
+        }
+        RouteProvider::CohereRerank { .. } => {
+            let resolved = resolved_route(runtime, route)?;
+            let raw = model::CohereRerankProvider::from_binding(&resolved, "")
+                .map_err(|_| EgressError::InvalidRequest)?;
+            runtime
+                .rerank(
+                    route_binding(runtime, route, raw)?.with_response_cache(ResponseCacheMode::Off),
+                )
+                .map(|_| ())
+        }
         RouteProvider::OpenAiChat { operator } => runtime
             .chat(
                 route_binding(
@@ -274,6 +350,11 @@ pub(crate) fn prepare_payload(payload: &mut ProviderPayload, attempt_digest: &st
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
         }
+        ProviderPayload::Rerank(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
     }
 }
 
@@ -287,6 +368,7 @@ pub(crate) fn accepted_handoff(
         ProviderPayload::Embedding(request) => {
             ("embedding", model::configuration_revision(request))
         }
+        ProviderPayload::Rerank(request) => ("rerank", model::configuration_revision(request)),
     };
     let binding = BindingIdentity::new(
         &route.tenant,
@@ -317,7 +399,7 @@ pub(crate) async fn execute(
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
         (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(request)) => {
-            let provider = DispatchedChat {
+            let provider = Dispatched {
                 inner: OpenAiCompatibleChatProvider::new(
                     operator,
                     &route.model,
@@ -332,20 +414,12 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .chat({
-                    let mut binding = route_binding(runtime, route, provider)?;
-                    binding.accepted_spend = Some(handoff);
-                    binding.with_response_cache(ResponseCacheMode::Off)
-                })
+                .chat(accepted_route_binding(runtime, route, provider, handoff)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
-            let response = provider.chat(request).await.map_err(|error| ExecuteError {
-                code: match error {
-                    ModelError::Queue(_) => EgressError::StateUnavailable,
-                    ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
-                    _ => EgressError::Transport,
-                },
-                may_have_dispatched: started.load(Ordering::SeqCst),
-            })?;
+            let response = provider
+                .chat(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
             Ok(completed(
                 ProviderOutput::Chat {
                     text: response.text,
@@ -354,7 +428,7 @@ pub(crate) async fn execute(
             ))
         }
         (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request)) => {
-            let provider = DispatchedEmbedding {
+            let provider = Dispatched {
                 inner: GeminiEmbeddingProvider::new(
                     "gemini",
                     &route.model,
@@ -368,27 +442,59 @@ pub(crate) async fn execute(
                 started: started.clone(),
             };
             let provider = runtime
-                .embedding({
-                    let mut binding = route_binding(runtime, route, provider)?;
-                    binding.accepted_spend = Some(handoff);
-                    binding.with_response_cache(ResponseCacheMode::Off)
-                })
+                .embedding(accepted_route_binding(runtime, route, provider, handoff)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
             let response = provider
                 .embed(request)
                 .await
-                .map_err(|error| ExecuteError {
-                    code: match error {
-                        ModelError::Queue(_) => EgressError::StateUnavailable,
-                        ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
-                        _ => EgressError::Transport,
-                    },
-                    may_have_dispatched: started.load(Ordering::SeqCst),
-                })?;
+                .map_err(|error| execute_error(error, &started))?;
             Ok(completed(
                 ProviderOutput::Embedding {
                     vectors: response.vectors,
                     dimensions: response.dimensions,
+                },
+                response.trace,
+            ))
+        }
+        (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(request)) => {
+            let resolved = resolved_route(runtime, route)?;
+            let provider = Dispatched {
+                inner: model::CompatibleEmbeddingProvider::from_binding(&resolved, secret.value())
+                    .map_err(|_| EgressError::InvalidRequest)?,
+                started: started.clone(),
+            };
+            let provider = runtime
+                .embedding(accepted_route_binding(runtime, route, provider, handoff)?)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let response = provider
+                .embed(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
+            Ok(completed(
+                ProviderOutput::Embedding {
+                    vectors: response.vectors,
+                    dimensions: response.dimensions,
+                },
+                response.trace,
+            ))
+        }
+        (RouteProvider::CohereRerank { .. }, ProviderPayload::Rerank(request)) => {
+            let resolved = resolved_route(runtime, route)?;
+            let provider = Dispatched {
+                inner: model::CohereRerankProvider::from_binding(&resolved, secret.value())
+                    .map_err(|_| EgressError::InvalidRequest)?,
+                started: started.clone(),
+            };
+            let provider = runtime
+                .rerank(accepted_route_binding(runtime, route, provider, handoff)?)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let response = provider
+                .rerank(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
+            Ok(completed(
+                ProviderOutput::Rerank {
+                    hits: response.hits,
                 },
                 response.trace,
             ))

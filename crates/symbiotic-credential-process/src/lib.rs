@@ -26,6 +26,32 @@ pub enum RouteProvider {
     OpenAiChat { operator: String },
     /// Existing Gemini embedding adapter, pinned to Google's service.
     GeminiEmbedding { dimensions: usize },
+    /// Compatible embedding protocol and explicit dimensions, resolved by the registry.
+    CompatibleEmbedding {
+        /// OpenAI batch or Ollama single-input protocol.
+        adapter: symbiotic_ai_runtime::model::ModelAdapter,
+        /// Provider identity; never inferred from endpoint/model text.
+        operator: String,
+        /// Default output dimensions.
+        dimensions: usize,
+        /// Full-vector ceiling for reduced-dimension requests.
+        embedding_full_dimensions: usize,
+        /// Usable input token capacity after provider/model special/task tokens.
+        embedding_input_tokens: usize,
+    },
+    /// Cohere-compatible rerank protocol with hard candidate/input bounds.
+    CohereRerank {
+        /// Provider identity.
+        operator: String,
+        /// Maximum sum of query and candidate UTF-8 bytes.
+        rerank_input_bytes: usize,
+        /// Maximum candidate count.
+        rerank_candidates: usize,
+        /// Usable query/document token capacity after provider/model overhead.
+        rerank_context_tokens: usize,
+        /// Provider/model query token capacity.
+        rerank_query_tokens: usize,
+    },
 }
 
 /// Route configured by the credential-process owner. No defaults for safety limits.
@@ -43,9 +69,9 @@ pub struct RouteConfig {
     pub provider_request_limit: Option<u64>,
     /// Route identifier.
     pub route: String,
-    /// Opaque reference scoped to this tenant.
+    /// Opaque reference scoped to this tenant; empty only for `secret.backend: none`.
     pub secret_ref: String,
-    /// Actual backend location, invisible to Memory.
+    /// Actual backend location, or explicit `none` for keyless execution.
     pub secret: SecretSource,
     /// Pinned base URL; userinfo, query, fragments and redirects are refused.
     pub destination: String,
@@ -302,12 +328,12 @@ impl CredentialProcess {
             &a.destination,
             &a.model,
             &a.method,
-            &a.secret_ref,
             &a.manifest_ref,
         ];
         if fields
             .iter()
             .any(|field| field.is_empty() || field.len() > route.max_field_bytes)
+            || a.secret_ref.len() > route.max_field_bytes
             || a.markings.len() > 128
             || a.markings.iter().any(|marking| {
                 marking.is_empty()
@@ -352,8 +378,11 @@ impl CredentialProcess {
     ) -> DispatchResult {
         let source = route.secret.clone();
         let max = self.inner.config.max_secret_bytes;
-        let secret =
-            tokio::task::spawn_blocking(move || Secret::from_bytes(source.load(max)?)).await;
+        let secret = tokio::task::spawn_blocking(move || match source {
+            SecretSource::None => Ok(Secret::keyless()),
+            source => Secret::from_bytes(source.load(max)?),
+        })
+        .await;
         let mut output = None;
         let mut error = None;
         let mut diagnostics = Vec::new();
@@ -429,7 +458,7 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
     if route.account.trim().is_empty()
         || route.tenant.is_empty()
         || route.route.is_empty()
-        || route.secret_ref.is_empty()
+        || (matches!(route.secret, SecretSource::None) != route.secret_ref.is_empty())
         || route.model.is_empty()
         || route.max_field_bytes == 0
         || route.max_input_bytes == 0
@@ -485,6 +514,29 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
         return Err(EgressError::LimitExceeded);
     }
     match (&route.provider, payload) {
+        (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(request)) => {
+            let (adapter, _, settings) = provider::route_settings(route);
+            symbiotic_ai_runtime::model::wire::compatible_embedding_body(
+                adapter,
+                &route.model,
+                &settings,
+                request,
+                route.max_input_bytes,
+            )
+            .map(|_| ())
+            .map_err(payload_error)
+        }
+        (RouteProvider::CohereRerank { .. }, ProviderPayload::Rerank(request)) => {
+            let (_, _, settings) = provider::route_settings(route);
+            symbiotic_ai_runtime::model::wire::cohere_rerank_body(
+                &route.model,
+                &settings,
+                request,
+                route.max_input_bytes,
+            )
+            .map(|_| ())
+            .map_err(payload_error)
+        }
         (RouteProvider::OpenAiChat { .. }, ProviderPayload::Chat(request))
             if !request.messages.is_empty()
                 && request.messages.len() <= 128
@@ -521,6 +573,14 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
             .map_err(|_| EgressError::LimitExceeded)
         }
         _ => Err(EgressError::InvalidRequest),
+    }
+}
+
+fn payload_error(error: symbiotic_ai_runtime::ModelError) -> EgressError {
+    if error.code() == symbiotic_ai_runtime::model::DiagnosticCode::ProviderRequestLimitExceeded {
+        EgressError::LimitExceeded
+    } else {
+        EgressError::InvalidRequest
     }
 }
 

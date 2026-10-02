@@ -94,3 +94,34 @@ async fn recovery_status_method_uses_v2_and_rejects_old_replies() {
         Err(EgressError::Version)
     ));
 }
+
+#[test]
+fn retrieval_output_decimals_survive_tagged_json_round_trips() {
+    for json in [
+        r#"{"kind":"embedding","vectors":[[0.125,-0.5]],"dimensions":2}"#,
+        r#"{"kind":"rerank","hits":[{"index":0,"score":0.75}]}"#,
+    ] {
+        let output: ProviderOutput = serde_json::from_str(json).unwrap();
+        match &output {
+            ProviderOutput::Embedding {
+                vectors,
+                dimensions,
+            } => {
+                assert_eq!(vectors, &vec![vec![0.125, -0.5]]);
+                assert_eq!(*dimensions, 2);
+            }
+            ProviderOutput::Rerank { hits } => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].index, 0);
+                assert_eq!(hits[0].score, 0.75);
+            }
+            _ => panic!("wrong output"),
+        }
+        let encoded = serde_json::to_string(&output).unwrap();
+        let recovered: ProviderOutput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(output).unwrap(),
+            serde_json::to_value(recovered).unwrap()
+        );
+    }
+}
