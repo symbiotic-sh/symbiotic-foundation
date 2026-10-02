@@ -175,7 +175,7 @@ pub struct RegistryBinding<'a> {
     /// Resolved account execution policy.
     pub account: &'a AccountExecutionPolicy,
 }
-fn invalid(_message: &str) -> ModelError {
+fn invalid() -> ModelError {
     ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration)
 }
 fn nonempty(value: &str) -> bool {
@@ -213,7 +213,7 @@ impl TransportSettings {
                     || self.reasoning_effort.is_some()
                     || self.served_model.is_some()))
         {
-            return Err(invalid("invalid retrieval settings"));
+            return Err(invalid());
         }
         Ok(())
     }
@@ -221,7 +221,7 @@ impl TransportSettings {
 
 /// Validate endpoints before they can enter public provider descriptors.
 pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), ModelError> {
-    let url = reqwest::Url::parse(endpoint).map_err(|_| invalid("invalid endpoint"))?;
+    let url = reqwest::Url::parse(endpoint).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -229,9 +229,7 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), ModelError> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(invalid(
-            "endpoint must be HTTP(S) without credentials, query or fragment",
-        ));
+        return Err(invalid());
     }
     Ok(())
 }
@@ -266,12 +264,10 @@ impl ModelQueueConfig {
             || self.requests_per_minute == Some(0)
             || self.input_units_per_minute == Some(0)
         {
-            return Err(invalid(
-                "finite nonzero timeout, concurrency, attempts and pacing are required",
-            ));
+            return Err(invalid());
         }
         if !cfg!(debug_assertions) && self.request_debug_dir.is_some() {
-            return Err(invalid("request_debug_dir requires a development build"));
+            return Err(invalid());
         }
         Ok(())
     }
@@ -279,12 +275,12 @@ impl ModelQueueConfig {
 impl ModelRegistry {
     /// Load and validate the entire JSON configuration before serving any binding.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ModelError> {
-        Self::new(serde_json::from_slice(bytes).map_err(|_| invalid("invalid configuration JSON"))?)
+        Self::new(serde_json::from_slice(bytes).map_err(|_| invalid())?)
     }
     /// Validate all entries, bindings and account policies atomically.
     pub fn new(config: RegistryConfig) -> Result<Self, ModelError> {
         if config.version != 1 {
-            return Err(invalid("unsupported configuration version"));
+            return Err(invalid());
         }
         let mut registry = Self {
             config,
@@ -307,11 +303,11 @@ impl ModelRegistry {
                             && chrono::NaiveDate::parse_from_str(&p.date, "%Y-%m-%d").is_ok()
                     }))
             {
-                return Err(invalid("invalid model or unsupported operation/adapter"));
+                return Err(invalid());
             }
             for id in std::iter::once(&model.id).chain(&model.aliases) {
                 if !nonempty(id) || registry.models.insert(id.clone(), index).is_some() {
-                    return Err(invalid("duplicate or empty model/alias"));
+                    return Err(invalid());
                 }
             }
         }
@@ -324,7 +320,7 @@ impl ModelRegistry {
                     .is_some()
                 || account.policy.response_cache_dir.is_some()
             {
-                return Err(invalid("invalid account policy; runtime owns cache paths"));
+                return Err(invalid());
             }
         }
         let mut shared = HashMap::new();
@@ -335,9 +331,7 @@ impl ModelRegistry {
                 || binding.limits.max_output_tokens == Some(0)
                 || binding.secret_ref.as_deref().is_some_and(|s| !nonempty(s))
             {
-                return Err(invalid(
-                    "binding identity and finite nonzero limits are required",
-                ));
+                return Err(invalid());
             }
             validate_endpoint(&binding.endpoint)?;
             let model = registry.model(&binding.model)?;
@@ -346,9 +340,7 @@ impl ModelRegistry {
                 || (model.adapter != ModelAdapter::OpenAiChat
                     && binding.limits.max_output_tokens.is_some())
             {
-                return Err(invalid(
-                    "output tokens are required for chat and unsupported for this adapter",
-                ));
+                return Err(invalid());
             }
             let settings = &binding.settings;
             settings.validate_retrieval(model.adapter)?;
@@ -357,7 +349,7 @@ impl ModelRegistry {
                 .as_deref()
                 .is_some_and(|s| !nonempty(s))
             {
-                return Err(invalid("empty transport setting"));
+                return Err(invalid());
             }
             if model.adapter == ModelAdapter::OpenAiChat {
                 crate::validate_chat_settings(
@@ -369,7 +361,7 @@ impl ModelRegistry {
                 ModelAdapter::OpenAiChat
                     if settings.dimensions.is_some() || settings.served_model.is_some() =>
                 {
-                    return Err(invalid("unsupported chat settings"));
+                    return Err(invalid());
                 }
                 ModelAdapter::GeminiEmbedding
                     if settings.dimensions.is_none_or(|n| n == 0)
@@ -379,14 +371,14 @@ impl ModelRegistry {
                         || binding.endpoint
                             != "https://generativelanguage.googleapis.com/v1beta" =>
                 {
-                    return Err(invalid("unsupported Gemini endpoint or settings"));
+                    return Err(invalid());
                 }
                 ModelAdapter::JevClassifier
                     if settings.dimensions.is_some()
                         || settings.thinking.is_some()
                         || settings.reasoning_effort.is_some() =>
                 {
-                    return Err(invalid("unsupported classifier settings"));
+                    return Err(invalid());
                 }
                 _ => {}
             }
@@ -394,10 +386,10 @@ impl ModelRegistry {
                 .accounts
                 .get(&binding.account_policy)
                 .map(|i| &registry.config.accounts[*i])
-                .ok_or_else(|| invalid("unknown account policy"))?;
+                .ok_or_else(invalid)?;
             let key = match &binding.account_sharing_key {
                 Some(key) if nonempty(&key.0) => serde_json::json!(["shared", key]),
-                Some(_) => return Err(invalid("empty account sharing key")),
+                Some(_) => return Err(invalid()),
                 None => serde_json::json!([
                     "tenant-account",
                     binding.identity.tenant,
@@ -405,13 +397,12 @@ impl ModelRegistry {
                 ]),
             }
             .to_string();
-            let policy =
-                serde_json::to_value(&account.policy).map_err(|_| invalid("invalid policy"))?;
+            let policy = serde_json::to_value(&account.policy).map_err(|_| invalid())?;
             if shared
                 .insert(key, policy.clone())
                 .is_some_and(|previous| previous != policy)
             {
-                return Err(invalid("shared account policies disagree"));
+                return Err(invalid());
             }
             if registry
                 .bindings
@@ -424,7 +415,7 @@ impl ModelRegistry {
                 )
                 .is_some()
             {
-                return Err(invalid("duplicate tenant/provider binding"));
+                return Err(invalid());
             }
         }
         Ok(registry)
@@ -434,7 +425,7 @@ impl ModelRegistry {
         self.models
             .get(id)
             .map(|i| &self.config.models[*i])
-            .ok_or_else(|| invalid("unknown model or alias"))
+            .ok_or_else(invalid)
     }
     /// Resolve a configured tenant/provider pair without accessing credentials.
     pub fn binding(
@@ -446,7 +437,7 @@ impl ModelRegistry {
             .bindings
             .get(&(tenant.clone(), provider.clone()))
             .map(|i| &self.config.bindings[*i])
-            .ok_or_else(|| invalid("tenant provider is not configured"))?;
+            .ok_or_else(invalid)?;
         Ok(RegistryBinding {
             model: self.model(&binding.model)?,
             account: &self.config.accounts[self.accounts[&binding.account_policy]],

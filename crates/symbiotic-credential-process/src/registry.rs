@@ -8,7 +8,27 @@ pub(crate) struct Registry(Connection);
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 5;
+const REGISTRY_SCHEMA_VERSION: u16 = 6;
+
+// Stored receipt identity/status; accounting is projected from the ledger on reads.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredReceipt {
+    attempt_digest: String,
+    status: DispatchStatus,
+    attempt_id: AttemptId,
+    reference: SpendReceiptRef,
+}
+
+impl From<&DispatchReceipt> for StoredReceipt {
+    fn from(receipt: &DispatchReceipt) -> Self {
+        Self {
+            attempt_digest: receipt.attempt_digest.clone(),
+            status: receipt.status,
+            attempt_id: receipt.attempt_id.clone(),
+            reference: receipt.reference.clone(),
+        }
+    }
+}
 
 struct PreviousAttempt {
     binding: String,
@@ -51,7 +71,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 5 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 6 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -130,7 +150,7 @@ impl Registry {
                 let receipt = previous
                     .receipt
                     .ok_or(EgressError::ReconciliationRequired)?;
-                let receipt: DispatchReceipt =
+                let receipt: StoredReceipt =
                     serde_json::from_str(&receipt).map_err(|_| EgressError::StateUnavailable)?;
                 if receipt.status == DispatchStatus::Succeeded {
                     return Err(EgressError::InvocationComplete);
@@ -216,7 +236,8 @@ impl Registry {
             reference: handoff.reservation.reference.clone(),
             spend_state: SpendState::Unknown,
         };
-        let json = serde_json::to_string(&receipt).map_err(|_| EgressError::StateUnavailable)?;
+        let json = serde_json::to_string(&StoredReceipt::from(&receipt))
+            .map_err(|_| EgressError::StateUnavailable)?;
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -263,9 +284,11 @@ impl Registry {
     }
 
     pub(crate) fn finish(&mut self, result: &DispatchResult) -> Result<(), EgressError> {
-        let receipt =
-            serde_json::to_string(&result.receipt).map_err(|_| EgressError::StateUnavailable)?;
-        let json = serde_json::to_string(result).map_err(|_| EgressError::StateUnavailable)?;
+        let mut json = serde_json::to_value(result).map_err(|_| EgressError::StateUnavailable)?;
+        json["receipt"] = serde_json::to_value(StoredReceipt::from(&result.receipt))
+            .map_err(|_| EgressError::StateUnavailable)?;
+        let receipt = json["receipt"].to_string();
+        let json = json.to_string();
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -388,10 +411,18 @@ impl Registry {
         if time >= expires {
             return Ok(AttemptStatus::Expired);
         }
-        let mut result: DispatchResult =
+        let mut result: serde_json::Value =
             serde_json::from_str(&result.ok_or(EgressError::StateUnavailable)?)
                 .map_err(|_| EgressError::StateUnavailable)?;
-        result.receipt = self.project_receipt(result.receipt)?;
+        result["receipt"] = serde_json::to_value(
+            self.project_receipt(
+                serde_json::from_value(result["receipt"].take())
+                    .map_err(|_| EgressError::StateUnavailable)?,
+            )?,
+        )
+        .map_err(|_| EgressError::StateUnavailable)?;
+        let result: DispatchResult =
+            serde_json::from_value(result).map_err(|_| EgressError::StateUnavailable)?;
         Ok(if result.error.is_some() {
             AttemptStatus::Failed { result }
         } else {
@@ -422,10 +453,7 @@ impl Registry {
         Ok(())
     }
 
-    fn project_receipt(
-        &self,
-        mut receipt: DispatchReceipt,
-    ) -> Result<DispatchReceipt, EgressError> {
+    fn project_receipt(&self, receipt: StoredReceipt) -> Result<DispatchReceipt, EgressError> {
         let (ledger_state, usage): (String, Option<String>) = self
             .0
             .query_row(
@@ -434,14 +462,19 @@ impl Registry {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(state)?;
-        receipt.usage = usage
-            .map(|usage| serde_json::from_str(&usage))
-            .transpose()
-            .map_err(|_| EgressError::StateUnavailable)?
-            .unwrap_or_default();
-        receipt.spend_state = serde_json::from_value(serde_json::Value::String(ledger_state))
-            .map_err(|_| EgressError::StateUnavailable)?;
-        Ok(receipt)
+        Ok(DispatchReceipt {
+            attempt_digest: receipt.attempt_digest,
+            status: receipt.status,
+            attempt_id: receipt.attempt_id,
+            reference: receipt.reference,
+            usage: usage
+                .map(|usage| serde_json::from_str(&usage))
+                .transpose()
+                .map_err(|_| EgressError::StateUnavailable)?
+                .unwrap_or_default(),
+            spend_state: serde_json::from_value(serde_json::Value::String(ledger_state))
+                .map_err(|_| EgressError::StateUnavailable)?,
+        })
     }
 
     pub(crate) fn receipt(&self, id: &AttemptId) -> Result<Option<DispatchReceipt>, EgressError> {
@@ -557,6 +590,40 @@ mod tests {
             "grant_revision": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn stored_receipts_leave_accounting_in_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = open(&dir.path().join("registry.sqlite"));
+        let attempt = attempt();
+        let permit = registry.issue(&attempt, 2).unwrap().permit;
+        let receipt = registry
+            .consume(&attempt, &permit, &reservation(&attempt), 2)
+            .unwrap();
+        let stored: String = registry
+            .0
+            .query_row("SELECT receipt FROM egress_permits", [], |r| r.get(0))
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert!(stored.get("usage").is_none());
+        assert!(stored.get("spend_state").is_none());
+        finish_released(&mut registry, receipt);
+        let stored: String = registry
+            .0
+            .query_row("SELECT result FROM egress_permits", [], |r| r.get(0))
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert!(stored["receipt"].get("usage").is_none());
+        assert!(stored["receipt"].get("spend_state").is_none());
+        assert_eq!(
+            registry
+                .receipt(&attempt.attempt_id())
+                .unwrap()
+                .unwrap()
+                .spend_state,
+            SpendState::Released
+        );
     }
 
     #[test]
@@ -1254,7 +1321,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 4, 6] {
+        for version in [1, 2, 3, 4, 5, 7] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();

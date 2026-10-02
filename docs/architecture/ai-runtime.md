@@ -126,8 +126,7 @@ non-serializable `SecretValue` zeroizing container; `ResolvedAuth` is also non-D
 Without a registry, raw Foundation bindings require an explicit execution policy.
 `default_model_queue_config` and `default_model_capabilities` are removed; consumers
 must configure accounts rather than infer limits from a model/operator name.
-Sensitivity remains a typed request/trace field pending protocol cleanup, but has
-no selection, cache or dispatch authority. Memory owns provider grants.
+Memory owns provider grants.
 
 ## Errors and credential boundary
 
@@ -232,8 +231,7 @@ Dropping the caller's future (a job timeout, `tokio::time::timeout` around
   `max_in_flight`.
 
 An identical caller waiting on the item, or a later identical request, gets
-the result through deduplication and the cache. Without a cache, it runs the
-request again once the item has finished, as for any finished request.
+the result through deduplication, the cache or ledger recovery.
 
 The attempt renews its lease every third of `lease_seconds`, from its claim
 until the item is completed or failed. That covers the provider call and
@@ -317,10 +315,7 @@ now enforce charge certainty across the shared queued chat, embedding, rerank an
 paths; timeout or unknown charge requires reconciliation.
 
 `provider_request_limit` (default `None`) is an absolute account request allowance
-with no implicit reset/window; `Some(0)` refuses dispatch. The first reservation fixes
-this allowance in the persistent account state, including `None`. A different
-allowance after restart is refused as `InvalidConfiguration`; no account-limit update
-API is currently defined. Money remains reporting.
+with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporting.
 
 `ModelQueueConfig` fields:
 

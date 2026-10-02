@@ -313,34 +313,37 @@ fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() 
 }
 
 #[test]
-fn spend_allowance_is_fixed_by_first_reservation_without_dropping_unknown_charge() {
-    for first_limit in [None, Some(1)] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.sqlite");
-        let mut first = reservation("first", "first", "account");
-        first.request_limit = first_limit;
-        open(&path).reserve(&first).unwrap();
-        let ledger = open(&path);
-        let mut changed = reservation("changed", "changed", "account");
-        changed.request_limit = if first_limit.is_none() { Some(1) } else { None };
+fn spend_allowance_follows_configuration_and_keeps_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let mut first = reservation("first", "first", "account");
+    first.request_limit = None;
+    open(&path).reserve(&first).unwrap();
+    let ledger = open(&path);
+    let mut next = reservation("next", "next", "account");
+    for limit in [0, 1] {
+        next.request_limit = Some(limit);
         assert!(matches!(
-            ledger.reserve(&changed),
-            Err(ModelError::InvalidRequest(
-                DiagnosticCode::InvalidConfiguration
-            ))
+            ledger.reserve(&next),
+            Err(ModelError::BudgetExhausted(_))
         ));
-        assert_eq!(
-            ledger.receipt(&first.reference).unwrap().unwrap().state,
-            SpendState::Unknown
-        );
-        assert!(ledger.receipt(&changed.reference).unwrap().is_none());
-        assert_eq!(
-            rusqlite::Connection::open(path)
-                .unwrap()
-                .query_row("SELECT used FROM spend_accounts", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        assert!(ledger.receipt(&next.reference).unwrap().is_none());
     }
+    next.request_limit = Some(2);
+    assert!(ledger.reserve(&next).unwrap());
+    let mut unlimited = reservation("unlimited", "unlimited", "account");
+    unlimited.request_limit = None;
+    assert!(ledger.reserve(&unlimited).unwrap());
+    assert_eq!(
+        ledger.receipt(&first.reference).unwrap().unwrap().state,
+        SpendState::Unknown
+    );
+    assert_eq!(
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT used FROM spend_accounts", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
 }

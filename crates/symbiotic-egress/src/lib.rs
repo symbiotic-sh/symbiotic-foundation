@@ -2,7 +2,6 @@
 //! Sign admissions only after durability and ordered publication of the grant revision.
 //! All protocol timestamps are absolute Unix seconds (UTC), never milliseconds.
 
-pub use symbiotic_core::Sensitivity;
 pub use symbiotic_model::{
     ChatMessage, ChatRequest, EmbeddingRequest, SpendReceiptRef, SpendState,
 };

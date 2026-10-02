@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use symbiotic_core::{ModelIdentity, QueueId, QueueItemId, Sensitivity, TraceId};
+use symbiotic_core::{ModelIdentity, QueueId, QueueItemId, TraceId};
 use symbiotic_model::{
     CacheEntry, ChatMessage, ChatProvider, ChatRequest, ChatResponse, InMemoryReceiptSink,
     ModelAdmission, ModelCapability, ModelError, ModelProvider, ModelQueueConfig, ProviderAuthMode,
@@ -58,7 +58,6 @@ fn request(text: &str) -> ChatRequest {
         max_output_tokens: None,
         temperature: Some(0.0),
         response_format: None,
-        sensitivity: Sensitivity::Shareable,
         role_binding: None,
         source: None,
         metadata: json!({}),
@@ -157,7 +156,6 @@ impl ChatProvider for Loopback {
                 model: self.descriptor.identity.clone(),
                 role_binding: None,
                 source: None,
-                sensitivity: Sensitivity::Shareable,
                 request_hash: String::new(),
                 response_hash: None,
                 cache: CacheTrace {

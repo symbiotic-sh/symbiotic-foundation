@@ -159,7 +159,6 @@ Owns normalized invocation traces:
 - queue item reference;
 - role binding;
 - source;
-- `sensitivity` (current required Rust field, obsolete and pending removal);
 - request/response hashes;
 - cache status;
 - token/media/cost usage;
@@ -173,10 +172,8 @@ the host decides which optional telemetry sinks receive them. Optional usage
 telemetry is distinct from Foundation's canonical spend ledger; see the
 [boundary contract](architecture/boundary.md#spend-ledger-and-budgets).
 
-Current sinks include JSONL, in-memory, fail-fast fanout, and best-effort
-wrapping for model invocation traces. Queue event traces have separate JSONL and
-in-memory sinks plus a `QueueEventTraceAdapter` that can be attached to
-`symbiotic-queue` event sinks without changing model trace readers.
+Current sinks include JSONL, in-memory and fail-fast fanout for model invocation
+traces. Queue event traces have separate JSONL and in-memory sinks.
 
 ## Auth Modes
 

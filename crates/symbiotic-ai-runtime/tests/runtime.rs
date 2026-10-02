@@ -12,7 +12,7 @@ use symbiotic_ai_runtime::{
     ModelError, ModelProvider, ModelQueueConfig, ProviderDescriptor, ReceiptStatus,
     ResponseCacheMode, Runtime, RuntimeConfig,
 };
-use symbiotic_core::{ModelIdentity, Sensitivity, TraceId};
+use symbiotic_core::{ModelIdentity, TraceId};
 use symbiotic_trace::{InvocationOutcome, ModelInvocationTrace};
 
 fn binding<P>(provider: P) -> ModelBinding<P> {
@@ -53,7 +53,6 @@ fn request(text: &str) -> ChatRequest {
         max_output_tokens: Some(32),
         temperature: Some(0.0),
         response_format: None,
-        sensitivity: Sensitivity::Shareable,
         role_binding: None,
         source: None,
         metadata: json!({}),
@@ -153,7 +152,6 @@ impl ChatProvider for Loopback {
                 model: self.descriptor.identity.clone(),
                 role_binding: request.role_binding.clone(),
                 source: request.source.clone(),
-                sensitivity: Sensitivity::Shareable,
                 request_hash: String::new(),
                 response_hash: None,
                 cache: Default::default(),

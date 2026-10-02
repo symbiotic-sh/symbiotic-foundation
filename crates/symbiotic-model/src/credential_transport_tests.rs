@@ -59,7 +59,6 @@ fn embedding_request(batch: bool) -> EmbeddingRequest {
         },
         dimensions: None,
         task: None,
-        sensitivity: Sensitivity::Shareable,
         role_binding: None,
         source: None,
         metadata: Value::Null,
@@ -73,7 +72,7 @@ async fn gemini_single_and_batch_results_cross_the_complete_credential_boundary(
             (401, KEY, format!("unauthorized {KEY}")),
             (200, KEY, format!(r#"{{"embedding":{{"values":[0.5]}},"embeddings":[{{"values":[0.5]}},{{"values":[0.5]}}],"ignored":"{KEY}"}}"#)),
             (200, KEY, format!(r#"{{"embedding":{{"values":["{KEY}"]}},"embeddings":[{{"values":["{KEY}"]}}]}}"#)),
-            (200, "123400000", r#"{"embedding":{"values":[1.234e8]},"embeddings":[{"values":[1.234e8]},{"values":[1.234e8]}]}"#.into()),
+            (200, "123400000", r#"{"embedding":{"values":[123400000]},"embeddings":[{"values":[123400000]},{"values":[123400000]}]}"#.into()),
         ] {
             let (endpoint, server) = fixture(TcpListener::bind("127.0.0.1:0").unwrap(), status, &body, None);
             let result = GeminiEmbeddingProvider::new("gemini", "model", key, 1)
@@ -150,7 +149,7 @@ async fn chat_classifier_final_errors_and_normalized_answers_cross_the_same_boun
     for (key, reply, questions) in [
         (
             "123400000",
-            r#"{"answer":1.234e8}"#,
+            r#"{"answer":123400000}"#,
             vec![ClassifierQuestion::noul("answer", "yes?", None, None)],
         ),
         (

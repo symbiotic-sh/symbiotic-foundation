@@ -189,15 +189,6 @@ impl BindingIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Sensitivity {
-    Public,
-    Shareable,
-    Private,
-    Restricted,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

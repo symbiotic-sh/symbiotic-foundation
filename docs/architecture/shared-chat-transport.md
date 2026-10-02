@@ -7,10 +7,7 @@ one shared implementation from retaining response metadata consistently.
 
 The shared Foundation adapter encodes OpenAI-compatible requests, executes HTTP
 and decodes responses. Builder-level thinking and reasoning effort preserve
-`ChatRequest` source compatibility. Memory can supply its existing reqwest client
-for connection-pool reuse; Foundation's reqwest dependency aligns with Memory's
-0.13 client type. A supplied client does not confer retry, timeout or budget policy
-ownership. Transport and execution policy follow the Foundation
+`ChatRequest` source compatibility. Transport and execution policy follow the Foundation
 [boundary contract](boundary.md#ownership); budgets follow its
 [spend contract](boundary.md#spend-ledger-and-budgets).
 
