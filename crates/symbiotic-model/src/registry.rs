@@ -154,13 +154,42 @@ fn nonempty(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+/// Validate endpoints before they can enter public provider descriptors.
+pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), ModelError> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| invalid("invalid endpoint"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid(
+            "endpoint must be HTTP(S) without credentials, query or fragment",
+        ));
+    }
+    Ok(())
+}
+
 impl ModelQueueConfig {
     /// Refuse unusable execution policy rather than normalizing it silently.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.max_in_flight == 0
             || self.max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
             || self.lease_seconds == 0
-            || self.lease_seconds > i64::MAX as u64 / 1000
+            || i64::try_from(self.lease_seconds)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|duration| chrono::Utc::now().checked_add_signed(duration))
+                .is_none()
+            || self.retry_jitter_seconds.checked_add(1).is_none()
+            || self.budget_renewal_seconds.is_some_and(|seconds| {
+                i64::try_from(seconds)
+                    .ok()
+                    .and_then(chrono::Duration::try_seconds)
+                    .and_then(|duration| chrono::Utc::now().checked_add_signed(duration))
+                    .is_none()
+            })
             || self.logical_retry_attempts == 0
             || self.retry_attempts == 0
             || self
@@ -242,19 +271,7 @@ impl ModelRegistry {
                     "binding identity and finite nonzero limits are required",
                 ));
             }
-            let url =
-                reqwest::Url::parse(&binding.endpoint).map_err(|_| invalid("invalid endpoint"))?;
-            if !matches!(url.scheme(), "http" | "https")
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(invalid(
-                    "endpoint must be HTTP(S) without credentials, query or fragment",
-                ));
-            }
+            validate_endpoint(&binding.endpoint)?;
             let model = registry.model(&binding.model)?;
             if (model.adapter == ModelAdapter::OpenAiChat
                 && binding.limits.max_output_tokens.is_none())

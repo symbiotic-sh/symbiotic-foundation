@@ -138,3 +138,27 @@ fn nested_identity_unknown_fields_are_refused() {
         assert!(load(&config).is_err(), "{identity}/{field}");
     }
 }
+
+#[test]
+fn regression_policy_rejects_unrepresentable_durations() {
+    for (field, value) in [
+        ("retry_jitter_seconds", u64::MAX),
+        ("budget_renewal_seconds", u64::MAX),
+        ("budget_renewal_seconds", i64::MAX as u64 / 1000 + 1),
+        ("lease_seconds", i64::MAX as u64 / 1000),
+    ] {
+        let mut config = config();
+        config["accounts"][0]["policy"][field] = json!(value);
+        let error = load(&config).expect_err(field);
+        assert!(matches!(
+            error,
+            symbiotic_model::ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration
+            )
+        ));
+    }
+    let mut config = config();
+    config["accounts"][0]["policy"]["retry_jitter_seconds"] = json!(u64::MAX - 1);
+    config["accounts"][0]["policy"]["budget_renewal_seconds"] = json!(0);
+    assert!(load(&config).is_ok());
+}

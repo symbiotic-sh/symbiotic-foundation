@@ -307,14 +307,30 @@ impl State {
         self.items.get(item_id).cloned()
     }
 
-    fn lease(&mut self, item_id: &str, worker_id: &str, lease_seconds: u64, now: DateTime<Utc>) {
+    fn lease(
+        &mut self,
+        item_id: &str,
+        worker_id: &str,
+        lease_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
         self.set_status(item_id, QueueStatus::Running);
         let item = self.items.get_mut(item_id).expect("claimed item exists");
         item.attempt = item.attempt.saturating_add(1);
         item.lease_owner = Some(worker_id.to_string());
-        item.lease_until = Some(now + ChronoDuration::seconds(lease_seconds.max(1) as i64));
+        item.lease_until = Some(lease_until);
         item.updated_at = now;
     }
+}
+
+fn lease_deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, QueueError> {
+    i64::try_from(seconds.max(1))
+        .ok()
+        .and_then(ChronoDuration::try_seconds)
+        .and_then(|duration| now.checked_add_signed(duration))
+        .ok_or(QueueError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))
 }
 
 fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<symbiotic_core::DiagnosticCode>)> {
@@ -346,9 +362,17 @@ impl QueueBackend for MemoryQueue {
             ));
         }
         let now = Utc::now();
+        let lease_until = lease_deadline(now, request.lease_seconds)?;
         let (reclaimed, claimed) = {
             let mut state = self.lock()?;
             let queue_id = request.queue_id.0.as_str();
+            if state
+                .cooldowns
+                .get(queue_id)
+                .is_some_and(|until| *until > Utc::now())
+            {
+                return Ok(Vec::new());
+            }
             let reclaimed = state.reclaim_expired(queue_id, now);
             let mut limit = request.limit.max(1);
             if let Some(max_in_flight) = request.max_in_flight {
@@ -381,7 +405,7 @@ impl QueueBackend for MemoryQueue {
             let claimed = ids
                 .iter()
                 .map(|id| {
-                    state.lease(id, &request.worker_id, request.lease_seconds, now);
+                    state.lease(id, &request.worker_id, lease_until, now);
                     state.items[id].clone()
                 })
                 .collect::<Vec<_>>();
@@ -406,6 +430,7 @@ impl QueueBackend for MemoryQueue {
             ));
         }
         let now = Utc::now();
+        let lease_until = lease_deadline(now, lease_seconds)?;
         let (reclaimed, retired, claimed, missing) = {
             let mut state = self.lock()?;
             let queue_id = state
@@ -428,9 +453,13 @@ impl QueueBackend for MemoryQueue {
                 let claimable =
                     matches!(current.status, QueueStatus::Pending | QueueStatus::Failed)
                         && current.run_after <= now
+                        && state
+                            .cooldowns
+                            .get(&queue_id)
+                            .is_none_or(|until| *until <= Utc::now())
                         && max_in_flight.is_none_or(|cap| state.running_count(&queue_id) < cap);
                 let claimed = claimable.then(|| {
-                    state.lease(&item_id.0, worker_id, lease_seconds, now);
+                    state.lease(&item_id.0, worker_id, lease_until, now);
                     state.items[&item_id.0].clone()
                 });
                 (reclaimed, retired, claimed, false)
@@ -466,7 +495,7 @@ impl QueueBackend for MemoryQueue {
                 .items
                 .get_mut(&item_id.0)
                 .expect("running item exists");
-            item.lease_until = Some(now + ChronoDuration::seconds(lease_seconds.max(1) as i64));
+            item.lease_until = Some(lease_deadline(now, lease_seconds)?);
             item.updated_at = now;
             Ok(())
         })?;

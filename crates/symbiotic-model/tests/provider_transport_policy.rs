@@ -268,3 +268,33 @@ async fn built_in_clients_refuse_redirects_without_contacting_the_target() {
         }
     }
 }
+
+#[test]
+fn regression_raw_endpoints_refuse_credentials_before_descriptor_publication() {
+    use symbiotic_model::ModelProvider;
+    for endpoint in [
+        "https://synthetic-user:synthetic-password@example.com/v1",
+        "https://example.com/v1?api_key=synthetic-query-key",
+        "https://example.com/v1#synthetic-fragment",
+        "file:///synthetic-path",
+    ] {
+        let chat = OpenAiCompatibleChatProvider::new("fixture", "fixture", endpoint, "")
+            .with_request_limit(65536)
+            .with_response_limit(65536);
+        let classifier = JevClassifierProvider::new("fixture", "fixture", endpoint, "")
+            .with_request_limit(65536)
+            .with_response_limit(65536);
+        for provider in [
+            &chat as &dyn ModelProvider,
+            &classifier as &dyn ModelProvider,
+        ] {
+            assert!(provider.validate_configuration().is_err(), "{endpoint}");
+            assert!(!format!("{:?}", provider.descriptor()).contains("synthetic-"));
+            assert!(
+                !serde_json::to_string(provider.descriptor())
+                    .unwrap()
+                    .contains("synthetic-")
+            );
+        }
+    }
+}

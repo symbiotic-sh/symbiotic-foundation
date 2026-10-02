@@ -420,11 +420,16 @@ impl QueueBackend for SqliteQueue {
             ));
         }
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(request.lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, request.lease_seconds)?;
         let mut limit = request.limit.max(1);
         let claimed = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+            if cooldown_active(&tx, &request.queue_id)? {
+                return Ok(Vec::new());
+            }
             reclaim_expired_in_tx(&tx, &request.queue_id, now)?;
             if let Some(max_in_flight) = request.max_in_flight {
                 let running: i64 = tx
@@ -504,11 +509,16 @@ impl QueueBackend for SqliteQueue {
             ));
         }
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, lease_seconds)?;
         let claimed = {
             let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn.transaction().map_err(storage_error)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
             let item = get_required(&tx, item_id)?;
+            if cooldown_active(&tx, &item.queue_id)? {
+                return Ok(None);
+            }
             reclaim_expired_in_tx(&tx, &item.queue_id, now)?;
             if let Some(max_in_flight) = max_in_flight {
                 let running: i64 = tx
@@ -588,7 +598,7 @@ impl QueueBackend for SqliteQueue {
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
         let now = Utc::now();
-        let lease_until = now + ChronoDuration::seconds(lease_seconds.max(1) as i64);
+        let lease_until = lease_deadline(now, lease_seconds)?;
         let item = update_running_item(&self.conn, item_id, worker_id, |conn| {
             conn.execute(
                 "update queue_items set lease_until = ?2, updated_at = ?3 where item_id = ?1",
@@ -789,6 +799,34 @@ impl QueueBackend for SqliteQueue {
     }
 }
 
+fn lease_deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, QueueError> {
+    i64::try_from(seconds.max(1))
+        .ok()
+        .and_then(ChronoDuration::try_seconds)
+        .and_then(|duration| now.checked_add_signed(duration))
+        .ok_or(QueueError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))
+}
+
+fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "select cooldown_until from queue_cooldowns where queue_id = ?1",
+            params![queue_id.0],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    raw.map(|value| {
+        parse_ts(value)
+            .map(|until| until > Utc::now())
+            .map_err(storage_error)
+    })
+    .transpose()
+    .map(|active| active.unwrap_or(false))
+}
+
 const QUEUE_SCHEMA_VERSION: u32 = 2;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
@@ -802,6 +840,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     let schema_version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage_error)?;
+    // Under the no-migrations rule, initialization atomically stamps the current queue schema and other versions or unversioned queue layouts are refused.
     if schema_version == i64::from(QUEUE_SCHEMA_VERSION) {
         return Ok(());
     }

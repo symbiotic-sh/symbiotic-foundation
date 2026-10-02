@@ -864,7 +864,7 @@ impl JevClassifierProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": base_url }),
+                metadata: serde_json::json!({ "wire": "systemone", "served_model": model, "endpoint": crate::registry::validate_endpoint(&base_url).ok().map(|()| base_url.as_str()) }),
             },
             client: HttpClient::default(),
             base_url,
@@ -1089,6 +1089,7 @@ impl ModelProvider for JevClassifierProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        crate::registry::validate_endpoint(&self.base_url)?;
         self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;

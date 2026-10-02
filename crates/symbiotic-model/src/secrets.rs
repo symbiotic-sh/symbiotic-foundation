@@ -73,20 +73,25 @@ impl CredentialBoundary {
     }
 }
 
-fn numeric_spellings(number: &serde_json::Number) -> Vec<String> {
-    let mut spellings = vec![number.to_string()];
-    if let Some(value) = number.as_f64() {
+fn numeric_float_spellings(value: f64) -> SecretValue<Vec<String>> {
+    let mut spellings = SecretValue::new(vec![value.to_string()]);
+    if let Ok(value) = serde_json::to_string(&value) {
+        spellings.push(value);
+    }
+    let value = value as f32;
+    if value.is_finite() {
         spellings.push(value.to_string());
         if let Ok(value) = serde_json::to_string(&value) {
             spellings.push(value);
         }
-        let value = value as f32;
-        if value.is_finite() {
-            spellings.push(value.to_string());
-            if let Ok(value) = serde_json::to_string(&value) {
-                spellings.push(value);
-            }
-        }
+    }
+    spellings
+}
+
+fn numeric_spellings(number: &serde_json::Number) -> SecretValue<Vec<String>> {
+    let mut spellings = SecretValue::new(vec![number.to_string()]);
+    if let Some(value) = number.as_f64() {
+        spellings.append(&mut numeric_float_spellings(value));
     }
     spellings
 }
@@ -94,8 +99,12 @@ fn numeric_spellings(number: &serde_json::Number) -> Vec<String> {
 /// The finite credential encoding set, including numeric re-spellings.
 fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate::ModelError> {
     let mut encodings = SecretValue::new(vec![secret.to_owned()]);
-    if let Ok(serde_json::Value::Number(number)) = serde_json::from_str(secret) {
-        encodings.extend(numeric_spellings(&number));
+    // Parse borrowed text directly into a primitive; JSON deserialization can
+    // retain credential text in an arbitrary-precision Number or error scratch.
+    if let Ok(value) = secret.trim().parse::<f64>()
+        && value.is_finite()
+    {
+        encodings.append(&mut numeric_float_spellings(value));
     }
     let escaped = SecretValue::new(serde_json::to_string(secret).map_err(|_| {
         crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidCredentialEncoding)
@@ -103,17 +112,22 @@ fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate:
     encodings.push(escaped[1..escaped.len() - 1].to_owned());
     for all in [false, true] {
         for upper in [false, true] {
-            let mut encoded = String::new();
+            let mut encoded = SecretValue::new(String::new());
             for byte in secret.bytes() {
                 if !all && (byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)) {
                     encoded.push(char::from(byte));
-                } else if upper {
-                    encoded.push_str(&format!("%{byte:02X}"));
                 } else {
-                    encoded.push_str(&format!("%{byte:02x}"));
+                    let digits = if upper {
+                        b"0123456789ABCDEF"
+                    } else {
+                        b"0123456789abcdef"
+                    };
+                    encoded.push('%');
+                    encoded.push(char::from(digits[usize::from(byte >> 4)]));
+                    encoded.push(char::from(digits[usize::from(byte & 15)]));
                 }
             }
-            encodings.push(encoded);
+            encodings.push(std::mem::take(&mut *encoded));
         }
     }
     for engine in [
@@ -155,9 +169,9 @@ pub(crate) fn check_response(
         return Ok(());
     }
     let encodings = credential_encodings(secret)?;
-    let wire = serde_json::to_string(value).map_err(|_| {
+    let wire = SecretValue::new(serde_json::to_string(value).map_err(|_| {
         crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidProviderResponse)
-    })?;
+    })?);
     if contains(value, &encodings) || contains_text(&wire, &encodings) {
         return Err(crate::ModelError::Provider(
             symbiotic_core::DiagnosticCode::CredentialBearingProviderResponseRefused,
@@ -280,6 +294,21 @@ mod tests {
         let normalized: f32 = serde_json::from_value(raw).unwrap();
         assert!(check_response(&serde_json::json!([normalized]), "123400000").is_err());
     }
+    #[test]
+    fn regression_numeric_scratch_uses_zeroizing_storage() {
+        let number = serde_json::Number::from(123400000);
+        let mut scratch: SecretValue<Vec<String>> = numeric_spellings(&number);
+        assert!(scratch.iter().any(|value| value == "123400000"));
+        scratch.zeroize();
+        assert!(scratch.is_empty());
+        for secret in ["123400000", "1.234e8", "0.123456789", "-123400000"] {
+            let encodings = credential_encodings(secret).unwrap();
+            let normalized: f32 = serde_json::from_str(secret).unwrap();
+            assert!(check_response(&serde_json::json!([normalized]), secret).is_err());
+            assert!(encodings.iter().any(|value| value == secret));
+        }
+    }
+
     #[test]
     fn secret_clones_are_owned_zeroizing_containers() {
         let mut secret = SecretValue::new(String::from("synthetic"));

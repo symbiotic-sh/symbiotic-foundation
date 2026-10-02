@@ -1244,7 +1244,7 @@ where
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
             QueueStatus::Stopped => return Err(dead_item_retry_error(&enqueue.item)),
-            QueueStatus::Dead if budget_renewed(&enqueue.item, config) => {
+            QueueStatus::Dead if budget_renewed(&enqueue.item, config)? => {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
             QueueStatus::Dead => {
@@ -1396,7 +1396,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         };
         match current.status {
             QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
-            QueueStatus::Dead if budget_renewed(&current, config) => {
+            QueueStatus::Dead if budget_renewed(&current, config)? => {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1696,13 +1696,29 @@ where
                     failed_timing(),
                 )
                 .await;
-            let delay_ms = retry_delay_ms(
+            let delay_ms = match retry_delay_ms(
                 item.attempt,
                 config,
                 &item.item_id,
                 &this.request_hash,
                 &err,
-            );
+            ) {
+                Ok(delay) => delay,
+                Err(err) => {
+                    let failed = queue
+                        .fail_with(
+                            &item.item_id,
+                            worker_id,
+                            Failure {
+                                error: err.code(),
+                                error_class: Some(error_class(&err)),
+                                run_after: None,
+                            },
+                        )
+                        .await;
+                    return Settled::Failed { err, failed };
+                }
+            };
             // Failed limiter state refuses visibly and cannot admit a retry.
             if is_transient(&err)
                 && let Err(cooldown_err) =
@@ -1886,8 +1902,8 @@ fn retry_delay_ms(
     item_id: &QueueItemId,
     request_hash: &str,
     err: &ModelError,
-) -> u64 {
-    retry_backoff_ms(attempt, config.retry_base_delay_ms)
+) -> Result<u64, ModelError> {
+    Ok(retry_backoff_ms(attempt, config.retry_base_delay_ms)
         .saturating_add(
             retry_jitter_seconds(
                 config.retry_jitter_seconds,
@@ -1895,10 +1911,10 @@ fn retry_delay_ms(
                 request_hash,
                 attempt,
                 err,
-            )
+            )?
             .saturating_mul(1_000),
         )
-        .clamp(1, 120_000)
+        .clamp(1, 120_000))
 }
 
 #[cfg(test)]
@@ -1914,7 +1930,9 @@ fn retry_after_seconds(
         retry_jitter_seconds: max_jitter_seconds,
         ..ModelQueueConfig::default()
     };
-    retry_delay_ms(attempt, &config, item_id, request_hash, err).div_ceil(1_000)
+    retry_delay_ms(attempt, &config, item_id, request_hash, err)
+        .unwrap()
+        .div_ceil(1_000)
 }
 
 #[cfg(feature = "queue")]
@@ -1924,9 +1942,9 @@ fn retry_jitter_seconds(
     request_hash: &str,
     attempt: u32,
     err: &ModelError,
-) -> u64 {
+) -> Result<u64, ModelError> {
     if max_jitter_seconds == 0 {
-        return 0;
+        return Ok(0);
     }
     let err_kind = match err {
         ModelError::RateLimited(_) => "rate_limited",
@@ -1942,17 +1960,30 @@ fn retry_jitter_seconds(
     let digest = hasher.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(bytes) % (max_jitter_seconds + 1)
+    let range = max_jitter_seconds
+        .checked_add(1)
+        .ok_or(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))?;
+    Ok(u64::from_le_bytes(bytes) % range)
 }
 
 /// Whether a request another call exhausted (or that was exhausted before a
 /// restart) gets a fresh attempt budget: only when the policy renews budgets
 /// and the renewal time has passed since the request went dead.
 #[cfg(feature = "queue")]
-fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> bool {
-    config.budget_renewal_seconds.is_some_and(|seconds| {
-        Utc::now() - item.updated_at >= ChronoDuration::seconds(seconds as i64)
-    })
+fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> Result<bool, ModelError> {
+    let Some(seconds) = config.budget_renewal_seconds else {
+        return Ok(false);
+    };
+    let deadline = i64::try_from(seconds)
+        .ok()
+        .and_then(ChronoDuration::try_seconds)
+        .and_then(|duration| item.updated_at.checked_add_signed(duration))
+        .ok_or(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ))?;
+    Ok(Utc::now() >= deadline)
 }
 
 #[cfg(feature = "queue")]
@@ -2109,7 +2140,7 @@ async fn reenqueue_dead_item(
         max_attempts: state.max_attempts,
     };
     let payload = model_queue_payload(&capability, request_hash, descriptor, next_state);
-    let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err);
+    let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err)?;
     // Replace the dead item only while it is still the newest for the
     // request: a caller holding a stale item must not start a second chain.
     let outcome = queue
@@ -2454,15 +2485,14 @@ async fn wait_for_model_cooldown(
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
 ) -> Result<(), ModelError> {
-    let durable_until = queue
-        .cooldown_until(queue_id)
-        .await
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
-    let sleep_for = durable_until.and_then(|until| (until - Utc::now()).to_std().ok());
-    if let Some(sleep_for) = sleep_for {
-        tokio::time::sleep(sleep_for).await;
+    loop {
+        let durable_until = queue.cooldown_until(queue_id).await.map_err(queue_error)?;
+        let sleep_for = durable_until.and_then(|until| (until - Utc::now()).to_std().ok());
+        match sleep_for {
+            Some(duration) if !duration.is_zero() => tokio::time::sleep(duration).await,
+            _ => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 #[cfg(feature = "queue")]
@@ -2674,7 +2704,7 @@ impl OpenAiCompatibleChatProvider {
                 auth_mode: ProviderAuthMode::ApiKey {
                     secret_ref: "runtime".to_string(),
                 },
-                metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": base_url }),
+                metadata: serde_json::json!({ "wire": "openai-compatible", "endpoint": registry::validate_endpoint(&base_url).ok().map(|()| base_url.as_str()) }),
             },
             client: HttpClient::default(),
             base_url,
@@ -2744,6 +2774,7 @@ impl ModelProvider for OpenAiCompatibleChatProvider {
     }
 
     fn validate_configuration(&self) -> Result<(), ModelError> {
+        registry::validate_endpoint(&self.base_url)?;
         self.client.get()?;
         required_byte_limit(self.max_request_bytes)?;
         required_byte_limit(self.max_response_bytes)?;
@@ -3404,6 +3435,25 @@ mod tests {
     use std::time::Duration;
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
+
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn regression_cooldown_wait_rereads_after_waking() {
+        let queue = std::sync::Arc::new(symbiotic_queue::MemoryQueue::new());
+        let queue_id = QueueId::new("extended-cooldown");
+        queue
+            .note_cooldown(&queue_id, Utc::now() + ChronoDuration::milliseconds(100))
+            .await
+            .unwrap();
+        let waiter = wait_for_model_cooldown(queue.as_ref(), &queue_id);
+        tokio::pin!(waiter);
+        // Poll through the initial read so the extension occurs while sleeping.
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        let extended = Utc::now() + ChronoDuration::milliseconds(250);
+        queue.note_cooldown(&queue_id, extended).await.unwrap();
+        waiter.await.unwrap();
+        assert!(Utc::now() >= extended);
+    }
 
     #[test]
     fn failed_http_client_construction_refuses_chat_and_embedding_configuration() {

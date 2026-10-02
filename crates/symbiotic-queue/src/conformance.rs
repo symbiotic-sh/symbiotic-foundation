@@ -45,6 +45,8 @@ macro_rules! queue_backend_conformance {
             failure_without_retry_deadline_stops_with_attempts_remaining,
             enqueue_replacing_supersedes_only_the_current_item,
             cooldown_only_moves_forward,
+            regression_claims_observe_extended_cooldowns,
+            regression_unrepresentable_leases_are_refused,
             unknown_item_is_absent,
         );
     };
@@ -665,4 +667,71 @@ pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
     assert_eq!(duplicate.disposition, EnqueueDisposition::TerminalDuplicate);
     assert_eq!(duplicate.item.item_id, item.item_id);
     assert_eq!(duplicate.item.last_error_class.as_deref(), Some("queue"));
+}
+
+/// A cooldown extension accepted before a claim must keep both claim APIs pending.
+pub async fn regression_claims_observe_extended_cooldowns(queue: Arc<dyn QueueBackend>) {
+    let item = queue.enqueue(request("cooldown-claim")).await.unwrap().item;
+    let now = Utc::now();
+    queue
+        .note_cooldown(&queue_id(), now - ChronoDuration::seconds(1))
+        .await
+        .unwrap();
+    assert!(queue.cooldown_until(&queue_id()).await.unwrap().unwrap() < Utc::now());
+    // Simulate the extension between a caller's final read and claim acceptance.
+    queue
+        .note_cooldown(&queue_id(), now + ChronoDuration::seconds(60))
+        .await
+        .unwrap();
+    assert!(
+        queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queue
+            .claim(claim("worker", 1, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let item = queue.get_item(&item.item_id).await.unwrap().unwrap();
+    assert_eq!(item.status, QueueStatus::Pending);
+    assert_eq!(item.attempt, 0);
+}
+
+/// Invalid leases must fail without spending an attempt or poisoning the backend.
+pub async fn regression_unrepresentable_leases_are_refused(queue: Arc<dyn QueueBackend>) {
+    let item = queue.enqueue(request("invalid-lease")).await.unwrap().item;
+    for seconds in [u64::MAX, i64::MAX as u64 / 1000] {
+        assert!(matches!(
+            queue
+                .claim_item(&item.item_id, "worker", seconds, None)
+                .await,
+            Err(QueueError::InvalidRequest(_))
+        ));
+        let mut request = claim("worker", 1, None);
+        request.lease_seconds = seconds;
+        assert!(matches!(
+            queue.claim(request).await,
+            Err(QueueError::InvalidRequest(_))
+        ));
+    }
+    assert_eq!(
+        queue
+            .get_item(&item.item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        0
+    );
+    claim_one(queue.as_ref(), &item.item_id, 60).await;
+    assert!(matches!(
+        queue.heartbeat(&item.item_id, "worker", u64::MAX).await,
+        Err(QueueError::InvalidRequest(_))
+    ));
+    queue.heartbeat(&item.item_id, "worker", 60).await.unwrap();
 }
