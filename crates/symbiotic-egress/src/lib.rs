@@ -28,6 +28,11 @@ pub enum EgressError {
     /// Invalid fields, digest or immutable invocation binding.
     #[error("invalid egress request")]
     InvalidRequest,
+    /// Configured identity and response bounds cannot fit in the reply frame.
+    #[error(
+        "max_frame_bytes must fit the reply envelope plus max_field_bytes identity bounds and max_response_bytes response bound"
+    )]
+    InvalidFrameConfiguration,
     /// Admission authentication failed.
     #[error("invalid admission authentication")]
     Unauthorized,

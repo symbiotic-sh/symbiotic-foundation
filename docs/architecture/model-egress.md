@@ -288,7 +288,11 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
 isolation, or explicitly pools execution across routes or tenants. Shared bindings
 must agree on account limits. Each route requires all `RouteConfig` fields documented in the Rust type, including
-finite field/input/response/token/concurrency/timeout settings. These are configured
+finite field/input/response/token/concurrency/timeout settings. The escaped identity
+field bounds, response allowance and reply envelope must fit `max_frame_bytes`
+together; invalid bounds name `max_frame_bytes`, `max_field_bytes` and
+`max_response_bytes`, and an oversized reply returns `LimitExceeded`.
+These are configured
 limits, not measured capacity; their labels and qualification follow
 [boundary.md](boundary.md#bounds-as-labelled-settings). Startup registers every
 route with the runtime. Concurrency, rate buckets and cooldowns are grouped by
@@ -297,8 +301,9 @@ independent tenant accounts remain isolated. The same non-null sharing key
 explicitly pools execution limits across routes, models and tenants. Bindings
 in one group must agree on concurrency and pacing limits or startup is refused.
 Route and registry validation runs before creating state, acquiring the process
-lock, loading the admission key or opening the runtime. Configuration conflicts
-return `InvalidRequest`; actual state/IO failures return `StateUnavailable`.
+lock, loading the admission key or opening the runtime. Frame-bound conflicts
+return `InvalidFrameConfiguration`; other configuration conflicts return
+`InvalidRequest`; actual state/IO failures return `StateUnavailable`.
 Dropping the last process handle explicitly releases its lock so descriptors
 inherited by concurrently spawned children cannot delay a subsequent reopen.
 Unknown config fields
