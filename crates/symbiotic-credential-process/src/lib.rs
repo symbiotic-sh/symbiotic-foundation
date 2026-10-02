@@ -36,6 +36,8 @@ pub enum RouteProvider {
         dimensions: usize,
         /// Full-vector ceiling for reduced-dimension requests.
         embedding_full_dimensions: usize,
+        /// Usable input token capacity after provider/model special/task tokens.
+        embedding_input_tokens: usize,
     },
     /// Cohere-compatible rerank protocol with hard candidate/input bounds.
     CohereRerank {
@@ -45,6 +47,10 @@ pub enum RouteProvider {
         rerank_input_bytes: usize,
         /// Maximum candidate count.
         rerank_candidates: usize,
+        /// Usable query/document token capacity after provider/model overhead.
+        rerank_context_tokens: usize,
+        /// Provider/model query token capacity.
+        rerank_query_tokens: usize,
     },
 }
 

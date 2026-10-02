@@ -568,7 +568,10 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
         ModelAdapter::OllamaEmbedding,
         ModelAdapter::CohereRerank,
     ] {
-        for echo in [false, true] {
+        for (echo, incomplete) in [(false, false), (true, false), (false, true)] {
+            if incomplete && adapter == ModelAdapter::OllamaEmbedding {
+                continue;
+            }
             let body = match adapter {
                 ModelAdapter::CohereRerank => {
                     json!({"results":[{"index":0,"relevance_score":0.7}]})
@@ -596,7 +599,7 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
                 "identity":{"tenant":"tenant","provider":"provider","revision":"1","account":"account"},
                 "model":"example-chat","endpoint":endpoint,"secret_ref":"synthetic","account_policy":"policy","account_sharing_key":null,
                 "limits":{"max_request_bytes":4096,"max_response_bytes":4096,"max_output_tokens":null},
-                "settings": if rerank {json!({"rerank_candidates":2,"rerank_input_bytes":64})} else {json!({"dimensions":2,"embedding_full_dimensions":1024})}
+                "settings": if rerank {json!({"rerank_candidates":2,"rerank_input_bytes":64,"rerank_context_tokens":4093,"rerank_query_tokens":2048})} else {json!({"dimensions":2,"embedding_full_dimensions":1024,"embedding_input_tokens":8192})}
             }]);
             let state = tempfile::tempdir().unwrap();
             let receipts = Arc::new(InMemoryReceiptSink::default());
@@ -622,7 +625,7 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
             let result = match provider {
                 ConfiguredProvider::Embedding(provider) => provider
                     .embed(EmbeddingRequest {
-                        inputs: vec!["input".into()],
+                        inputs: vec!["input".into(); if incomplete { 2 } else { 1 }],
                         dimensions: None,
                         task: None,
                         sensitivity: symbiotic_core::Sensitivity::Private,
@@ -638,8 +641,8 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
                 ConfiguredProvider::Rerank(provider) => provider
                     .rerank(RerankRequest {
                         query: "query".into(),
-                        documents: vec!["candidate".into()],
-                        top_k: Some(1),
+                        documents: vec!["candidate".into(); if incomplete { 2 } else { 1 }],
+                        top_k: None,
                         sensitivity: symbiotic_core::Sensitivity::Private,
                         role_binding: None,
                         source: None,
@@ -653,8 +656,14 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
                 _ => panic!("wrong adapter"),
             };
             server.join().unwrap();
-            if echo {
+            if echo || incomplete {
                 assert!(matches!(result, Err(ModelError::Provider(_))));
+                assert!(
+                    !receipts
+                        .receipts()
+                        .iter()
+                        .any(|r| r.status == symbiotic_ai_runtime::ReceiptStatus::Succeeded)
+                );
             } else {
                 let trace = result.unwrap();
                 assert!(trace.queue_item_id.is_some());

@@ -121,18 +121,24 @@ pub(crate) fn route_settings(
             operator,
             dimensions,
             embedding_full_dimensions,
+            embedding_input_tokens,
         } => {
             settings.dimensions = Some(*dimensions);
             settings.embedding_full_dimensions = Some(*embedding_full_dimensions);
+            settings.embedding_input_tokens = Some(*embedding_input_tokens);
             (*adapter, operator.as_str())
         }
         RouteProvider::CohereRerank {
             operator,
             rerank_input_bytes,
             rerank_candidates,
+            rerank_context_tokens,
+            rerank_query_tokens,
         } => {
             settings.rerank_input_bytes = Some(*rerank_input_bytes);
             settings.rerank_candidates = Some(*rerank_candidates);
+            settings.rerank_context_tokens = Some(*rerank_context_tokens);
+            settings.rerank_query_tokens = Some(*rerank_query_tokens);
             (model::ModelAdapter::CohereRerank, operator.as_str())
         }
     };

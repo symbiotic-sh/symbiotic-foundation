@@ -267,9 +267,13 @@ creation/rotation is performed. Secret buffers and adapter key storage zeroize o
 
 Configured providers include `open_ai_chat { operator }`,
 `gemini_embedding { dimensions }`, `compatible_embedding { adapter, operator,
-dimensions, embedding_full_dimensions }` (adapter `open_ai_embedding` or
+dimensions, embedding_full_dimensions, embedding_input_tokens }` (adapter `open_ai_embedding` or
 `ollama_embedding`), and `cohere_rerank { operator, rerank_input_bytes,
-rerank_candidates }`. They compile into the same validated registry as embedded
+rerank_candidates, rerank_context_tokens, rerank_query_tokens }`. The token budgets
+are the deployed model's usable query/document context after special/template tokens
+and its query capacity. The shared adapter conservatively bounds UTF-8 bytes against
+these token capacities and sends `max_tokens_per_doc` explicitly; see
+[the admission contract](ai-runtime.md#configured-registry). They compile into the same validated registry as embedded
 calls. Compatible transports use the configured base URL and preserve one HTTP
 request per permit; Ollama batching is refused. Chat uses its configured base URL; Gemini is pinned
 to `https://generativelanguage.googleapis.com/v1beta` and safe model-name characters.

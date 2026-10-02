@@ -1714,6 +1714,8 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                     operator: "test".into(),
                     rerank_input_bytes: 64,
                     rerank_candidates: 2,
+                    rerank_context_tokens: 16,
+                    rerank_query_tokens: 8,
                 }
             } else {
                 RouteProvider::CompatibleEmbedding {
@@ -1721,6 +1723,7 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                     operator: "test".into(),
                     dimensions: 2,
                     embedding_full_dimensions: 1024,
+                    embedding_input_tokens: 16,
                 }
             };
             if !rerank {
@@ -1761,6 +1764,35 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
                 })
             };
             let mut attempt = admission.attempt;
+            {
+                let mut oversized = payload.clone();
+                match &mut oversized {
+                    ProviderPayload::Rerank(request) => request.documents[0] = "x".repeat(17),
+                    ProviderPayload::Embedding(request) => request.inputs[0] = "x".repeat(17),
+                    _ => unreachable!(),
+                }
+                let (oversized_admission, _) = fixture.attempt("retrieval-over-capacity", 1, 10);
+                let mut oversized_attempt = oversized_admission.attempt;
+                oversized_attempt.input_digest = oversized.digest().unwrap();
+                let oversized_admission = AdmissionKey::new(KEY.to_vec())
+                    .unwrap()
+                    .sign_attempt(oversized_attempt)
+                    .unwrap();
+                let oversized_permit = permit(&process, &oversized_admission).await;
+                assert!(matches!(
+                    exchange(
+                        &process,
+                        inject(oversized_admission.clone(), oversized, oversized_permit)
+                    )
+                    .await,
+                    Err(EgressError::LimitExceeded)
+                ));
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    status(&process, &oversized_admission).await,
+                    AttemptStatus::Permitted
+                ));
+            }
             attempt.input_digest = payload.digest().unwrap();
             let admission = AdmissionKey::new(KEY.to_vec())
                 .unwrap()

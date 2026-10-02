@@ -150,6 +150,15 @@ pub fn compatible_embedding_body(
     {
         return Err(invalid());
     }
+    if request.inputs.iter().any(|input| {
+        settings
+            .embedding_input_tokens
+            .is_none_or(|limit| input.len() > limit)
+    }) {
+        return Err(ModelError::InvalidRequest(
+            DiagnosticCode::ProviderRequestLimitExceeded,
+        ));
+    }
     #[derive(Serialize)]
     struct OpenAiBody<'a> {
         model: &'a str,
@@ -200,20 +209,42 @@ pub fn cohere_rerank_body(
 ) -> Result<(Vec<u8>, usize), ModelError> {
     settings.validate_retrieval(ModelAdapter::CohereRerank)?;
     let count = request.documents.len();
+    if count == 0 || request.top_k == Some(0) {
+        return Err(invalid());
+    }
+    if settings.rerank_candidates.is_none_or(|limit| count > limit) {
+        return Err(ModelError::InvalidRequest(
+            DiagnosticCode::ProviderRequestLimitExceeded,
+        ));
+    }
+    let context_tokens = settings.rerank_context_tokens.ok_or_else(invalid)?;
+    // Byte-level text tokenization needs at most one token per UTF-8 byte.
+    // Include the query in every pair; deployment reserves template/special tokens
+    // in the configured usable capacity. Never rely on a bytes/4 estimate.
+    if settings
+        .rerank_query_tokens
+        .is_none_or(|limit| request.query.len() > limit)
+        || request.documents.iter().any(|doc| {
+            request
+                .query
+                .len()
+                .checked_add(doc.len())
+                .is_none_or(|n| n > context_tokens)
+        })
+    {
+        return Err(ModelError::InvalidRequest(
+            DiagnosticCode::ProviderRequestLimitExceeded,
+        ));
+    }
     let bytes = request
         .documents
         .iter()
         .try_fold(request.query.len(), |sum, doc| sum.checked_add(doc.len()));
-    if count == 0 || request.top_k == Some(0) {
-        return Err(invalid());
-    }
-    if settings.rerank_candidates.is_none_or(|limit| count > limit)
-        || bytes.is_none_or(|bytes| {
-            settings
-                .rerank_input_bytes
-                .is_none_or(|limit| bytes > limit)
-        })
-    {
+    if bytes.is_none_or(|bytes| {
+        settings
+            .rerank_input_bytes
+            .is_none_or(|limit| bytes > limit)
+    }) {
         return Err(ModelError::InvalidRequest(
             DiagnosticCode::ProviderRequestLimitExceeded,
         ));
@@ -225,6 +256,7 @@ pub fn cohere_rerank_body(
         query: &'a str,
         documents: &'a [String],
         top_n: usize,
+        max_tokens_per_doc: usize,
     }
     Ok((
         wire::encode(
@@ -233,6 +265,7 @@ pub fn cohere_rerank_body(
                 query: &request.query,
                 documents: &request.documents,
                 top_n,
+                max_tokens_per_doc: context_tokens,
             },
             Some(max_bytes),
         )?,
@@ -351,7 +384,7 @@ impl RerankProvider for CohereRerankProvider {
                 let (raw, text) = transport.send("/rerank", body).await?;
                 let parsed: RerankResults =
                     serde_json::from_value(raw.clone()).map_err(|_| malformed())?;
-                if parsed.results.len() > top_n || parsed.results.is_empty() {
+                if parsed.results.len() != top_n {
                     return Err(malformed());
                 }
                 let mut indices = HashSet::new();
@@ -369,16 +402,18 @@ impl RerankProvider for CohereRerankProvider {
                     });
                 }
                 hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index)));
+                let mut trace = success_trace(
+                    &transport.descriptor,
+                    request.sensitivity,
+                    request.role_binding.clone(),
+                    request.source.clone(),
+                    hash_json(&request)?,
+                    Some(&text),
+                );
+                trace.usage.reported_cost_usd = reported_cost_usd(&raw);
                 Ok(RerankResponse {
                     hits,
-                    trace: success_trace(
-                        &transport.descriptor,
-                        request.sensitivity,
-                        request.role_binding.clone(),
-                        request.source.clone(),
-                        hash_json(&request)?,
-                        Some(&text),
-                    ),
+                    trace,
                     raw_provider_response: Some(raw),
                 })
             })

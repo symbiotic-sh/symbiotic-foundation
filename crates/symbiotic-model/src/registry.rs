@@ -97,10 +97,21 @@ pub struct TransportSettings {
     /// Required full-vector ceiling for compatible embeddings; reduced output
     /// dimensions must not exceed it. No model-name defaults are inferred.
     pub embedding_full_dimensions: Option<usize>,
+    /// Required usable input token capacity of the deployed compatible embedder,
+    /// after reserving special/template/task tokens. One token per UTF-8 byte is
+    /// used for conservative admission with supported byte-level tokenizers.
+    pub embedding_input_tokens: Option<usize>,
     /// Required hard sum of query and candidate UTF-8 bytes for reranking.
     pub rerank_input_bytes: Option<usize>,
     /// Required hard candidate count for reranking, checked before encoding.
     pub rerank_candidates: Option<usize>,
+    /// Required usable query/document token capacity of the deployed reranker,
+    /// after reserving provider/model special and template tokens. Admission uses
+    /// one token per UTF-8 byte as a conservative bound, not an average estimate.
+    /// Also sent as `max_tokens_per_doc` to disable the provider's default cutoff.
+    pub rerank_context_tokens: Option<usize>,
+    /// Required provider/model query token capacity; must fit the usable context.
+    pub rerank_query_tokens: Option<usize>,
     /// Optional expected System One served model name.
     pub served_model: Option<String>,
 }
@@ -178,16 +189,25 @@ impl TransportSettings {
             ModelAdapter::OpenAiEmbedding | ModelAdapter::OllamaEmbedding
         );
         let rerank = adapter == ModelAdapter::CohereRerank;
-        if (!embedding && self.embedding_full_dimensions.is_some())
-            || (!rerank && (self.rerank_input_bytes.is_some() || self.rerank_candidates.is_some()))
+        if (!embedding
+            && (self.embedding_full_dimensions.is_some() || self.embedding_input_tokens.is_some()))
+            || (!rerank
+                && (self.rerank_input_bytes.is_some()
+                    || self.rerank_candidates.is_some()
+                    || self.rerank_context_tokens.is_some()
+                    || self.rerank_query_tokens.is_some()))
             || (embedding
                 && (self.dimensions.is_none_or(|n| n == 0)
                     || self.embedding_full_dimensions.is_none_or(|n| n == 0)
+                    || self.embedding_input_tokens.is_none_or(|n| n == 0)
                     || self.dimensions > self.embedding_full_dimensions))
             || (rerank
                 && (self.dimensions.is_some()
                     || self.rerank_input_bytes.is_none_or(|n| n == 0)
-                    || self.rerank_candidates.is_none_or(|n| n == 0)))
+                    || self.rerank_candidates.is_none_or(|n| n == 0)
+                    || self.rerank_context_tokens.is_none_or(|n| n == 0)
+                    || self.rerank_query_tokens.is_none_or(|n| n == 0)
+                    || self.rerank_query_tokens > self.rerank_context_tokens))
             || ((embedding || rerank)
                 && (self.thinking.is_some()
                     || self.reasoning_effort.is_some()
