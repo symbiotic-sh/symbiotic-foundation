@@ -297,11 +297,6 @@ impl Runtime {
     /// needed, opens (or creates) its queue database and retires state older
     /// than the retention window.
     pub fn open(config: RuntimeConfig) -> Result<Self, ModelError> {
-        let worker_id = config
-            .worker_id
-            .clone()
-            .unwrap_or_else(|| format!("symbiotic-ai-runtime:{}", std::process::id()));
-        let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
         let queue: Arc<dyn QueueBackend> = match &config.state_dir {
             Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
             None => Arc::new(MemoryQueue::new()),
@@ -310,7 +305,20 @@ impl Runtime {
             Some(dir) => Arc::new(spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?),
             None => Arc::new(model::UnavailableSpendLedger),
         };
-        Ok(Self {
+        Ok(Self::from_state(config, queue, spend))
+    }
+
+    fn from_state(
+        config: RuntimeConfig,
+        queue: Arc<dyn QueueBackend>,
+        spend: Arc<dyn SpendLedger>,
+    ) -> Self {
+        let worker_id = config
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| format!("symbiotic-ai-runtime:{}", std::process::id()));
+        let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
+        Self {
             inner: Arc::new(Inner {
                 spend,
                 queue,
@@ -324,7 +332,7 @@ impl Runtime {
                 trace_sink: config.trace_sink,
                 receipt_sink: config.receipt_sink,
             }),
-        })
+        }
     }
 
     /// Canonical receipt lookup. Consumer commit refusal never alters this receipt.
@@ -347,7 +355,11 @@ impl Runtime {
 
     /// An in-memory runtime for configuration inspection; dispatch is refused.
     pub fn in_memory() -> Self {
-        Self::open(RuntimeConfig::default()).expect("an in-memory runtime needs no I/O")
+        Self::from_state(
+            RuntimeConfig::default(),
+            Arc::new(MemoryQueue::new()),
+            Arc::new(model::UnavailableSpendLedger),
+        )
     }
 
     pub fn state_dir(&self) -> Option<&Path> {

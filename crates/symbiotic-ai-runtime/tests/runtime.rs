@@ -68,6 +68,7 @@ struct Loopback {
     peak: Arc<AtomicUsize>,
     fail: Option<Arc<ModelError>>,
     delay: Duration,
+    credential: Option<Arc<symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider>>,
 }
 
 impl Loopback {
@@ -85,6 +86,7 @@ impl Loopback {
             peak: Arc::new(AtomicUsize::new(0)),
             fail: None,
             delay: Duration::from_millis(15),
+            credential: None,
         }
     }
 
@@ -106,6 +108,16 @@ impl Loopback {
 }
 
 impl ModelProvider for Loopback {
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.credential
+            .as_ref()
+            .and_then(|p| p.credential_fingerprint())
+    }
+    fn credential_boundary(&self) -> Option<&symbiotic_ai_runtime::model::CredentialBoundary> {
+        self.credential
+            .as_ref()
+            .and_then(|p| p.credential_boundary())
+    }
     fn failure_charge(&self, error: &ModelError) -> symbiotic_ai_runtime::model::FailureCharge {
         if matches!(error, ModelError::Timeout(_)) {
             symbiotic_ai_runtime::model::FailureCharge::Unknown
@@ -940,6 +952,15 @@ async fn a_rotated_credential_gets_a_fresh_budget(runtime: Runtime) {
         .into_iter()
         .find_map(|r| r.spend_receipt)
         .unwrap();
+    let err = bind(KEY_B).chat(request("rotate")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "rotating an unreconciled credential must refuse dispatch: {err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
     // This synthetic endpoint establishes that its rejected key incurred no charge.
     runtime
         .reconcile_spend(&reference, symbiotic_ai_runtime::SpendState::Released, None)
@@ -2172,4 +2193,118 @@ async fn execution_explicit_invocations_are_isolated_by_binding_inside_a_shared_
             status
         );
     }
+}
+
+#[tokio::test]
+async fn execution_cache_hit_binds_inputs_and_recovers_selected_output_after_restart() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let configured = binding(raw.clone()).with_policy(policy());
+    let primer = runtime
+        .execute_chat(configured.clone(), "primer", request("X"))
+        .await
+        .unwrap();
+    let selected = runtime
+        .execute_chat(configured.clone(), "cached-invocation", request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.output.trace.cache.response_cache,
+        symbiotic_trace::CacheStatus::Hit
+    );
+    assert_eq!(
+        selected.attempt.unwrap().unwrap().reference,
+        primer.attempt.unwrap().unwrap().reference
+    );
+    let identity = configured.identity.as_ref().unwrap();
+    assert!(
+        runtime
+            .invocation_status(identity, None, "cached-invocation")
+            .unwrap()
+            .unwrap()
+            .output_available
+    );
+    let error = runtime
+        .execute_chat(configured.clone(), "cached-invocation", request("Y"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+    ));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    runtime.purge_responses(|_| true).unwrap();
+    drop(runtime);
+    let restarted = persistent(dir.path());
+    let recovered = restarted
+        .execute_chat(configured, "cached-invocation", request("X"))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(recovered.output).unwrap(),
+        serde_json::to_value(selected.output).unwrap()
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT used FROM spend_accounts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn spend_credential_rotation_cannot_bypass_an_unknown_timeout() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut original = Loopback::new(unique_identity()).slow(Duration::from_secs(2));
+    original.credential = Some(Arc::new(
+        symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
+            "loopback",
+            "synthetic",
+            "http://localhost",
+            KEY_A,
+        ),
+    ));
+    let mut rotated = original.clone().slow(Duration::ZERO);
+    rotated.credential = Some(Arc::new(
+        symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider::new(
+            "loopback",
+            "synthetic",
+            "http://localhost",
+            KEY_B,
+        ),
+    ));
+    let configure = |raw| {
+        binding(raw)
+            .with_policy(ModelQueueConfig {
+                request_timeout_seconds: Some(1),
+                ..policy()
+            })
+            .with_response_cache(ResponseCacheMode::Off)
+    };
+    let first = runtime.chat(configure(original.clone())).unwrap();
+    assert!(matches!(
+        first.chat(request("rotation timeout")).await,
+        Err(ModelError::Timeout(_))
+    ));
+    let second = runtime.chat(configure(rotated)).unwrap();
+    let error = second.chat(request("rotation timeout")).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(original.calls.load(Ordering::SeqCst), 1);
 }

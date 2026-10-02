@@ -57,6 +57,13 @@ impl SqliteSpendLedger {
                 Err(conflict())
             };
         }
+        let cached: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM spend_cached_invocations WHERE account=?1 AND invocation=?2)",
+            params![r.account, r.invocation], |row| row.get(0),
+        ).map_err(storage)?;
+        if cached {
+            return Err(conflict());
+        }
         let limit = r
             .request_limit
             .map(i64::try_from)
@@ -213,6 +220,30 @@ fn receipt_in(
     })
     .transpose()
 }
+fn invocation_in(
+    conn: &Connection,
+    account: &str,
+    invocation: &str,
+) -> Result<Option<SpendReceipt>, ModelError> {
+    let cached = conn.query_row(
+        "SELECT reference, binding, output FROM spend_cached_invocations WHERE account=?1 AND invocation=?2",
+        params![account, invocation],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+    ).optional().map_err(storage)?;
+    if let Some((reference, binding, output)) = cached {
+        let mut receipt = receipt_in(conn, &SpendReceiptRef(reference))?.ok_or_else(conflict)?;
+        receipt.reservation.invocation = invocation.into();
+        receipt.reservation.binding = binding;
+        receipt.output = Some(serde_json::from_str(&output).map_err(storage)?);
+        return Ok(Some(receipt));
+    }
+    let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
+    reference
+        .map(|r| receipt_in(conn, &SpendReceiptRef(r)))
+        .transpose()
+        .map(Option::flatten)
+}
+
 impl SpendLedger for SqliteSpendLedger {
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
@@ -282,11 +313,45 @@ impl SpendLedger for SqliteSpendLedger {
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
-        let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
-        reference
-            .map(|r| receipt_in(&conn, &SpendReceiptRef(r)))
-            .transpose()
-            .map(Option::flatten)
+        invocation_in(&conn, account, invocation)
+    }
+    fn bind_cached(
+        &self,
+        account: &str,
+        invocation: &str,
+        binding: &str,
+        reference: &SpendReceiptRef,
+        output: serde_json::Value,
+    ) -> Result<SpendReceipt, ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        // Serialize selection with reservation and other cache-hit callers.
+        if let Some(existing) = invocation_in(&tx, account, invocation)? {
+            if existing.reservation.binding != binding || existing.output.is_none() {
+                return Err(conflict());
+            }
+            return Ok(existing);
+        }
+        let mut receipt = receipt_in(&tx, reference)?.ok_or_else(conflict)?;
+        if receipt.reservation.account != account
+            || receipt.reservation.binding != binding
+            || receipt.state == SpendState::Released
+            || receipt.output.is_none()
+        {
+            return Err(conflict());
+        }
+        let encoded = serde_json::to_string(&output).map_err(storage)?;
+        tx.execute(
+            "INSERT INTO spend_cached_invocations(account, invocation, binding, reference, output) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![account, invocation, binding, reference.0, encoded],
+        ).map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        receipt.reservation.invocation = invocation.into();
+        receipt.reservation.binding = binding.into();
+        receipt.output = Some(output);
+        Ok(receipt)
     }
     fn finish(
         &self,
