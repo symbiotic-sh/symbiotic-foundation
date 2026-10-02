@@ -320,6 +320,26 @@ with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporti
 A classify request that fails validation returns `InvalidRequest` before it
 takes a queue slot.
 
+## Explicit invocation recovery
+
+`Runtime::execute_chat`, `execute_embedding`, `execute_rerank` and
+`execute_classifier` take a binding, an explicit logical invocation identity and
+its request. Their `ExecutionResult` or `ExecutionError` includes its exact
+accepted or recovered attempt's accounting state and canonical receipt reference.
+Status lookup failures remain visible separately from the output or execution error.
+`Runtime::invocation_status` discovers that receipt after a lost reply or restart
+using the same binding identity, account sharing configuration and invocation.
+These APIs require no telemetry sink. Caller invocation identities are scoped to
+the full tenant/provider/configuration binding, including when accounts share quota.
+Within that binding, reusing an invocation with different inputs or a changed
+provider descriptor is refused.
+
+Credential acceptance records a handoff bound to the complete reservation,
+account, operation, provider binding and exact queued input. Dispatch validates
+that identity and atomically consumes its single-use dispatch owner. Reservation
+and settlement run on the blocking pool under queue lease renewal; ownership is
+checked again immediately before transport.
+
 ## Receipts
 
 A `QueueReceiptSink` gets one `QueueReceipt` per step of a call:
@@ -362,9 +382,14 @@ these writes fails:
 The same holds elsewhere. A cache hit whose trace write fails is still
 returned, with the diagnostic. A failed failure-trace write is logged. A failed cooldown write returns a
 queue error and persists a stopped item, because execution without its account
-limiter is not allowed. Stopped items cannot be claimed, continued as logical retry
-chains or renewed by `budget_renewal_seconds`; identical waiters and later calls
-return the recorded refusal while the queue retains the item. Failures without a
+limiter is not allowed. Stopped items cannot be claimed directly. Genuine terminal refusals, including
+cooldown-storage failures, cannot be continued or renewed. A later handoff may
+reconsider an account-budget refusal or an uncertain-charge refusal whose receipt
+has been reconciled to Released. Accepted attempts still count toward the logical
+attempt limit; account reservation denials do not consume provider attempts.
+Existing waiters return the recorded refusal. Durable successful output is checked
+in every queue state and before dispatch, so interrupted queue completion cannot
+hide a paid result. Failures without a
 retry deadline also stop the item. Retryable failures with a deadline become failed
 or dead according to their attempt budget. Retry also requires the known-zero
 charge evidence described above.
@@ -401,7 +426,7 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 2 and the current queue table layouts.
+queue files require schema version 4 and the current queue table layouts.
 Other layouts are refused without migration. Unknown stored failure codes/classes
 are refused with a static error. Terminal items without a recorded error class
 return a queue error, without inferring a

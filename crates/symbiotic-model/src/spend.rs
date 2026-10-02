@@ -8,6 +8,24 @@ use symbiotic_trace::UsageTrace;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendReceiptRef(pub String);
 
+/// Per-execution receipt pointer; accounting remains in the canonical ledger.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct ExecutionAttemptContext(std::sync::Arc<std::sync::Mutex<Option<SpendReceiptRef>>>);
+impl ExecutionAttemptContext {
+    /// The exact accepted or recovered receipt observed by this execution.
+    pub fn reference(&self) -> Result<Option<SpendReceiptRef>, ModelError> {
+        self.0
+            .lock()
+            .map(|reference| reference.clone())
+            .map_err(|_| storage())
+    }
+    pub(crate) fn capture(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+        *self.0.lock().map_err(|_| storage())? = Some(reference.clone());
+        Ok(())
+    }
+}
+
 /// Enforceable request accounting, separate from monetary observations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +50,33 @@ pub struct SpendReservation {
     pub request_limit: Option<u64>,
 }
 
+/// A single-use accepted attempt, bound to its account, input and runtime binding.
+/// The ledger stores this identity before accepting the trusted handoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedSpendHandoff {
+    /// Accepted account, logical invocation and exact attempt identity.
+    pub reservation: SpendReservation,
+    /// Hash of the operation, provider binding and exact queued request.
+    pub input_identity: String,
+}
+
+/// Scope a caller's invocation to its exact tenant/provider/configuration binding.
+pub fn execution_invocation_identity(
+    binding: &symbiotic_core::BindingIdentity,
+    invocation: &str,
+) -> Result<String, ModelError> {
+    crate::configuration_revision(&(binding, invocation)).map(|revision| revision.0)
+}
+
+/// Exact queued input identity, including operation and provider binding.
+pub fn handoff_input_identity(
+    kind: &str,
+    binding: Option<&symbiotic_core::BindingIdentity>,
+    request_hash: &str,
+) -> Result<String, ModelError> {
+    crate::configuration_revision(&(kind, binding, request_hash)).map(|revision| revision.0)
+}
+
 /// Authoritative receipt. Missing usage retains Unknown even with successful output.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpendReceipt {
@@ -47,7 +92,17 @@ pub struct SpendReceipt {
 /// A successful reserve returns true only for a newly accepted attempt.
 pub trait SpendLedger: Send + Sync {
     fn reserve(&self, reservation: &SpendReservation) -> Result<bool, ModelError>;
+    /// Atomically validate and consume dispatch ownership for an accepted handoff.
+    /// Reuse, identity mismatch and non-unknown accounting are refused.
+    fn acquire_handoff(
+        &self,
+        handoff: &AcceptedSpendHandoff,
+        account: &str,
+        input_identity: &str,
+        owner: &str,
+    ) -> Result<(), ModelError>;
     fn receipt(&self, reference: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError>;
+    /// Latest accepted attempt for this account/invocation, including Released accounting.
     fn invocation(
         &self,
         account: &str,
@@ -74,6 +129,15 @@ pub(crate) fn reconciliation() -> ModelError {
 pub struct UnavailableSpendLedger;
 impl SpendLedger for UnavailableSpendLedger {
     fn reserve(&self, _: &SpendReservation) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn acquire_handoff(
+        &self,
+        _: &AcceptedSpendHandoff,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<(), ModelError> {
         Err(storage())
     }
     fn receipt(&self, _: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError> {

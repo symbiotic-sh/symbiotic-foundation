@@ -23,6 +23,16 @@ impl SpendLedger for Fixture {
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
         self.ledger.reserve(r)
     }
+    fn acquire_handoff(
+        &self,
+        handoff: &symbiotic_model::AcceptedSpendHandoff,
+        account: &str,
+        input_identity: &str,
+        owner: &str,
+    ) -> Result<(), ModelError> {
+        self.ledger
+            .acquire_handoff(handoff, account, input_identity, owner)
+    }
     fn receipt(&self, r: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError> {
         self.ledger.receipt(r)
     }

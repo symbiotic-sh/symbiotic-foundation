@@ -3,7 +3,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{path::Path, sync::Mutex};
 use symbiotic_core::DiagnosticCode;
 use symbiotic_model::{
-    ModelError, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState,
+    AcceptedSpendHandoff, ModelError, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation,
+    SpendState,
 };
 use symbiotic_trace::UsageTrace;
 
@@ -90,6 +91,25 @@ impl SqliteSpendLedger {
         }
         let json = serde_json::to_string(r).map_err(storage)?;
         conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown')", params![r.reference.0, r.account, r.invocation, r.binding, json]).map_err(storage)?;
+        Ok(true)
+    }
+
+    /// Reserve a trusted handoff and its exact queued input in the permit transaction.
+    pub fn reserve_handoff_in(
+        conn: &rusqlite::Transaction<'_>,
+        handoff: &AcceptedSpendHandoff,
+    ) -> Result<bool, ModelError> {
+        if handoff.input_identity.is_empty() {
+            return Err(conflict());
+        }
+        if !Self::reserve_in(conn, &handoff.reservation)? {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE spend_receipts SET handoff_input=?2 WHERE reference=?1",
+            params![handoff.reservation.reference.0, handoff.input_identity],
+        )
+        .map_err(storage)?;
         Ok(true)
     }
 
@@ -201,6 +221,38 @@ impl SpendLedger for SqliteSpendLedger {
         tx.commit().map_err(storage)?;
         Ok(accepted)
     }
+    fn acquire_handoff(
+        &self,
+        handoff: &AcceptedSpendHandoff,
+        account: &str,
+        input_identity: &str,
+        owner: &str,
+    ) -> Result<(), ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let old = receipt_in(&tx, &handoff.reservation.reference)?.ok_or_else(conflict)?;
+        if old.reservation != handoff.reservation
+            || old.state != SpendState::Unknown
+            || old.reservation.account != account
+            || handoff.input_identity != input_identity
+            || owner.is_empty()
+        {
+            return Err(conflict());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE spend_receipts SET dispatch_owner=?3 WHERE reference=?1
+             AND handoff_input=?2 AND dispatch_owner IS NULL AND state='unknown'",
+                params![handoff.reservation.reference.0, input_identity, owner],
+            )
+            .map_err(storage)?;
+        if changed != 1 {
+            return Err(conflict());
+        }
+        tx.commit().map_err(storage)
+    }
     fn receipt(&self, reference: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
         receipt_in(&conn, reference)
@@ -211,7 +263,7 @@ impl SpendLedger for SqliteSpendLedger {
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
-        let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 AND state!='released'", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
+        let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
         reference
             .map(|r| receipt_in(&conn, &SpendReceiptRef(r)))
             .transpose()
@@ -230,5 +282,156 @@ impl SpendLedger for SqliteSpendLedger {
             .map_err(storage)?;
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn accepted(path: &Path) -> AcceptedSpendHandoff {
+        symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
+        let handoff = AcceptedSpendHandoff {
+            reservation: SpendReservation {
+                reference: SpendReceiptRef("accepted:attempt-1".into()),
+                account: "account-a".into(),
+                invocation: "invocation-1".into(),
+                binding: "exact-attempt-1".into(),
+                request_limit: Some(1),
+            },
+            input_identity: "exact-input-1".into(),
+        };
+        let mut conn = Connection::open(path).unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(SqliteSpendLedger::reserve_handoff_in(&tx, &handoff).unwrap());
+        tx.commit().unwrap();
+        handoff
+    }
+
+    #[test]
+    fn accepted_handoff_refuses_other_accounts_attempts_and_inputs_before_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let handoff = accepted(&path);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        assert!(
+            ledger
+                .acquire_handoff(&handoff, "account-b", "exact-input-1", "owner")
+                .is_err()
+        );
+        assert!(
+            ledger
+                .acquire_handoff(&handoff, "account-a", "other-input", "owner")
+                .is_err()
+        );
+        let mut changed = handoff.clone();
+        changed.reservation.binding = "other-attempt".into();
+        assert!(
+            ledger
+                .acquire_handoff(&changed, "account-a", "exact-input-1", "owner")
+                .is_err()
+        );
+        changed = handoff.clone();
+        changed.reservation.invocation = "other-invocation".into();
+        assert!(
+            ledger
+                .acquire_handoff(&changed, "account-a", "exact-input-1", "owner")
+                .is_err()
+        );
+        changed = handoff.clone();
+        changed.input_identity = "forged-input".into();
+        assert!(
+            ledger
+                .acquire_handoff(&changed, "account-a", "forged-input", "owner")
+                .is_err()
+        );
+        ledger
+            .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
+            .unwrap();
+        assert!(
+            ledger
+                .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accepted_handoff_has_one_atomic_dispatch_owner_across_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let handoff = accepted(&path);
+        let barrier = Arc::new(Barrier::new(2));
+        let joins: Vec<_> = (0..2)
+            .map(|i| {
+                let ledger = SqliteSpendLedger::open(&path).unwrap();
+                let handoff = handoff.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ledger
+                        .acquire_handoff(
+                            &handoff,
+                            "account-a",
+                            "exact-input-1",
+                            &format!("owner-{i}"),
+                        )
+                        .is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            joins
+                .into_iter()
+                .map(|join| usize::from(join.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        assert_eq!(
+            ledger
+                .receipt(&handoff.reservation.reference)
+                .unwrap()
+                .unwrap()
+                .state,
+            SpendState::Unknown
+        );
+        assert!(
+            ledger
+                .acquire_handoff(&handoff, "account-a", "exact-input-1", "after-restart")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_or_released_reservations_do_not_authorize_an_accepted_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let handoff = accepted(&path);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        ledger
+            .finish(
+                &handoff.reservation.reference,
+                SpendState::Released,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .acquire_handoff(&handoff, "account-a", "exact-input-1", "owner")
+                .is_err()
+        );
+        let mut ordinary = handoff;
+        ordinary.reservation.reference = SpendReceiptRef("ordinary".into());
+        ordinary.reservation.invocation = "ordinary".into();
+        ledger.reserve(&ordinary.reservation).unwrap();
+        assert!(
+            ledger
+                .acquire_handoff(&ordinary, "account-a", "exact-input-1", "owner")
+                .is_err()
+        );
     }
 }

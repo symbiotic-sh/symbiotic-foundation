@@ -261,20 +261,62 @@ fn completed(
     (output, trace.usage, diagnostics)
 }
 
+/// Give each admitted attempt a queue identity while preserving provider-visible input.
+pub(crate) fn prepare_payload(payload: &mut ProviderPayload, attempt_digest: &str) {
+    match payload {
+        ProviderPayload::Chat(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
+        ProviderPayload::Embedding(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
+    }
+}
+
+pub(crate) fn accepted_handoff(
+    attempt: &symbiotic_egress::DurableAttempt,
+    route: &RouteConfig,
+    payload: &ProviderPayload,
+) -> Result<model::AcceptedSpendHandoff, EgressError> {
+    let (kind, request_hash) = match payload {
+        ProviderPayload::Chat(request) => ("chat", model::configuration_revision(request)),
+        ProviderPayload::Embedding(request) => {
+            ("embedding", model::configuration_revision(request))
+        }
+    };
+    let binding = BindingIdentity::new(
+        &route.tenant,
+        &route.route,
+        model::configuration_revision(route)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .0,
+        &route.account,
+    );
+    Ok(model::AcceptedSpendHandoff {
+        reservation: crate::spend_reservation(attempt, route)?,
+        input_identity: model::handoff_input_identity(
+            kind,
+            Some(&binding),
+            &request_hash.map_err(|_| EgressError::InvalidRequest)?.0,
+        )
+        .map_err(|_| EgressError::InvalidRequest)?,
+    })
+}
+
 pub(crate) async fn execute(
     runtime: &Runtime,
     route: &RouteConfig,
     secret: Arc<Secret>,
     payload: ProviderPayload,
-    attempt_digest: &str,
+    handoff: model::AcceptedSpendHandoff,
 ) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
-        (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(mut request)) => {
-            // Per-attempt queue identity without changing provider-visible inputs.
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
+        (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(request)) => {
             let provider = DispatchedChat {
                 inner: OpenAiCompatibleChatProvider::new(
                     operator,
@@ -292,8 +334,7 @@ pub(crate) async fn execute(
             let provider = runtime
                 .chat({
                     let mut binding = route_binding(runtime, route, provider)?;
-                    binding.accepted_spend =
-                        Some(SpendReceiptRef(format!("egress:{attempt_digest}")));
+                    binding.accepted_spend = Some(handoff);
                     binding.with_response_cache(ResponseCacheMode::Off)
                 })
                 .map_err(|_| EgressError::StateUnavailable)?;
@@ -312,13 +353,7 @@ pub(crate) async fn execute(
                 response.trace,
             ))
         }
-        (
-            RouteProvider::GeminiEmbedding { dimensions },
-            ProviderPayload::Embedding(mut request),
-        ) => {
-            request.source = Some(attempt_digest.to_owned());
-            request.role_binding = None;
-            request.metadata = serde_json::Value::Null;
+        (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request)) => {
             let provider = DispatchedEmbedding {
                 inner: GeminiEmbeddingProvider::new(
                     "gemini",
@@ -335,8 +370,7 @@ pub(crate) async fn execute(
             let provider = runtime
                 .embedding({
                     let mut binding = route_binding(runtime, route, provider)?;
-                    binding.accepted_spend =
-                        Some(SpendReceiptRef(format!("egress:{attempt_digest}")));
+                    binding.accepted_spend = Some(handoff);
                     binding.with_response_cache(ResponseCacheMode::Off)
                 })
                 .map_err(|_| EgressError::StateUnavailable)?;

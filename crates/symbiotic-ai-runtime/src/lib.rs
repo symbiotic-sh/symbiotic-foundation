@@ -54,9 +54,13 @@ use symbiotic_queue::{MemoryQueue, QueueBackend};
 use symbiotic_queue_sqlite::SqliteQueue;
 use symbiotic_trace::TraceSink;
 
+mod execution;
 mod maintained;
+pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
 pub mod spend;
-pub use model::{SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState};
+pub use model::{
+    AcceptedSpendHandoff, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState,
+};
 
 use maintained::{MaintainedQueue, ResponseRetention};
 
@@ -144,7 +148,13 @@ pub struct ModelBinding<P> {
     pub provider: P,
     /// Foundation-internal handoff already reserved atomically with its permit.
     #[doc(hidden)]
-    pub accepted_spend: Option<SpendReceiptRef>,
+    pub accepted_spend: Option<AcceptedSpendHandoff>,
+    /// Caller-selected logical invocation, for durable status lookup and recovery.
+    /// Reusing it with different inputs is refused. `None` derives identity from the request.
+    pub invocation: Option<String>,
+    /// Foundation-internal capture of the exact attempt selected for this call.
+    #[doc(hidden)]
+    pub attempt_context: Option<model::ExecutionAttemptContext>,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
     /// Explicit quota pool. `None` isolates by tenant and concrete account.
@@ -168,6 +178,8 @@ impl<P> ModelBinding<P> {
         Self {
             provider,
             accepted_spend: None,
+            invocation: None,
+            attempt_context: None,
             identity: None,
             account_sharing_key: None,
             policy: None,
@@ -180,6 +192,18 @@ impl<P> ModelBinding<P> {
     /// Set the tenant, provider principal, configuration revision and account.
     pub fn with_identity(mut self, identity: BindingIdentity) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Set a caller-selected logical invocation for durable recovery.
+    /// Scope it to this binding account and reuse it only for the same inputs.
+    pub fn with_invocation(mut self, invocation: impl Into<String>) -> Self {
+        self.invocation = Some(invocation.into());
+        self
+    }
+
+    pub(crate) fn with_attempt_context(mut self, context: model::ExecutionAttemptContext) -> Self {
+        self.attempt_context = Some(context);
         self
     }
 
@@ -562,6 +586,15 @@ impl Runtime {
                     symbiotic_core::DiagnosticCode::BindingIdentityIsRequired,
                 )
             })?;
+        if binding
+            .invocation
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
+        }
         let queue_id = QueueId::new(account_scope(
             &identity,
             binding.account_sharing_key.as_ref(),
@@ -677,6 +710,8 @@ impl Runtime {
             worker_id: self.inner.worker_id.clone(),
             policy,
             sinks: Sinks {
+                invocation: binding.invocation.clone(),
+                attempt_context: binding.attempt_context.clone(),
                 queue_id,
                 identity,
                 trace: binding
@@ -725,6 +760,8 @@ struct Bound {
 }
 
 struct Sinks {
+    invocation: Option<String>,
+    attempt_context: Option<model::ExecutionAttemptContext>,
     queue_id: QueueId,
     identity: BindingIdentity,
     trace: Option<Arc<dyn TraceSink>>,
@@ -738,6 +775,12 @@ macro_rules! apply_sinks {
             provider = provider
                 .with_queue_id(self.queue_id)
                 .with_binding_identity(self.identity);
+            if let Some(invocation) = self.invocation {
+                provider = provider.with_invocation(invocation);
+            }
+            if let Some(context) = self.attempt_context {
+                provider = provider.with_attempt_context(context);
+            }
             if let Some(sink) = self.trace {
                 provider = provider.with_trace_sink(sink);
             }

@@ -252,24 +252,23 @@ impl CredentialProcess {
                 if request.payload.digest()? != request.admission.attempt.input_digest {
                     return Err(EgressError::InvalidRequest);
                 }
+                let mut payload = request.payload;
+                provider::prepare_payload(&mut payload, &digest(&request.admission.attempt)?);
+                let handoff =
+                    provider::accepted_handoff(&request.admission.attempt, &route, &payload)?;
                 let receipt = self
                     .inner
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .consume(
-                        &request.admission.attempt,
-                        &request.permit,
-                        &spend_reservation(&request.admission.attempt, &route)?,
-                    )?;
+                    .consume(&request.admission.attempt, &request.permit, &handoff)?;
                 // Spawning occurs immediately after consumption with no await in
                 // between. Client cancellation cannot leave a consumed-but-cancelled
                 // live task; a process crash leaves the durable unknown receipt.
                 let process = self.clone();
-                let task =
-                    tokio::spawn(
-                        async move { process.dispatch(route, request.payload, receipt).await },
-                    );
+                let task = tokio::spawn(async move {
+                    process.dispatch(route, payload, receipt, handoff).await
+                });
                 task.await
                     .map_err(|_| EgressError::Transport)
                     .map(Reply::Dispatched)
@@ -349,6 +348,7 @@ impl CredentialProcess {
         route: RouteConfig,
         payload: ProviderPayload,
         mut receipt: DispatchReceipt,
+        handoff: symbiotic_ai_runtime::model::AcceptedSpendHandoff,
     ) -> DispatchResult {
         let source = route.secret.clone();
         let max = self.inner.config.max_secret_bytes;
@@ -364,7 +364,7 @@ impl CredentialProcess {
                     &route,
                     Arc::new(secret),
                     payload,
-                    &receipt.attempt_digest,
+                    handoff,
                 )
                 .await
                 {

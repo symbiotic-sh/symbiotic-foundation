@@ -755,7 +755,7 @@ where
 /// Usage receipts of one queued call.
 #[cfg(feature = "queue")]
 struct CallReceipts {
-    accepted_spend: Option<SpendReceiptRef>,
+    accepted_spend: Option<AcceptedSpendHandoff>,
     sink: Option<Arc<dyn QueueReceiptSink>>,
     binding: Option<symbiotic_core::BindingIdentity>,
     queue_id: QueueId,
@@ -795,9 +795,12 @@ impl CallReceipts {
         };
         sink.record_receipt(QueueReceipt {
             spend_receipt: item.filter(|i| i.attempt > 0).map(|i| {
-                self.accepted_spend.clone().unwrap_or_else(|| {
-                    SpendReceiptRef(format!("runtime:{}:{}", i.item_id.0, i.attempt))
-                })
+                self.accepted_spend
+                    .as_ref()
+                    .map(|h| h.reservation.reference.clone())
+                    .unwrap_or_else(|| {
+                        SpendReceiptRef(format!("runtime:{}:{}", i.item_id.0, i.attempt))
+                    })
             }),
             binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
@@ -875,8 +878,10 @@ fn elapsed_ms(since: std::time::Instant) -> u64 {
 struct QueuedCall<Req> {
     queue: Arc<dyn QueueBackend>,
     spend: Arc<dyn SpendLedger>,
-    accepted_spend: Option<SpendReceiptRef>,
+    accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
+    attempt_binding: String,
+    attempt_context: Option<ExecutionAttemptContext>,
     worker_id: String,
     config: ModelQueueConfig,
     queue_id: QueueId,
@@ -899,22 +904,41 @@ struct QueuedCall<Req> {
 
 #[cfg(feature = "queue")]
 impl<Req> QueuedCall<Req> {
-    fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
+    async fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<Res>, ModelError> {
         if self.accepted_spend.is_some() {
             return Ok(None);
         }
-        self.spend
-            .invocation(&self.queue_id.0, &self.invocation)?
-            .and_then(|receipt| receipt.output)
-            .map(|output| {
-                secrets::composed_result(
-                    self.result_owner.as_ref(),
-                    serde_json::from_value(output).map_err(|_| spend::storage()),
-                )
-            })
-            .transpose()
+        let spend = self.spend.clone();
+        let account = self.queue_id.0.clone();
+        let invocation = self.invocation.clone();
+        let binding = self.attempt_binding.clone();
+        let context = self.attempt_context.clone();
+        run_blocking(move || {
+            let receipt = spend.invocation(&account, &invocation)?;
+            if receipt
+                .as_ref()
+                .is_some_and(|r| r.reservation.binding != binding)
+            {
+                return Err(spend::reconciliation());
+            }
+            if let Some(receipt) = &receipt
+                && let Some(context) = context
+            {
+                context.capture(&receipt.reservation.reference)?;
+            }
+            Ok(receipt)
+        })
+        .await?
+        .and_then(|receipt| receipt.output)
+        .map(|output| {
+            secrets::composed_result(
+                self.result_owner.as_ref(),
+                serde_json::from_value(output).map_err(|_| spend::storage()),
+            )
+        })
+        .transpose()
     }
 
     fn cache_entry(&self) -> CacheEntry<'_> {
@@ -964,6 +988,81 @@ impl<Req> QueuedCall<Req> {
             current,
         )
         .await
+    }
+
+    async fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+        if self.accepted_spend.is_none() {
+            let spend = self.spend.clone();
+            let reference = reference.clone();
+            run_blocking(move || spend.finish(&reference, SpendState::Released, None, None))
+                .await?;
+        }
+        Ok(())
+    }
+
+    // A later handoff may reconsider accounting refusals after reconciliation
+    // or restored account allowance. Other stopped failures remain terminal.
+    async fn reconsider_stopped(
+        &self,
+        item: &QueueItem,
+    ) -> Result<Option<EnqueueOutcome>, ModelError> {
+        let mut denied = item.last_error == Some(DiagnosticCode::SpendBudgetExhausted);
+        if !denied {
+            if item.last_error != Some(DiagnosticCode::SpendReconciliationRequired) {
+                return Ok(None);
+            }
+            let spend = self.spend.clone();
+            let account = self.queue_id.0.clone();
+            let invocation = self.invocation.clone();
+            let receipt = run_blocking(move || spend.invocation(&account, &invocation)).await?;
+            let Some(receipt) = receipt.filter(|r| r.state == SpendState::Released) else {
+                return Ok(None);
+            };
+            // A reclaimed queue claim may itself have been denied while an
+            // earlier accepted attempt was still unknown. That claim never
+            // consumed a provider attempt either.
+            denied = receipt.reservation.reference
+                != SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+        }
+        let state = logical_retry_state(&item.payload, logical_max_attempts(&self.config));
+        // Reservation denial is a queue claim, never a provider attempt.
+        let attempts_used = state
+            .attempts_used
+            .saturating_add(item.attempt)
+            .saturating_sub(u32::from(denied));
+        if attempts_used >= state.max_attempts {
+            return if budget_renewed(item, &self.config)? {
+                self.renew_budget(&item.item_id).await.map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        let remaining = state.max_attempts - attempts_used;
+        let payload = model_queue_payload(
+            &self.capability,
+            &self.request_hash,
+            &self.descriptor,
+            LogicalRetryState {
+                attempts_used,
+                max_attempts: state.max_attempts,
+            },
+        );
+        self.queue
+            .enqueue_replacing(
+                EnqueueRequest {
+                    queue_id: self.queue_id.clone(),
+                    kind: self.kind.clone(),
+                    payload,
+                    idempotency_key: self.idempotency_key.clone(),
+                    run_after: None,
+                    max_attempts: Some(remaining.min(item_max_attempts(&self.config))),
+                    force: true,
+                },
+                &item.item_id,
+            )
+            .await
+            .map(Some)
+            .map_err(queue_error)
     }
 
     /// The next item of the request's retry chain after `dead`, or `None`
@@ -1233,12 +1332,31 @@ where
         &runtime.binding_identity,
         provider.credential_fingerprint(),
     ))?;
-    let idempotency_key = Some(format!("{}:{provider_identity}:{request_hash}", queue_id.0));
+    let attempt_binding = hash_json(&(&provider_identity, &request_hash))?;
+    let invocation = match &runtime.invocation {
+        Some(invocation) => execution_invocation_identity(
+            runtime
+                .binding_identity
+                .as_ref()
+                .ok_or(ModelError::InvalidRequest(
+                    DiagnosticCode::BindingIdentityIsRequired,
+                ))?,
+            invocation,
+        )?,
+        None => attempt_binding.clone(),
+    };
+    let idempotency_key = Some(format!(
+        "{}:{provider_identity}:{request_hash}:{}",
+        queue_id.0,
+        hash_json(&invocation)?
+    ));
     let call_state = Arc::new(QueuedCall {
         queue: runtime.queue.clone(),
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
-        invocation: hash_json(&(&descriptor, &request_hash))?,
+        invocation,
+        attempt_binding,
+        attempt_context: runtime.attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
         config: runtime.config.clone(),
         receipts: CallReceipts {
@@ -1276,12 +1394,20 @@ where
         })
         .await?;
     }
-    if let Some(cached) = call_state.cached::<Res>(None).await? {
+    // Ordinary cache hits retain their cache provenance and need no dispatch
+    // store. Explicit invocation replay must validate its exact binding first.
+    if runtime.invocation.is_none()
+        && let Some(cached) = call_state.cached::<Res>(None).await?
+    {
         return Ok(cached);
     }
-
-    if let Some(output) = this.recovered::<Res>()? {
+    if let Some(output) = this.recovered::<Res>().await? {
         return Ok(output);
+    }
+    if runtime.invocation.is_some()
+        && let Some(cached) = call_state.cached::<Res>(None).await?
+    {
+        return Ok(cached);
     }
     let queued_at = std::time::Instant::now();
     // Cooldown + rate-bucket wait accumulated across loop iterations, so the
@@ -1300,7 +1426,13 @@ where
         .await;
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate {
         match enqueue.item.status {
-            QueueStatus::Stopped => return Err(dead_item_retry_error(&enqueue.item)),
+            QueueStatus::Stopped => {
+                if let Some(next) = this.reconsider_stopped(&enqueue.item).await? {
+                    enqueue = next;
+                } else {
+                    return Err(dead_item_retry_error(&enqueue.item));
+                }
+            }
             QueueStatus::Dead if budget_renewed(&enqueue.item, config)? => {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
@@ -1331,6 +1463,9 @@ where
     // its throttle time across them, for its receipts.
     let mut waiting_attempt: Option<(std::time::Instant, Duration)> = None;
     loop {
+        if let Some(output) = this.recovered::<Res>().await? {
+            return Ok(output);
+        }
         if let Some(cached) = call_state.cached::<Res>(Some(&enqueue.item)).await? {
             return Ok(cached);
         }
@@ -1442,6 +1577,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     where
         Res: Serialize + TraceCarrier + for<'de> Deserialize<'de> + Send + 'static,
     {
+        if let Some(output) = self.recovered::<Res>().await? {
+            return Ok(Followed::Answer(output));
+        }
         let current = self
             .queue
             .get_item(&enqueue.item.item_id)
@@ -1451,6 +1589,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             *enqueue = self.enqueue().await?;
             return Ok(Followed::Moved);
         };
+        if let Some(output) = self.recovered::<Res>().await? {
+            return Ok(Followed::Answer(output));
+        }
         match current.status {
             QueueStatus::Stopped => Err(dead_item_retry_error(&current)),
             QueueStatus::Dead if budget_renewed(&current, config)? => {
@@ -1475,9 +1616,6 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             QueueStatus::Succeeded => {
                 if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
                     return Ok(Followed::Answer(cached));
-                }
-                if let Some(output) = self.recovered::<Res>()? {
-                    return Ok(Followed::Answer(output));
                 }
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
@@ -1570,62 +1708,119 @@ where
     };
     let reference = this
         .accepted_spend
-        .clone()
+        .as_ref()
+        .map(|h| h.reservation.reference.clone())
         .unwrap_or_else(|| SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt)));
-    let reserve = if this.accepted_spend.is_some() {
-        this.spend.receipt(&reference).and_then(|r| {
-            r.filter(|r| r.state == SpendState::Unknown)
-                .map(|_| true)
-                .ok_or_else(spend::reconciliation)
-        })
-    } else {
-        this.spend.reserve(&SpendReservation {
-            reference: reference.clone(),
-            account: this.queue_id.0.clone(),
-            invocation: this.invocation.clone(),
-            binding: this.invocation.clone(),
-            request_limit: config.provider_request_limit,
-        })
-    };
-    if !matches!(reserve, Ok(true)) {
-        let err = reserve.err().unwrap_or_else(spend::reconciliation);
-        queue
-            .fail_with(
-                &item.item_id,
-                worker_id,
-                Failure {
-                    error: err.code(),
-                    error_class: Some(error_class(&err)),
-                    run_after: None,
-                },
-            )
-            .await
-            .map_err(queue_error)?;
-        return Err(err);
-    }
-    // Only an attempt that reaches the provider spends rate budget.
-    if let Some(rate) = rate
-        && let Err(err) = rate.charge()
-    {
-        if this.accepted_spend.is_none() {
-            this.spend
-                .finish(&reference, SpendState::Released, None, None)?;
-        }
-        queue
-            .fail(&item.item_id, worker_id, err.code(), None)
-            .await
-            .map_err(queue_error)?;
-        return Err(err);
-    }
-
+    let ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled = holding_lease(
         queue,
         &item.item_id,
         worker_id,
         config.lease_seconds,
-        settle(&call_state, &item, provider, call, &clock, &reference),
+        ownership_lost.clone(),
+        async {
+            // Another worker may have saved an answer since our last follow.
+            if let Some(response) = this.recovered::<Res>().await? {
+                let completed = queue.complete(&item.item_id, worker_id).await;
+                return Ok(Settled::Succeeded {
+                    response,
+                    provider_ms: 0,
+                    completed,
+                });
+            }
+            let state = call_state.clone();
+            let reference_for_reserve = reference.clone();
+            let owner = format!("{}:{}", item.item_id.0, item.attempt);
+            let reserve = run_blocking(move || {
+                if let Some(handoff) = &state.accepted_spend {
+                    let identity = handoff_input_identity(
+                        &state.kind,
+                        state.binding_identity.as_ref(),
+                        &state.request_hash,
+                    )?;
+                    state
+                        .spend
+                        .acquire_handoff(handoff, &state.queue_id.0, &identity, &owner)?;
+                    Ok(true)
+                } else {
+                    state.spend.reserve(&SpendReservation {
+                        reference: reference_for_reserve,
+                        account: state.queue_id.0.clone(),
+                        invocation: state.invocation.clone(),
+                        binding: state.attempt_binding.clone(),
+                        request_limit: state.config.provider_request_limit,
+                    })
+                }
+            })
+            .await;
+            if matches!(reserve, Ok(true))
+                && let Some(context) = &this.attempt_context
+            {
+                context.capture(&reference)?;
+            }
+            // A blocking reservation can finish after ownership was lost. It
+            // must never authorize a provider call under that stale claim.
+            let ownership = if ownership_lost.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ModelError::Queue(DiagnosticCode::QueueFailure))
+            } else {
+                queue
+                    .heartbeat(&item.item_id, worker_id, config.lease_seconds)
+                    .await
+                    .map_err(queue_error)
+            };
+            if let Err(err) = ownership {
+                if matches!(reserve, Ok(true)) {
+                    this.release_before_dispatch(&reference).await?;
+                }
+                return Err(err);
+            }
+            if !matches!(reserve, Ok(true)) {
+                let err = reserve.err().unwrap_or_else(spend::reconciliation);
+                queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: err.code(),
+                            error_class: Some(error_class(&err)),
+                            run_after: None,
+                        },
+                    )
+                    .await
+                    .map_err(queue_error)?;
+                return Err(err);
+            }
+            // Only an attempt that reaches the provider spends rate budget.
+            if let Some(rate) = rate
+                && let Err(err) = rate.charge()
+            {
+                if this.accepted_spend.is_none() {
+                    let spend = this.spend.clone();
+                    let reference = reference.clone();
+                    run_blocking(move || {
+                        spend.finish(&reference, SpendState::Released, None, None)
+                    })
+                    .await?;
+                }
+                queue
+                    .fail(&item.item_id, worker_id, err.code(), None)
+                    .await
+                    .map_err(queue_error)?;
+                return Err(err);
+            }
+            Ok(settle(
+                &call_state,
+                &item,
+                provider,
+                call,
+                &clock,
+                &reference,
+                &ownership_lost,
+            )
+            .await)
+        },
     )
-    .await;
+    .await?;
     drop(permit);
 
     // The item is completed or failed: report what the writes returned, then
@@ -1723,6 +1918,7 @@ async fn settle<P, Req, Res, F, Fut>(
     call: F,
     clock: &AttemptClock,
     reference: &SpendReceiptRef,
+    ownership_lost: &std::sync::atomic::AtomicBool,
 ) -> Settled<Res>
 where
     P: ModelProvider + Clone,
@@ -1751,6 +1947,33 @@ where
             },
         )
         .await;
+    // Running telemetry may itself await. Validate ownership once more at
+    // the actual transport boundary; after dispatch retain its outcome.
+    if ownership_lost.load(std::sync::atomic::Ordering::SeqCst) {
+        let err = this
+            .release_before_dispatch(reference)
+            .await
+            .err()
+            .unwrap_or(ModelError::Queue(DiagnosticCode::QueueFailure));
+        return Settled::Failed {
+            err,
+            failed: Ok(FailOutcome::Stopped),
+        };
+    }
+    if let Err(err) = queue
+        .heartbeat(&item.item_id, worker_id, config.lease_seconds)
+        .await
+    {
+        let err = this
+            .release_before_dispatch(reference)
+            .await
+            .err()
+            .unwrap_or_else(|| queue_error(err));
+        return Settled::Failed {
+            err,
+            failed: Ok(FailOutcome::Stopped),
+        };
+    }
     let provider_started = std::time::Instant::now();
     let result = within_timeout(
         &this.queue_id,
@@ -1770,12 +1993,14 @@ where
         !matches!(err, ModelError::Timeout(_))
             && provider.failure_charge(err) == FailureCharge::KnownZero
     });
-    if known_zero
-        && this.accepted_spend.is_none()
-        && let Err(err) = this
-            .spend
-            .finish(reference, SpendState::Released, None, None)
-    {
+    let released = if known_zero && this.accepted_spend.is_none() {
+        let spend = this.spend.clone();
+        let reference = reference.clone();
+        run_blocking(move || spend.finish(&reference, SpendState::Released, None, None)).await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = released {
         let failed = queue
             .fail_with(
                 &item.item_id,
@@ -1813,20 +2038,24 @@ where
                 } else {
                     SpendState::Unknown
                 };
-                let saved = serde_json::to_value(&response)
-                    .map_err(|_| spend::storage())
-                    .and_then(|output| {
-                        this.spend.finish(
-                            reference,
-                            state,
-                            if has_measured_usage(&usage) {
-                                Some(usage)
-                            } else {
-                                None
-                            },
-                            Some(output),
-                        )
-                    });
+                let response_to_save = response.clone();
+                let spend = this.spend.clone();
+                let reference = reference.clone();
+                let saved = run_blocking(move || {
+                    let output =
+                        serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?;
+                    spend.finish(
+                        &reference,
+                        state,
+                        if has_measured_usage(&usage) {
+                            Some(usage)
+                        } else {
+                            None
+                        },
+                        Some(output),
+                    )
+                })
+                .await;
                 if let Err(err) = saved {
                     note_side_effect(
                         &mut response,
@@ -1919,7 +2148,21 @@ where
                     note_model_cooldown(queue, &this.queue_id, &err, config.retry_base_delay_ms)
                         .await
             {
-                warn_side_effect(&this.queue_id, "cooldown_write_failed", failure.code());
+                let failed = queue
+                    .fail_with(
+                        &item.item_id,
+                        worker_id,
+                        Failure {
+                            error: failure.code(),
+                            error_class: Some(FailureClass::Queue),
+                            run_after: None,
+                        },
+                    )
+                    .await;
+                return Settled::Failed {
+                    err: failure,
+                    failed,
+                };
             }
             this.receipts
                 .record(
@@ -1984,10 +2227,12 @@ async fn holding_lease<T>(
     item_id: &QueueItemId,
     worker_id: &str,
     lease_seconds: u64,
+    ownership_lost: Arc<std::sync::atomic::AtomicBool>,
     work: impl std::future::Future<Output = T>,
 ) -> T {
     let renew = async {
-        let interval = Duration::from_secs((lease_seconds / 3).clamp(1, 60));
+        let interval =
+            Duration::from_millis((lease_seconds.saturating_mul(1000) / 3).clamp(1, 60_000));
         loop {
             tokio::time::sleep(interval).await;
             if queue
@@ -1995,6 +2240,7 @@ async fn holding_lease<T>(
                 .await
                 .is_err()
             {
+                ownership_lost.store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         }

@@ -1,6 +1,6 @@
 //! Durable permit replay protection and bounded result recovery; no provider credentials.
 use rusqlite::{Connection, OptionalExtension, params};
-use symbiotic_ai_runtime::{SpendReservation, SpendState, spend::SqliteSpendLedger};
+use symbiotic_ai_runtime::{SpendState, model::AcceptedSpendHandoff, spend::SqliteSpendLedger};
 use symbiotic_egress::*;
 use uuid::Uuid;
 
@@ -163,7 +163,7 @@ impl Registry {
         &mut self,
         attempt: &DurableAttempt,
         permit: &DispatchPermit,
-        reservation: &SpendReservation,
+        handoff: &AcceptedSpendHandoff,
     ) -> Result<DispatchReceipt, EgressError> {
         let attempt_digest = digest(attempt)?;
         if attempt_digest != permit.attempt_digest {
@@ -203,7 +203,7 @@ impl Registry {
         if changed != 1 {
             return Err(EgressError::PermitRefused);
         }
-        if !SqliteSpendLedger::reserve_in(&tx, reservation).map_err(ledger_error)? {
+        if !SqliteSpendLedger::reserve_handoff_in(&tx, handoff).map_err(ledger_error)? {
             return Err(EgressError::PermitRefused);
         }
         tx.commit().map_err(state)?;
@@ -432,19 +432,22 @@ fn ledger_error(err: symbiotic_ai_runtime::ModelError) -> EgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symbiotic_ai_runtime::SpendReceiptRef;
+    use symbiotic_ai_runtime::{SpendReceiptRef, SpendReservation};
 
     fn open(path: &std::path::Path) -> Registry {
         symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
         Registry::open(path).unwrap()
     }
-    fn reservation(a: &DurableAttempt) -> SpendReservation {
-        SpendReservation {
-            reference: SpendReceiptRef(format!("egress:{}", digest(a).unwrap())),
-            account: "test-account".into(),
-            invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id)).unwrap(),
-            binding: digest(a).unwrap(),
-            request_limit: None,
+    fn reservation(a: &DurableAttempt) -> AcceptedSpendHandoff {
+        AcceptedSpendHandoff {
+            reservation: SpendReservation {
+                reference: SpendReceiptRef(format!("egress:{}", digest(a).unwrap())),
+                account: "test-account".into(),
+                invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id)).unwrap(),
+                binding: digest(a).unwrap(),
+                request_limit: None,
+            },
+            input_identity: "test-input".into(),
         }
     }
 

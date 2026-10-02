@@ -484,7 +484,9 @@ pub(crate) struct QueueRuntime {
     pub(crate) admission: Option<ModelAdmission>,
     pub(crate) rate_state: crate::ModelRateState,
     pub(crate) spend: Arc<dyn crate::SpendLedger>,
-    pub(crate) accepted_spend: Option<crate::SpendReceiptRef>,
+    pub(crate) accepted_spend: Option<crate::AcceptedSpendHandoff>,
+    pub(crate) invocation: Option<String>,
+    pub(crate) attempt_context: Option<crate::ExecutionAttemptContext>,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
     /// Queue identity override; `None` uses the descriptor's `queue_id`.
     pub(crate) queue_id: Option<QueueId>,
@@ -507,6 +509,8 @@ impl QueueRuntime {
             rate_state: crate::ModelRateState::default(),
             spend: Arc::new(crate::UnavailableSpendLedger),
             accepted_spend: None,
+            invocation: None,
+            attempt_context: None,
             response_cache: None,
             queue_id: None,
             binding_identity: None,
@@ -546,10 +550,23 @@ macro_rules! queue_runtime_builders {
         pub fn with_spend_ledger(
             mut self,
             ledger: Arc<dyn $crate::SpendLedger>,
-            accepted: Option<$crate::SpendReceiptRef>,
+            accepted: Option<$crate::AcceptedSpendHandoff>,
         ) -> Self {
             self.runtime.spend = ledger;
             self.runtime.accepted_spend = accepted;
+            self
+        }
+
+        /// Capture the exact canonical receipt for the runtime execution API.
+        #[doc(hidden)]
+        pub fn with_attempt_context(mut self, context: $crate::ExecutionAttemptContext) -> Self {
+            self.runtime.attempt_context = Some(context);
+            self
+        }
+
+        /// Explicit logical invocation identity for durable status and recovery.
+        pub fn with_invocation(mut self, invocation: String) -> Self {
+            self.runtime.invocation = Some(invocation);
             self
         }
 
