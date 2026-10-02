@@ -187,6 +187,10 @@ A permit invalidated by a grant-revision change or authority expiry before hando
 After Memory reauthorizes both principals, the next admission under the published revision
 is a new handoff for the same invocation, with the following ordinal and a higher record
 sequence and a currently valid signed deadline; it cannot mutate an existing signed attempt.
+Ordinals may have gaps when durable attempts were never issued, including expiry before
+issuance; issued ordinals and record sequences must still strictly increase.
+Issuing a successor permanently invalidates an unconsumed predecessor. Acceptance refuses
+that predecessor and status remains `Invalidated` even if Foundation's clock rolls back.
 Ordinary expiry needs no revision publication, so reauthorization after expiry can
 use the same published revision. For example, ordinal 1 issued
 under revision 10 and invalidated by revision 11 permits a newly signed ordinal 2 under
@@ -198,8 +202,8 @@ The existing runtime `queue.sqlite` is extended with `egress_permits` and
 `egress_grant_revisions` replay-protection tables. They store hashes, ordinal/sequence,
 grant-revision bindings, authority deadlines, accepted-handoff counts, consumption status,
 recoverable permit tokens and accounting receipts. Pending status is projected from the
-stored permit revision, the durably published revision and Foundation's clock, so
-publication and authority expiry need no permit-history scan. V3 also stores
+stored permit revision, the durably published revision, indexed successor existence
+and Foundation's clock, so publication and authority expiry need no permit-history scan. V3 also stores
 safe typed results until the signed recovery deadline, never prompts or provider credentials.
 The owner-only database and same-UID authenticated IPC protect these recovery values.
 SQLite FULL synchronization (including macOS fullfsync) makes consumption precede

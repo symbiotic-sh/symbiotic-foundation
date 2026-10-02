@@ -157,6 +157,8 @@ IPC or admission delay reaches Foundation's acceptance at second 101 or later.
 Foundation refuses D with `AuthorityExpired` before consuming its permit or
 reserving a request. A newly authorized attempt with the next ordinal, higher
 record sequence and fresh deadline may proceed under the same grant revision.
+Unissued attempts may leave ordinal gaps. Once a successor is issued, its unconsumed
+predecessor remains invalidated even if the clock rolls back before its deadline.
 An attempt accepted at second 100 keeps its execution, accounting and recovery
 after second 101; a retry requires a new authority check and deadline.
 

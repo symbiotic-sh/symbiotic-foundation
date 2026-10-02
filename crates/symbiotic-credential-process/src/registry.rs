@@ -117,9 +117,8 @@ impl Registry {
             if a.attempt_ordinal <= previous.ordinal {
                 return Err(EgressError::PermitRefused);
             }
-            if previous.ordinal.checked_add(1) != Some(a.attempt_ordinal)
-                || a.record_sequence <= previous.record_sequence
-            {
+            // Durable attempts can expire before issuance and leave ordinal gaps.
+            if a.record_sequence <= previous.record_sequence {
                 return Err(EgressError::InvalidRequest);
             }
             accepted_attempts = previous.accepted_attempts;
@@ -151,8 +150,6 @@ impl Registry {
                     return Err(EgressError::ReconciliationRequired);
                 }
             }
-        } else if a.attempt_ordinal != 1 {
-            return Err(EgressError::InvalidRequest);
         }
         // Only the current reservation can spend: prior attempts were zero.
         if accepted_attempts >= max_attempts {
@@ -224,13 +221,26 @@ impl Registry {
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        let accepted_attempts: u32 = tx.query_row(
-            "SELECT accepted_attempts FROM egress_permits WHERE attempt_digest=?1 AND token=?2 AND consumed=0",
-            params![attempt_digest, permit.token], |r| r.get(0)).optional().map_err(state)?
+        let (accepted_attempts, superseded): (u32, bool) = tx
+            .query_row(
+                "SELECT p.accepted_attempts, EXISTS(
+                SELECT 1 FROM egress_permits successor
+                WHERE successor.invocation_key=p.invocation_key AND successor.ordinal>p.ordinal)
+             FROM egress_permits p WHERE p.attempt_digest=?1 AND p.token=?2 AND p.consumed=0",
+                params![attempt_digest, permit.token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(state)?
             .ok_or(EgressError::PermitRefused)?;
         // The immediate transaction orders current authority with revision publication
         // and the durable replay/reservation acceptance point.
         Self::check_revision(&tx, attempt)?;
+        // Issuance permanently supersedes an unconsumed predecessor, even if
+        // the clock rolls back. Only the latest row can advance its handoff count.
+        if superseded {
+            return Err(EgressError::PermitRefused);
+        }
         // Recheck the current route allowance even for a permit issued before restart.
         if accepted_attempts >= max_attempts {
             return Err(EgressError::BudgetRefused);
@@ -324,7 +334,9 @@ impl Registry {
             .0
             .query_row(
                 "SELECT p.consumed, p.finished, p.recovery_expires_at, p.receipt, p.result,
-                        p.grant_revision = g.revision, p.expires_at
+                        p.grant_revision = g.revision, p.expires_at, EXISTS(
+                            SELECT 1 FROM egress_permits successor
+                            WHERE successor.invocation_key=p.invocation_key AND successor.ordinal>p.ordinal)
                  FROM egress_permits p JOIN egress_grant_revisions g ON g.grant_key=p.grant_key
                  WHERE p.invocation_key=?1 AND p.ordinal=?2",
                 params![key, id.attempt_ordinal],
@@ -337,6 +349,7 @@ impl Registry {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, bool>(5)?,
                         row.get::<_, u64>(6)?,
+                        row.get::<_, bool>(7)?,
                     ))
                 },
             )
@@ -350,16 +363,19 @@ impl Registry {
             result,
             current_revision,
             authority_expires,
+            superseded,
         )) = row
         else {
             return Ok(AttemptStatus::NotIssued);
         };
         if !consumed {
-            return Ok(if current_revision && time < authority_expires {
-                AttemptStatus::Permitted
-            } else {
-                AttemptStatus::Invalidated
-            });
+            return Ok(
+                if !superseded && current_revision && time < authority_expires {
+                    AttemptStatus::Permitted
+                } else {
+                    AttemptStatus::Invalidated
+                },
+            );
         }
         if !finished {
             return Ok(AttemptStatus::Dispatched {
@@ -448,6 +464,10 @@ impl Registry {
 }
 
 pub(crate) fn now() -> Result<u64, EgressError> {
+    #[cfg(test)]
+    if let Some(time) = tests::CLOCK.with(std::cell::Cell::get) {
+        return Ok(time);
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|time| time.as_secs())
@@ -468,6 +488,27 @@ fn ledger_error(err: symbiotic_ai_runtime::ModelError) -> EgressError {
 mod tests {
     use super::*;
     use symbiotic_ai_runtime::{SpendReceiptRef, SpendReservation};
+
+    thread_local! {
+        pub(super) static CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    struct TestClock;
+    impl TestClock {
+        fn new(time: u64) -> Self {
+            let clock = Self;
+            clock.set(time);
+            clock
+        }
+        fn set(&self, time: u64) {
+            CLOCK.with(|clock| clock.set(Some(time)));
+        }
+    }
+    impl Drop for TestClock {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| clock.set(None));
+        }
+    }
 
     fn open(path: &std::path::Path) -> Registry {
         symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
@@ -492,6 +533,20 @@ mod tests {
         }
     }
 
+    fn finish_released(registry: &mut Registry, mut receipt: DispatchReceipt) {
+        receipt.status = DispatchStatus::CredentialUnavailable;
+        receipt.spend_state = SpendState::Released;
+        registry
+            .finish(&DispatchResult {
+                receipt,
+                output: None,
+                error: Some(EgressError::CredentialUnavailable),
+                diagnostics: Vec::new(),
+                receipt_persisted: true,
+            })
+            .unwrap();
+    }
+
     fn attempt() -> DurableAttempt {
         serde_json::from_value(serde_json::json!({
             "tenant": "tenant", "incarnation": "incarnation", "invocation_id": "retry",
@@ -502,6 +557,173 @@ mod tests {
             "grant_revision": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn issued_successor_prevents_clock_rollback_from_reviving_pending_predecessor() {
+        let clock = TestClock::new(100);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut registry = open(&path);
+        let mut first = attempt();
+        first.expires_at = 101;
+        let first_grant = registry.issue(&first, 1).unwrap();
+        clock.set(101);
+        let mut second = first.clone();
+        second.attempt_ordinal = 2;
+        second.record_sequence = 2;
+        second.recorded_at = 101;
+        second.expires_at = 200;
+        let second_grant = registry.issue(&second, 1).unwrap();
+        clock.set(100);
+        for restart in [false, true] {
+            if restart {
+                drop(registry);
+                registry = open(&path);
+            }
+            assert!(matches!(
+                registry.consume(&first, &first_grant.permit, &reservation(&first), 1),
+                Err(EgressError::PermitRefused)
+            ));
+            assert!(matches!(
+                registry.attempt_status(&first.attempt_id(), 100).unwrap(),
+                AttemptStatus::Invalidated
+            ));
+            let reattached = registry.issue(&first, 1).unwrap();
+            assert_eq!(reattached.permit.token, first_grant.permit.token);
+            assert!(matches!(reattached.status, AttemptStatus::Invalidated));
+            assert!(registry.receipt(&first.attempt_id()).unwrap().is_none());
+            assert_eq!(
+                registry
+                    .0
+                    .query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                        .get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let receipt = registry
+            .consume(&second, &second_grant.permit, &reservation(&second), 1)
+            .unwrap();
+        finish_released(&mut registry, receipt);
+        second.attempt_ordinal = 3;
+        second.record_sequence = 3;
+        assert!(matches!(
+            registry.issue(&second, 1),
+            Err(EgressError::BudgetRefused)
+        ));
+        assert_eq!(
+            registry
+                .0
+                .query_row(
+                    "SELECT sum(consumed), sum(accepted_attempts) FROM egress_permits",
+                    [],
+                    |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?))
+                )
+                .unwrap(),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn expiry_before_issuance_allows_ordinal_gaps_without_losing_invariants() {
+        let clock = TestClock::new(100);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut registry = open(&path);
+        let mut first = attempt();
+        first.expires_at = 101;
+        clock.set(101);
+        assert!(matches!(
+            registry.issue(&first, 2),
+            Err(EgressError::AuthorityExpired)
+        ));
+        assert!(matches!(
+            registry.attempt_status(&first.attempt_id(), 101).unwrap(),
+            AttemptStatus::NotIssued
+        ));
+        let mut second = first.clone();
+        second.attempt_ordinal = 2;
+        second.record_sequence = 2;
+        second.recorded_at = 101;
+        second.expires_at = 102;
+        let granted = registry.issue(&second, 2).unwrap();
+        let receipt = registry
+            .consume(&second, &granted.permit, &reservation(&second), 2)
+            .unwrap();
+        finish_released(&mut registry, receipt);
+        clock.set(102);
+        let mut third = second.clone();
+        third.attempt_ordinal = 3;
+        third.record_sequence = 3;
+        assert!(matches!(
+            registry.issue(&third, 2),
+            Err(EgressError::AuthorityExpired)
+        ));
+        assert!(matches!(
+            registry.attempt_status(&third.attempt_id(), 102).unwrap(),
+            AttemptStatus::NotIssued
+        ));
+        drop(registry);
+        registry = open(&path);
+        let mut fourth = third.clone();
+        fourth.attempt_ordinal = 4;
+        fourth.record_sequence = 4;
+        fourth.recorded_at = 102;
+        fourth.expires_at = 200;
+        let mut changed = fourth.clone();
+        changed.record_sequence = 2;
+        assert!(matches!(
+            registry.issue(&changed, 2),
+            Err(EgressError::InvalidRequest)
+        ));
+        changed = fourth.clone();
+        changed.input_digest = "c".repeat(64);
+        assert!(matches!(
+            registry.issue(&changed, 2),
+            Err(EgressError::InvalidRequest)
+        ));
+        let granted = registry.issue(&fourth, 2).unwrap();
+        changed = fourth.clone();
+        changed.expires_at += 1;
+        assert!(matches!(
+            registry.issue(&changed, 2),
+            Err(EgressError::InvalidRequest)
+        ));
+        assert!(matches!(
+            registry.issue(&third, 2),
+            Err(EgressError::PermitRefused)
+        ));
+        let receipt = registry
+            .consume(&fourth, &granted.permit, &reservation(&fourth), 2)
+            .unwrap();
+        finish_released(&mut registry, receipt);
+        assert_eq!(
+            registry
+                .0
+                .query_row(
+                    "SELECT accepted_attempts FROM egress_permits WHERE ordinal=4",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            2
+        );
+        // Another skipped ordinal must still carry the accepted-handoff count.
+        fourth.attempt_ordinal = 6;
+        fourth.record_sequence = 6;
+        assert!(matches!(
+            registry.issue(&fourth, 2),
+            Err(EgressError::BudgetRefused)
+        ));
+        assert_eq!(
+            registry
+                .0
+                .query_row("SELECT count(*) FROM egress_permits", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

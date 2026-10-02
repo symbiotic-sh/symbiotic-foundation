@@ -74,7 +74,7 @@ pub struct DurableAttempt {
     pub incarnation: String,
     /// Logical invocation, stable across retries.
     pub invocation_id: String,
-    /// One-based attempt ordinal, strictly increasing.
+    /// One-based attempt ordinal, strictly increasing; unissued attempts may leave gaps.
     pub attempt_ordinal: u32,
     /// Position of this attempt in Memory K's serialization order.
     pub record_sequence: u64,
@@ -416,9 +416,10 @@ pub struct DispatchResult {
 pub enum AttemptStatus {
     /// No permit has been issued for this identity.
     NotIssued,
-    /// Permit committed, not consumed, with current revision and unexpired authority.
+    /// Latest issued permit, not consumed, with current revision and unexpired authority.
     Permitted,
-    /// Revision changed or authority expired before handoff; no charge or allowance consumed.
+    /// Revision changed, authority expired or a successor was issued before handoff;
+    /// no charge or allowance consumed. Supersession survives clock rollback.
     Invalidated,
     /// Permit consumed; completion is not durably known (including a process crash).
     Dispatched { receipt: DispatchReceipt },
