@@ -5216,6 +5216,7 @@ mod tests {
     #[cfg(feature = "queue")]
     #[tokio::test]
     async fn rate_charge_failure_releases_reservation_and_stops_dispatch() {
+        let cache = tempfile::tempdir().unwrap();
         for queue in [
             Arc::new(symbiotic_queue::MemoryQueue::new()) as Arc<dyn QueueBackend>,
             Arc::new(SqliteQueue::in_memory().unwrap()) as Arc<dyn QueueBackend>,
@@ -5237,6 +5238,7 @@ mod tests {
                 rate_burst_seconds: 60,
                 logical_retry_attempts: 3,
                 retry_attempts: 3,
+                response_cache_dir: Some(cache.path().to_path_buf()),
                 ..ModelQueueConfig::default()
             };
             let install = |rate| {
@@ -5260,6 +5262,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(item.status, QueueStatus::Stopped);
+            assert!(item.idempotency_key.is_some());
             let reference = spend::runtime_reference(&item.item_id.0, item.attempt).unwrap();
             let accounted = spend.receipt(&reference).unwrap().unwrap();
             assert_eq!(accounted.state, SpendState::Released);

@@ -209,6 +209,14 @@ fn queued(
         .with_spend_ledger(test_spend::ledger(), None)
 }
 
+fn queued_with_cache(
+    provider: Loopback,
+    queue: Arc<dyn QueueBackend>,
+    config: ModelQueueConfig,
+) -> QueuedChatProvider<Loopback> {
+    queued(provider, queue, config).with_response_cache(Arc::new(TextKeyedCache::default()))
+}
+
 #[tokio::test]
 async fn providers_sharing_admission_share_one_model_cap() {
     let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
@@ -713,7 +721,7 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     };
 
     let kept = down();
-    let provider = queued(kept.clone(), Arc::new(MemoryQueue::new()), once.clone());
+    let provider = queued_with_cache(kept.clone(), Arc::new(MemoryQueue::new()), once.clone());
     provider.chat(request("same")).await.unwrap_err();
     let err = provider.chat(request("same")).await.unwrap_err();
     assert!(matches!(
@@ -723,7 +731,7 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     assert_eq!(kept.calls.load(Ordering::SeqCst), 1, "no second paid call");
 
     let renewed = down();
-    let provider = queued(
+    let provider = queued_with_cache(
         renewed.clone(),
         Arc::new(MemoryQueue::new()),
         ModelQueueConfig {
@@ -1257,7 +1265,8 @@ async fn an_abandoned_call_that_fails_records_its_class_and_releases_its_lease(
             symbiotic_core::DiagnosticCode::HttpUnavailable,
         )]);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
+    let provider =
+        queued_with_cache(raw.clone(), queue.clone(), leased()).with_receipt_sink(receipts.clone());
 
     abandon(&provider, "doomed", Duration::from_millis(300)).await;
     let item = settled(&queue, &queued_item(&receipts), Duration::from_secs(5)).await;
@@ -1696,7 +1705,7 @@ async fn failed_cooldown_is_terminal(
             symbiotic_core::DiagnosticCode::HttpUnavailable,
         )]);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
@@ -2809,7 +2818,8 @@ async fn reconciliation_preserves_exhausted_attempt_limits(
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
-    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
+    let provider =
+        queued_with_cache(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
     provider.chat(request("last attempt")).await.unwrap_err();
     spend.release_last();
     provider.chat(request("last attempt")).await.unwrap_err();
@@ -2962,7 +2972,7 @@ async fn uncertain_charge_cooldown_failure_is_visible_and_terminal(
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
