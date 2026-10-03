@@ -892,9 +892,9 @@ impl QueueReceiptSink for DelayedReceipt {
 }
 
 #[tokio::test]
-async fn slow_receipt_sink_cannot_dispatch_an_expired_or_cancelled_claim() {
+async fn slow_receipt_sink_renews_lease_and_respects_cancellation() {
     for status in [ReceiptStatus::Queued, ReceiptStatus::Running] {
-        for cancel in [false, true] {
+        for (cancel, expire) in [(false, false), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
             drop(runtime(dir.path()));
             let sink = Arc::new(DelayedReceipt {
@@ -908,41 +908,73 @@ async fn slow_receipt_sink_cannot_dispatch_an_expired_or_cancelled_claim() {
                 ..Default::default()
             })
             .unwrap();
-            let j = jobs(&r, JobConfig::default());
+            let j = jobs(
+                &r,
+                JobConfig {
+                    claim_lease_seconds: 1,
+                    ..Default::default()
+                },
+            );
             let p = Provider::new();
             let id = enqueue(&j, spec("slow-receipt", &p)).await;
             let runner = start(&j, p.clone()).await;
             tokio::time::timeout(Duration::from_secs(5), sink.entered.notified())
                 .await
                 .unwrap();
+            // Receipt emission remains blocked longer than the entire lease.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let leased = row(&j, &id).await;
+            assert_eq!(leased.state, JobState::Running);
+            assert!(leased.lease_until.unwrap() > chrono::Utc::now());
+            assert_eq!(p.calls.load(Ordering::SeqCst), 0);
             if cancel {
                 j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
                     .await
                     .unwrap();
-            } else {
-                // Expire the lease deterministically while receipt emission is blocked.
+            }
+            if expire {
+                // Keep the original forced-fence case as well as real renewal.
                 sql(dir.path())
                     .execute("UPDATE jobs SET lease_until=0", [])
                     .unwrap();
             }
             sink.resume.notify_one();
-            if cancel {
-                wait_state(&j, &id, JobState::Cancelled).await;
-                runner.shutdown().await.unwrap();
+            if expire {
+                let result = tokio::time::timeout(Duration::from_secs(5), runner.wait())
+                    .await
+                    .unwrap();
+                assert!(result.is_err());
             } else {
-                tokio::select! {
-                    biased;
-                    _ = p.started.notified() => panic!("transport started after claim expiry"),
-                    result = tokio::time::timeout(Duration::from_secs(5), runner.wait()) => {
-                        assert!(result.unwrap().is_err());
-                    }
-                }
+                wait_state(
+                    &j,
+                    &id,
+                    if cancel {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Succeeded
+                    },
+                )
+                .await;
+                runner.shutdown().await.unwrap();
             }
-            assert_eq!(p.calls.load(Ordering::SeqCst), 0);
-            let receipt = row(&j, &id).await.receipt.unwrap();
-            let receipt = j_runtime_receipt(dir.path(), &SpendReceiptRef::new(receipt).unwrap());
-            assert_eq!(receipt.state, SpendState::Released);
-            assert!(receipt.pre_dispatch_released);
+            let final_row = row(&j, &id).await;
+            assert_eq!(
+                p.calls.load(Ordering::SeqCst),
+                usize::from(!cancel && !expire)
+            );
+            let receipt = j_runtime_receipt(
+                dir.path(),
+                &SpendReceiptRef::new(final_row.receipt.unwrap()).unwrap(),
+            );
+            assert_eq!(
+                receipt.state,
+                if cancel || expire {
+                    SpendState::Released
+                } else {
+                    SpendState::Settled
+                }
+            );
+            assert_eq!(receipt.pre_dispatch_released, cancel || expire);
         }
     }
 }
@@ -1099,52 +1131,65 @@ async fn review_4_direct_settlement_respects_purge_even_after_confirmation() {
 async fn purging_one_binding_preserves_another_bindings_recovery_answer() {
     for confirmed in [false, true] {
         for answer_before_purge in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let r = runtime(dir.path());
-            let j = jobs(&r, JobConfig::default());
-            let p = Provider::new();
-            let id = enqueue(&j, spec("binding-purge", &p)).await;
-            let key = j.invocation_key("binding-purge").unwrap();
-            let mut other = binding(p.clone());
-            other.identity.as_mut().unwrap().revision.0 = "2".into();
-            if answer_before_purge {
-                r.execute_chat(other.clone(), &key, request())
+            for paid_job in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let r = runtime(dir.path());
+                let j = jobs(&r, JobConfig::default());
+                let p = Provider::new();
+                let id = enqueue(&j, spec("binding-purge", &p)).await;
+                let key = j.invocation_key("binding-purge").unwrap();
+                if paid_job {
+                    let runner = start(&j, p.clone()).await;
+                    wait_state(&j, &id, JobState::Succeeded).await;
+                    runner.shutdown().await.unwrap();
+                }
+                let mut other = binding(p.clone());
+                other.identity.as_mut().unwrap().revision.0 = "2".into();
+                // Register the second binding under a different kind in this same scope.
+                let mut second = spec("other-kind", &p);
+                second.kind = "other-chat".into();
+                second.owners = vec!["other-owner".into()];
+                second.payload = model_job_payload(&other, &request()).unwrap();
+                enqueue(&j, second).await;
+                if answer_before_purge {
+                    r.execute_chat(other.clone(), &key, request())
+                        .await
+                        .unwrap();
+                }
+                j.request(JobRequest::PurgeOwner("owner-a".into()))
                     .await
                     .unwrap();
-            }
-            j.request(JobRequest::PurgeOwner("owner-a".into()))
-                .await
-                .unwrap();
-            assert_eq!(row(&j, &id).await.state, JobState::Purged);
-            if confirmed {
-                let page = j.completions(1, 10000).await.unwrap();
-                j.request(JobRequest::Ack(vec![(
-                    page[0].delivery.token.clone(),
-                    Disposition::Discarded,
-                )]))
-                .await
-                .unwrap();
-                assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
-            }
-            if !answer_before_purge {
-                r.execute_chat(other.clone(), &key, request())
+                assert_eq!(row(&j, &id).await.state, JobState::Purged);
+                if confirmed {
+                    let page = j.completions(1, 10000).await.unwrap();
+                    j.request(JobRequest::Ack(vec![(
+                        page[0].delivery.token.clone(),
+                        Disposition::Discarded,
+                    )]))
                     .await
                     .unwrap();
+                    assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
+                }
+                if !answer_before_purge {
+                    r.execute_chat(other.clone(), &key, request())
+                        .await
+                        .unwrap();
+                }
+                let status = r
+                    .invocation_status(other.identity.as_ref().unwrap(), None, &key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(status.state, SpendState::Settled);
+                assert!(status.output_available);
+                assert_eq!(copies(dir.path()), 1);
+                drop(j);
+                drop(r);
+                let reopened = runtime(dir.path());
+                let recovered = reopened.execute_chat(other, &key, request()).await.unwrap();
+                assert_eq!(recovered.output.text, "paid answer");
+                assert_eq!(recovered.attempt.unwrap().unwrap(), status);
+                assert_eq!(p.calls.load(Ordering::SeqCst), 1 + usize::from(paid_job));
             }
-            let status = r
-                .invocation_status(other.identity.as_ref().unwrap(), None, &key)
-                .unwrap()
-                .unwrap();
-            assert_eq!(status.state, SpendState::Settled);
-            assert!(status.output_available);
-            assert_eq!(copies(dir.path()), 1);
-            drop(j);
-            drop(r);
-            let reopened = runtime(dir.path());
-            let recovered = reopened.execute_chat(other, &key, request()).await.unwrap();
-            assert_eq!(recovered.output.text, "paid answer");
-            assert_eq!(recovered.attempt.unwrap().unwrap(), status);
-            assert_eq!(p.calls.load(Ordering::SeqCst), 1);
         }
     }
 }

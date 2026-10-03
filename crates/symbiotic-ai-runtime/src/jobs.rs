@@ -279,6 +279,11 @@ impl ModelJobs {
                 if let Some(receipt) = receipt
                     && let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(row.id))?
                     && (row.state.acked() || row.purged || row.result_expired) {
+                    // Preserve the accepted direct attempt in the existing receipt
+                    // reference, so confirmation cannot erase its invocation binding.
+                    if purging {
+                        tx.execute("UPDATE jobs SET receipt=?3 WHERE scope=?1 AND id=?2", params![serde_json::to_string(&row.id.scope).map_err(|_| JobError::Storage)?, row.id.id, receipt]).map_err(|_| JobError::Storage)?;
+                    }
                     tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [&receipt]).map_err(|_| JobError::Storage)?;
                 }
             }

@@ -17,13 +17,13 @@ fn reservation(id: &str) -> SpendReservation {
     }
 }
 
-fn steps(history: usize, explicit: bool) -> Vec<usize> {
+fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<usize> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
     symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
     let ledger = SqliteSpendLedger::open(&path)
         .unwrap()
-        .with_retention(std::time::Duration::ZERO);
+        .with_retention(retention);
     {
         let mut conn = ledger.0.lock().unwrap();
         let tx = conn.transaction().unwrap();
@@ -81,7 +81,21 @@ fn steps(history: usize, explicit: bool) -> Vec<usize> {
             .unwrap();
     }
     result.push(count.swap(0, Ordering::Relaxed));
-    assert_eq!(ledger.expire_recovery().unwrap(), usize::from(explicit));
+    let receipt = ledger.receipt(&r.reference).unwrap().unwrap();
+    assert!(receipt.output.is_some());
+    let saved = explicit && !retention.is_zero();
+    assert_eq!(receipt.recovery.is_some(), saved);
+    if saved {
+        // Advance expiry deterministically without sleeping or changing the
+        // production clock; the sweep must actually remove a retained answer.
+        ledger.0.lock().unwrap().execute(
+            "UPDATE spend_receipts SET recovery_expires_at='2000-01-01T00:00:00+00:00' WHERE reference=?1",
+            [r.reference.as_str()],
+        ).unwrap();
+    }
+    count.store(0, Ordering::Relaxed);
+    // Zero retention skips saving, so there is no answer for maintenance to erase.
+    assert_eq!(ledger.expire_recovery().unwrap(), usize::from(saved));
     result.push(count.swap(0, Ordering::Relaxed));
     ledger.discard_recovery("account", "invocation").unwrap();
     result.push(count.swap(0, Ordering::Relaxed));
@@ -90,15 +104,22 @@ fn steps(history: usize, explicit: bool) -> Vec<usize> {
 
 #[test]
 fn request_and_expiry_work_is_independent_of_retained_history() {
-    for explicit in [false, true] {
-        let small = steps(10, explicit);
-        let large = steps(10_000, explicit);
-        eprintln!("explicit={explicit}: VM steps at 10 receipts={small:?}, at 10,000={large:?}");
-        for (operation, (small, large)) in small.iter().zip(&large).enumerate() {
-            assert!(
-                *large <= small + 20,
-                "explicit={explicit}, operation={operation}: {small} -> {large}"
+    for retention in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(60),
+    ] {
+        for explicit in [false, true] {
+            let small = steps(10, explicit, retention);
+            let large = steps(10_000, explicit, retention);
+            eprintln!(
+                "retention={retention:?}, explicit={explicit}: VM steps at 10 receipts={small:?}, at 10,000={large:?}"
             );
+            for (operation, (small, large)) in small.iter().zip(&large).enumerate() {
+                assert!(
+                    *large <= small + 20,
+                    "retention={retention:?}, explicit={explicit}, operation={operation}: {small} -> {large}"
+                );
+            }
         }
     }
 }

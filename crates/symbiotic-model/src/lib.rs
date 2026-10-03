@@ -2227,7 +2227,8 @@ where
     // No provider future exists until this block succeeds.
     let attempt = job.attempt()?;
     let item_id = QueueItemId(reference.as_str().into());
-    let prepared = async {
+    let mut monitoring = Vec::new();
+    let prepared = holding_job_lease(&job, true, &mut monitoring, async {
         let request: Req = serde_json::from_slice(&payload)
             .map_err(|_| ModelError::InvalidRequest(DiagnosticCode::InvalidConfiguration))?;
         if hash_json(&request)? != this.request_hash {
@@ -2263,7 +2264,7 @@ where
             rate.charge()?;
         }
         Ok::<_, ModelError>(())
-    }
+    })
     .await;
     if let Err(error) = prepared {
         let owner = job.clone();
@@ -2325,26 +2326,8 @@ where
         }
         Ok::<_, ModelError>((result, side_error, panicked))
     };
-    tokio::pin!(transport);
-    let mut timer = tokio::time::interval(job.heartbeat_interval());
-    timer.tick().await;
-    let mut monitoring: Vec<ModelError> = Vec::new();
-    let mut fenced = false;
-    let (mut result, side_error, panicked) = loop {
-        tokio::select! {
-            result = &mut transport => break result?,
-            _ = timer.tick(), if !fenced => {
-                let owner = job.clone();
-                if let Err(error) = run_blocking(move || owner.heartbeat()).await {
-                    if !monitoring.iter().any(|cause| cause.code() == error.code()) {
-                        tracing::warn!(code = %error.code(), "model job heartbeat failed");
-                        monitoring.push(error);
-                    }
-                    fenced = error.code() == DiagnosticCode::QueueFailure;
-                }
-            }
-        }
-    };
+    let (mut result, side_error, panicked) =
+        holding_job_lease(&job, false, &mut monitoring, transport).await?;
     let known_zero = result.as_ref().err().is_some_and(|error| {
         !panicked
             && !matches!(error, ModelError::Timeout(_))
@@ -2435,6 +2418,43 @@ where
         return Err(error);
     }
     outcome
+}
+
+// One renewal owner covers both receipt preparation and dispatched transport.
+// Before dispatch, cancellation or renewal failure releases the reservation;
+// after dispatch, accounting must finish before a renewal error reaches the caller.
+#[cfg(feature = "queue")]
+async fn holding_job_lease<T>(
+    job: &Arc<dyn ModelJob>,
+    before_dispatch: bool,
+    monitoring: &mut Vec<ModelError>,
+    work: impl std::future::Future<Output = Result<T, ModelError>>,
+) -> Result<T, ModelError> {
+    tokio::pin!(work);
+    let mut timer = tokio::time::interval(job.heartbeat_interval());
+    timer.tick().await;
+    let mut fenced = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = timer.tick(), if !fenced => {
+                let owner = job.clone();
+                match run_blocking(move || owner.heartbeat()).await {
+                    Ok(true) if before_dispatch => return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted)),
+                    Ok(_) => {},
+                    Err(error) if before_dispatch => return Err(error),
+                    Err(error) => {
+                        fenced = error.code() == DiagnosticCode::QueueFailure;
+                        if !monitoring.iter().any(|cause| cause.code() == error.code()) {
+                            tracing::warn!(code = %error.code(), "model job heartbeat failed");
+                            monitoring.push(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The leased part of an attempt: the running receipt, the provider call,

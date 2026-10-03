@@ -41,30 +41,27 @@ fn recovery_erased(
     }) else {
         return Ok(false);
     };
-    let mut stmt = tx.prepare(
-        "SELECT b.binding FROM jobs j JOIN model_job_bindings b ON b.scope=j.scope AND (j.kind=b.kind OR j.kind IS NULL)
-         WHERE j.scope=?1 AND j.key=?2 AND (j.purged=1 OR j.final_state='\"Purged\"')",
-    ).map_err(storage)?;
-    let mut rows = stmt
-        .query(params![
-            serde_json::to_string(&scope).map_err(storage)?,
-            key
-        ])
+    let reference: Option<String> = tx
+        .query_row(
+            "SELECT receipt FROM jobs
+         WHERE scope=?1 AND key=?2 AND (purged=1 OR final_state='\"Purged\"')",
+            params![serde_json::to_string(&scope).map_err(storage)?, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?
+        .flatten();
+    let Some(reference) = reference else {
+        return Ok(false);
+    };
+    let erased_invocation: String = tx
+        .query_row(
+            "SELECT invocation FROM spend_receipts WHERE reference=?1",
+            [reference],
+            |row| row.get(0),
+        )
         .map_err(storage)?;
-    while let Some(row) = rows.next().map_err(storage)? {
-        let (identity, _): (
-            symbiotic_core::BindingIdentity,
-            Option<symbiotic_core::AccountSharingKey>,
-        ) = serde_json::from_str(&row.get::<_, String>(0).map_err(storage)?).map_err(storage)?;
-        if symbiotic_model::execution_invocation_identity(
-            &identity,
-            invocation.ok_or_else(conflict)?,
-        )? == receipt.reservation.invocation
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(erased_invocation == receipt.reservation.invocation)
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
