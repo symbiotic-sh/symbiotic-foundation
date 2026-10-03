@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/symbiotic-supervise",
     "crates/symbiotic-egress",
     "crates/symbiotic-credential-process",
     "crates/symbiotic-ai-runtime",

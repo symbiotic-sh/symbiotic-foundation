@@ -7,13 +7,38 @@ use symbiotic_egress::{
 };
 use tokio::{net::UnixListener, sync::Semaphore};
 
-/// Bind without replacing an existing socket. Remove a stale socket explicitly after
-/// proving its prior process is stopped; never unlink another process's listener.
+/// Bind while holding the state lock, removing only a stale socket.
+/// The lock proves the previous state owner has exited. An active listener or
+/// non-socket path is refused, even if a different state directory names it.
 pub fn bind(process: &CredentialProcess) -> Result<UnixListener, EgressError> {
     let path = &process.config().socket_path;
     let parent = path.parent().ok_or(EgressError::InvalidRequest)?;
     symbiotic_ai_runtime::model::private_fs::check_private_dir(parent)
         .map_err(|_| EgressError::StateUnavailable)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+            if !metadata.file_type().is_socket() {
+                return Err(EgressError::StateUnavailable);
+            }
+            // Do not block on a full listener backlog. Only ECONNREFUSED proves
+            // there is no listener at this existing socket; other failures refuse.
+            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let address =
+                socket2::SockAddr::unix(path).map_err(|_| EgressError::StateUnavailable)?;
+            match socket.connect(&address) {
+                Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+                _ => return Err(EgressError::StateUnavailable),
+            }
+            std::fs::remove_file(path).map_err(|_| EgressError::StateUnavailable)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(EgressError::StateUnavailable),
+    }
     let listener = UnixListener::bind(path).map_err(|_| EgressError::StateUnavailable)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|_| EgressError::StateUnavailable)?;
