@@ -200,7 +200,7 @@ fn persistent(dir: &std::path::Path) -> Runtime {
 #[tokio::test]
 async fn spend_dispatch_requires_an_explicit_state_directory() {
     for runtime in [
-        Runtime::in_memory(),
+        Runtime::in_memory().unwrap(),
         Runtime::open(RuntimeConfig::default()).unwrap(),
     ] {
         let raw = Loopback::new(unique_identity());
@@ -310,7 +310,7 @@ async fn bindings_of_one_model_share_its_cap() {
 
 #[tokio::test]
 async fn conflicting_limits_for_one_model_are_rejected_and_other_models_are_independent() {
-    let runtime = Runtime::in_memory();
+    let runtime = Runtime::in_memory().unwrap();
     let identity = unique_identity();
     runtime
         .chat(binding(Loopback::new(identity.clone())).with_policy(policy()))
@@ -1279,7 +1279,13 @@ async fn purging_a_source_removes_only_its_responses() {
         .unwrap(),
         0
     );
-    assert_eq!(Runtime::in_memory().purge_responses(|_| true).unwrap(), 0);
+    assert_eq!(
+        Runtime::in_memory()
+            .unwrap()
+            .purge_responses(|_| true)
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1356,6 +1362,7 @@ fn runtime_refuses_missing_binding_identity() {
     let raw = Loopback::new(unique_identity());
     assert!(
         Runtime::in_memory()
+            .unwrap()
             .chat(ModelBinding::new(raw).with_policy(policy()))
             .is_err()
     );
@@ -1640,6 +1647,7 @@ fn registry_refuses_transport_or_policy_overrides_and_unconfigured_policy() {
     assert!(runtime.chat(binding).is_err());
     assert!(
         Runtime::in_memory()
+            .unwrap()
             .chat(binding_without_policy(Loopback::new(unique_identity())))
             .is_err()
     );
@@ -1653,7 +1661,7 @@ fn supported_http_bindings_require_finite_request_and_response_limits() {
     use symbiotic_ai_runtime::model::{
         GeminiEmbeddingProvider, JevClassifierProvider, OpenAiCompatibleChatProvider,
     };
-    let runtime = Runtime::in_memory();
+    let runtime = Runtime::in_memory().unwrap();
     for request_limit in [None, Some(0), Some(1024)] {
         for response_limit in [None, Some(0), Some(1024)] {
             let valid = request_limit == Some(1024) && response_limit == Some(1024);
@@ -1711,10 +1719,12 @@ fn production_request_debug_dir_is_refused_at_bind_time() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dir.path().join("request-dumps");
     let raw = Loopback::new(unique_identity());
-    let result = Runtime::in_memory().chat(binding(raw).with_policy(ModelQueueConfig {
-        request_debug_dir: Some(dumps.clone()),
-        ..policy()
-    }));
+    let result = Runtime::in_memory()
+        .unwrap()
+        .chat(binding(raw).with_policy(ModelQueueConfig {
+            request_debug_dir: Some(dumps.clone()),
+            ..policy()
+        }));
     assert!(matches!(result, Err(ModelError::InvalidRequest(_))));
     assert!(!dumps.exists());
 }
@@ -1739,7 +1749,10 @@ fn raw_and_registry_bindings_refuse_the_same_invalid_chat_settings() {
         .with_output_limit(1024)
         .with_thinking(thinking)
         .with_reasoning_effort(effort);
-        let raw_error = match Runtime::in_memory().chat(binding(raw).with_policy(policy())) {
+        let raw_error = match Runtime::in_memory()
+            .unwrap()
+            .chat(binding(raw).with_policy(policy()))
+        {
             Err(error) => error,
             Ok(_) => panic!("invalid raw binding was accepted"),
         };
@@ -1879,7 +1892,9 @@ fn credential_adapter_validation_errors_have_no_text_payload() {
         "http://localhost",
         KEY,
     ));
-    let result = Runtime::in_memory().chat(binding(adapter).with_policy(policy()));
+    let result = Runtime::in_memory()
+        .unwrap()
+        .chat(binding(adapter).with_policy(policy()));
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("invalid configuration was accepted"),
@@ -2657,7 +2672,12 @@ fn fdn_zero_maintenance_interval_is_refused() {
         RuntimeConfig::default().maintenance_interval,
         Duration::from_secs(60)
     );
-    assert!(Runtime::in_memory().last_maintenance_error().is_none());
+    assert!(
+        Runtime::in_memory()
+            .unwrap()
+            .last_maintenance_error()
+            .is_none()
+    );
 }
 
 #[tokio::test]

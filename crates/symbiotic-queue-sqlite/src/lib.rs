@@ -4,6 +4,8 @@
 //! queue-bound model providers, hosts with their own queue) never contains
 //! SQLite, whatever features other crates in the same build enable.
 
+pub mod jobs;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -48,6 +50,12 @@ pub struct SqliteQueue {
 }
 
 impl SqliteQueue {
+    /// Initialize the current queue/job format on a caller-owned ledger connection.
+    /// Unknown formats are refused; pre-release state has no migrations.
+    pub fn initialize_connection(conn: &mut Connection) -> Result<(), QueueError> {
+        configure(conn)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, QueueError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(storage_error)?;
@@ -364,6 +372,15 @@ impl SqliteQueue {
 
 #[async_trait]
 impl QueueBackend for SqliteQueue {
+    async fn jobs(
+        &self,
+        scope: &symbiotic_queue::jobs::JobScope,
+        config: &symbiotic_queue::jobs::JobConfig,
+        now: DateTime<Utc>,
+        request: symbiotic_queue::jobs::JobRequest,
+    ) -> Result<symbiotic_queue::jobs::JobResponse, symbiotic_queue::jobs::JobError> {
+        self.job_operation(scope, config, now, request)
+    }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.enqueue_inner(request, None).await
     }
@@ -787,7 +804,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 9;
+pub const QUEUE_SCHEMA_VERSION: u32 = 14;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -810,7 +827,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     }
     // Before release, only an empty, unversioned queue can be initialized.
     let existing_queue = tx
-        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')")
+        .prepare("select 1 from sqlite_master where type = 'table' and name collate nocase in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'jobs', 'job_owners')")
         .and_then(|mut stmt| stmt.exists([]))
         .map_err(storage_error)?;
     if schema_version != 0 || existing_queue {
@@ -869,6 +886,7 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
         ",
     )
     .map_err(storage_error)?;
+    jobs::initialize(&tx).map_err(storage_error)?;
     tx.pragma_update(None, "user_version", QUEUE_SCHEMA_VERSION)
         .map_err(storage_error)?;
     tx.commit().map_err(storage_error)
@@ -1206,6 +1224,8 @@ mod tests {
             "queue_cooldowns",
             "spend_accounts",
             "spend_receipts",
+            "jobs",
+            "job_owners",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("queue.sqlite");
@@ -1252,7 +1272,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'jobs', 'job_owners')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
     }
@@ -1270,6 +1290,8 @@ mod tests {
             6,
             7,
             8,
+            9,
+            i64::from(QUEUE_SCHEMA_VERSION) - 1,
             i64::from(QUEUE_SCHEMA_VERSION) + 1,
         ] {
             for existing in [false, true] {

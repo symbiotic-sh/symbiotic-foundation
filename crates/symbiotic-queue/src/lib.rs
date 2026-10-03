@@ -19,6 +19,7 @@ use thiserror::Error;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod jobs;
 mod memory;
 
 pub use memory::{DEFAULT_RETAINED_TERMINAL_ITEMS, MemoryQueue};
@@ -170,6 +171,18 @@ impl QueueError {
 
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
+    /// Execute an atomic generic-job operation using the trusted host's clock
+    /// and versioned configuration. Authority verification belongs to the host
+    /// inside the acceptance transaction. Backends without a job store fail visibly.
+    async fn jobs(
+        &self,
+        _scope: &jobs::JobScope,
+        _config: &jobs::JobConfig,
+        _now: DateTime<Utc>,
+        _request: jobs::JobRequest,
+    ) -> Result<jobs::JobResponse, jobs::JobError> {
+        Err(jobs::JobError::Unavailable)
+    }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError>;
     /// Force-enqueue `request` only while `current` is still the newest item
     /// for its idempotency key; otherwise return that newest item unchanged,
