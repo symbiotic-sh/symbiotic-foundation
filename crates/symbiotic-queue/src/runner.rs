@@ -95,6 +95,14 @@ pub enum RunnerError {
     /// Store/configuration failure.
     #[error(transparent)]
     Store(#[from] JobError),
+    /// First monitoring failure and total failures while the handler drains.
+    #[error("job monitoring failed {count} times; first cause: {cause}")]
+    Monitoring {
+        /// First store/configuration cause.
+        cause: JobError,
+        /// Total failed monitoring operations, including the first.
+        count: usize,
+    },
     /// Handler panicked; the runner attempts a fenced final failure without retry.
     #[error("job handler panicked: {0:?}")]
     HandlerPanicked(JobId),
@@ -136,10 +144,11 @@ impl Shared {
         }
     }
 
-    async fn execute(self: &Arc<Self>, claim: JobRecord) -> Result<(), RunnerError> {
+    async fn execute(self: &Arc<Self>, mut claim: JobRecord) -> Result<(), RunnerError> {
         if claim.execution != Execution::Handler {
             return Err(JobError::InvalidRequest.into());
         }
+        claim.payload = None;
         let (cancel, rx) = watch::channel(false);
         let shared = self.clone();
         let row = claim.clone();
@@ -173,11 +182,17 @@ impl Shared {
                 _ = poll.tick(), if errors.is_empty() => self.signal_cancel(&claim, &cancel).await,
             };
             if let Err(error) = check {
-                // Ask work to stop, retaining every failure. Once cancellation
+                // Count monitoring failures while asking work to stop. Once cancellation
                 // is signalled, polling adds nothing; scheduled heartbeats must
                 // still protect draining work until the store fences the claim.
                 let fenced = matches!(error, JobError::StaleClaim);
-                errors.push(RunnerError::Store(error));
+                match errors.first_mut() {
+                    Some(RunnerError::Monitoring { count, .. }) => *count += 1,
+                    _ => errors.push(RunnerError::Monitoring {
+                        cause: error,
+                        count: 1,
+                    }),
+                }
                 cancel.send_replace(true);
                 if fenced {
                     break task.join_next().await;
@@ -185,6 +200,16 @@ impl Shared {
             }
         };
         let (state, output, diagnostic) = match outcome {
+            Some(Ok(Ok(Some(Ok(output))))) if output.len() > self.jobs.max_result_bytes => {
+                errors.push(
+                    JobError::ResultTooLarge {
+                        job: claim.id.clone(),
+                        bytes: output.len(),
+                    }
+                    .into(),
+                );
+                (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
+            }
             Some(Ok(Ok(Some(Ok(output))))) => (JobState::Succeeded, Some(output), None),
             Some(Ok(Ok(Some(Err(failure))))) => (JobState::Failed, None, Some(failure.code)),
             Some(Ok(Ok(None))) => (JobState::Cancelled, None, None),

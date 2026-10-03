@@ -13,6 +13,28 @@ use std::sync::{
 };
 use symbiotic_queue::runner::*;
 
+// Count live buffers of exactly the regression's claim size, including clones.
+struct PayloadAllocator;
+static LARGE_BUFFERS: AtomicUsize = AtomicUsize::new(0);
+const CLAIM_BYTES: usize = 8 * 1024 * 1024;
+#[global_allocator]
+static ALLOCATOR: PayloadAllocator = PayloadAllocator;
+unsafe impl std::alloc::GlobalAlloc for PayloadAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if layout.size() == CLAIM_BYTES && !ptr.is_null() {
+            LARGE_BUFFERS.fetch_add(1, Ordering::SeqCst);
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if layout.size() == CLAIM_BYTES {
+            LARGE_BUFFERS.fetch_sub(1, Ordering::SeqCst);
+        }
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+    }
+}
+
 struct Handler<F>(F);
 #[async_trait::async_trait]
 impl<F, Fut> JobHandler for Handler<F>
@@ -415,7 +437,7 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
             .unwrap_err();
         assert!(matches!(error, RunnerError::Workers(workers)
             if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
-                if matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage)]))));
+                if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
         let row = s.get(&id).await;
         assert_eq!(row.state, JobState::Succeeded);
         assert_eq!(row.generation, 1);
@@ -598,8 +620,8 @@ async fn monitoring_error_completion_case(
     assert!(matches!(error, RunnerError::Workers(workers)
     if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
         if match fence {
-            CompletionFence::Live => matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage)]),
-            _ => matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage), RunnerError::Store(JobError::StaleClaim)]),
+            CompletionFence::Live => matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]),
+            _ => matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }, RunnerError::Store(JobError::StaleClaim)]),
         })));
     assert!(failed.load(Ordering::SeqCst));
     assert_eq!(completions.load(Ordering::SeqCst), 1);
@@ -701,6 +723,7 @@ async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
     let row = s.final_row(&running).await;
     assert_eq!(row.state, JobState::Cancelled);
     assert_eq!(row.output, Some(b"already sent finished".to_vec()));
+    assert!(row.payload.is_none());
     assert_eq!(row.generation, 1);
     runner.shutdown().await.unwrap();
 }
@@ -745,6 +768,213 @@ async fn runner_handler_panic_is_final_and_visible() {
         Some(symbiotic_core::DiagnosticCode::QueueFailure)
     );
     assert_eq!(row.generation, 1);
+}
+
+#[tokio::test]
+async fn runner_cancel_between_claim_and_entry_deletes_input() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let id = s.insert(s.spec("cancel-before-entry")).await;
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
+            move |request: &JobRequest| {
+                let job = match request {
+                    JobRequest::Get(job) => Some(job.clone()),
+                    _ => None,
+                };
+                let (store, scope, config) = (store.clone(), scope.clone(), config.clone());
+                Box::pin(async move {
+                    if let Some(job) = job {
+                        store
+                            .jobs(
+                                &scope,
+                                &config,
+                                Utc::now(),
+                                JobRequest::Cancel(Selector::Ids(vec![job])),
+                            )
+                            .await?;
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let calls = calls.clone();
+            move |_, bytes| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(bytes) }
+            }
+        })
+        .await;
+    let row = s.final_row(&id).await;
+    runner.shutdown().await.unwrap();
+    assert_eq!(row.state, JobState::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(row.generation, 1);
+    assert!(row.payload.is_none());
+}
+
+#[tokio::test]
+async fn runner_oversized_result_is_terminal_and_typed() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.max_result_bytes = 4;
+    let id = s.insert(s.spec("oversized-result")).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = s
+        .runner(1, {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(vec![0; 5]) }
+            }
+        })
+        .await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, RunnerError::Workers(workers)
+        if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+            if matches!(errors.as_slice(), [RunnerError::Store(JobError::ResultTooLarge { job, bytes: 5 })] if job == &id))));
+    let row = s.get(&id).await;
+    assert_eq!(row.state, JobState::Failed);
+    assert_eq!(
+        row.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    assert!(row.output.is_none());
+    s.advance(60);
+    assert!(matches!(
+        s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
+        JobResponse::Job(None)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn runner_claim_payload_is_dropped_before_entry_fetch() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let mut spec = s.spec("large-claim");
+    spec.payload = vec![42; CLAIM_BYTES];
+    let id = s.insert(spec).await;
+    let checked = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let checked = checked.clone();
+            move |request: &JobRequest| {
+                if matches!(request, JobRequest::Get(_)) && !checked.swap(true, Ordering::SeqCst) {
+                    assert_eq!(
+                        LARGE_BUFFERS.load(Ordering::SeqCst),
+                        0,
+                        "runner copied or retained the unused claim payload"
+                    );
+                }
+                Box::pin(async { Ok(()) })
+                    as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let entered = entered.clone();
+            move |_, bytes| {
+                let entered = entered.clone();
+                async move {
+                    assert_eq!(bytes.len(), CLAIM_BYTES);
+                    assert!(bytes.iter().all(|byte| *byte == 42));
+                    entered.notify_one();
+                    Ok(Vec::new())
+                }
+            }
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let row = s.final_row(&id).await;
+    runner.shutdown().await.unwrap();
+    assert!(checked.load(Ordering::SeqCst));
+    assert_eq!(row.state, JobState::Succeeded);
+}
+
+#[tokio::test]
+async fn runner_repeated_monitoring_errors_are_bounded_and_completion_is_separate() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    s.insert(s.spec("repeated-monitoring")).await;
+    let started = Arc::new(AtomicBool::new(false));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (started, failures, finish) = (started.clone(), failures.clone(), finish.clone());
+            move |request: &JobRequest| {
+                let monitoring = matches!(request, JobRequest::Heartbeat { .. })
+                    && started.load(Ordering::SeqCst);
+                let completing = matches!(request, JobRequest::Complete { .. });
+                if monitoring && failures.fetch_add(1, Ordering::SeqCst) + 1 == 8 {
+                    finish.add_permits(1);
+                }
+                Box::pin(async move {
+                    if monitoring {
+                        Err(JobError::Storage)
+                    } else if completing {
+                        Err(JobError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let runner = s
+        .runner_with_backend(backend, 1, move |_, bytes| {
+            let (started, finish) = (started.clone(), finish.clone());
+            async move {
+                started.store(true, Ordering::SeqCst);
+                finish.acquire().await.unwrap().forget();
+                Ok(bytes)
+            }
+        })
+        .await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), runner.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failures.load(Ordering::SeqCst), 8);
+    let RunnerError::Workers(workers) = error else {
+        panic!("{error:?}")
+    };
+    let [RunnerError::Workers(errors)] = workers.as_slice() else {
+        panic!("{workers:?}")
+    };
+    assert_eq!(
+        errors.len(),
+        2,
+        "repeated monitoring failures must be summarized"
+    );
+    assert!(matches!(
+        errors[1],
+        RunnerError::Store(JobError::Unavailable)
+    ));
+    assert!(matches!(
+        errors[0],
+        RunnerError::Monitoring {
+            cause: JobError::Storage,
+            count: 8
+        }
+    ));
 }
 
 struct Suite {
@@ -1266,6 +1496,7 @@ async fn jobs_cancel_and_result_origins() {
     let row = s.get(&running).await;
     assert_eq!(row.state, JobState::Cancelled);
     assert_eq!(row.output, Some(data!("answer retained")));
+    assert!(row.payload.is_none());
     assert_eq!(row.origin, Some(ResultOrigin::Handler));
     assert!(row.receipt.is_none());
     let mut paid = s.spec("paid");

@@ -628,6 +628,9 @@ fn finish(
     config: &JobConfig,
 ) -> Result<(), JobError> {
     row.state = state;
+    if state == JobState::Cancelled {
+        row.payload = None;
+    }
     row.finished_at = Some(now);
     row.lease_until = None;
     if row.recovery_until.is_none() {
