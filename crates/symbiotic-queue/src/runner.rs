@@ -21,8 +21,10 @@ pub struct RunnerConfig {
     pub version: u32,
     /// Concurrent handlers (4; PROVISIONAL).
     pub worker_count: usize,
-    /// Store polling period for new work and external cancellation (100 ms; PROVISIONAL).
+    /// Store polling period for new work (100 ms; PROVISIONAL).
     pub poll_interval_ms: u64,
+    /// Heartbeat/cancel interval in milliseconds; None derives lease/3 (PROVISIONAL).
+    pub heartbeat_interval_ms: Option<u64>,
     /// Independent bounded maintenance period (60 seconds; PROVISIONAL).
     pub maintenance_interval_ms: u64,
 }
@@ -33,6 +35,7 @@ impl Default for RunnerConfig {
             version: 1,
             worker_count: 4,
             poll_interval_ms: 100,
+            heartbeat_interval_ms: None,
             maintenance_interval_ms: 60_000,
         }
     }
@@ -95,12 +98,12 @@ pub enum RunnerError {
     /// Store/configuration failure.
     #[error(transparent)]
     Store(#[from] JobError),
-    /// First monitoring failure and total failures while the handler drains.
-    #[error("job monitoring failed {count} times; first cause: {cause}")]
+    /// One heartbeat failure cause and its occurrence count while the handler drains.
+    #[error("job heartbeat failed {count} times; cause: {cause}")]
     Monitoring {
-        /// First store/configuration cause.
+        /// Store/configuration cause.
         cause: JobError,
-        /// Total failed monitoring operations, including the first.
+        /// Failed heartbeats with this cause, including the first.
         count: usize,
     },
     /// Handler panicked; the runner attempts a fenced final failure without retry.
@@ -121,6 +124,7 @@ struct Shared {
     kind: String,
     handler: Arc<dyn JobHandler>,
     poll: Duration,
+    heartbeat: Duration,
 }
 
 impl Shared {
@@ -128,20 +132,6 @@ impl Shared {
         self.backend
             .jobs(&self.scope, &self.jobs, Utc::now(), request)
             .await
-    }
-
-    async fn current(&self, claim: &JobRecord) -> Result<Box<JobRecord>, JobError> {
-        match self.op(JobRequest::Get(claim.id.clone())).await? {
-            JobResponse::Job(Some(row))
-                if row.state == JobState::Running
-                    && row.generation == claim.generation
-                    && row.lease_until.is_some_and(|until| until > Utc::now()) =>
-            {
-                Ok(row)
-            }
-            JobResponse::Job(_) => Err(JobError::StaleClaim),
-            _ => Err(JobError::InvalidRequest),
-        }
     }
 
     async fn execute(self: &Arc<Self>, mut claim: JobRecord) -> Result<(), RunnerError> {
@@ -156,7 +146,17 @@ impl Shared {
         // worker is itself aborted. Ordinary cancel/shutdown always drains it.
         let mut task = JoinSet::new();
         task.spawn(async move {
-            let current = shared.current(&row).await?;
+            let current = match shared.op(JobRequest::Get(row.id.clone())).await? {
+                JobResponse::Job(Some(current))
+                    if current.state == JobState::Running
+                        && current.generation == row.generation
+                        && current.lease_until.is_some_and(|until| until > Utc::now()) =>
+                {
+                    current
+                }
+                JobResponse::Job(_) => return Err(JobError::StaleClaim),
+                _ => return Err(JobError::InvalidRequest),
+            };
             if current.cancel_requested || current.purged {
                 return Ok::<_, JobError>(None);
             }
@@ -169,34 +169,34 @@ impl Shared {
             };
             Ok(Some(shared.handler.run(&ctx, payload).await))
         });
-        let mut renew =
-            tokio::time::interval(Duration::from_secs(self.jobs.claim_lease_seconds) / 3);
-        let mut poll = tokio::time::interval(self.poll);
+        let mut renew = tokio::time::interval(self.heartbeat);
         let mut errors = Vec::new();
         let outcome = loop {
-            let check = tokio::select! {
+            let error = tokio::select! {
                 result = task.join_next() => break result,
-                _ = renew.tick() => self.op(JobRequest::Heartbeat { job: claim.id.clone(), generation: claim.generation }).await.map(|response| {
-                    if matches!(response, JobResponse::Done) { Ok(()) } else { Err(JobError::InvalidRequest) }
-                }).and_then(|r| r),
-                _ = poll.tick(), if errors.is_empty() => self.signal_cancel(&claim, &cancel).await,
+                response = async {
+                    renew.tick().await;
+                    self.op(JobRequest::Heartbeat { job: claim.id.clone(), generation: claim.generation }).await
+                } => match response {
+                    Ok(JobResponse::Heartbeat(true)) => { cancel.send_replace(true); continue; }
+                    Ok(JobResponse::Heartbeat(false)) => continue,
+                    Ok(_) => JobError::InvalidRequest,
+                    Err(error) => error,
+                },
             };
-            if let Err(error) = check {
-                // Count monitoring failures while asking work to stop. Once cancellation
-                // is signalled, polling adds nothing; scheduled heartbeats must
-                // still protect draining work until the store fences the claim.
-                let fenced = matches!(error, JobError::StaleClaim);
-                match errors.first_mut() {
-                    Some(RunnerError::Monitoring { count, .. }) => *count += 1,
-                    _ => errors.push(RunnerError::Monitoring {
-                        cause: error,
-                        count: 1,
-                    }),
-                }
-                cancel.send_replace(true);
-                if fenced {
-                    break task.join_next().await;
-                }
+            let fenced = matches!(error, JobError::StaleClaim);
+            match errors.iter_mut().find(
+                |entry| matches!(entry, RunnerError::Monitoring { cause, .. } if cause == &error),
+            ) {
+                Some(RunnerError::Monitoring { count, .. }) => *count += 1,
+                _ => errors.push(RunnerError::Monitoring {
+                    cause: error,
+                    count: 1,
+                }),
+            }
+            cancel.send_replace(true);
+            if fenced {
+                break task.join_next().await;
             }
         };
         let (state, output, diagnostic) = match outcome {
@@ -248,18 +248,6 @@ impl Shared {
         } else {
             Err(RunnerError::Workers(errors))
         }
-    }
-
-    async fn signal_cancel(
-        &self,
-        claim: &JobRecord,
-        cancel: &watch::Sender<bool>,
-    ) -> Result<(), JobError> {
-        let row = self.current(claim).await?;
-        if row.cancel_requested || row.purged {
-            cancel.send_replace(true);
-        }
-        Ok(())
     }
 
     async fn maintain(
@@ -331,14 +319,17 @@ impl JobRunner {
         if config.version != 1
             || config.worker_count == 0
             || config.poll_interval_ms == 0
+            || config.heartbeat_interval_ms == Some(0)
             || config.maintenance_interval_ms == 0
             || kind.is_empty()
         {
             return Err(JobError::InvalidRequest.into());
         }
+        let heartbeat = config.heartbeat_interval_ms.map(Duration::from_millis);
         let shared = Arc::new(Shared {
             backend,
             scope,
+            heartbeat: heartbeat.unwrap_or(Duration::from_secs(jobs.claim_lease_seconds) / 3),
             jobs,
             kind,
             handler,

@@ -361,88 +361,196 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
 
 #[tokio::test]
 async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
-    for heartbeat in [false, true] {
-        let mut s = Suite::new();
-        s.now = Utc::now();
-        s.config.claim_lease_seconds = 1;
-        let id = s.insert(s.spec("draining-lease")).await;
-        let started = Arc::new(AtomicBool::new(false));
-        let failed = Arc::new(AtomicBool::new(false));
-        let renewals = Arc::new(AtomicUsize::new(0));
-        let backend = Arc::new(InterceptJobs {
-            backend: s.backend.clone(),
-            before: {
-                let (started, failed, renewals) =
-                    (started.clone(), failed.clone(), renewals.clone());
-                move |request: &JobRequest| {
-                    let monitoring = if heartbeat {
-                        matches!(request, JobRequest::Heartbeat { .. })
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    let id = s.insert(s.spec("draining-lease")).await;
+    let started = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+    let renewals = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (started, failed, renewals) = (started.clone(), failed.clone(), renewals.clone());
+            move |request: &JobRequest| {
+                let monitoring = matches!(request, JobRequest::Heartbeat { .. });
+                if matches!(request, JobRequest::Heartbeat { .. }) && failed.load(Ordering::SeqCst)
+                {
+                    renewals.fetch_add(1, Ordering::SeqCst);
+                }
+                let error = monitoring
+                    && started.load(Ordering::SeqCst)
+                    && !failed.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if error {
+                        Err(JobError::Storage)
                     } else {
-                        matches!(request, JobRequest::Get(_))
-                    };
-                    if matches!(request, JobRequest::Heartbeat { .. })
-                        && failed.load(Ordering::SeqCst)
-                    {
-                        renewals.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
                     }
-                    let error = monitoring
-                        && started.load(Ordering::SeqCst)
-                        && !failed.swap(true, Ordering::SeqCst);
-                    Box::pin(async move {
-                        if error {
-                            Err(JobError::Storage)
-                        } else {
-                            Ok(())
-                        }
-                    })
-                        as futures::future::BoxFuture<'static, Result<(), JobError>>
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let cancelled = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let (cancelled, finish) = (cancelled.clone(), finish.clone());
+            move |ctx, bytes| {
+                let (started, cancelled, finish) =
+                    (started.clone(), cancelled.clone(), finish.clone());
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    ctx.cancel.cancelled().await;
+                    cancelled.notify_one();
+                    finish.acquire().await.unwrap().forget();
+                    Ok(bytes)
                 }
-            },
-        });
-        let cancelled = Arc::new(tokio::sync::Notify::new());
-        let finish = Arc::new(tokio::sync::Semaphore::new(0));
-        let runner = s
-            .runner_with_backend(backend, 1, {
-                let (cancelled, finish) = (cancelled.clone(), finish.clone());
-                move |ctx, bytes| {
-                    let (started, cancelled, finish) =
-                        (started.clone(), cancelled.clone(), finish.clone());
-                    async move {
-                        started.store(true, Ordering::SeqCst);
-                        ctx.cancel.cancelled().await;
-                        cancelled.notify_one();
-                        finish.acquire().await.unwrap().forget();
-                        Ok(bytes)
+            }
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    s.now = Utc::now();
+    assert!(
+        matches!(
+            s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
+            JobResponse::Job(None)
+        ),
+        "draining handler lost its lease"
+    );
+    assert!(renewals.load(Ordering::SeqCst) >= 2);
+    finish.add_permits(1);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, RunnerError::Workers(workers)
+        if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+            if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
+    let row = s.get(&id).await;
+    assert_eq!(row.state, JobState::Succeeded);
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.output, Some(s.spec("draining-lease").payload));
+}
+
+#[tokio::test]
+async fn runner_running_no_lookup_can_block_renewal_or_completion() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    let id = s.insert(s.spec("no-running-lookup")).await;
+    let started = Arc::new(AtomicBool::new(false));
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let renewals = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (started, lookups, renewals) = (started.clone(), lookups.clone(), renewals.clone());
+            move |request: &JobRequest| {
+                let running_lookup =
+                    matches!(request, JobRequest::Get(_)) && started.load(Ordering::SeqCst);
+                if running_lookup {
+                    lookups.fetch_add(1, Ordering::SeqCst);
+                }
+                if matches!(request, JobRequest::Heartbeat { .. }) && started.load(Ordering::SeqCst)
+                {
+                    renewals.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    if running_lookup {
+                        std::future::pending::<()>().await;
                     }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let (entered, finish, started) = (entered.clone(), finish.clone(), started.clone());
+            move |_, bytes| {
+                let (entered, finish, started) = (entered.clone(), finish.clone(), started.clone());
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    entered.notify_one();
+                    finish.acquire().await.unwrap().forget();
+                    Ok(bytes)
                 }
-            })
-            .await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        s.now = Utc::now();
-        assert!(
-            matches!(
-                s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
-                JobResponse::Job(None)
-            ),
-            "draining handler lost its lease"
-        );
-        assert!(renewals.load(Ordering::SeqCst) >= 2);
-        finish.add_permits(1);
-        let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(matches!(error, RunnerError::Workers(workers)
-            if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
-                if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
-        let row = s.get(&id).await;
-        assert_eq!(row.state, JobState::Succeeded);
-        assert_eq!(row.generation, 1);
-        assert_eq!(row.output, Some(s.spec("draining-lease").payload));
-    }
+            }
+        })
+        .await;
+    entered.notified().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        renewals.load(Ordering::SeqCst) >= 2,
+        "lookup blocked renewal"
+    );
+    s.now = Utc::now();
+    assert!(matches!(
+        s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
+        JobResponse::Job(None)
+    ));
+    finish.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), runner.shutdown())
+        .await
+        .expect("lookup blocked completion")
+        .unwrap();
+    assert_eq!(s.get(&id).await.state, JobState::Succeeded);
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "running handler read content"
+    );
+}
+
+#[tokio::test]
+async fn runner_pending_heartbeat_does_not_block_completion() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let id = s.insert(s.spec("slow-heartbeat")).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let entered = entered.clone();
+            move |request: &JobRequest| {
+                let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
+                let entered = entered.clone();
+                Box::pin(async move {
+                    if heartbeat {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let finish = finish.clone();
+            move |_, bytes| {
+                let finish = finish.clone();
+                async move {
+                    finish.acquire().await.unwrap().forget();
+                    Ok(bytes)
+                }
+            }
+        })
+        .await;
+    entered.notified().await;
+    finish.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), runner.shutdown())
+        .await
+        .expect("heartbeat blocked completion")
+        .unwrap();
+    assert_eq!(s.get(&id).await.state, JobState::Succeeded);
 }
 
 #[tokio::test]
@@ -511,27 +619,19 @@ enum CompletionFence {
 
 #[tokio::test]
 async fn runner_monitoring_storage_error_still_completes_finished_handler() {
-    for heartbeat in [true, false] {
-        for state in [JobState::Succeeded, JobState::Failed] {
-            monitoring_error_completion_case(heartbeat, state, CompletionFence::Live).await;
-        }
+    for state in [JobState::Succeeded, JobState::Failed] {
+        monitoring_error_completion_case(state, CompletionFence::Live).await;
     }
 }
 
 #[tokio::test]
 async fn runner_monitoring_storage_error_completion_keeps_lease_and_generation_fences() {
-    for heartbeat in [true, false] {
-        for fence in [CompletionFence::Expired, CompletionFence::Superseded] {
-            monitoring_error_completion_case(heartbeat, JobState::Succeeded, fence).await;
-        }
+    for fence in [CompletionFence::Expired, CompletionFence::Superseded] {
+        monitoring_error_completion_case(JobState::Succeeded, fence).await;
     }
 }
 
-async fn monitoring_error_completion_case(
-    heartbeat: bool,
-    state: JobState,
-    fence: CompletionFence,
-) {
+async fn monitoring_error_completion_case(state: JobState, fence: CompletionFence) {
     let mut s = Suite::new();
     s.now = Utc::now();
     s.config.claim_lease_seconds = 3;
@@ -548,11 +648,7 @@ async fn monitoring_error_completion_case(
                 if matches!(request, JobRequest::Complete { .. }) {
                     completions.fetch_add(1, Ordering::SeqCst);
                 }
-                let monitoring = if heartbeat {
-                    matches!(request, JobRequest::Heartbeat { .. })
-                } else {
-                    matches!(request, JobRequest::Get(_))
-                };
+                let monitoring = matches!(request, JobRequest::Heartbeat { .. });
                 let error = monitoring
                     && started.load(Ordering::SeqCst)
                     && !failed.swap(true, Ordering::SeqCst);
@@ -688,25 +784,57 @@ async fn runner_renews_lease_while_handler_runs() {
 async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
     let mut s = Suite::new();
     s.now = Utc::now();
+    assert!(RunnerConfig::default().heartbeat_interval_ms.is_none());
+    let heartbeat_entered = Arc::new(tokio::sync::Notify::new());
+    let heartbeat_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (entered, gate) = (heartbeat_entered.clone(), heartbeat_gate.clone());
+            move |request: &JobRequest| {
+                let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
+                let (entered, gate) = (entered.clone(), gate.clone());
+                Box::pin(async move {
+                    if heartbeat {
+                        entered.notify_one();
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
     let running = s.insert(s.spec("running")).await;
     let permits = Arc::new(tokio::sync::Semaphore::new(0));
     let gate = permits.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tokens, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
     let runner = s
-        .runner(1, move |ctx, _| {
-            let (gate, tx) = (gate.clone(), tx.clone());
-            async move {
-                tx.send(false).unwrap();
-                ctx.cancel.cancelled().await;
-                assert!(ctx.cancel.is_cancelled());
-                ctx.cancel.cancelled().await;
-                tx.send(true).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(b"already sent finished".to_vec())
-            }
-        })
+        .runner_with_config(
+            backend,
+            RunnerConfig {
+                worker_count: 1,
+                heartbeat_interval_ms: Some(100),
+                ..RunnerConfig::default()
+            },
+            move |ctx, _| {
+                tokens.send(ctx.cancel.clone()).unwrap();
+                let (gate, tx) = (gate.clone(), tx.clone());
+                async move {
+                    tx.send(false).unwrap();
+                    ctx.cancel.cancelled().await;
+                    assert!(ctx.cancel.is_cancelled());
+                    ctx.cancel.cancelled().await;
+                    tx.send(true).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    Ok(b"already sent finished".to_vec())
+                }
+            },
+        )
         .await;
     assert!(!rx.recv().await.unwrap());
+    let token = token_rx.recv().await.unwrap();
+    heartbeat_entered.notified().await;
     let pending = s.insert(s.spec("pending")).await;
     assert_eq!(
         s.changed(JobRequest::Cancel(Selector::Group("group".into())))
@@ -717,7 +845,16 @@ async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
     assert_eq!(row.state, JobState::Cancelled);
     assert!(row.payload.is_none());
     assert_eq!(row.generation, 0);
-    assert!(rx.recv().await.unwrap());
+    // A pending heartbeat has not yet read cancel intent; no separate poll may signal it.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!token.is_cancelled());
+    heartbeat_gate.add_permits(1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    );
     assert_eq!(s.get(&running).await.state, JobState::Running);
     permits.add_permits(1);
     let row = s.final_row(&running).await;
@@ -731,6 +868,7 @@ async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
 #[tokio::test]
 async fn runner_external_purge_signals_token_and_keeps_no_output() {
     let mut s = Suite::new();
+    s.config.claim_lease_seconds = 1;
     s.now = Utc::now();
     let id = s.insert(s.spec("purge")).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -923,12 +1061,20 @@ async fn runner_repeated_monitoring_errors_are_bounded_and_completion_is_separat
                 let monitoring = matches!(request, JobRequest::Heartbeat { .. })
                     && started.load(Ordering::SeqCst);
                 let completing = matches!(request, JobRequest::Complete { .. });
-                if monitoring && failures.fetch_add(1, Ordering::SeqCst) + 1 == 8 {
-                    finish.add_permits(1);
-                }
+                let failure = monitoring.then(|| {
+                    let count = failures.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count == 8 {
+                        finish.add_permits(1);
+                    }
+                    if count % 2 == 1 {
+                        JobError::Storage
+                    } else {
+                        JobError::Unavailable
+                    }
+                });
                 Box::pin(async move {
-                    if monitoring {
-                        Err(JobError::Storage)
+                    if let Some(error) = failure {
+                        Err(error)
                     } else if completing {
                         Err(JobError::Unavailable)
                     } else {
@@ -961,18 +1107,25 @@ async fn runner_repeated_monitoring_errors_are_bounded_and_completion_is_separat
     };
     assert_eq!(
         errors.len(),
-        2,
+        3,
         "repeated monitoring failures must be summarized"
     );
     assert!(matches!(
-        errors[1],
+        errors[2],
         RunnerError::Store(JobError::Unavailable)
     ));
     assert!(matches!(
         errors[0],
         RunnerError::Monitoring {
             cause: JobError::Storage,
-            count: 8
+            count: 4
+        }
+    ));
+    assert!(matches!(
+        errors[1],
+        RunnerError::Monitoring {
+            cause: JobError::Unavailable,
+            count: 4
         }
     ));
 }

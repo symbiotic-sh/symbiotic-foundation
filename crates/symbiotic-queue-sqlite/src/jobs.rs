@@ -273,7 +273,7 @@ impl SqlRows<'_> {
             }),
         )
     }
-    fn delivery_metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError> {
+    fn metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError> {
         let columns = COLUMNS
             .split(", ")
             .map(|c| match c {
@@ -288,7 +288,9 @@ impl SqlRows<'_> {
                 params![json(&id.scope)?, id.id],
                 read_record,
             )
-            .map_err(storage)
+            .optional()
+            .map_err(storage)?
+            .ok_or(JobError::NotFound)
     }
     fn output(&mut self, id: &JobId) -> Result<Option<Vec<u8>>, JobError> {
         self.conn
@@ -878,11 +880,15 @@ fn apply_job_request(
             ))
         }
         JobRequest::Heartbeat { job, generation } => {
-            let mut row = get(rows, scope, &job)?;
+            scoped(scope, &job)?;
+            let row = rows.metadata(&job)?;
             live(&row, generation, now)?;
-            row.lease_until = Some(deadline(now, config.claim_lease_seconds)?);
-            rows.save(row)?;
-            Ok(JobResponse::Done)
+            let until = stamp(deadline(now, config.claim_lease_seconds)?);
+            let sql = "UPDATE jobs SET lease_until=?3 WHERE scope=?1 AND id=?2";
+            rows.conn
+                .execute(sql, params![json(scope)?, job.id, until])
+                .map_err(storage)?;
+            Ok(JobResponse::Heartbeat(row.cancel_requested || row.purged))
         }
         JobRequest::Complete {
             job,
@@ -1047,7 +1053,7 @@ fn apply_job_request(
             let mut admitted = Vec::new();
             let mut bytes: usize = 2; // JSON array brackets, plus commas between deliveries.
             for info in candidates {
-                let mut row = rows.delivery_metadata(&info.id)?;
+                let mut row = rows.metadata(&info.id)?;
                 if row.recovery_until.is_some_and(|until| until <= now) {
                     row.result_expired = true;
                     delete_copies(&mut row);
@@ -1282,6 +1288,69 @@ mod tests {
     fn count(conn: &Connection, table: &str) -> usize {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn jobs_heartbeat_never_decodes_or_rewrites_content() {
+        let queue = SqliteQueue::in_memory().unwrap();
+        let scope = scope();
+        let config = JobConfig::default();
+        let now = Utc::now();
+        queue
+            .job_operation(
+                &scope,
+                &config,
+                now,
+                JobRequest::Enqueue(vec![spec("heartbeat")]),
+            )
+            .unwrap();
+        let row = match queue
+            .job_operation(
+                &scope,
+                &config,
+                now,
+                JobRequest::Claim {
+                    kinds: vec!["handler".into()],
+                    slots_available: 1,
+                },
+            )
+            .unwrap()
+        {
+            JobResponse::Job(Some(row)) => row,
+            other => panic!("{other:?}"),
+        };
+        // Invalid content types make any attempt to decode the blobs fail visibly.
+        // Heartbeats need only metadata and must preserve even unreadable content.
+        queue
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET payload='unreadable input', output='unreadable output'",
+                [],
+            )
+            .unwrap();
+        for (cancel, purged) in [(false, false), (true, false), (false, true)] {
+            queue
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET cancel_requested=?1, purged=?2",
+                    params![cancel, purged],
+                )
+                .unwrap();
+            assert!(matches!(queue.job_operation(
+                &scope, &config, now + Duration::seconds(1),
+                JobRequest::Heartbeat { job: row.id.clone(), generation: row.generation }
+            ).unwrap(), JobResponse::Heartbeat(requested) if requested == (cancel || purged)));
+        }
+        let conn = queue.conn.lock().unwrap();
+        assert!(conn.query_row(
+            "SELECT payload='unreadable input' AND output='unreadable output' AND lease_until=?1 FROM jobs",
+            [stamp(now + Duration::seconds(1) + Duration::seconds(config.claim_lease_seconds as i64))],
+            |r| r.get::<_, bool>(0)
+        ).unwrap());
     }
 
     #[test]
