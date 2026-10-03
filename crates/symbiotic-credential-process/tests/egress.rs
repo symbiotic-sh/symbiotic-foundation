@@ -1137,17 +1137,12 @@ async fn signed_attempt_time_warning(
     tolerance_seconds: u64,
     should_warn: bool,
 ) {
-    use std::io::Write;
     use tracing::instrument::WithSubscriber;
 
     let mut fixture = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
     fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
     let process = fixture.process().await;
-    let failed_writes = Arc::new(AtomicUsize::new(0));
-    let failures = failed_writes.clone();
     let reentrant_process = process.clone();
-    let (sink, reader) = std::os::unix::net::UnixStream::pair().unwrap();
-    drop(reader);
     let logs = CapturedLogs(
         Arc::default(),
         Some(Arc::new(move || {
@@ -1161,10 +1156,6 @@ async fn signed_attempt_time_warning(
                 receive.recv_timeout(Duration::from_secs(1)).unwrap(),
                 Ok(())
             );
-            // Logging IO errors stay in the subscriber, never in admission or dispatch.
-            let error = (&sink).write_all(b"clock warning\n").unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-            failures.fetch_add(1, Ordering::SeqCst);
         })),
     );
     let (mut admission, payload) = fixture.attempt("clock-warning", 1, 1);
@@ -1226,16 +1217,33 @@ async fn signed_attempt_time_warning(
             assert!(value("ahead_seconds") > tolerance_seconds);
         }
     }
-    assert_eq!(
-        failed_writes.load(Ordering::SeqCst),
-        if should_warn { 3 } else { 0 }
-    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
+async fn signed_attempt_time_open_log_sink_reports_executable_warnings() {
+    let logs = executable_dispatch(None, None, Some((3600, 5, false))).await;
+    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr.
+    assert_eq!(logs.matches("WARN").count(), 3);
+    assert_eq!(
+        logs.matches("event=\"signed_attempt_time_ahead\"").count(),
+        3
+    );
+    for field in [
+        "recorded_at=",
+        "foundation_now=",
+        "ahead_seconds=",
+        "tolerance_seconds=5",
+    ] {
+        assert_eq!(logs.matches(field).count(), 3);
+    }
+    assert!(!logs.contains(SECRET));
+    assert!(!logs.contains(&general_purpose::STANDARD.encode(SECRET)));
+}
+
+#[tokio::test]
 async fn signed_attempt_time_closed_log_sink_preserves_permit_and_dispatch() {
-    executable_dispatch(None, None, Some((3600, 5))).await;
+    executable_dispatch(None, None, Some((3600, 5, true))).await;
 }
 
 #[tokio::test]
@@ -1253,8 +1261,8 @@ async fn signed_attempt_time_warning_tolerance_defaults_to_five_seconds() {
 async fn executable_dispatch(
     proxy: Option<&str>,
     numeric_cost: Option<&'static str>,
-    clock_case: Option<(u64, u64)>,
-) {
+    clock_case: Option<(u64, u64, bool)>,
+) -> String {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -1289,7 +1297,7 @@ async fn executable_dispatch(
         numeric_cost.unwrap_or(r#""0.00001234567890123456789""#),
     )
     .await;
-    if let Some((_, tolerance_seconds)) = clock_case {
+    if let Some((_, tolerance_seconds, _)) = clock_case {
         fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
     }
     let config_path = fixture.dir.path().join("config.json");
@@ -1331,7 +1339,7 @@ async fn executable_dispatch(
             .spawn()
             .unwrap(),
     );
-    if clock_case.is_some() {
+    if matches!(clock_case, Some((_, _, true))) {
         // Closing the reader makes stderr writes fail with BrokenPipe.
         drop(child.0.stderr.take());
     }
@@ -1341,7 +1349,7 @@ async fn executable_dispatch(
         timeout: Duration::from_secs(3),
     };
     let (mut admission, payload) = fixture.attempt("executable", 1, 1);
-    if let Some((ahead_seconds, _)) = clock_case {
+    if let Some((ahead_seconds, _, _)) = clock_case {
         admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
         admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
         admission = AdmissionKey::new(KEY.to_vec())
@@ -1429,6 +1437,11 @@ async fn executable_dispatch(
     );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
+    let mut logs = String::new();
+    if let Some(mut stderr) = child.0.stderr.take() {
+        use std::io::Read;
+        stderr.read_to_string(&mut logs).unwrap();
+    }
     drop(child);
     std::fs::remove_file(&fixture.config.socket_path).unwrap();
     let mut child = Child(command.spawn().unwrap());
@@ -1441,6 +1454,7 @@ async fn executable_dispatch(
         serde_json::to_value(recovered).unwrap()
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    logs
 }
 
 #[tokio::test]
