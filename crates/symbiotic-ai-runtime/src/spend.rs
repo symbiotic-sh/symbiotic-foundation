@@ -263,7 +263,7 @@ impl SqliteSpendLedger {
                 .and_then(|d| now.checked_add_signed(d))
                 .ok_or_else(|| storage(()))?;
             let expires = deadline.map_or(expires, |until| until.min(expires));
-            if !keep || expires <= now {
+            if !keep || deadline.is_some_and(|until| until <= now) {
                 return Ok(());
             }
             tx.execute(

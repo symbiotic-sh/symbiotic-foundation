@@ -17,6 +17,60 @@ fn reservation(id: &str) -> SpendReservation {
     }
 }
 
+#[test]
+fn zero_retention_is_swept_but_expired_job_deadlines_never_save_answers() {
+    let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    for (deadline, saved) in [
+        (None, true),
+        (Some(now - chrono::Duration::seconds(1)), false),
+        (Some(now), false),
+        (Some(now + chrono::Duration::seconds(1)), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
+        let ledger = SqliteSpendLedger::open(&path)
+            .unwrap()
+            .with_retention(std::time::Duration::ZERO);
+        let r = reservation("zero-retention");
+        ledger.reserve_explicit(&r, 1).unwrap();
+        let output = Some(serde_json::json!({"answer": "private"}));
+        {
+            let mut conn = ledger.0.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            SqliteSpendLedger::save_recovery_in(
+                &tx,
+                &r.reference,
+                &output,
+                ledger.retention(),
+                deadline,
+                None,
+                now,
+            )
+            .unwrap();
+            SqliteSpendLedger::finish_in(&tx, &r.reference, SpendState::Unknown, None, output)
+                .unwrap();
+            let stored: (Option<String>, Option<String>) = tx
+                .query_row(
+                    "SELECT recovery,recovery_expires_at FROM spend_receipts WHERE reference=?1",
+                    [r.reference.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored.0.is_some(), saved, "deadline={deadline:?}");
+            assert_eq!(stored.1, saved.then(|| now.to_rfc3339()));
+            tx.commit().unwrap();
+        }
+        let before = ledger.receipt(&r.reference).unwrap().unwrap();
+        assert!(before.recovery.is_none());
+        assert_eq!(ledger.expire_recovery().unwrap(), usize::from(saved));
+        assert_eq!(
+            serde_json::to_value(ledger.receipt(&r.reference).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+}
+
 fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<usize> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
@@ -83,9 +137,9 @@ fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<
     result.push(count.swap(0, Ordering::Relaxed));
     let receipt = ledger.receipt(&r.reference).unwrap().unwrap();
     assert!(receipt.output.is_some());
-    let saved = explicit && !retention.is_zero();
-    assert_eq!(receipt.recovery.is_some(), saved);
-    if saved {
+    let available = explicit && !retention.is_zero();
+    assert_eq!(receipt.recovery.is_some(), available);
+    if available {
         // Advance expiry deterministically without sleeping or changing the
         // production clock; the sweep must actually remove a retained answer.
         ledger.0.lock().unwrap().execute(
@@ -94,8 +148,8 @@ fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<
         ).unwrap();
     }
     count.store(0, Ordering::Relaxed);
-    // Zero retention skips saving, so there is no answer for maintenance to erase.
-    assert_eq!(ledger.expire_recovery().unwrap(), usize::from(saved));
+    // Zero retention is unreadable immediately, but still leaves an expired row to sweep.
+    assert_eq!(ledger.expire_recovery().unwrap(), usize::from(explicit));
     result.push(count.swap(0, Ordering::Relaxed));
     ledger.discard_recovery("account", "invocation").unwrap();
     result.push(count.swap(0, Ordering::Relaxed));
