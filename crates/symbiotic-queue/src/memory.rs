@@ -23,6 +23,7 @@ pub const DEFAULT_RETAINED_TERMINAL_ITEMS: usize = 10_000;
 #[derive(Clone)]
 pub struct MemoryQueue {
     state: Arc<Mutex<State>>,
+    jobs: Arc<Mutex<JobMemoryState>>,
     event_sink: Option<Arc<dyn QueueEventSink>>,
 }
 
@@ -57,6 +58,7 @@ impl MemoryQueue {
                 retain_terminal: retain.max(1),
                 ..State::default()
             })),
+            jobs: Arc::new(Mutex::new(JobMemoryState::default())),
             event_sink: None,
         }
     }
@@ -356,6 +358,23 @@ fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<symbiotic_core:
 
 #[async_trait]
 impl QueueBackend for MemoryQueue {
+    async fn jobs(
+        &self,
+        scope: &crate::jobs::JobScope,
+        config: &crate::jobs::JobConfig,
+        now: DateTime<Utc>,
+        request: crate::jobs::JobRequest,
+    ) -> Result<crate::jobs::JobResponse, crate::jobs::JobError> {
+        let mut state = self
+            .jobs
+            .lock()
+            .map_err(|_| crate::jobs::JobError::Storage)?;
+        let mut tx = state.clone();
+        let response = crate::jobs::apply_job_request(&mut tx, scope, config, now, request)?;
+        *state = tx;
+        Ok(response)
+    }
+
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.enqueue_inner(request, None).await
     }
@@ -736,5 +755,153 @@ mod tests {
         let queue = MemoryQueue::new().with_event_sink(sink.clone());
         run_to_success(&queue, "event").await;
         assert_eq!(sink.0.load(Ordering::SeqCst), 3);
+    }
+}
+
+// Job operations share the queue instance, but retain keyed tombstones forever.
+// The legacy limiter queue's terminal eviction never touches job records.
+#[derive(Clone, Default)]
+struct JobMemoryState {
+    rows: std::collections::BTreeMap<String, crate::jobs::JobRecord>,
+    summaries:
+        std::collections::BTreeMap<(crate::jobs::JobScope, String), crate::jobs::GroupSummary>,
+}
+
+impl crate::jobs::JobRows for JobMemoryState {
+    fn get(
+        &mut self,
+        id: &crate::jobs::JobId,
+    ) -> Result<Option<crate::jobs::JobRecord>, crate::jobs::JobError> {
+        Ok(self
+            .rows
+            .get(&id.id)
+            .filter(|r| r.id.scope == id.scope)
+            .cloned())
+    }
+    fn by_key(
+        &mut self,
+        scope: &crate::jobs::JobScope,
+        key: &str,
+    ) -> Result<Option<crate::jobs::JobRecord>, crate::jobs::JobError> {
+        Ok(self
+            .rows
+            .values()
+            .find(|r| &r.id.scope == scope && r.key == key)
+            .cloned())
+    }
+    fn select(
+        &mut self,
+        scope: &crate::jobs::JobScope,
+        query: crate::jobs::JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<crate::jobs::JobRecord>, crate::jobs::JobError> {
+        use crate::jobs::{JobQuery, JobState};
+        let mut rows: Vec<_> = self
+            .rows
+            .values()
+            .filter(|r| &r.id.scope == scope)
+            .filter(|r| match &query {
+                JobQuery::Group(g) => r.group.as_ref() == Some(g),
+                JobQuery::Owner(o) => r.owners.contains(o),
+                JobQuery::Pending { kinds, priority } => {
+                    r.claimable(now)
+                        && kinds.contains(&r.kind)
+                        && priority.is_none_or(|p| p == r.priority)
+                }
+                JobQuery::Final => {
+                    !r.state.unfinished()
+                        && !r.state.acked()
+                        && r.delivery_until.is_none_or(|until| until <= now)
+                }
+                JobQuery::Notices => r.state == JobState::AwaitingAdmission,
+                JobQuery::Expired => {
+                    !r.state.unfinished()
+                        && !r.state.acked()
+                        && !r.result_expired
+                        && r.recovery_until.is_some_and(|until| until <= now)
+                }
+                JobQuery::Diagnostics { group, after } => {
+                    r.group.as_ref() == Some(group)
+                        && matches!(
+                            r.state,
+                            JobState::Failed | JobState::Uncertain | JobState::AwaitingAdmission
+                        )
+                        && after.as_ref().is_none_or(|id| r.id.id > *id)
+                }
+            })
+            .cloned()
+            .collect();
+        match query {
+            JobQuery::Final => rows.sort_by_key(|r| (r.finished_at, r.id.id.clone())),
+            JobQuery::Expired => rows.sort_by_key(|r| (r.recovery_until, r.id.id.clone())),
+            JobQuery::Diagnostics { .. } => {}
+            _ => rows.sort_by_key(|r| (r.created_at, r.id.id.clone())),
+        }
+        rows.truncate(limit);
+        Ok(rows)
+    }
+    fn save(&mut self, row: crate::jobs::JobRecord) -> Result<(), crate::jobs::JobError> {
+        let old = self.rows.insert(row.id.id.clone(), row.clone());
+        if let Some(group) = &row.group {
+            let summary = self
+                .summaries
+                .entry((row.id.scope.clone(), group.clone()))
+                .or_default();
+            crate::jobs::summary_transition(summary, old.as_ref(), &row)?;
+            summary.oldest_pending = self
+                .rows
+                .values()
+                .filter(|r| {
+                    r.id.scope == row.id.scope
+                        && r.group.as_ref() == Some(group)
+                        && r.state == crate::jobs::JobState::Pending
+                })
+                .map(|r| r.created_at)
+                .min();
+        }
+        Ok(())
+    }
+    fn usage(
+        &mut self,
+        scope: &crate::jobs::JobScope,
+    ) -> Result<crate::jobs::PendingUsage, crate::jobs::JobError> {
+        let mut usage = crate::jobs::PendingUsage::default();
+        for row in self
+            .rows
+            .values()
+            .filter(|r| &r.id.scope == scope && r.state.unfinished())
+        {
+            usage.items += 1;
+            usage.bytes += crate::jobs::job_input_bytes(row)?;
+        }
+        Ok(usage)
+    }
+    fn summary(
+        &mut self,
+        scope: &crate::jobs::JobScope,
+        group: &str,
+        rebuild: bool,
+    ) -> Result<crate::jobs::GroupSummary, crate::jobs::JobError> {
+        let key = (scope.clone(), group.to_string());
+        if rebuild {
+            let mut summary = crate::jobs::GroupSummary::default();
+            for row in self
+                .rows
+                .values()
+                .filter(|r| &r.id.scope == scope && r.group.as_deref() == Some(group))
+            {
+                *summary.counts.entry(row.state).or_default() += 1;
+                if row.state == crate::jobs::JobState::Pending {
+                    summary.oldest_pending = Some(
+                        summary
+                            .oldest_pending
+                            .map_or(row.created_at, |v| v.min(row.created_at)),
+                    );
+                }
+            }
+            self.summaries.insert(key.clone(), summary);
+        }
+        Ok(self.summaries.get(&key).cloned().unwrap_or_default())
     }
 }

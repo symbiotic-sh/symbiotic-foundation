@@ -11,6 +11,7 @@ description = "Local SQLite backend for the symbiotic-queue contracts"
 async-trait.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 rusqlite.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-queue = { path = "../symbiotic-queue" }

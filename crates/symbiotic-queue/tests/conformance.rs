@@ -7,3 +7,7 @@ use symbiotic_queue::{MemoryQueue, QueueBackend};
 symbiotic_queue::queue_backend_conformance!(
     || Arc::new(MemoryQueue::new()) as Arc<dyn QueueBackend>
 );
+
+symbiotic_queue::job_backend_conformance!(
+    || Arc::new(MemoryQueue::new()) as Arc<dyn symbiotic_queue::QueueBackend>
+);
