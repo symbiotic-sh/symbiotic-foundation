@@ -142,13 +142,6 @@ fn settlement_work_does_not_grow_with_confirmed_purge_history() {
         let scope = serde_json::to_string(&job_scope).unwrap();
         let identity = symbiotic_core::BindingIdentity::new("tenant", "provider", "1", "account");
         let invocation = crate::spend::job_invocation_key(&job_scope, "unrelated").unwrap();
-        let binding =
-            serde_json::to_string(&(&identity, None::<symbiotic_core::AccountSharingKey>)).unwrap();
-        tx.execute(
-            "INSERT INTO model_job_bindings VALUES (?1,'chat',?2)",
-            params![scope, binding],
-        )
-        .unwrap();
         for n in 0..history {
             tx.execute("INSERT INTO jobs(scope,id,key,digest,state,final_state,delivery_generation) VALUES (?1,?2,?2,'digest','\"Discarded\"','\"Purged\"',0)", params![scope, n.to_string()]).unwrap();
         }

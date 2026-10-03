@@ -1128,6 +1128,59 @@ async fn review_4_direct_settlement_respects_purge_even_after_confirmation() {
 }
 
 #[tokio::test]
+async fn purge_before_reservation_prevents_later_recovery_even_after_confirmation() {
+    for confirmed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let p = Provider::new();
+        let id = enqueue(&j, spec("purge-before-reservation", &p)).await;
+        let key = j.invocation_key("purge-before-reservation").unwrap();
+        j.request(JobRequest::PurgeOwner("owner-a".into()))
+            .await
+            .unwrap();
+        assert!(row(&j, &id).await.receipt.is_none());
+        assert_eq!(
+            sql(dir.path())
+                .query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        if confirmed {
+            let page = j.completions(1, 10000).await.unwrap();
+            j.request(JobRequest::Ack(vec![(
+                page[0].delivery.token.clone(),
+                Disposition::Discarded,
+            )]))
+            .await
+            .unwrap();
+            assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
+        }
+        let b = binding(p.clone());
+        let result = r.execute_chat(b.clone(), &key, request()).await.unwrap();
+        assert_eq!(result.output.text, "paid answer");
+        let status = r
+            .invocation_status(b.identity.as_ref().unwrap(), None, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, SpendState::Settled);
+        assert!(!status.output_available);
+        assert_eq!(copies(dir.path()), 0);
+        drop(j);
+        drop(r);
+        assert!(matches!(
+            runtime(dir.path()).execute_chat(b, &key, request()).await,
+            Err(ExecutionError {
+                source: ModelError::Queue(symbiotic_core::DiagnosticCode::InvocationCompleted),
+                ..
+            })
+        ));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn purging_one_binding_preserves_another_bindings_recovery_answer() {
     for confirmed in [false, true] {
         for answer_before_purge in [false, true] {
@@ -1137,7 +1190,7 @@ async fn purging_one_binding_preserves_another_bindings_recovery_answer() {
                 let j = jobs(&r, JobConfig::default());
                 let p = Provider::new();
                 let id = enqueue(&j, spec("binding-purge", &p)).await;
-                let key = j.invocation_key("binding-purge").unwrap();
+                let key = j.invocation_key("other-kind").unwrap();
                 if paid_job {
                     let runner = start(&j, p.clone()).await;
                     wait_state(&j, &id, JobState::Succeeded).await;

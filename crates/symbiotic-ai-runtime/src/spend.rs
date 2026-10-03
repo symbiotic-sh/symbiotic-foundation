@@ -31,9 +31,8 @@ pub(crate) fn job_invocation_key(
 
 // Scoped invocation keys address the canonical job row through UNIQUE(scope,key).
 // Confirmation preserves final_state, so erasure needs no history scan or mirror.
-fn recovery_erased(
+pub(crate) fn recovery_erased(
     tx: &rusqlite::Transaction<'_>,
-    receipt: &SpendReceipt,
     invocation: Option<&str>,
 ) -> Result<bool, ModelError> {
     let Some((scope, key)) = invocation.and_then(|key| {
@@ -41,27 +40,13 @@ fn recovery_erased(
     }) else {
         return Ok(false);
     };
-    let reference: Option<String> = tx
-        .query_row(
-            "SELECT receipt FROM jobs
-         WHERE scope=?1 AND key=?2 AND (purged=1 OR final_state='\"Purged\"')",
-            params![serde_json::to_string(&scope).map_err(storage)?, key],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(storage)?
-        .flatten();
-    let Some(reference) = reference else {
-        return Ok(false);
-    };
-    let erased_invocation: String = tx
-        .query_row(
-            "SELECT invocation FROM spend_receipts WHERE reference=?1",
-            [reference],
-            |row| row.get(0),
-        )
-        .map_err(storage)?;
-    Ok(erased_invocation == receipt.reservation.invocation)
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs
+         WHERE scope=?1 AND key=?2 AND (purged=1 OR final_state='\"Purged\"'))",
+        params![serde_json::to_string(&scope).map_err(storage)?, key],
+        |row| row.get(0),
+    )
+    .map_err(storage)
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
@@ -261,7 +246,7 @@ impl SqliteSpendLedger {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), ModelError> {
         let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
-        let keep = !recovery_erased(tx, &old, invocation)?;
+        let keep = !recovery_erased(tx, invocation)?;
         if old.attempt_limit.is_some()
             && old.output.is_some()
             && let Some(value) = &output

@@ -107,11 +107,13 @@ fn input(
 fn paid_resolution(
     tx: &Transaction<'_>,
     receipt: &crate::SpendReceipt,
+    invocation: &str,
     now: chrono::DateTime<Utc>,
     max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
     let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
-    if bytes > max_bytes {
+    let erased = spend::recovery_erased(tx, Some(invocation)).map_err(|_| JobError::Storage)?;
+    if erased || bytes > max_bytes {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
             [receipt.reservation.reference.as_str()],
@@ -119,7 +121,11 @@ fn paid_resolution(
         .map_err(|_| JobError::Storage)?;
         return Ok(JobResolution::Failed {
             receipt: receipt.reservation.reference.as_str().into(),
-            diagnostic: DiagnosticCode::QueueResultTooLarge,
+            diagnostic: if erased {
+                DiagnosticCode::InvocationCompleted
+            } else {
+                DiagnosticCode::QueueResultTooLarge
+            },
         });
     }
     let deadline: Option<String> = tx
@@ -279,11 +285,6 @@ impl ModelJobs {
                 if let Some(receipt) = receipt
                     && let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(row.id))?
                     && (row.state.acked() || row.purged || row.result_expired) {
-                    // Preserve the accepted direct attempt in the existing receipt
-                    // reference, so confirmation cannot erase its invocation binding.
-                    if purging {
-                        tx.execute("UPDATE jobs SET receipt=?3 WHERE scope=?1 AND id=?2", params![serde_json::to_string(&row.id.scope).map_err(|_| JobError::Storage)?, row.id.id, receipt]).map_err(|_| JobError::Storage)?;
-                    }
                     tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [&receipt]).map_err(|_| JobError::Storage)?;
                 }
             }
@@ -392,14 +393,14 @@ impl ModelJobs {
                     let reference = crate::SpendReceiptRef::new(row.receipt.as_deref().ok_or(JobError::Storage)?).map_err(|_| JobError::Storage)?;
                     let receipt = spend::receipt_in(tx, &reference).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
                     let resolution = if receipt.output.is_some() {
-                        paid_resolution(tx, &receipt, now, jobs.config.max_result_bytes)?
+                        paid_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?
                     } else if receipt.state == SpendState::Released {
                         JobResolution::KnownZeroCharge { receipt: receipt.reservation.reference.as_str().into() }
                     } else if receipt.state == SpendState::Settled {
                         JobResolution::Failed { receipt: receipt.reservation.reference.as_str().into(), diagnostic: DiagnosticCode::InvocationCompleted }
                     } else { JobResolution::Uncertain { receipt: receipt.reservation.reference.as_str().into() } };
                     jobs.op(tx, now, JobRequest::Resolve { job: row.id.clone(), generation: row.generation, resolution })?;
-                    if row.purged || row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
+                    if row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
                         tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [receipt.reservation.reference.as_str()]).map_err(|_| JobError::Storage)?;
                     }
                 }
@@ -467,9 +468,15 @@ impl ClaimOwner {
                 &current.id,
                 current.generation,
                 now,
-                paid_resolution(tx, receipt, now, self.jobs.config.max_result_bytes)?,
+                paid_resolution(
+                    tx,
+                    receipt,
+                    &self.jobs.invocation_key(&current.key)?,
+                    now,
+                    self.jobs.config.max_result_bytes,
+                )?,
             )?;
-            if current.purged || current.recovery_until.is_some_and(|until| until <= now) {
+            if current.recovery_until.is_some_and(|until| until <= now) {
                 tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [receipt.reservation.reference.as_str()]).map_err(|_| JobError::Storage)?;
             }
             return Ok((true, None));
@@ -697,7 +704,13 @@ impl model::ModelJob for ClaimOwner {
                     let receipt = spend::receipt_in(tx, &reference)
                         .map_err(|_| JobError::Storage)?
                         .ok_or(JobError::Storage)?;
-                    paid_resolution(tx, &receipt, now, self.jobs.config.max_result_bytes)?
+                    paid_resolution(
+                        tx,
+                        &receipt,
+                        &self.jobs.invocation_key(&current.key)?,
+                        now,
+                        self.jobs.config.max_result_bytes,
+                    )?
                 } else if state == SpendState::Released && retry {
                     JobResolution::KnownZeroCharge {
                         receipt: reference.as_str().into(),
