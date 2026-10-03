@@ -23,7 +23,7 @@ impl From<SpendReceipt> for ExecutionAttemptStatus {
         Self {
             reference: receipt.reservation.reference,
             state: receipt.state,
-            output_available: receipt.output.is_some(),
+            output_available: receipt.recovery.is_some(),
         }
     }
 }
@@ -122,6 +122,24 @@ impl Runtime {
             .spend
             .invocation(&account, &invocation)
             .map(|receipt| receipt.map(ExecutionAttemptStatus::from))
+    }
+
+    /// Discard the saved answer after host acceptance, preserving completion and spend.
+    /// The host supplies authenticated authority for the exact account and binding.
+    pub fn discard_invocation_output(
+        &self,
+        identity: &BindingIdentity,
+        sharing: Option<&AccountSharingKey>,
+        invocation: &str,
+    ) -> Result<(), ModelError> {
+        if !identity.is_valid() || invocation.trim().is_empty() {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        let account = account_scope(identity, sharing)?;
+        let invocation = crate::model::execution_invocation_identity(identity, invocation)?;
+        self.inner.spend.discard_recovery(&account, &invocation)
     }
 
     execute!(

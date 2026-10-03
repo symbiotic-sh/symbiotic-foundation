@@ -38,12 +38,14 @@ struct Sweep {
     queue: SqliteQueue,
     retention: chrono::Duration,
     responses: ResponseRetention,
+    recovery: crate::spend::SqliteSpendLedger,
 }
 
 impl Sweep {
     /// Mark calls orphaned by a crash dead, then drop finished calls, both
     /// older than the retention window; then prune the response cache.
     fn run(&self) -> Result<(), ModelError> {
+        self.recovery.expire_recovery()?;
         let cutoff = Utc::now() - self.retention;
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
@@ -61,6 +63,7 @@ impl MaintainedQueue {
         queue: SqliteQueue,
         retention: Duration,
         responses: ResponseRetention,
+        recovery: crate::spend::SqliteSpendLedger,
     ) -> Self {
         Self {
             sweep: Arc::new(Sweep {
@@ -68,6 +71,7 @@ impl MaintainedQueue {
                 retention: chrono::Duration::from_std(retention)
                     .unwrap_or_else(|_| chrono::Duration::days(3650)),
                 responses,
+                recovery,
             }),
             queue,
             finished: AtomicU64::new(0),
@@ -78,22 +82,20 @@ impl MaintainedQueue {
         self.sweep.run()
     }
 
-    async fn finished_one(&self) {
+    async fn finished_one(&self) -> Result<(), QueueError> {
         if self.finished.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY == SWEEP_EVERY - 1 {
-            // Retention is housekeeping: a failed sweep retries at the next
-            // interval and never fails the call that triggered it. It does
-            // file and database I/O, so it runs on the blocking pool.
             let sweep = self.sweep.clone();
             match tokio::task::spawn_blocking(move || sweep.run()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(%err, "runtime retention sweep failed; it retries at the next interval");
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "runtime retention sweep did not finish; it retries at the next interval");
+                Ok(result) => result.map_err(|e| QueueError::Storage(e.code()))?,
+                Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+                Err(_) => {
+                    return Err(QueueError::Storage(
+                        symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+                    ));
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -143,9 +145,10 @@ impl QueueBackend for MaintainedQueue {
     }
 
     async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
-        let result = self.queue.complete(item_id, worker_id).await;
-        self.finished_one().await;
-        result
+        // Only successful queue updates count as finished calls. Preserve a
+        // queue-write failure rather than replacing it with a sweep failure.
+        self.queue.complete(item_id, worker_id).await?;
+        self.finished_one().await
     }
 
     async fn fail(
@@ -158,9 +161,9 @@ impl QueueBackend for MaintainedQueue {
         let result = self
             .queue
             .fail(item_id, worker_id, error, retry_after_seconds)
-            .await;
-        self.finished_one().await;
-        result
+            .await?;
+        self.finished_one().await?;
+        Ok(result)
     }
 
     async fn fail_with(
@@ -169,9 +172,9 @@ impl QueueBackend for MaintainedQueue {
         worker_id: &str,
         failure: Failure,
     ) -> Result<FailOutcome, QueueError> {
-        let result = self.queue.fail_with(item_id, worker_id, failure).await;
-        self.finished_one().await;
-        result
+        let result = self.queue.fail_with(item_id, worker_id, failure).await?;
+        self.finished_one().await?;
+        Ok(result)
     }
 
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
@@ -191,5 +194,63 @@ impl QueueBackend for MaintainedQueue {
         until: DateTime<Utc>,
     ) -> Result<(), QueueError> {
         self.queue.note_cooldown(queue_id, until).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symbiotic_model::{SpendLedger, SpendReceiptRef, SpendReservation, SpendState};
+
+    #[tokio::test]
+    async fn recovery_sweep_failure_reaches_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = SqliteQueue::open(&path).unwrap();
+        let ledger = crate::spend::SqliteSpendLedger::open(&path)
+            .unwrap()
+            .with_retention(Duration::ZERO);
+        let r = SpendReservation {
+            reference: SpendReceiptRef::new("paid").unwrap(),
+            account: "account".into(),
+            invocation: "explicit".into(),
+            binding: "input".into(),
+            request_limit: None,
+        };
+        ledger.reserve_explicit(&r, 3).unwrap();
+        ledger
+            .finish(
+                &r.reference,
+                SpendState::Unknown,
+                None,
+                Some(serde_json::json!({"answer":"private"})),
+            )
+            .unwrap();
+        let maintained = MaintainedQueue::new(
+            queue,
+            Duration::from_secs(60),
+            ResponseRetention {
+                cache: DirResponseCache::new(dir.path().join("responses")),
+                max_age: None,
+                max_bytes: None,
+            },
+            ledger,
+        );
+        maintained
+            .finished
+            .store(SWEEP_EVERY - 1, Ordering::Relaxed);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER refuse_expiry BEFORE UPDATE OF recovery ON spend_receipts BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        assert!(matches!(
+            maintained.complete(&QueueItemId::new(), "worker").await,
+            Err(QueueError::NotFound(_))
+        ));
+        assert_eq!(maintained.finished.load(Ordering::Relaxed), SWEEP_EVERY - 1);
+        assert!(matches!(
+            maintained.finished_one().await,
+            Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+            ))
+        ));
     }
 }

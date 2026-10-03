@@ -39,6 +39,22 @@ impl SpendLedger for Fixture {
         }
         Ok(accepted)
     }
+    fn reserve_explicit(&self, r: &SpendReservation, limit: u32) -> Result<bool, ModelError> {
+        let accepted = self.ledger.reserve_explicit(r, limit)?;
+        if accepted && let Some(hook) = &self.after_reserve {
+            hook();
+        }
+        Ok(accepted)
+    }
+    fn discard_recovery(&self, a: &str, i: &str) -> Result<(), ModelError> {
+        self.ledger.discard_recovery(a, i)
+    }
+    fn purge_recovery(
+        &self,
+        matches: &dyn Fn(&serde_json::Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        self.ledger.purge_recovery(matches)
+    }
     fn acquire_handoff(
         &self,
         handoff: &symbiotic_model::AcceptedSpendHandoff,

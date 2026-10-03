@@ -230,6 +230,45 @@ pub struct CachedResponse {
     pub bytes: u64,
 }
 
+impl CachedResponse {
+    /// Decode the shared trace ownership fields for cache and invocation erasure.
+    pub fn from_value(
+        value: &Value,
+        modified: std::time::SystemTime,
+        bytes: u64,
+    ) -> Result<Self, ModelError> {
+        let trace = value.get("trace");
+        let text = |key: &str| {
+            trace
+                .and_then(|trace| trace.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let decode = |value: &Value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
+        };
+        Ok(Self {
+            binding: trace
+                .and_then(|trace| trace.pointer("/metadata/binding"))
+                .map(decode)
+                .transpose()?,
+            source: text("source"),
+            role_binding: text("role_binding"),
+            model: trace
+                .and_then(|trace| trace.get("model"))
+                .map(|model| {
+                    serde_json::from_value(model.clone()).map_err(|_| {
+                        ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
+                    })
+                })
+                .transpose()?,
+            modified,
+            bytes,
+        })
+    }
+}
+
 impl DirResponseCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -294,35 +333,11 @@ impl DirResponseCache {
             let raw = std::fs::read(&path).map_err(|err| cache_io(&path, err))?;
             let value: Value = serde_json::from_slice(&raw)
                 .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))?;
-            let trace = value.get("trace");
-            let text = |key: &str| {
-                trace
-                    .and_then(|trace| trace.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            };
-            let decode = |value: &Value| {
-                serde_json::from_value(value.clone())
-                    .map_err(|_| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
-            };
-            let response = CachedResponse {
-                binding: trace
-                    .and_then(|trace| trace.pointer("/metadata/binding"))
-                    .map(decode)
-                    .transpose()?,
-                source: text("source"),
-                role_binding: text("role_binding"),
-                model: trace
-                    .and_then(|trace| trace.get("model"))
-                    .map(|model| {
-                        serde_json::from_value(model.clone()).map_err(|_| {
-                            ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
-                        })
-                    })
-                    .transpose()?,
-                modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                bytes: meta.len(),
-            };
+            let response = CachedResponse::from_value(
+                &value,
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+            )?;
             if matches(&response) {
                 remove_entry(&path)?;
                 removed += 1;

@@ -68,6 +68,8 @@ struct Loopback {
     fail: Option<Arc<ModelError>>,
     delay: Duration,
     credential: Option<Arc<symbiotic_ai_runtime::model::OpenAiCompatibleChatProvider>>,
+    measured: bool,
+    start_gate: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl Loopback {
@@ -86,6 +88,8 @@ impl Loopback {
             fail: None,
             delay: Duration::from_millis(15),
             credential: None,
+            measured: false,
+            start_gate: None,
         }
     }
 
@@ -135,6 +139,9 @@ impl ChatProvider for Loopback {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
+        if let Some(gate) = &self.start_gate {
+            gate.wait().await;
+        }
         tokio::time::sleep(self.delay).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         if let Some(err) = &self.fail {
@@ -155,7 +162,10 @@ impl ChatProvider for Loopback {
                 request_hash: String::new(),
                 response_hash: None,
                 cache: Default::default(),
-                usage: Default::default(),
+                usage: symbiotic_trace::UsageTrace {
+                    input_tokens: self.measured.then_some(7),
+                    ..Default::default()
+                },
                 timing: Default::default(),
                 outcome: InvocationOutcome::Succeeded,
                 error_class: None,
@@ -246,7 +256,7 @@ async fn spend_timeout_never_uses_the_unused_attempt_allowance() {
 }
 
 #[tokio::test]
-async fn spend_lost_success_reply_recovers_without_response_cache_after_restart() {
+async fn spend_explicit_lost_success_reply_recovers_without_response_cache_after_restart() {
     let dir = private_tempdir();
     let raw = Loopback::new(unique_identity());
     let install = |runtime: &Runtime| {
@@ -254,6 +264,7 @@ async fn spend_lost_success_reply_recovers_without_response_cache_after_restart(
             .chat(
                 binding(raw.clone())
                     .with_policy(policy())
+                    .with_invocation("lost-reply")
                     .with_response_cache(ResponseCacheMode::Off),
             )
             .unwrap()
@@ -447,6 +458,7 @@ async fn spend_cache_off_recovers_the_same_attempt_and_binding_sinks_apply() {
         .chat(
             binding(raw.clone())
                 .with_policy(policy())
+                .with_invocation("same-attempt")
                 .with_receipt_sink(receipts.clone())
                 .with_response_cache(ResponseCacheMode::Off),
         )
@@ -468,7 +480,8 @@ async fn spend_cache_off_recovers_the_same_attempt_and_binding_sinks_apply() {
 async fn a_queue_id_isolates_a_role_or_pools_models() {
     let state = private_tempdir();
     let runtime = persistent(state.path());
-    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(150));
+    let mut raw = Loopback::new(unique_identity());
+    raw.start_gate = Some(Arc::new(tokio::sync::Barrier::new(2)));
     let one_slot = ModelQueueConfig {
         max_in_flight: 1,
         ..policy()
@@ -1106,7 +1119,8 @@ fn age(path: &std::path::Path, by: Duration) {
 #[tokio::test]
 async fn an_expired_cached_response_misses_and_the_sweep_removes_it() {
     let dir = private_tempdir();
-    let raw = Loopback::new(unique_identity());
+    let mut raw = Loopback::new(unique_identity());
+    raw.measured = true;
     let ask = |runtime: &Runtime| {
         let chat = runtime
             .chat(binding(raw.clone()).with_policy(policy()))
@@ -1125,8 +1139,8 @@ async fn an_expired_cached_response_misses_and_the_sweep_removes_it() {
     ask(&runtime).await;
     assert_eq!(
         raw.calls.load(Ordering::SeqCst),
-        1,
-        "ledger recovery prevents redispatch after cache expiry"
+        2,
+        "an implicit call cannot recover an expired cache entry from the ledger"
     );
 
     // The sweep at open removes expired entries.
@@ -1186,7 +1200,8 @@ async fn the_sweep_keeps_the_newest_responses_within_the_size_limit() {
 #[tokio::test]
 async fn purging_a_source_removes_only_its_responses() {
     let dir = private_tempdir();
-    let raw = Loopback::new(unique_identity());
+    let mut raw = Loopback::new(unique_identity());
+    raw.measured = true;
     let runtime = persistent(dir.path());
     let chat = runtime
         .chat(binding(raw.clone()).with_policy(policy()))
@@ -1208,10 +1223,27 @@ async fn purging_a_source_removes_only_its_responses() {
         })
         .unwrap();
     assert_eq!(removed, 1);
-    // Cache purge preserves the paid attempt and its recovery result.
+    // Erasure preserves accounting, while the erased implicit answer is fetched again.
     chat.chat(from("tenant-a/doc-1", "one")).await.unwrap();
     chat.chat(from("tenant-b/doc-2", "two")).await.unwrap();
-    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT used FROM spend_accounts", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
     assert_eq!(Runtime::in_memory().purge_responses(|_| true).unwrap(), 0);
 }
 
@@ -2129,7 +2161,10 @@ async fn execution_error_keeps_its_exact_receipt_when_a_new_attempt_is_accepted_
     let error = runtime
         .execute_chat(
             binding(raw)
-                .with_policy(policy())
+                .with_policy(ModelQueueConfig {
+                    logical_retry_attempts: 2,
+                    ..policy()
+                })
                 .with_receipt_sink(sink)
                 .with_response_cache(ResponseCacheMode::Off),
             "racing-invocation",
@@ -2241,7 +2276,10 @@ async fn execution_explicit_invocations_bypass_cache_and_recover_their_own_outpu
         ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired)
     ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
-    runtime.purge_responses(|_| true).unwrap();
+    // Evict the optional response cache while retaining this invocation's answer.
+    DirResponseCache::new(dir.path().join(symbiotic_ai_runtime::RESPONSES_DIR))
+        .purge(|_| true)
+        .unwrap();
     drop(runtime);
     let restarted = persistent(dir.path());
     let recovered = restarted
@@ -2431,5 +2469,380 @@ async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
         symbiotic_core::DiagnosticCode::SpendReconciliationRequired
     );
     assert!(refused.attempt.unwrap().is_none());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fdn_saved_answer_expires_at_retention_without_reopening() {
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().to_path_buf()),
+        retention: Duration::ZERO,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let raw = Loopback::new(unique_identity());
+    let configured = binding(raw.clone()).with_policy(policy());
+    runtime
+        .execute_chat(configured.clone(), "expiry", request("private"))
+        .await
+        .unwrap();
+    let error = runtime
+        .execute_chat(configured.clone(), "expiry", request("private"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.source.code(),
+        symbiotic_core::DiagnosticCode::InvocationCompleted
+    );
+    assert!(!error.attempt.unwrap().unwrap().output_available);
+    let identity = configured.identity.as_ref().unwrap();
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_status_writes BEFORE UPDATE ON spend_receipts BEGIN SELECT RAISE(ABORT, 'read must not write'); END;").unwrap();
+    assert!(
+        !runtime
+            .invocation_status(identity, None, "expiry")
+            .unwrap()
+            .unwrap()
+            .output_available
+    );
+    conn.execute_batch("DROP TRIGGER refuse_status_writes;")
+        .unwrap();
+    let ledger = symbiotic_ai_runtime::spend::SqliteSpendLedger::open(
+        &dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    assert_eq!(ledger.expire_recovery().unwrap(), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    drop(runtime);
+    let error = persistent(dir.path())
+        .execute_chat(configured, "expiry", request("private"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.source.code(),
+        symbiotic_core::DiagnosticCode::InvocationCompleted
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fdn_explicit_limit_survives_pruning_and_never_renews() {
+    let dir = private_tempdir();
+    let raw = Loopback::new(unique_identity()).unavailable();
+    let mut config = policy();
+    config.budget_renewal_seconds = Some(0);
+    let configured = binding(raw.clone()).with_policy(config);
+    let runtime = persistent(dir.path());
+    runtime
+        .execute_chat(configured.clone(), "exhausted", request("retry"))
+        .await
+        .unwrap_err();
+    runtime
+        .execute_chat(configured.clone(), "exhausted", request("retry"))
+        .await
+        .unwrap_err();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    drop(runtime);
+    rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE))
+        .unwrap()
+        .execute("DELETE FROM queue_items", [])
+        .unwrap();
+    persistent(dir.path())
+        .execute_chat(configured, "exhausted", request("retry"))
+        .await
+        .unwrap_err();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fdn_implicit_receipt_contains_only_completion_marker() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let response = runtime
+        .chat(
+            binding(Loopback::new(unique_identity()))
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off),
+        )
+        .unwrap()
+        .chat(request("private"))
+        .await
+        .unwrap();
+    let reference =
+        serde_json::from_value(response.trace.metadata["spend_receipt"].clone()).unwrap();
+    assert_eq!(
+        runtime.spend_receipt(&reference).unwrap().unwrap().output,
+        Some(json!({"output_received": true}))
+    );
+}
+
+#[tokio::test]
+async fn fdn_discard_and_erasure_preserve_accounting_and_completion() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut raw = Loopback::new(unique_identity());
+    raw.measured = true;
+    let configured = binding(raw.clone())
+        .with_policy(policy())
+        .with_response_cache(ResponseCacheMode::Off);
+    let identity = configured.identity.clone().unwrap();
+    let mut a = request("first source");
+    a.source = Some("source-a".into());
+    let mut b = request("second source");
+    b.source = Some("source-b".into());
+    let first = runtime
+        .execute_chat(configured.clone(), "a", a.clone())
+        .await
+        .unwrap();
+    runtime
+        .execute_chat(configured.clone(), "a2", a.clone())
+        .await
+        .unwrap();
+    let second = runtime
+        .execute_chat(configured.clone(), "b", b.clone())
+        .await
+        .unwrap();
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    let evidence = || {
+        conn.prepare("SELECT reference,state,usage,output FROM spend_receipts ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before = evidence();
+    assert_eq!(
+        runtime
+            .purge_responses(|r| r.source.as_deref() == Some("source-a"))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        runtime
+            .execute_chat(configured.clone(), "a2", a.clone())
+            .await
+            .unwrap_err()
+            .source
+            .code(),
+        symbiotic_core::DiagnosticCode::InvocationCompleted
+    );
+    let error = runtime
+        .execute_chat(configured.clone(), "a", a)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.source.code(),
+        symbiotic_core::DiagnosticCode::InvocationCompleted
+    );
+    assert_eq!(
+        error.attempt.unwrap().unwrap().reference,
+        first.attempt.unwrap().unwrap().reference
+    );
+    assert_eq!(
+        runtime
+            .execute_chat(configured.clone(), "b", b.clone())
+            .await
+            .unwrap()
+            .attempt
+            .unwrap(),
+        second.attempt.unwrap()
+    );
+    runtime
+        .discard_invocation_output(&identity, None, "b")
+        .unwrap();
+    runtime
+        .discard_invocation_output(&identity, None, "b")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .execute_chat(configured, "b", b)
+            .await
+            .unwrap_err()
+            .source
+            .code(),
+        symbiotic_core::DiagnosticCode::InvocationCompleted
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(evidence(), before);
+    assert_eq!(
+        conn.query_row("SELECT used FROM spend_accounts", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL", [], |r| r.get::<_,u64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn fdn_implicit_success_is_never_recovered_and_unknown_still_blocks() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let mut raw = Loopback::new(unique_identity());
+    raw.measured = true;
+    let chat = runtime
+        .chat(
+            binding(raw.clone())
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off),
+        )
+        .unwrap();
+    let first = chat.chat(request("identical")).await.unwrap();
+    let second = chat.chat(request("identical")).await.unwrap();
+    assert_ne!(
+        first.trace.metadata["spend_receipt"],
+        second.trace.metadata["spend_receipt"]
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM spend_receipts WHERE attempt_limit IS NOT NULL OR recovery IS NOT NULL OR attempts_used!=0", [], |r| r.get::<_,u64>(0)).unwrap(), 0);
+    let unknown = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let chat = runtime
+        .chat(
+            binding(unknown.clone())
+                .with_policy(policy())
+                .with_response_cache(ResponseCacheMode::Off),
+        )
+        .unwrap();
+    chat.chat(request("unknown")).await.unwrap_err();
+    // Remove queue coordination; the exact Unknown ledger guard must still stop dispatch.
+    conn.execute("DELETE FROM queue_items", []).unwrap();
+    assert_eq!(
+        chat.chat(request("unknown")).await.unwrap_err().code(),
+        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+    );
+    assert_eq!(unknown.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fdn_original_ceiling_survives_reconciliation_and_changed_configuration() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let mut initial = policy();
+    initial.logical_retry_attempts = 3;
+    let error = runtime
+        .execute_chat(
+            binding(raw.clone()).with_policy(initial),
+            "frozen",
+            request("input"),
+        )
+        .await
+        .unwrap_err();
+    runtime
+        .reconcile_spend(
+            &error.attempt.unwrap().unwrap().reference,
+            symbiotic_ai_runtime::SpendState::Released,
+            None,
+        )
+        .unwrap();
+    let mut higher = policy();
+    higher.logical_retry_attempts = 20;
+    higher.budget_renewal_seconds = Some(0);
+    let retry = binding(raw.clone().unavailable()).with_policy(higher);
+    runtime
+        .execute_chat(retry.clone(), "frozen", request("input"))
+        .await
+        .unwrap_err();
+    runtime
+        .execute_chat(retry, "frozen", request("input"))
+        .await
+        .unwrap_err();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 3);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT attempt_limit, attempts_used FROM spend_receipts ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?))
+        )
+        .unwrap(),
+        (3, 3)
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM queue_items WHERE json_type(payload_json, '$.logical_retry') IS NOT NULL", [], |r| r.get::<_,u64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn fdn_completed_replay_ignores_higher_and_lower_ceilings() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity());
+    let original = runtime
+        .execute_chat(
+            binding(raw.clone()).with_policy(policy()),
+            "completed",
+            request("input"),
+        )
+        .await
+        .unwrap();
+    for ceiling in [1, 10] {
+        let mut config = policy();
+        config.logical_retry_attempts = ceiling;
+        let replay = runtime
+            .execute_chat(
+                binding(raw.clone()).with_policy(config),
+                "completed",
+                request("input"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay.output).unwrap(),
+            serde_json::to_value(&original.output).unwrap()
+        );
+    }
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fdn_unknown_replay_attaches_to_its_receipt_after_queue_pruning() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).failing(ModelError::Timeout(
+        symbiotic_core::DiagnosticCode::HttpTimeout,
+    ));
+    let configured = binding(raw.clone()).with_policy(policy());
+    let first = runtime
+        .execute_chat(configured.clone(), "unknown", request("input"))
+        .await
+        .unwrap_err();
+    let reference = first.attempt.unwrap().unwrap().reference;
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    conn.execute("DELETE FROM queue_items", []).unwrap();
+    let replay = runtime
+        .execute_chat(configured, "unknown", request("input"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        replay.source.code(),
+        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+    );
+    assert_eq!(replay.attempt.unwrap().unwrap().reference, reference);
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }

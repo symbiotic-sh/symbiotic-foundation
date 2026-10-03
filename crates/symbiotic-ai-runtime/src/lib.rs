@@ -101,8 +101,9 @@ pub struct RuntimeConfig {
     pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     /// Persistent state older than this is retired: queue records of
     /// finished calls, and calls orphaned by a crash. Seven days by default.
-    /// Retiring a finished call only drops its deduplication record; cached
-    /// responses follow `response_max_age` and `response_max_bytes`.
+    /// Explicit recovery answers expire this long after completion; accounting
+    /// receipts and frozen attempt budgets remain. Cached responses follow
+    /// `response_max_age` and `response_max_bytes`.
     pub retention: Duration,
     /// Cached responses older than this miss, and the retention sweep
     /// removes them. 30 days by default; `None` keeps them indefinitely.
@@ -120,7 +121,7 @@ impl Default for RuntimeConfig {
             worker_id: None,
             trace_sink: None,
             receipt_sink: None,
-            retention: Duration::from_secs(7 * 24 * 60 * 60),
+            retention: model::DEFAULT_RETENTION,
             response_max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
             response_max_bytes: Some(1 << 30),
         }
@@ -303,7 +304,10 @@ impl Runtime {
             None => Arc::new(MemoryQueue::new()),
         };
         let spend: Arc<dyn SpendLedger> = match &config.state_dir {
-            Some(dir) => Arc::new(spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?),
+            Some(dir) => Arc::new(
+                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?
+                    .with_retention(config.retention),
+            ),
             None => Arc::new(model::UnavailableSpendLedger),
         };
         Ok(Self::from_state(config, queue, spend))
@@ -380,9 +384,36 @@ impl Runtime {
         &self,
         matches: impl Fn(&CachedResponse) -> bool,
     ) -> Result<usize, ModelError> {
+        let recoveries = if self.is_persistent() {
+            self.inner.spend.purge_recovery(&|value| {
+                let trace: symbiotic_trace::ModelInvocationTrace =
+                    serde_json::from_value(value.get("trace").cloned().ok_or(
+                        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable),
+                    )?)
+                    .map_err(|_| {
+                        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable)
+                    })?;
+                let response = CachedResponse::from_value(
+                    value,
+                    trace.timestamp.into(),
+                    serde_json::to_vec(value)
+                        .map_err(|_| {
+                            ModelError::Queue(
+                                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+                            )
+                        })?
+                        .len() as u64,
+                )?;
+                Ok(matches(&response))
+            })?
+        } else {
+            0
+        };
         match &self.inner.state_dir {
-            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches),
-            None => Ok(0),
+            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR))
+                .purge(matches)
+                .map(|n| n + recoveries),
+            None => Ok(recoveries),
         }
     }
 
@@ -891,6 +922,7 @@ fn open_persistent_queue(
             max_age: config.response_max_age,
             max_bytes: config.response_max_bytes,
         },
+        spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention),
     );
     queue.maintain()?;
     Ok(queue)

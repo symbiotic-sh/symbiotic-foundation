@@ -879,6 +879,7 @@ struct QueuedCall<Req> {
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
+    explicit_invocation: bool,
     attempt_binding: String,
     attempt_context: ExecutionAttemptContext,
     worker_id: String,
@@ -905,7 +906,7 @@ impl<Req> QueuedCall<Req> {
     async fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<Res>, ModelError> {
-        if self.accepted_spend.is_some() {
+        if !self.explicit_invocation || self.accepted_spend.is_some() {
             return Ok(None);
         }
         let spend = self.spend.clone();
@@ -921,15 +922,34 @@ impl<Req> QueuedCall<Req> {
             {
                 return Err(spend::reconciliation());
             }
-            if let Some(receipt) = &receipt
-                && receipt.output.is_some()
-            {
+            let Some(receipt) = receipt else {
+                return Ok(None);
+            };
+            if receipt.output.is_some() {
+                context.capture(&receipt.reservation.reference)?;
+                return receipt
+                    .recovery
+                    .map(Some)
+                    .ok_or(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+            }
+            // An unresolved attempt may still belong to a live worker. Join its
+            // queue item; the atomic Unknown guard refuses any new dispatch.
+            if receipt.state == SpendState::Unknown {
                 context.capture(&receipt.reservation.reference)?;
             }
-            Ok(receipt)
+            if receipt.state == SpendState::Released
+                && receipt
+                    .attempt_limit
+                    .is_some_and(|limit| receipt.attempts_used >= limit)
+            {
+                context.capture(&receipt.reservation.reference)?;
+                return Err(ModelError::BudgetExhausted(
+                    DiagnosticCode::AttemptBudgetExhausted,
+                ));
+            }
+            Ok(None)
         })
         .await?
-        .and_then(|receipt| receipt.output)
         .map(|output| {
             secrets::composed_result(
                 self.result_owner.as_ref(),
@@ -937,6 +957,44 @@ impl<Req> QueuedCall<Req> {
             )
         })
         .transpose()
+    }
+
+    async fn retry_state(&self, item: Option<&QueueItem>) -> Result<LogicalRetryState, ModelError> {
+        if self.explicit_invocation {
+            let spend = self.spend.clone();
+            let account = self.queue_id.0.clone();
+            let invocation = self.invocation.clone();
+            let receipt = run_blocking(move || spend.invocation(&account, &invocation)).await?;
+            return Ok(LogicalRetryState {
+                attempts_used: receipt.as_ref().map_or(0, |r| r.attempts_used),
+                max_attempts: receipt
+                    .and_then(|r| r.attempt_limit)
+                    .unwrap_or_else(|| logical_max_attempts(&self.config)),
+            });
+        }
+        match item {
+            Some(item) => {
+                let mut state = logical_retry_state(&item.payload)?;
+                state.attempts_used = state
+                    .attempts_used
+                    .checked_add(self.provider_attempts(item).await?)
+                    .ok_or(ModelError::Queue(DiagnosticCode::QueueFailure))?;
+                Ok(state)
+            }
+            None => Ok(LogicalRetryState {
+                attempts_used: 0,
+                max_attempts: logical_max_attempts(&self.config),
+            }),
+        }
+    }
+
+    fn payload(&self, state: LogicalRetryState) -> Value {
+        model_queue_payload(
+            &self.capability,
+            &self.request_hash,
+            &self.descriptor,
+            (!self.explicit_invocation).then_some(state),
+        )
     }
 
     fn cache_entry(&self) -> CacheEntry<'_> {
@@ -955,15 +1013,7 @@ impl<Req> QueuedCall<Req> {
             .enqueue(EnqueueRequest {
                 queue_id: self.queue_id.clone(),
                 kind: self.kind.clone(),
-                payload: model_queue_payload(
-                    &self.capability,
-                    &self.request_hash,
-                    &self.descriptor,
-                    LogicalRetryState {
-                        attempts_used: 0,
-                        max_attempts: logical_max_attempts(&self.config),
-                    },
-                ),
+                payload: self.payload(self.retry_state(None).await?),
                 idempotency_key: self.idempotency_key.clone(),
                 run_after: None,
                 max_attempts: Some(item_max_attempts(&self.config)),
@@ -975,6 +1025,11 @@ impl<Req> QueuedCall<Req> {
     }
 
     async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
+        if self.explicit_invocation {
+            return Err(ModelError::BudgetExhausted(
+                DiagnosticCode::AttemptBudgetExhausted,
+            ));
+        }
         reenqueue_with_fresh_budget(
             self.queue.as_ref(),
             &self.queue_id,
@@ -1095,27 +1150,17 @@ impl<Req> QueuedCall<Req> {
             }
             _ => return Ok(None),
         }
-        let state = logical_retry_state(&item.payload, logical_max_attempts(&self.config));
-        let attempts_used = state
-            .attempts_used
-            .saturating_add(self.provider_attempts(item).await?);
+        let state = self.retry_state(Some(item)).await?;
+        let attempts_used = state.attempts_used;
         if attempts_used >= state.max_attempts {
-            return if budget_renewed(item, &self.config)? {
+            return if !self.explicit_invocation && budget_renewed(item, &self.config)? {
                 self.renew_budget(&item.item_id).await.map(Some)
             } else {
                 Ok(None)
             };
         }
         let remaining = state.max_attempts - attempts_used;
-        let payload = model_queue_payload(
-            &self.capability,
-            &self.request_hash,
-            &self.descriptor,
-            LogicalRetryState {
-                attempts_used,
-                max_attempts: state.max_attempts,
-            },
-        );
+        let payload = self.payload(state);
         self.queue
             .enqueue_replacing(
                 EnqueueRequest {
@@ -1153,7 +1198,8 @@ impl<Req> QueuedCall<Req> {
             dead,
             &self.config,
             err,
-            self.provider_attempts(dead).await?,
+            self.retry_state(Some(dead)).await?,
+            self.explicit_invocation,
         )
         .await
     }
@@ -1420,6 +1466,7 @@ where
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         invocation,
+        explicit_invocation: runtime.invocation.is_some(),
         attempt_binding,
         attempt_context: attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
@@ -1485,6 +1532,11 @@ where
             AttemptTiming::NONE,
         )
         .await;
+    // Completion may race the lookup before enqueue. A terminal queue duplicate
+    // attaches to the receipt written before that terminal transition.
+    if let Some(output) = this.recovered::<Res>().await? {
+        return Ok(output);
+    }
     if enqueue.disposition == EnqueueDisposition::TerminalDuplicate
         && enqueue.item.status == QueueStatus::Dead
         && let Some(next) = this.reconsider_stopped(&enqueue.item).await?
@@ -1500,7 +1552,9 @@ where
                     return Err(dead_item_retry_error(&enqueue.item));
                 }
             }
-            QueueStatus::Dead if budget_renewed(&enqueue.item, config)? => {
+            QueueStatus::Dead
+                if !this.explicit_invocation && budget_renewed(&enqueue.item, config)? =>
+            {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
             QueueStatus::Dead => {
@@ -1675,7 +1729,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                     Err(dead_item_retry_error(&current))
                 }
             }
-            QueueStatus::Dead if budget_renewed(&current, config)? => {
+            QueueStatus::Dead if !self.explicit_invocation && budget_renewed(&current, config)? => {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1854,13 +1908,20 @@ where
                         .acquire_handoff(handoff, &state.queue_id.0, &identity, &owner)?;
                     Ok(true)
                 } else {
-                    state.spend.reserve(&SpendReservation {
+                    let reservation = SpendReservation {
                         reference: reference_for_reserve,
                         account: state.queue_id.0.clone(),
                         invocation: state.invocation.clone(),
                         binding: state.attempt_binding.clone(),
                         request_limit: state.config.provider_request_limit,
-                    })
+                    };
+                    if state.explicit_invocation {
+                        state
+                            .spend
+                            .reserve_explicit(&reservation, logical_max_attempts(&state.config))
+                    } else {
+                        state.spend.reserve(&reservation)
+                    }
                 }
             })
             .await;
@@ -2604,38 +2665,54 @@ fn model_queue_payload(
     capability: &ModelCapability,
     request_hash: &str,
     descriptor: &ProviderDescriptor,
-    retry_state: LogicalRetryState,
+    retry_state: Option<LogicalRetryState>,
 ) -> Value {
-    serde_json::json!({
-        "capability": capability,
-        "request_hash": request_hash,
-        "model": descriptor.identity,
-        "binding": descriptor.metadata.get("binding"),
-        "logical_retry": {
-            "attempts_used": retry_state.attempts_used,
-            "max_attempts": retry_state.max_attempts,
-        },
-    })
+    let mut payload = serde_json::json!({
+        "capability": capability, "request_hash": request_hash,
+        "model": descriptor.identity, "binding": descriptor.metadata.get("binding"),
+    });
+    if let Some(state) = retry_state {
+        payload["logical_retry"] = serde_json::json!({ "attempts_used": state.attempts_used, "max_attempts": state.max_attempts });
+    }
+    payload
 }
 
 #[cfg(feature = "queue")]
-fn logical_retry_state(payload: &Value, default_max_attempts: u32) -> LogicalRetryState {
-    let retry = payload.get("logical_retry");
-    let attempts_used = retry
-        .and_then(|value| value.get("attempts_used"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
-    let max_attempts = retry
-        .and_then(|value| value.get("max_attempts"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(default_max_attempts)
-        .max(1);
-    LogicalRetryState {
+fn logical_retry_state(payload: &Value) -> Result<LogicalRetryState, ModelError> {
+    let decode = |key| {
+        payload
+            .pointer(key)
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(ModelError::Queue(DiagnosticCode::QueueFailure))
+    };
+    let attempts_used = decode("/logical_retry/attempts_used")?;
+    let max_attempts = decode("/logical_retry/max_attempts")?;
+    if max_attempts == 0 || attempts_used > max_attempts {
+        return Err(ModelError::Queue(DiagnosticCode::QueueFailure));
+    }
+    Ok(LogicalRetryState {
         attempts_used,
         max_attempts,
+    })
+}
+
+#[cfg(all(test, feature = "queue"))]
+#[test]
+fn implicit_retry_state_refuses_missing_or_invalid_budgets() {
+    for payload in [
+        serde_json::json!({}),
+        serde_json::json!({"logical_retry":{"attempts_used":0,"max_attempts":0}}),
+        serde_json::json!({"logical_retry":{"attempts_used":4,"max_attempts":3}}),
+        serde_json::json!({"logical_retry":{"attempts_used":0,"max_attempts":4294967296u64}}),
+    ] {
+        assert!(logical_retry_state(&payload).is_err());
     }
+    let valid = logical_retry_state(
+        &serde_json::json!({"logical_retry":{"attempts_used":1,"max_attempts":3}}),
+    )
+    .unwrap();
+    assert_eq!((valid.attempts_used, valid.max_attempts), (1, 3));
 }
 
 // Retry bookkeeping follows the same execution boundary rather than another state type.
@@ -2652,10 +2729,10 @@ async fn reenqueue_dead_item(
     item: &QueueItem,
     config: &ModelQueueConfig,
     err: &ModelError,
-    provider_attempts: u32,
+    state: LogicalRetryState,
+    explicit: bool,
 ) -> Result<Option<EnqueueOutcome>, ModelError> {
-    let state = logical_retry_state(&item.payload, logical_max_attempts(config));
-    let attempts_used = state.attempts_used.saturating_add(provider_attempts);
+    let attempts_used = state.attempts_used;
     if item.status == QueueStatus::Stopped || attempts_used >= state.max_attempts {
         return Ok(None);
     }
@@ -2664,7 +2741,12 @@ async fn reenqueue_dead_item(
         attempts_used,
         max_attempts: state.max_attempts,
     };
-    let payload = model_queue_payload(&capability, request_hash, descriptor, next_state);
+    let payload = model_queue_payload(
+        &capability,
+        request_hash,
+        descriptor,
+        (!explicit).then_some(next_state),
+    );
     let retry_after_ms = retry_delay_ms(item.attempt, config, &item.item_id, request_hash, err)?;
     // Replace the dead item only while it is still the newest for the
     // request: a caller holding a stale item must not start a second chain.
@@ -2705,10 +2787,10 @@ async fn reenqueue_with_fresh_budget(
         &capability,
         request_hash,
         descriptor,
-        LogicalRetryState {
+        Some(LogicalRetryState {
             attempts_used: 0,
             max_attempts: logical_max_attempts(config),
-        },
+        }),
     );
     // Conditional on `current` still being the newest item, so a delayed
     // caller cannot renew over a budget another caller renewed meanwhile.
@@ -4699,10 +4781,10 @@ mod tests {
                     &ModelCapability::Chat,
                     &request_hash,
                     &descriptor,
-                    LogicalRetryState {
+                    Some(LogicalRetryState {
                         attempts_used: 0,
                         max_attempts: 2,
-                    },
+                    }),
                 ),
                 idempotency_key: Some(format!("{}:{request_hash}", queue_id.0)),
                 run_after: None,

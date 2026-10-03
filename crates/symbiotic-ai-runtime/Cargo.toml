@@ -23,6 +23,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 tempfile = "3"

@@ -743,7 +743,11 @@ async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
             max_in_flight: 2,
             ..config()
         },
-    );
+    )
+    .with_binding_identity(symbiotic_core::BindingIdentity::new(
+        "tenant", "provider", "1", "account",
+    ))
+    .with_invocation("retry-waiters".into());
     // Two callers of the same request: one runs the failing attempt, the
     // other waits on the same queue item.
     let (first, second) = tokio::join!(
@@ -2333,6 +2337,22 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         Ok(accepted)
     }
 
+    fn reserve_explicit(
+        &self,
+        r: &symbiotic_model::SpendReservation,
+        limit: u32,
+    ) -> Result<bool, ModelError> {
+        self.inner.reserve_explicit(r, limit)
+    }
+    fn discard_recovery(&self, a: &str, i: &str) -> Result<(), ModelError> {
+        self.inner.discard_recovery(a, i)
+    }
+    fn purge_recovery(
+        &self,
+        matches: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        self.inner.purge_recovery(matches)
+    }
     fn acquire_handoff(
         &self,
         handoff: &symbiotic_model::AcceptedSpendHandoff,
@@ -2703,6 +2723,10 @@ async fn a_joined_waiter_recovers_durable_output_from_every_queue_state(
                 ..config()
             },
         )
+        .with_binding_identity(symbiotic_core::BindingIdentity::new(
+            "tenant", "provider", "1", "account",
+        ))
+        .with_invocation("joined-waiter".into())
         .with_receipt_sink(receipts.clone());
         let first = tokio::spawn({
             let provider = provider.clone();

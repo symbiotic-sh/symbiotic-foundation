@@ -74,6 +74,9 @@ impl ExecutionAttemptContext {
     }
 }
 
+/// Default runtime retention for queue state and explicit recovery answers.
+pub const DEFAULT_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Enforceable request accounting, separate from monetary observations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,15 +139,33 @@ pub struct SpendReceipt {
     #[serde(default)]
     pub pre_dispatch_released: bool,
     pub usage: Option<UsageTrace>,
-    /// Same-attempt runtime result, or credential completion evidence; egress
-    /// output bytes stay in its authenticated, deadline-bounded recovery store.
+    /// Content-free completion evidence. Accounting survives recovery deletion.
     pub output: Option<Value>,
+    /// Frozen ceiling, present only for runtime explicit invocations.
+    pub attempt_limit: Option<u32>,
+    /// Provider attempts carried forward on each explicit receipt.
+    pub attempts_used: u32,
+    /// Same-invocation answer, present only until discard or retention expiry.
+    pub recovery: Option<Value>,
 }
 
 /// Accounting boundary used by every queued operation and credential handoff.
 /// A successful reserve returns true only for a newly accepted attempt.
 pub trait SpendLedger: Send + Sync {
     fn reserve(&self, reservation: &SpendReservation) -> Result<bool, ModelError>;
+    /// Reserve an explicit invocation under its frozen provider-attempt ceiling.
+    fn reserve_explicit(
+        &self,
+        reservation: &SpendReservation,
+        limit: u32,
+    ) -> Result<bool, ModelError>;
+    /// Delete only the saved answer for an authenticated account/invocation.
+    fn discard_recovery(&self, account: &str, invocation: &str) -> Result<(), ModelError>;
+    /// Delete matching live recovery answers, preserving accounting evidence.
+    fn purge_recovery(
+        &self,
+        matches: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError>;
     /// Atomically release a reservation and record that transport never started.
     /// Must not reclassify a provider attempt already settled or reconciled.
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError>;
@@ -186,6 +207,18 @@ pub(crate) fn reconciliation() -> ModelError {
 pub struct UnavailableSpendLedger;
 impl SpendLedger for UnavailableSpendLedger {
     fn reserve(&self, _: &SpendReservation) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn reserve_explicit(&self, _: &SpendReservation, _: u32) -> Result<bool, ModelError> {
+        Err(storage())
+    }
+    fn discard_recovery(&self, _: &str, _: &str) -> Result<(), ModelError> {
+        Err(storage())
+    }
+    fn purge_recovery(
+        &self,
+        _: &dyn Fn(&Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
         Err(storage())
     }
     fn release_before_dispatch(&self, _: &SpendReceiptRef) -> Result<(), ModelError> {

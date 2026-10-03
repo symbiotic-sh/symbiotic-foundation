@@ -35,7 +35,7 @@ zeroize = "1"
 libc = "0.2"
 
 [dev-dependencies]
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 # Tests run the queued providers on the SQLite backend.
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 futures = "0.3"
