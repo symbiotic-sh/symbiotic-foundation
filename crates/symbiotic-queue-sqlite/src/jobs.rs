@@ -199,6 +199,61 @@ pub fn jobs_in_transaction(
     Ok(response)
 }
 
+/// Receipt owners affected by deletion, selected before the transition removes
+/// owner membership or tombstones metadata. Work is bounded by the live population.
+/// SQL for job selection remains exclusively in this backend.
+pub fn paid_copies_for_request(
+    tx: &Transaction<'_>,
+    scope: &JobScope,
+    config: &JobConfig,
+    now: DateTime<Utc>,
+    request: &JobRequest,
+) -> Result<Vec<JobRecord>, JobError> {
+    let mut rows = SqlRows::new(tx);
+    let ids = match request {
+        JobRequest::Ack(acks) => {
+            if acks.len() > config.max_batch {
+                return Err(JobError::InvalidRequest);
+            }
+            acks.iter()
+                .map(|(token, _)| {
+                    scoped(scope, &token.job)?;
+                    Ok(token.job.clone())
+                })
+                .collect::<Result<Vec<_>, JobError>>()?
+        }
+        JobRequest::PurgeOwner(owner) => rows
+            .inspect(
+                scope,
+                JobQuery::Owner(owner.clone()),
+                now,
+                config.max_live_jobs,
+            )?
+            .into_iter()
+            .map(|r| r.id)
+            .collect(),
+        JobRequest::Maintain => rows
+            .inspect(scope, JobQuery::Expired, now, config.maintenance_batch)?
+            .into_iter()
+            .map(|r| r.id)
+            .collect(),
+        _ => Vec::new(),
+    };
+    ids.into_iter()
+        .map(|id| {
+            let row = rows.metadata(&id)?;
+            if row.execution == Execution::Model
+                && row.receipt.is_none()
+                && matches!(request, JobRequest::PurgeOwner(_))
+            {
+                rows.get(&id)?.ok_or(JobError::NotFound)
+            } else {
+                Ok(row)
+            }
+        })
+        .collect()
+}
+
 struct SqlRows<'a> {
     conn: &'a Connection,
     #[cfg(test)]
@@ -449,6 +504,12 @@ impl SqlRows<'_> {
                 let filter = "state IN ('\"Pending\"','\"Running\"','\"Uncertain\"') AND (state='\"Pending\"' OR (state='\"Running\"' AND execution='\"Handler\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2))".to_string();
                 (filter, "created_at, id", "jobs_claim")
             }
+            JobQuery::Recovery { kinds, after } => {
+                args.push(json(&kinds)?.into());
+                args.push(stamp(now).into());
+                args.push(after.unwrap_or_default().into());
+                ("state IN ('\"Pending\"','\"Running\"','\"Uncertain\"') AND execution='\"Model\"' AND (state='\"Uncertain\"' OR (state='\"Running\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2)) AND id>?4".to_string(), "id", "jobs_claim")
+            }
             JobQuery::Final => {
                 args.push(stamp(now).into());
                 ("state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"') AND (delivery_until IS NULL OR delivery_until<=?2)".to_string(), "finished_at, id", "jobs_delivery")
@@ -535,6 +596,11 @@ enum JobQuery {
     Owner(String),
     /// Waiting claims within handler kinds, FIFO.
     Pending { kinds: Vec<String> },
+    /// Expired model claims and unresolved paid attempts, ascending ID.
+    Recovery {
+        kinds: Vec<String>,
+        after: Option<String>,
+    },
     /// Unleased final deliveries, oldest first.
     Final,
     /// Final recovery copies past deadline.
@@ -870,6 +936,62 @@ fn apply_job_request(
                 page.push(row);
             }
             Ok(JobResponse::Candidates(page))
+        }
+        JobRequest::RecoveryCandidates {
+            kinds,
+            after,
+            limit,
+            max_bytes,
+        } => {
+            page(config, limit)?;
+            if kinds.is_empty() || max_bytes < 2 || max_bytes > config.max_page_bytes {
+                return Err(JobError::InvalidRequest);
+            }
+            let selected = rows.select(scope, JobQuery::Recovery { kinds, after }, now, limit)?;
+            let mut page = Vec::new();
+            let mut bytes = 2;
+            for row in selected {
+                let Some(required) =
+                    page_bytes(&row, bytes, max_bytes, !page.is_empty(), |bytes| {
+                        JobError::CandidateTooLarge {
+                            job: row.id.clone(),
+                            bytes,
+                        }
+                    })?
+                else {
+                    break;
+                };
+                bytes = required;
+                page.push(row);
+            }
+            Ok(JobResponse::Candidates(page))
+        }
+        JobRequest::RefusePending { job, diagnostic } => {
+            let mut row = get(rows, scope, &job)?;
+            if row.execution != Execution::Model {
+                return Err(JobError::InvalidRequest);
+            }
+            if row.state == JobState::Pending {
+                row.diagnostic = Some(diagnostic);
+                finish(&mut row, JobState::Refused, now, config)?;
+                rows.save(row)?;
+            }
+            Ok(JobResponse::Done)
+        }
+        JobRequest::ClaimPaid { job, receipt } => {
+            let row = get(rows, scope, &job)?;
+            if row.execution != Execution::Model || receipt.is_empty() {
+                return Err(JobError::InvalidRequest);
+            }
+            let claimed = claim_job(rows, config, now, row)?;
+            if let Some(mut row) = claimed {
+                row.receipt = Some(receipt);
+                row.origin = Some(ResultOrigin::Paid);
+                rows.save(row.clone())?;
+                Ok(JobResponse::Job(Some(Box::new(row))))
+            } else {
+                Ok(JobResponse::Job(None))
+            }
         }
         JobRequest::ClaimJob(job) => {
             let row = get(rows, scope, &job)?;

@@ -382,6 +382,20 @@ pub enum JobRequest {
     /// Claim the inspected job inside the account owner's acceptance transaction.
     /// The trusted caller holds its account/handler slot; the store is not a limiter.
     ClaimJob(JobId),
+    /// Ledger owner claims and records the reservation reference in its transaction.
+    ClaimPaid { job: JobId, receipt: String },
+    /// Execution-owner refusal before accepting a paid attempt; no receipt is fabricated.
+    RefusePending {
+        job: JobId,
+        diagnostic: DiagnosticCode,
+    },
+    /// Bounded ledger-recovery page; active leases are never inspected.
+    RecoveryCandidates {
+        kinds: Vec<String>,
+        after: Option<String>,
+        limit: usize,
+        max_bytes: usize,
+    },
     /// Extend a live claim and return cancellation intent without reading content.
     Heartbeat { job: JobId, generation: u64 },
     /// Set a final result or Uncertain under a live generation.
@@ -483,6 +497,9 @@ pub enum JobError {
     /// The caller-selected backend does not provide a job store.
     #[error("job store unavailable")]
     Unavailable,
+    /// Execution-owner failure, preserving the closed diagnostic without content.
+    #[error("job execution failed: {0}")]
+    Execution(DiagnosticCode),
     /// Backend/serialization failure.
     #[error("job storage failure")]
     Storage,

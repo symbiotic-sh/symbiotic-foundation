@@ -490,6 +490,40 @@ impl ResponseCache for DirResponseCache {
     }
 }
 
+/// Ledger-owned lifecycle for a durable model job. The execution owner acquires
+/// its account slot before calling `claim`; no second queue or admission exists.
+#[doc(hidden)]
+pub trait ModelJob: Send + Sync {
+    /// Recover a matching committed answer before admission or rate checks.
+    fn recover(&self, reservation: &crate::SpendReservation) -> Result<bool, ModelError>;
+    /// Atomically claim and reserve, or recover an existing ledger outcome.
+    /// The returned payload is the waiting copy read in the claim transaction.
+    fn claim(
+        &self,
+        reservation: &crate::SpendReservation,
+        limit: u32,
+    ) -> Result<Option<Vec<u8>>, ModelError>;
+    /// Renew the claim and read cancellation intent in one store call.
+    fn heartbeat(&self) -> Result<bool, ModelError>;
+    /// Settle accounting and the job together. Retry requires known-zero evidence.
+    fn finish(
+        &self,
+        state: crate::SpendState,
+        usage: Option<UsageTrace>,
+        output: Option<Value>,
+        failure: Option<symbiotic_core::DiagnosticCode>,
+        retry: bool,
+    ) -> Result<(), ModelError>;
+    /// Release a reservation when transport has not started; cancellation is final.
+    fn release(&self) -> Result<(), ModelError>;
+    /// Refuse malformed input before transport or reservation.
+    fn refuse(&self, code: symbiotic_core::DiagnosticCode) -> Result<(), ModelError>;
+    /// Claim ordinal for the existing configured retry backoff.
+    fn attempt(&self) -> Result<u32, ModelError>;
+    /// Heartbeat interval from the validated runner policy.
+    fn heartbeat_interval(&self) -> std::time::Duration;
+}
+
 /// Everything a queued provider carries besides its inner provider.
 #[derive(Clone)]
 pub(crate) struct QueueRuntime {
@@ -501,6 +535,7 @@ pub(crate) struct QueueRuntime {
     pub(crate) rate_state: crate::ModelRateState,
     pub(crate) spend: Arc<dyn crate::SpendLedger>,
     pub(crate) accepted_spend: Option<crate::AcceptedSpendHandoff>,
+    pub(crate) job: Option<Arc<dyn ModelJob>>,
     pub(crate) invocation: Option<String>,
     pub(crate) attempt_context: Option<crate::ExecutionAttemptContext>,
     pub(crate) response_cache: Option<Arc<dyn ResponseCache>>,
@@ -526,6 +561,7 @@ impl QueueRuntime {
             rate_state: crate::ModelRateState::default(),
             spend: Arc::new(crate::UnavailableSpendLedger),
             accepted_spend: None,
+            job: None,
             invocation: None,
             attempt_context: None,
             response_cache: None,
@@ -571,6 +607,13 @@ macro_rules! queue_runtime_builders {
         ) -> Self {
             self.runtime.spend = ledger;
             self.runtime.accepted_spend = accepted;
+            self
+        }
+
+        /// Execute through the ledger-owned job claim instead of a direct-call queue item.
+        #[doc(hidden)]
+        pub fn with_job_owner(mut self, job: Arc<dyn $crate::ModelJob>) -> Self {
+            self.runtime.job = Some(job);
             self
         }
 

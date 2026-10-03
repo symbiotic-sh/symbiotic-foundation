@@ -399,6 +399,46 @@ with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporti
 A classify request that fails validation returns `InvalidRequest` before it
 takes a queue slot.
 
+## Durable model jobs
+
+`Runtime::model_jobs(scope, config)` opens the model job API on the canonical
+spend ledger's SQLite connection. `model_job_payload` encodes the full request
+and its frozen binding identity and account sharing setting, without credentials.
+`ModelJobs::start_chat`, `start_embedding`, `start_rerank` and `start_classifier`
+start workers for one handler kind. Workers start without consumer resubmission;
+`JobRunner::shutdown` drains sent calls and returns worker or monitoring failures.
+
+The job key is the D1 explicit invocation identity. ModelAdmission acquires the
+same account slot used by direct calls before the job claim. There is no direct-call
+queue item, nested admission or second slot. Claim and reservation commit in one
+transaction, which returns the payload passed to transport. Jobs use the same rate
+state, cooldown, finite timeout and credential sanitation as direct execution.
+Paid settlement, the ledger's saved answer and job completion commit together.
+The job record retains only a receipt reference; it never stores a paid answer.
+
+Restart inspects expired claims and Uncertain jobs in bounded pages, using ledger
+evidence before dispatch. A committed answer from a direct `execute_*` under the
+same key completes the job without another call. A reservation without an answer
+or trusted zero-charge evidence becomes Uncertain and is never resent blindly.
+The frozen job claim ceiling is not renewed by a restart or a duplicate enqueue.
+
+`ModelJobs::completions` delivers final jobs oldest first, within item and encoded
+byte bounds, preflighting the ledger answer length before loading it. A single
+oversized completion returns `CompletionTooLarge` without taking a lease. Confirm,
+owner erasure and bounded maintenance delete ledger recovery and job copies in the
+same transaction. Accounting and completion evidence remain. `recovery_until`
+limits final answer availability only: expired Pending jobs can run, and expired
+Uncertain jobs retain their input for reconciliation. Completion after the deadline
+settles accounting without storing an answer. Owner erasure is sticky; an in-flight
+purged call can settle but cannot save output, and an unresolved purged charge stays
+Uncertain until reconciled.
+
+Cancel observed before transport releases the reservation. A sent paid call
+finishes under its normal timeout; cancellation keeps its answer and never retries.
+Cancellation arrives with the lease heartbeat, using the runner's configured
+interval. Version 1 has no job result cache, socket API or streaming provider
+contract. Acceptance tests are in `crates/symbiotic-ai-runtime/tests/jobs.rs`.
+
 ## Explicit invocation recovery
 
 `Runtime::execute_chat`, `execute_embedding`, `execute_rerank` and
