@@ -108,7 +108,20 @@ fn paid_resolution(
     tx: &Transaction<'_>,
     receipt: &crate::SpendReceipt,
     now: chrono::DateTime<Utc>,
+    max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
+    let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
+    if bytes > max_bytes {
+        tx.execute(
+            "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
+            [receipt.reservation.reference.as_str()],
+        )
+        .map_err(|_| JobError::Storage)?;
+        return Ok(JobResolution::Failed {
+            receipt: receipt.reservation.reference.as_str().into(),
+            diagnostic: DiagnosticCode::QueueResultTooLarge,
+        });
+    }
     let deadline: Option<String> = tx
         .query_row(
             "SELECT recovery_expires_at FROM spend_receipts WHERE reference=?1",
@@ -126,7 +139,45 @@ fn paid_resolution(
     })
 }
 
+// This canonical registration survives confirmation and erasure: neither removes
+// the kind's single binding. IMMEDIATE transactions serialize registration/enqueue.
+fn bind_kind(
+    tx: &Transaction<'_>,
+    scope: &JobScope,
+    kind: &str,
+    identity: &crate::BindingIdentity,
+    sharing: &Option<crate::AccountSharingKey>,
+) -> Result<(), JobError> {
+    let scope = serde_json::to_string(scope).map_err(|_| JobError::Storage)?;
+    let binding = serde_json::to_string(&(identity, sharing)).map_err(|_| JobError::Storage)?;
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT binding FROM model_job_bindings WHERE scope=?1 AND kind=?2",
+            params![scope, kind],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|_| JobError::Storage)?;
+    if previous
+        .as_ref()
+        .is_some_and(|previous| previous != &binding)
+    {
+        return Err(JobError::KeyConflict);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO model_job_bindings(scope,kind,binding) VALUES (?1,?2,?3)",
+        params![scope, kind, binding],
+    )
+    .map_err(|_| JobError::Storage)?;
+    Ok(())
+}
+
 impl ModelJobs {
+    /// D1 invocation key for direct execution/recovery of this scoped job.
+    /// The scope and caller key identify one invocation across job attempts.
+    pub fn invocation_key(&self, key: &str) -> Result<String, JobError> {
+        spend::job_invocation_key(&self.scope, key).map_err(|_| JobError::Storage)
+    }
     fn transaction<T>(
         &self,
         f: impl FnOnce(&mut Transaction<'_>, chrono::DateTime<Utc>) -> Result<T, JobError>,
@@ -181,10 +232,10 @@ impl ModelJobs {
             if specs.len() > self.config.max_batch {
                 return Err(JobError::InvalidRequest);
             }
-            for spec in specs
-                .iter()
-                .filter(|spec| spec.execution == Execution::Model)
-            {
+            for spec in specs {
+                if spec.execution != Execution::Model {
+                    return Err(JobError::InvalidRequest);
+                }
                 let (identity, sharing, _) = input(&spec.payload)?;
                 if !identity.is_valid()
                     || identity.tenant.0 != self.scope.tenant
@@ -206,18 +257,24 @@ impl ModelJobs {
             return Err(JobError::InvalidRequest);
         }
         self.transaction(|tx, now| {
+            if let JobRequest::Enqueue(specs) = &request {
+                for spec in specs {
+                    let (identity, sharing, _) = input(&spec.payload)?;
+                    bind_kind(tx, &self.scope, &spec.kind, &identity, &sharing)?;
+                }
+            }
             let affected = symbiotic_queue_sqlite::jobs::paid_copies_for_request(tx, &self.scope, &self.config, now, &request)?;
             let response = self.op(tx, now, request)?;
             for row in affected {
                 let receipt = match row.receipt {
-                    Some(reference) => Some(reference),
-                    None if purging && row.execution == Execution::Model && row.payload.is_some() => {
+                    reference if !(purging && row.state.unfinished()) => reference,
+                    _ if purging && row.execution == Execution::Model && row.payload.is_some() => {
                         let (identity, sharing, _) = input(row.payload.as_deref().ok_or(JobError::InvalidRequest)?)?;
                         let account = crate::account_scope(&identity, sharing.as_ref()).map_err(|_| JobError::Storage)?;
-                        let invocation = model::execution_invocation_identity(&identity, &row.key).map_err(|_| JobError::Storage)?;
+                        let invocation = model::execution_invocation_identity(&identity, &self.invocation_key(&row.key)?).map_err(|_| JobError::Storage)?;
                         spend::invocation_in(tx, &account, &invocation).map_err(|_| JobError::Storage)?.map(|r| r.reservation.reference.as_str().to_string())
                     }
-                    None => None,
+                    _ => row.receipt,
                 };
                 if let Some(receipt) = receipt
                     && let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(row.id))?
@@ -316,17 +373,10 @@ impl ModelJobs {
         }
     }
 
-    async fn recover(
-        &self,
-        account: String,
-        identity: crate::BindingIdentity,
-        kind: String,
-    ) -> Result<(), JobError> {
+    async fn recover(&self, kind: String) -> Result<(), JobError> {
         let mut after = None;
         loop {
             let jobs = self.clone();
-            let account = account.clone();
-            let identity = identity.clone();
             let kind = kind.clone();
             let cursor = after.clone();
             let (count, last) = tokio::task::spawn_blocking(move || jobs.transaction(|tx, now| {
@@ -334,12 +384,14 @@ impl ModelJobs {
                 let count = rows.len();
                 let last = rows.last().map(|r| r.id.id.clone());
                 for row in rows {
-                    let invocation = model::execution_invocation_identity(&identity, &row.key).map_err(|_| JobError::Storage)?;
-                    let receipt = spend::invocation_in(tx, &account, &invocation).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
+                    let reference = crate::SpendReceiptRef::new(row.receipt.as_deref().ok_or(JobError::Storage)?).map_err(|_| JobError::Storage)?;
+                    let receipt = spend::receipt_in(tx, &reference).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
                     let resolution = if receipt.output.is_some() {
-                        paid_resolution(tx, &receipt, now)?
+                        paid_resolution(tx, &receipt, now, jobs.config.max_result_bytes)?
                     } else if receipt.state == SpendState::Released {
                         JobResolution::KnownZeroCharge { receipt: receipt.reservation.reference.as_str().into() }
+                    } else if receipt.state == SpendState::Settled {
+                        JobResolution::Failed { receipt: receipt.reservation.reference.as_str().into(), diagnostic: DiagnosticCode::InvocationCompleted }
                     } else { JobResolution::Uncertain { receipt: receipt.reservation.reference.as_str().into() } };
                     jobs.op(tx, now, JobRequest::Resolve { job: row.id.clone(), generation: row.generation, resolution })?;
                     if row.purged || row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
@@ -356,16 +408,23 @@ impl ModelJobs {
     }
 }
 
+#[derive(Clone)]
+struct Claim {
+    id: JobId,
+    generation: u64,
+    receipt: String,
+    max_attempts: u32,
+}
 struct ClaimOwner {
     jobs: ModelJobs,
-    candidate: JobRecord,
-    claim: Mutex<Option<JobRecord>>,
+    candidate: JobId,
+    claim: Mutex<Option<Claim>>,
     heartbeat: Duration,
     finished: AtomicBool,
     stop: watch::Receiver<bool>,
 }
 impl ClaimOwner {
-    fn claim_record(&self) -> Result<JobRecord, ModelError> {
+    fn claim_record(&self) -> Result<Claim, ModelError> {
         self.claim
             .lock()
             .map_err(storage)?
@@ -380,7 +439,7 @@ impl ClaimOwner {
     ) -> Result<(bool, Option<crate::SpendReceipt>), JobError> {
         let JobResponse::Job(Some(current)) =
             self.jobs
-                .op(tx, now, JobRequest::Get(self.candidate.id.clone()))?
+                .op(tx, now, JobRequest::Get(self.candidate.clone()))?
         else {
             return Err(JobError::NotFound);
         };
@@ -398,7 +457,13 @@ impl ClaimOwner {
         if let Some(receipt) = &previous
             && receipt.output.is_some()
         {
-            self.resolve(tx, &current, now, paid_resolution(tx, receipt, now)?)?;
+            self.resolve(
+                tx,
+                &current.id,
+                current.generation,
+                now,
+                paid_resolution(tx, receipt, now, self.jobs.config.max_result_bytes)?,
+            )?;
             if current.purged || current.recovery_until.is_some_and(|until| until <= now) {
                 tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [receipt.reservation.reference.as_str()]).map_err(|_| JobError::Storage)?;
             }
@@ -409,7 +474,8 @@ impl ClaimOwner {
     fn resolve(
         &self,
         tx: &mut Transaction<'_>,
-        row: &JobRecord,
+        job: &JobId,
+        generation: u64,
         now: chrono::DateTime<Utc>,
         resolution: JobResolution,
     ) -> Result<(), JobError> {
@@ -417,8 +483,8 @@ impl ClaimOwner {
             tx,
             now,
             JobRequest::Resolve {
-                job: row.id.clone(),
-                generation: row.generation,
+                job: job.clone(),
+                generation,
                 resolution,
             },
         )?;
@@ -457,7 +523,7 @@ impl model::ModelJob for ClaimOwner {
                     tx,
                     now,
                     JobRequest::ClaimPaid {
-                        job: self.candidate.id.clone(),
+                        job: self.candidate.clone(),
                         receipt: receipt.reservation.reference.as_str().into(),
                     },
                 )?
@@ -466,7 +532,8 @@ impl model::ModelJob for ClaimOwner {
                 };
                 self.resolve(
                     tx,
-                    &row,
+                    &row.id,
+                    row.generation,
                     now,
                     JobResolution::Uncertain {
                         receipt: receipt.reservation.reference.as_str().into(),
@@ -478,7 +545,7 @@ impl model::ModelJob for ClaimOwner {
                 tx,
                 now,
                 JobRequest::ClaimPaid {
-                    job: self.candidate.id.clone(),
+                    job: self.candidate.clone(),
                     receipt: reservation.reference.as_str().into(),
                 },
             )?
@@ -521,24 +588,33 @@ impl model::ModelJob for ClaimOwner {
             })
             .transpose()
             .map_err(storage)?;
-        *self.claim.lock().map_err(storage)? = result;
+        *self.claim.lock().map_err(storage)? = result
+            .map(|row| {
+                Ok(Claim {
+                    id: row.id,
+                    generation: row.generation,
+                    receipt: row.receipt.ok_or_else(|| storage(()))?,
+                    max_attempts: row.max_attempts,
+                })
+            })
+            .transpose()?;
         if payload.is_none() {
             self.finished.store(true, Ordering::SeqCst);
         }
         Ok(payload)
     }
     fn heartbeat(&self) -> Result<bool, ModelError> {
-        let row = self.claim_record()?;
+        let (job, generation) = {
+            let claim = self.claim.lock().map_err(storage)?;
+            let claim = claim.as_ref().ok_or_else(|| storage(()))?;
+            (claim.id.clone(), claim.generation)
+        };
         self.jobs
             .transaction(|tx, now| {
-                match self.jobs.op(
-                    tx,
-                    now,
-                    JobRequest::Heartbeat {
-                        job: row.id,
-                        generation: row.generation,
-                    },
-                )? {
+                match self
+                    .jobs
+                    .op(tx, now, JobRequest::Heartbeat { job, generation })?
+                {
                     JobResponse::Heartbeat(cancel) => Ok(cancel),
                     _ => Err(JobError::InvalidRequest),
                 }
@@ -555,13 +631,25 @@ impl model::ModelJob for ClaimOwner {
         &self,
         state: SpendState,
         usage: Option<UsageTrace>,
-        output: Option<serde_json::Value>,
-        failure: Option<DiagnosticCode>,
+        mut output: Option<serde_json::Value>,
+        mut failure: Option<DiagnosticCode>,
         retry: bool,
     ) -> Result<(), ModelError> {
         let row = self.claim_record()?;
-        let reference =
-            crate::SpendReceiptRef::new(row.receipt.as_ref().ok_or_else(|| storage(()))?)?;
+        let oversized = output
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(storage)?
+            .is_some_and(|bytes| bytes.len() > self.jobs.config.max_result_bytes);
+        let evidence = output
+            .as_ref()
+            .map(|_| serde_json::json!({"output_received": true}));
+        if oversized {
+            output = None;
+            failure = Some(DiagnosticCode::QueueResultTooLarge);
+        }
+        let reference = crate::SpendReceiptRef::new(&row.receipt)?;
         self.jobs
             .transaction(|tx, now| {
                 let JobResponse::Job(Some(current)) =
@@ -582,7 +670,7 @@ impl model::ModelJob for ClaimOwner {
                     now,
                 )
                 .map_err(|_| JobError::Storage)?;
-                spend::SqliteSpendLedger::finish_in(tx, &reference, state, usage, output.clone())
+                spend::SqliteSpendLedger::finish_in(tx, &reference, state, usage, evidence)
                     .map_err(|_| JobError::Storage)?;
                 if output.is_none() && current.cancel_requested && !current.purged {
                     self.jobs.op(
@@ -604,12 +692,12 @@ impl model::ModelJob for ClaimOwner {
                     let receipt = spend::receipt_in(tx, &reference)
                         .map_err(|_| JobError::Storage)?
                         .ok_or(JobError::Storage)?;
-                    paid_resolution(tx, &receipt, now)?
+                    paid_resolution(tx, &receipt, now, self.jobs.config.max_result_bytes)?
                 } else if state == SpendState::Released && retry {
                     JobResolution::KnownZeroCharge {
                         receipt: reference.as_str().into(),
                     }
-                } else if state == SpendState::Unknown {
+                } else if state == SpendState::Unknown && !oversized {
                     JobResolution::Uncertain {
                         receipt: reference.as_str().into(),
                     }
@@ -619,7 +707,7 @@ impl model::ModelJob for ClaimOwner {
                         diagnostic: failure.ok_or(JobError::InvalidRequest)?,
                     }
                 };
-                self.resolve(tx, &current, now, resolution)
+                self.resolve(tx, &current.id, current.generation, now, resolution)
             })
             .map_err(storage)?;
         self.finished.store(true, Ordering::SeqCst);
@@ -627,8 +715,7 @@ impl model::ModelJob for ClaimOwner {
     }
     fn release(&self) -> Result<(), ModelError> {
         let row = self.claim_record()?;
-        let reference =
-            crate::SpendReceiptRef::new(row.receipt.as_ref().ok_or_else(|| storage(()))?)?;
+        let reference = crate::SpendReceiptRef::new(&row.receipt)?;
         // The shared release owner records durable pre-dispatch evidence.
         self.jobs
             .transaction(|tx, now| {
@@ -636,7 +723,8 @@ impl model::ModelJob for ClaimOwner {
                     .map_err(|_| JobError::Storage)?;
                 self.resolve(
                     tx,
-                    &row,
+                    &row.id,
+                    row.generation,
                     now,
                     JobResolution::KnownZeroCharge {
                         receipt: reference.as_str().into(),
@@ -654,7 +742,7 @@ impl model::ModelJob for ClaimOwner {
                     tx,
                     now,
                     JobRequest::RefusePending {
-                        job: self.candidate.id.clone(),
+                        job: self.candidate.clone(),
                         diagnostic: code,
                     },
                 )?;
@@ -663,6 +751,46 @@ impl model::ModelJob for ClaimOwner {
             .map_err(storage)?;
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
+    }
+    fn eligible(&self) -> Result<bool, ModelError> {
+        let eligible = !*self.stop.borrow()
+            && self
+                .jobs
+                .transaction(|tx, now| {
+                    let JobResponse::Job(Some(row)) =
+                        self.jobs
+                            .op(tx, now, JobRequest::Get(self.candidate.clone()))?
+                    else {
+                        return Err(JobError::NotFound);
+                    };
+                    Ok(row.state == JobState::Pending && !row.cancel_requested && !row.purged)
+                })
+                .map_err(storage)?;
+        if !eligible {
+            self.finished.store(true, Ordering::SeqCst);
+        }
+        Ok(eligible)
+    }
+    fn can_retry(&self, limit: u32) -> Result<bool, ModelError> {
+        let claim = self.claim_record()?;
+        if claim.generation >= u64::from(claim.max_attempts.min(limit)) {
+            return Ok(false);
+        }
+        if self.heartbeat()? {
+            return Ok(false);
+        }
+        self.jobs
+            .transaction(|tx, _| {
+                let reference =
+                    crate::SpendReceiptRef::new(&claim.receipt).map_err(|_| JobError::Storage)?;
+                let receipt = spend::receipt_in(tx, &reference)
+                    .map_err(|_| JobError::Storage)?
+                    .ok_or(JobError::Storage)?;
+                Ok(receipt
+                    .attempt_limit
+                    .is_none_or(|limit| receipt.attempts_used < limit))
+            })
+            .map_err(storage)
     }
     fn attempt(&self) -> Result<u32, ModelError> {
         u32::try_from(self.claim_record()?.generation).map_err(storage)
@@ -683,34 +811,39 @@ macro_rules! model_runner {
                 if config.version != 1 || config.worker_count == 0 || config.poll_interval_ms == 0 || config.maintenance_interval_ms == 0 || heartbeat.is_zero() || heartbeat > Duration::from_secs(self.config.claim_lease_seconds) / 2 || kind.is_empty() || binding.accepted_spend.is_some() || bound.policy.request_debug_dir.is_some() || bound.sinks.identity.tenant.0 != self.scope.tenant {
                     return Err(JobError::InvalidRequest.into());
                 }
+                self.transaction(|tx, _| bind_kind(tx, &self.scope, &kind, &bound.sinks.identity, &binding.account_sharing_key))?;
                 let jobs = self.clone();
                 let maintenance = self.clone();
                 let poll = Duration::from_millis(config.poll_interval_ms);
                 Ok(JobRunner::start_owned(config.worker_count, move |mut stop| {
                     let jobs = jobs.clone(); let binding = binding.clone(); let kind = kind.clone();
-                    let account = bound.sinks.queue_id.0.clone(); let identity = bound.sinks.identity.clone();
                     async move {
                         loop {
                             if *stop.borrow() { return Ok(()); }
-                            jobs.recover(account.clone(), identity.clone(), kind.clone()).await?;
+                            jobs.recover(kind.clone()).await?;
                             let query = jobs.clone(); let query_kind = kind.clone();
                             let response = tokio::task::spawn_blocking(move || query.request_sync(JobRequest::Candidates { kinds: vec![query_kind], limit: 1, max_bytes: query.config.max_page_bytes })).await.map_err(|_| RunnerError::WorkerTask)??;
                             let JobResponse::Candidates(rows) = response else { return Err(JobError::InvalidRequest.into()) };
-                            if let Some(candidate) = rows.into_iter().next() {
+                            if let Some(mut candidate) = rows.into_iter().next() {
                                 if candidate.execution != Execution::Model { return Err(JobError::InvalidRequest.into()); }
-                                let owner = Arc::new(ClaimOwner { jobs: jobs.clone(), candidate: candidate.clone(), claim: Mutex::new(None), heartbeat, finished: AtomicBool::new(false), stop: stop.clone() });
-                                let request = input(candidate.payload.as_deref().ok_or(JobError::InvalidRequest)?).and_then(|(frozen, sharing, request)| {
-                                    if Some(&frozen) != binding.identity.as_ref() || sharing != binding.account_sharing_key { return Err(JobError::InvalidRequest); }
-                                    serde_json::from_value::<$request>(request).map_err(|_| JobError::InvalidRequest)
-                                });
+                                let owner = Arc::new(ClaimOwner { jobs: jobs.clone(), candidate: candidate.id.clone(), claim: Mutex::new(None), heartbeat, finished: AtomicBool::new(false), stop: stop.clone() });
+                                let request = {
+                                    let payload = candidate.payload.take().ok_or(JobError::InvalidRequest)?;
+                                    input(&payload).and_then(|(_, _, request)| serde_json::from_value::<$request>(request).map_err(|_| JobError::InvalidRequest))
+                                };
                                 let result = match request {
                                     Ok(request) => {
-                                        let mut binding = binding.clone().with_invocation(candidate.key);
+                                        let mut binding = binding.clone().with_invocation(jobs.invocation_key(&candidate.key)?);
                                         binding.job_owner = Some(owner.clone());
                                         jobs.runtime.$bind(binding).map_err(|_| JobError::InvalidRequest)?.$call(request).await
                                     }
                                     Err(_) => { model::ModelJob::refuse(owner.as_ref(), DiagnosticCode::InvalidConfiguration).map_err(|_| JobError::Storage)?; continue; }
                                 };
+                                if let Err(ModelError::InvalidRequest(code)) = &result
+                                    && !owner.finished.load(Ordering::SeqCst) {
+                                    model::ModelJob::refuse(owner.as_ref(), *code).map_err(|_| JobError::Storage)?;
+                                    continue;
+                                }
                                 if let Err(error) = result
                                     && (!owner.finished.load(Ordering::SeqCst) || matches!(error, ModelError::Queue(_)) && error.code() != DiagnosticCode::InvocationCompleted) {
                                     return Err(JobError::Execution(error.code()).into());
@@ -757,3 +890,90 @@ model_runner!(
     crate::ClassifyRequest,
     "Start classifier workers without caller resubmission."
 );
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn review_17_claim_retains_only_metadata_for_heartbeats() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs");
+        let binding = ModelBinding::new(model::StaticChatProvider::new("response"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"));
+        let spec = JobSpec {
+            key: "key".into(),
+            group: None,
+            owners: vec![],
+            kind: "chat".into(),
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &serde_json::json!({"data": "x".repeat(65536)}))
+                .expect("payload"),
+            limits: JobLimits { max_attempts: 1 },
+            recovery_until: None,
+        };
+        let JobResponse::Enqueued(rows) = jobs
+            .request(JobRequest::Enqueue(vec![spec]))
+            .await
+            .expect("enqueue")
+        else {
+            panic!("enqueue response")
+        };
+        let Enqueued::Inserted(id) = &rows[0] else {
+            panic!("inserted")
+        };
+        let JobResponse::Job(Some(candidate)) = jobs
+            .request(JobRequest::Get(id.clone()))
+            .await
+            .expect("row")
+        else {
+            panic!("row response")
+        };
+        let (_stop, stop) = watch::channel(false);
+        let owner = ClaimOwner {
+            jobs,
+            candidate: candidate.id.clone(),
+            claim: Mutex::new(None),
+            heartbeat: Duration::from_millis(10),
+            finished: AtomicBool::new(false),
+            stop,
+        };
+        let reservation = SpendReservation {
+            reference: crate::SpendReceiptRef::new("metadata-test").expect("reference"),
+            account: "account".into(),
+            invocation: "invocation".into(),
+            binding: "binding".into(),
+            request_limit: None,
+        };
+        assert!(
+            model::ModelJob::claim(&owner, &reservation, 1)
+                .expect("claim")
+                .is_some()
+        );
+        assert!(
+            std::mem::size_of_val(&owner.claim_record().expect("metadata"))
+                < std::mem::size_of::<JobRecord>()
+        );
+        assert!(!model::ModelJob::heartbeat(&owner).expect("heartbeat"));
+    }
+}

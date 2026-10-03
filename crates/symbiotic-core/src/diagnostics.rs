@@ -93,6 +93,7 @@ closed_codes! {
         ProviderResponseIsNotValidUtf8 => ("provider_response_is_not_valid_utf8", "provider response is not valid UTF-8"),
         ProviderResponseLimitExceeded => ("provider_response_limit_exceeded", "provider response limit exceeded"),
         ProviderResponseReadFailed => ("provider_response_read_failed", "provider response read failed"),
+        QueueResultTooLarge => ("queue_result_too_large", "job result exceeds retained result limit"),
         QueueFailure => ("queue_failure", "queue failure"),
         QueueItemKindMustNotBeEmpty => ("queue_item_kind_must_not_be_empty", "queue item kind must not be empty"),
         RateBucketDisappeared => ("rate_bucket_disappeared", "rate bucket disappeared"),

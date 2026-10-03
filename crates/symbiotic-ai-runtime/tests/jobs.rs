@@ -28,6 +28,7 @@ struct Provider {
     finish: Option<Arc<Notify>>,
     failures: usize,
     known_zero: bool,
+    panic: bool,
 }
 impl Provider {
     fn new() -> Self {
@@ -44,6 +45,7 @@ impl Provider {
             finish: None,
             failures: 0,
             known_zero: false,
+            panic: false,
         }
     }
 }
@@ -70,6 +72,7 @@ impl ChatProvider for Provider {
         if let Some(finish) = &self.finish {
             finish.notified().await;
         }
+        assert!(!self.panic, "synthetic provider panic");
         if ordinal < self.failures {
             return Err(ModelError::Unavailable(
                 symbiotic_core::DiagnosticCode::HttpUnavailable,
@@ -111,6 +114,17 @@ fn binding(p: Provider) -> ModelBinding<Provider> {
             retry_jitter_seconds: 0,
             ..Default::default()
         })
+}
+fn scoped_invocation(key: &str) -> Result<String, JobError> {
+    serde_json::to_string(&(
+        JobScope {
+            tenant: "tenant".into(),
+            incarnation: "1".into(),
+            queue: "model".into(),
+        },
+        key,
+    ))
+    .map_err(|_| JobError::Storage)
 }
 fn request() -> ChatRequest {
     ChatRequest {
@@ -221,9 +235,13 @@ async fn case_1_paid_commit_and_separate_direct_answer_recover_together() {
     let p = Provider::new();
     {
         let r = runtime(dir.path());
-        r.execute_chat(binding(p.clone()), "direct", request())
-            .await
-            .unwrap();
+        r.execute_chat(
+            binding(p.clone()),
+            &scoped_invocation("direct").unwrap(),
+            request(),
+        )
+        .await
+        .unwrap();
     }
     let r = runtime(dir.path());
     let j = jobs(&r, JobConfig::default());
@@ -463,19 +481,61 @@ async fn killed_app(test: &str) {
     runner.shutdown().await.unwrap();
 }
 #[tokio::test]
+// Acceptance cases 13 and 26 share this single whole-process crash scenario.
 async fn case_13_killed_after_dispatch_before_commit_is_uncertain_never_retried() {
     killed_app("case_13_killed_after_dispatch_before_commit_is_uncertain_never_retried").await;
 }
-#[tokio::test]
-async fn case_26_whole_app_crash_without_child_mode_recovers_paid_state() {
-    killed_app("case_26_whole_app_crash_without_child_mode_recovers_paid_state").await;
+
+// Case 22 owns queue state here. Registry format refusal is covered by
+// symbiotic-model/tests/registry.rs::invalid_configuration_is_refused_as_a_whole.
+// Memory state belongs to the Memory runtime, which Foundation never opens.
+fn database_snapshot(
+    conn: &rusqlite::Connection,
+) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let mut schema = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' UNION SELECT 'sqlite_master' ORDER BY name").unwrap();
+    let tables = schema
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|name| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT * FROM \"{}\" ORDER BY rowid",
+                    name.replace('"', "\"\"")
+                ))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get(i))
+                        .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (name, rows)
+        })
+        .collect()
 }
 
-#[test]
-fn case_22_incompatible_queue_schema_refuses_open_without_changes() {
+#[tokio::test]
+async fn case_22_incompatible_queue_schema_refuses_open_without_changes() {
     let dir = tempfile::tempdir().unwrap();
-    drop(runtime(dir.path()));
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let p = Provider::new();
+    let id = enqueue(&j, spec("retained-before-refusal", &p)).await;
+    let runner = start(&j, p).await;
+    wait_state(&j, &id, JobState::Succeeded).await;
+    runner.shutdown().await.unwrap();
+    drop(j);
+    drop(r);
     let conn = sql(dir.path());
+    let before = database_snapshot(&conn);
     conn.pragma_update(None, "user_version", 999).unwrap();
     assert!(
         Runtime::open(RuntimeConfig {
@@ -489,6 +549,7 @@ fn case_22_incompatible_queue_schema_refuses_open_without_changes() {
             .unwrap(),
         999
     );
+    assert_eq!(database_snapshot(&conn), before);
 }
 
 #[tokio::test]
@@ -550,10 +611,14 @@ async fn purge_pending_job_discards_separately_committed_direct_answer() {
     let dir = tempfile::tempdir().unwrap();
     let r = runtime(dir.path());
     let p = Provider::new();
-    r.execute_chat(binding(p.clone()), "direct-purge", request())
-        .await
-        .unwrap();
     let j = jobs(&r, JobConfig::default());
+    r.execute_chat(
+        binding(p.clone()),
+        &scoped_invocation("direct-purge").unwrap(),
+        request(),
+    )
+    .await
+    .unwrap();
     let id = enqueue(&j, spec("direct-purge", &p)).await;
     j.request(JobRequest::PurgeOwner("owner-a".into()))
         .await
@@ -681,9 +746,13 @@ async fn ledger_first_committed_answer_recovers_before_new_rate_admission() {
     let p = Provider::new();
     {
         let r = runtime(dir.path());
-        r.execute_chat(binding(p.clone()), "rate-recovery", request())
-            .await
-            .unwrap();
+        r.execute_chat(
+            binding(p.clone()),
+            &scoped_invocation("rate-recovery").unwrap(),
+            request(),
+        )
+        .await
+        .unwrap();
     }
     let j = jobs(&runtime(dir.path()), JobConfig::default());
     let id = enqueue(&j, spec("rate-recovery", &p)).await;
@@ -732,7 +801,7 @@ async fn direct_discard_leaves_accounting_and_reports_unavailable_job_answer() {
     r.discard_invocation_output(
         binding(p).identity.as_ref().unwrap(),
         None,
-        "discard-direct",
+        &scoped_invocation("discard-direct").unwrap(),
     )
     .unwrap();
     let page = j.completions(1, 10000).await.unwrap();
@@ -805,4 +874,560 @@ async fn pre_dispatch_heartbeat_failure_releases_accounting_without_transport() 
     assert_eq!(receipt.state, SpendState::Released);
     assert!(receipt.pre_dispatch_released);
     assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn review_12_incompatible_binding_is_rejected_before_consumption() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = jobs(&runtime(dir.path()), JobConfig::default());
+    let p = Provider::new();
+    let id = enqueue(&j, spec("binding-a", &p)).await;
+    let mut other = binding(p.clone());
+    other.identity.as_mut().unwrap().revision.0 = "2".into();
+    assert!(
+        j.start_chat(other.clone(), RunnerConfig::default(), "chat".into())
+            .await
+            .is_err()
+    );
+    let mut incompatible = spec("binding-b", &p);
+    incompatible.payload = model_job_payload(&other, &request()).unwrap();
+    assert_eq!(
+        j.request(JobRequest::Enqueue(vec![incompatible]))
+            .await
+            .unwrap_err(),
+        JobError::KeyConflict
+    );
+    assert_eq!(
+        (row(&j, &id).await.state, p.calls.load(Ordering::SeqCst)),
+        (JobState::Pending, 0)
+    );
+    let runner = start(&j, p).await;
+    wait_state(&j, &id, JobState::Succeeded).await;
+    runner.shutdown().await.unwrap();
+    // Confirmation must not reopen the kind for another binding, even after restart.
+    let page = j.completions(1, 10000).await.unwrap();
+    j.request(JobRequest::Ack(vec![(
+        page[0].delivery.token.clone(),
+        Disposition::Accepted,
+    )]))
+    .await
+    .unwrap();
+    let reopened = jobs(&runtime(dir.path()), JobConfig::default());
+    assert!(
+        reopened
+            .start_chat(other, RunnerConfig::default(), "chat".into())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn review_19_model_api_rejects_handler_enqueue_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = jobs(&runtime(dir.path()), JobConfig::default());
+    let p = Provider::new();
+    let mut handler = spec("handler", &p);
+    handler.execution = Execution::Handler;
+    assert_eq!(
+        j.request(JobRequest::Enqueue(vec![spec("model", &p), handler]))
+            .await
+            .unwrap_err(),
+        JobError::InvalidRequest
+    );
+    assert_eq!(
+        sql(dir.path())
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn review_11_scopes_keep_independent_ledger_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let a = jobs(&r, JobConfig::default());
+    let b = r
+        .model_jobs(
+            JobScope {
+                tenant: "tenant".into(),
+                incarnation: "2".into(),
+                queue: "model".into(),
+            },
+            JobConfig::default(),
+        )
+        .unwrap();
+    let p = Provider::new();
+    let first = enqueue(&a, spec("shared-key", &p)).await;
+    let second = enqueue(&b, spec("shared-key", &p)).await;
+    let ra = start(&a, p.clone()).await;
+    wait_state(&a, &first, JobState::Succeeded).await;
+    let rb = start(&b, p.clone()).await;
+    wait_state(&b, &second, JobState::Succeeded).await;
+    let delivered = a.completions(1, 10000).await.unwrap();
+    a.request(JobRequest::Ack(vec![(
+        delivered[0].delivery.token.clone(),
+        Disposition::Accepted,
+    )]))
+    .await
+    .unwrap();
+    let other = b.completions(1, 10000).await.unwrap();
+    assert!(other[0].output.is_some());
+    assert_ne!(
+        row(&a, &first).await.receipt,
+        row(&b, &second).await.receipt
+    );
+    assert_eq!(copies(dir.path()), 1);
+    assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    ra.shutdown().await.unwrap();
+    rb.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_4_direct_settlement_respects_purge_even_after_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let mut p = Provider::new();
+    p.finish = Some(Arc::new(Notify::new()));
+    let key = scoped_invocation("direct-race").unwrap();
+    let call = tokio::spawn({
+        let r = r.clone();
+        let p = p.clone();
+        async move { r.execute_chat(binding(p), &key, request()).await }
+    });
+    p.started.notified().await;
+    let id = enqueue(&j, spec("direct-race", &p)).await;
+    j.request(JobRequest::PurgeOwner("owner-a".into()))
+        .await
+        .unwrap();
+    let page = j.completions(1, 10000).await.unwrap();
+    j.request(JobRequest::Ack(vec![(
+        page[0].delivery.token.clone(),
+        Disposition::Discarded,
+    )]))
+    .await
+    .unwrap();
+    p.finish.as_ref().unwrap().notify_one();
+    assert!(call.await.unwrap().is_ok());
+    assert_eq!(copies(dir.path()), 0);
+    assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
+    assert_eq!(
+        sql(dir.path())
+            .query_row(
+                "SELECT count(*) FROM spend_receipts WHERE state='settled'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn review_6_reconciled_paid_without_answer_finalizes() {
+    for disposition in ["failed", "cancelled", "purged"] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let mut p = Provider::new();
+        p.failures = 1;
+        let id = enqueue(&j, spec("reconcile", &p)).await;
+        let runner = start(&j, p.clone()).await;
+        let uncertain = wait_state(&j, &id, JobState::Uncertain).await;
+        runner.shutdown().await.unwrap();
+        if disposition == "cancelled" {
+            j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+                .await
+                .unwrap();
+        }
+        if disposition == "purged" {
+            j.request(JobRequest::PurgeOwner("owner-a".into()))
+                .await
+                .unwrap();
+        }
+        r.reconcile_spend(
+            &SpendReceiptRef::new(uncertain.receipt.unwrap()).unwrap(),
+            SpendState::Settled,
+            Some(UsageTrace {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let runner = start(&j, p.clone()).await;
+        wait_state(
+            &j,
+            &id,
+            match disposition {
+                "cancelled" => JobState::Cancelled,
+                "purged" => JobState::Purged,
+                _ => JobState::Failed,
+            },
+        )
+        .await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        assert!(j.completions(1, 10000).await.unwrap()[0].output.is_none());
+        runner.shutdown().await.unwrap();
+    }
+}
+
+async fn review_7_paid_answer_size_is_enforced_on_settlement_and_adoption(adopt: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(
+        &r,
+        JobConfig {
+            max_result_bytes: 16,
+            ..Default::default()
+        },
+    );
+    let p = Provider::new();
+    if adopt {
+        r.execute_chat(
+            binding(p.clone()),
+            &scoped_invocation("oversize").unwrap(),
+            request(),
+        )
+        .await
+        .unwrap();
+    }
+    let id = enqueue(&j, spec("oversize", &p)).await;
+    let runner = start(&j, p.clone()).await;
+    let failed = wait_state(&j, &id, JobState::Failed).await;
+    assert_eq!(
+        failed.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::QueueResultTooLarge)
+    );
+    assert_eq!(copies(dir.path()), 0);
+    assert_eq!(
+        j_runtime_receipt(
+            dir.path(),
+            &SpendReceiptRef::new(failed.receipt.unwrap()).unwrap()
+        )
+        .state,
+        SpendState::Settled
+    );
+    assert!(j.completions(1, 10000).await.unwrap()[0].output.is_none());
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    runner.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn review_7_settlement_enforces_paid_answer_size() {
+    review_7_paid_answer_size_is_enforced_on_settlement_and_adoption(false).await;
+}
+
+#[tokio::test]
+async fn review_7_adoption_enforces_paid_answer_size() {
+    review_7_paid_answer_size_is_enforced_on_settlement_and_adoption(true).await;
+}
+
+#[tokio::test]
+async fn review_8_maintenance_budget_counts_ledger_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = jobs(
+        &runtime(dir.path()),
+        JobConfig {
+            maintenance_bytes_per_pass: 1,
+            ..Default::default()
+        },
+    );
+    let p = Provider::new();
+    let first = enqueue(&j, spec("expire-one", &p)).await;
+    let second = enqueue(&j, spec("expire-two", &p)).await;
+    let runner = start(&j, p).await;
+    wait_state(&j, &first, JobState::Succeeded).await;
+    wait_state(&j, &second, JobState::Succeeded).await;
+    runner.shutdown().await.unwrap();
+    // No job-copy bytes remain: the entire admission cost is canonical ledger output.
+    sql(dir.path())
+        .execute("UPDATE jobs SET recovery_until=0,payload=NULL", [])
+        .unwrap();
+    assert!(matches!(
+        j.request(JobRequest::Maintain).await.unwrap(),
+        JobResponse::Changed(1)
+    ));
+    assert_eq!(copies(dir.path()), 1);
+    assert!(matches!(
+        j.request(JobRequest::Maintain).await.unwrap(),
+        JobResponse::Changed(1)
+    ));
+    assert_eq!(copies(dir.path()), 0);
+}
+
+struct BrokenTrace;
+#[async_trait]
+impl symbiotic_trace::TraceSink for BrokenTrace {
+    async fn record_model_invocation(
+        &self,
+        _: ModelInvocationTrace,
+    ) -> Result<(), symbiotic_trace::TraceError> {
+        Err(symbiotic_trace::TraceError::Sink(
+            symbiotic_core::DiagnosticCode::StorageFailure,
+        ))
+    }
+}
+async fn review_9_10_jobs_emit_attempt_receipts_and_report_trace_failure(trace_failure: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    drop(runtime(dir.path()));
+    let receipts = Arc::new(model::InMemoryReceiptSink::default());
+    let r = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().into()),
+        receipt_sink: Some(receipts.clone()),
+        trace_sink: trace_failure
+            .then(|| Arc::new(BrokenTrace) as Arc<dyn symbiotic_trace::TraceSink>),
+        ..Default::default()
+    })
+    .unwrap();
+    let j = jobs(&r, JobConfig::default());
+    let p = Provider::new();
+    let id = enqueue(&j, spec("receipted", &p)).await;
+    let runner = start(&j, p).await;
+    let completed = wait_state(&j, &id, JobState::Succeeded).await;
+    let result = runner.shutdown().await;
+    assert_eq!(result.is_err(), trace_failure);
+    let events = receipts.receipts();
+    assert_eq!(
+        events.iter().map(|e| e.status).collect::<Vec<_>>(),
+        vec![
+            model::ReceiptStatus::Queued,
+            model::ReceiptStatus::Running,
+            model::ReceiptStatus::Succeeded
+        ]
+    );
+    assert_eq!(
+        events[1].spend_receipt.as_ref().unwrap().as_str(),
+        completed.receipt.as_ref().unwrap()
+    );
+    assert_eq!(events[2].spend_receipt, events[1].spend_receipt);
+    assert_eq!(events[2].attempt, 1);
+    assert_eq!(events[2].usage.as_ref().unwrap().input_tokens, Some(3));
+    if trace_failure {
+        assert!(events[2].metadata.get(model::RUNTIME_DIAGNOSTICS).is_some());
+    }
+    assert!(j.completions(1, 10000).await.unwrap()[0].output.is_some());
+}
+#[tokio::test]
+async fn review_9_jobs_emit_attempt_receipts() {
+    review_9_10_jobs_emit_attempt_receipts_and_report_trace_failure(false).await;
+}
+
+#[tokio::test]
+async fn review_10_trace_failure_reaches_runner_with_paid_answer_retained() {
+    review_9_10_jobs_emit_attempt_receipts_and_report_trace_failure(true).await;
+}
+
+#[tokio::test]
+async fn review_14_exhausted_attempt_skips_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = jobs(&runtime(dir.path()), JobConfig::default());
+    let mut p = Provider::new();
+    p.failures = 1;
+    p.known_zero = true;
+    let id = enqueue(&j, spec("exhausted", &p)).await;
+    let mut b = binding(p.clone());
+    b.policy.as_mut().unwrap().retry_base_delay_ms = 60000;
+    let runner = j
+        .start_chat(b, RunnerConfig::default(), "chat".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_state(&j, &id, JobState::Refused),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_15_provider_panic_persists_uncertainty() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = jobs(&runtime(dir.path()), JobConfig::default());
+    let mut p = Provider::new();
+    p.panic = true;
+    p.known_zero = true;
+    let id = enqueue(&j, spec("panic", &p)).await;
+    let runner = start(&j, p.clone()).await;
+    assert!(runner.wait().await.is_err());
+    let uncertain = row(&j, &id).await;
+    assert_eq!(uncertain.state, JobState::Uncertain);
+    assert_eq!(
+        j_runtime_receipt(
+            dir.path(),
+            &SpendReceiptRef::new(uncertain.receipt.unwrap()).unwrap()
+        )
+        .state,
+        SpendState::Unknown
+    );
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn review_3_purge_resolves_current_answer_after_released_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let p = Provider::new();
+    let mut s = spec("predecessor", &p);
+    s.limits.max_attempts = 2;
+    let id = enqueue(&j, s).await;
+    // A prior known-zero claim has returned the job to Pending.
+    let key = scoped_invocation("predecessor").unwrap();
+    let mut zero = p.clone();
+    zero.failures = 1;
+    zero.known_zero = true;
+    let mut b = binding(zero);
+    b.policy.as_mut().unwrap().logical_retry_attempts = 1;
+    assert!(r.execute_chat(b, &key, request()).await.is_err());
+    let predecessor: String = sql(dir.path())
+        .query_row(
+            "SELECT reference FROM spend_receipts ORDER BY rowid LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Permit the second explicit attempt under the original frozen ceiling.
+    sql(dir.path())
+        .execute("UPDATE spend_receipts SET attempt_limit=2", [])
+        .unwrap();
+    sql(dir.path())
+        .execute("UPDATE jobs SET receipt=?1,generation=1", [&predecessor])
+        .unwrap();
+    r.execute_chat(binding(p.clone()), &key, request())
+        .await
+        .unwrap();
+    assert_eq!(copies(dir.path()), 1);
+    j.request(JobRequest::PurgeOwner("owner-a".into()))
+        .await
+        .unwrap();
+    assert_eq!(row(&j, &id).await.state, JobState::Purged);
+    assert_eq!(copies(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn review_1_recovery_uses_recorded_attempt_not_latest_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let mut p = Provider::new();
+    p.failures = 1;
+    let mut s = spec("same-attempt", &p);
+    s.limits.max_attempts = 2;
+    let id = enqueue(&j, s).await;
+    let runner = start(&j, p.clone()).await;
+    let uncertain = wait_state(&j, &id, JobState::Uncertain).await;
+    runner.shutdown().await.unwrap();
+    let reference = SpendReceiptRef::new(uncertain.receipt.unwrap()).unwrap();
+    r.reconcile_spend(&reference, SpendState::Released, None)
+        .unwrap();
+    let ledger = spend::SqliteSpendLedger::open(&dir.path().join(QUEUE_DATABASE)).unwrap();
+    let mut later = ledger.receipt(&reference).unwrap().unwrap().reservation;
+    later.reference = SpendReceiptRef::new("later-paid-attempt").unwrap();
+    assert!(ledger.reserve(&later).unwrap());
+    ledger
+        .finish(
+            &later.reference,
+            SpendState::Settled,
+            Some(UsageTrace {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            Some(serde_json::json!({"text": "later answer"})),
+        )
+        .unwrap();
+    // An exhausted claim must resolve its recorded zero-charge receipt, not
+    // adopt the newer paid answer. This fixture isolates recovery selection.
+    sql(dir.path())
+        .execute("UPDATE jobs SET max_attempts=1", [])
+        .unwrap();
+    let runner = start(&j, p.clone()).await;
+    let refused = wait_state(&j, &id, JobState::Refused).await;
+    assert_eq!(refused.receipt.as_deref(), Some(reference.as_str()));
+    assert_eq!(
+        refused.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    );
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_5_invalid_classifier_is_refused_and_valid_work_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let b = ModelBinding::new(model::StaticClassifierProvider::new([
+        model::ClassifierAnswer::noul("q", 0.5),
+    ]))
+    .with_identity(BindingIdentity::new("tenant", "classifier", "1", "account"))
+    .with_policy(ModelQueueConfig::default());
+    let bad = model::ClassifyRequest::new(Default::default(), vec![]);
+    let good = model::ClassifyRequest::new(
+        Default::default(),
+        vec![model::ClassifierQuestion::noul("q", "question", None, None)],
+    );
+    let p = Provider::new();
+    let mut s = spec("bad-classifier", &p);
+    s.kind = "classify".into();
+    s.payload = model_job_payload(&b, &bad).unwrap();
+    let bad_id = enqueue(&j, s.clone()).await;
+    s.key = "good-classifier".into();
+    s.payload = model_job_payload(&b, &good).unwrap();
+    let good_id = enqueue(&j, s).await;
+    let runner = j
+        .start_classifier(b, RunnerConfig::default(), "classify".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_state(&j, &bad_id, JobState::Refused).await.generation,
+        0
+    );
+    wait_state(&j, &good_id, JobState::Succeeded).await;
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_13_unsent_candidate_observes_cancel_and_shutdown_during_admission() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let p = Provider::new();
+        let id = enqueue(&j, spec("waiting", &p)).await;
+        // A future cooldown forces an unsent wait without relying on scheduler speed.
+        let account = account_scope(binding(p.clone()).identity.as_ref().unwrap(), None).unwrap();
+        sql(dir.path())
+            .execute(
+                "INSERT INTO queue_cooldowns(queue_id,cooldown_until,updated_at) VALUES (?1,?2,?3)",
+                rusqlite::params![
+                    account,
+                    (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let runner = start(&j, p.clone()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if cancel {
+            j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(500), runner.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            row(&j, &id).await.state,
+            if cancel {
+                JobState::Cancelled
+            } else {
+                JobState::Pending
+            }
+        );
+        assert!(row(&j, &id).await.receipt.is_none());
+    }
 }

@@ -789,6 +789,23 @@ impl CallReceipts {
         error: Option<DiagnosticCode>,
         timing: AttemptTiming,
     ) {
+        self.record_attempt(
+            status,
+            item.map(|i| (&i.item_id, i.attempt)),
+            trace,
+            error,
+            timing,
+        )
+        .await;
+    }
+    async fn record_attempt(
+        &self,
+        status: ReceiptStatus,
+        item: Option<(&QueueItemId, u32)>,
+        trace: Option<&ModelInvocationTrace>,
+        error: Option<DiagnosticCode>,
+        timing: AttemptTiming,
+    ) {
         let Some(sink) = &self.sink else {
             return;
         };
@@ -800,14 +817,14 @@ impl CallReceipts {
                     tracing::warn!(code = error.code().code(), "receipt context unavailable");
                     None
                 })
-                .filter(|_| item.is_some_and(|i| i.attempt > 0)),
+                .filter(|_| item.is_some_and(|i| i.1 > 0)),
             binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
-            item_id: item.map(|item| item.item_id.clone()),
+            item_id: item.map(|item| item.0.clone()),
             request_hash: self.request_hash.clone(),
             status,
-            attempt: item.map_or(0, |item| item.attempt),
+            attempt: item.map_or(0, |item| item.1),
             request_units: 1,
             input_units: self.input_units,
             usage: trace.map(|trace| trace.usage.clone()),
@@ -1265,6 +1282,16 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     where
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
+        self.record_success_diagnostic(response).await.0
+    }
+    async fn record_success_diagnostic<Res>(
+        self: &Arc<Self>,
+        response: Res,
+    ) -> (Res, Option<DiagnosticCode>)
+    where
+        Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
+    {
+        let mut diagnostic = None;
         let mut response = response;
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
@@ -1282,6 +1309,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             // The blocking task has dropped its handle by the time it is joined.
             response = Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone());
             if let Err(err) = stored {
+                diagnostic = Some(err.code());
                 note_side_effect(
                     &mut response,
                     &self.queue_id,
@@ -1295,6 +1323,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 .record_model_invocation(response.trace().clone())
                 .await
         {
+            diagnostic = Some(err.code());
             note_side_effect(
                 &mut response,
                 &self.queue_id,
@@ -1302,7 +1331,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 err.code(),
             );
         }
-        response
+        (response, diagnostic)
     }
 }
 
@@ -2149,23 +2178,39 @@ where
     // Rate waits happen before claim/reservation. The one admission owner is
     // shared with direct calls; the permit remains held through settlement.
     let permit = runtime.admission.as_ref().ok_or_else(spend::storage)?;
-    let (_slot, rate) = loop {
-        let slot = permit
-            .acquire(&this.queue_id, this.config.max_in_flight)
-            .await?;
-        wait_for_model_cooldown(this.queue.as_ref(), &this.queue_id).await?;
-        match check_model_budget(
-            &runtime.rate_state,
-            &this.queue_id,
-            &this.config,
-            &this.request,
-        )
-        .await?
-        {
-            RateCheck::Cleared(rate) => break (slot, rate),
-            RateCheck::Wait(wait) => {
-                drop(slot);
-                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+    let (_slot, rate) = {
+        let admission = async {
+            loop {
+                let slot = permit
+                    .acquire(&this.queue_id, this.config.max_in_flight)
+                    .await?;
+                wait_for_model_cooldown(this.queue.as_ref(), &this.queue_id).await?;
+                match check_model_budget(
+                    &runtime.rate_state,
+                    &this.queue_id,
+                    &this.config,
+                    &this.request,
+                )
+                .await?
+                {
+                    RateCheck::Cleared(rate) => break Ok::<_, ModelError>((slot, rate)),
+                    RateCheck::Wait(wait) => {
+                        drop(slot);
+                        tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                    }
+                }
+            }
+        };
+        tokio::pin!(admission);
+        let mut eligibility = tokio::time::interval(RATE_WAIT_SLICE);
+        loop {
+            tokio::select! {
+                biased;
+                _ = eligibility.tick() => {
+                    let owner = job.clone();
+                    if !run_blocking(move || owner.eligible()).await? { return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted)); }
+                }
+                result = &mut admission => break result?,
             }
         }
     };
@@ -2203,44 +2248,87 @@ where
         run_blocking(move || owner.release()).await?;
         return Err(error);
     }
-    let transport = async {
-        let result = dispatch_model(
-            &this.queue_id,
-            &this.config,
-            &provider,
-            call(provider.clone(), this.request.clone()),
+    let attempt = job.attempt()?;
+    let item_id = QueueItemId(reference.as_str().into());
+    this.receipts
+        .record_attempt(
+            ReceiptStatus::Queued,
+            Some((&item_id, 0)),
+            None,
+            None,
+            AttemptTiming::NONE,
         )
         .await;
+    this.receipts
+        .record_attempt(
+            ReceiptStatus::Running,
+            Some((&item_id, attempt)),
+            None,
+            None,
+            AttemptTiming::NONE,
+        )
+        .await;
+    let provider_started = Instant::now();
+    let dispatch = this.clone();
+    let transport_provider = provider.clone();
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(async move {
+        dispatch_model(
+            &dispatch.queue_id,
+            &dispatch.config,
+            &transport_provider,
+            call(transport_provider.clone(), dispatch.request.clone()),
+        )
+        .await
+    });
+    let transport = async {
+        let (result, panicked) = match task.join_next().await {
+            Some(Ok(result)) => (result, false),
+            _ => (Err(ModelError::Queue(DiagnosticCode::QueueFailure)), true),
+        };
         let mut side_error = None;
         if let Err(error) = &result
+            && !panicked
             && !matches!(error, ModelError::Timeout(_))
             && provider.failure_charge(error) == FailureCharge::KnownZero
             && is_retryable(error, &this.config)
         {
-            let delay = retry_delay_ms(
-                job.attempt()?,
-                &this.config,
-                &QueueItemId(reference.as_str().into()),
-                &this.request_hash,
-                error,
-            )?;
-            if is_transient(error) {
-                side_error = note_model_cooldown(this.queue.as_ref(), &this.queue_id, error, delay)
-                    .await
-                    .err();
-            }
-            if side_error.is_none() {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            let owner = job.clone();
+            let limit = logical_max_attempts(&this.config);
+            let retry_allowed = match run_blocking(move || owner.can_retry(limit)).await {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    side_error = Some(error);
+                    false
+                }
+            };
+            if retry_allowed {
+                let delay = retry_delay_ms(
+                    job.attempt()?,
+                    &this.config,
+                    &QueueItemId(reference.as_str().into()),
+                    &this.request_hash,
+                    error,
+                )?;
+                if is_transient(error) {
+                    side_error =
+                        note_model_cooldown(this.queue.as_ref(), &this.queue_id, error, delay)
+                            .await
+                            .err();
+                }
+                if side_error.is_none() {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
             }
         }
-        Ok::<_, ModelError>((result, side_error))
+        Ok::<_, ModelError>((result, side_error, panicked))
     };
     tokio::pin!(transport);
     let mut timer = tokio::time::interval(job.heartbeat_interval());
     timer.tick().await;
     let mut monitoring: Vec<ModelError> = Vec::new();
     let mut fenced = false;
-    let (mut result, side_error) = loop {
+    let (mut result, side_error, panicked) = loop {
         tokio::select! {
             result = &mut transport => break result?,
             _ = timer.tick(), if !fenced => {
@@ -2256,7 +2344,8 @@ where
         }
     };
     let known_zero = result.as_ref().err().is_some_and(|error| {
-        !matches!(error, ModelError::Timeout(_))
+        !panicked
+            && !matches!(error, ModelError::Timeout(_))
             && provider.failure_charge(error) == FailureCharge::KnownZero
     });
     let retry = result.as_ref().err().is_some_and(|error| {
@@ -2300,16 +2389,50 @@ where
     };
     let owner = job.clone();
     run_blocking(move || owner.finish(state, usage, output, failure, retry)).await?;
-    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
-        return Err(error);
-    }
-    match result {
-        Ok(response) => Ok(this.record_success(response).await),
+    let outcome = match result {
+        Ok(response) => {
+            let (response, diagnostic) = this.record_success_diagnostic(response).await;
+            this.receipts
+                .record_attempt(
+                    ReceiptStatus::Succeeded,
+                    Some((&item_id, attempt)),
+                    Some(response.trace()),
+                    None,
+                    AttemptTiming {
+                        queue_wait_ms: None,
+                        throttle_wait_ms: None,
+                        provider_ms: Some(provider_started.elapsed().as_millis() as u64),
+                    },
+                )
+                .await;
+            if let Some(code) = diagnostic {
+                Err(ModelError::Queue(code))
+            } else {
+                Ok(response)
+            }
+        }
         Err(error) => {
+            this.receipts
+                .record_attempt(
+                    ReceiptStatus::Failed,
+                    Some((&item_id, attempt)),
+                    None,
+                    Some(error.code()),
+                    AttemptTiming {
+                        queue_wait_ms: None,
+                        throttle_wait_ms: None,
+                        provider_ms: Some(provider_started.elapsed().as_millis() as u64),
+                    },
+                )
+                .await;
             this.trace_failure(None, &error).await;
             Err(error)
         }
+    };
+    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
+        return Err(error);
     }
+    outcome
 }
 
 /// The leased part of an attempt: the running receipt, the provider call,

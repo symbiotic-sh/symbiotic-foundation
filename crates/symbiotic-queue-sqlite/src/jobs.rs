@@ -133,7 +133,11 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
 /// Initialize job tables as part of the queue's atomic format initialization.
 pub(super) fn initialize(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(
-        "CREATE TABLE jobs (
+        "CREATE TABLE model_job_bindings (
+        scope TEXT NOT NULL, kind TEXT NOT NULL, binding TEXT NOT NULL,
+        PRIMARY KEY(scope, kind)
+    );
+    CREATE TABLE jobs (
         scope TEXT NOT NULL,
         id TEXT NOT NULL,
         key TEXT NOT NULL,
@@ -243,7 +247,7 @@ pub fn paid_copies_for_request(
         .map(|id| {
             let row = rows.metadata(&id)?;
             if row.execution == Execution::Model
-                && row.receipt.is_none()
+                && row.state.unfinished()
                 && matches!(request, JobRequest::PurgeOwner(_))
             {
                 rows.get(&id)?.ok_or(JobError::NotFound)
@@ -360,7 +364,7 @@ impl SqlRows<'_> {
     fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError> {
         self.conn
             .query_row(
-                "SELECT coalesce(length(CAST(payload AS BLOB)),0) + coalesce(length(CAST(output AS BLOB)),0) FROM jobs WHERE scope=?1 AND id=?2",
+                "SELECT coalesce(length(CAST(payload AS BLOB)),0) + coalesce(length(CAST(output AS BLOB)),0) + coalesce((SELECT length(CAST(recovery AS BLOB)) FROM spend_receipts WHERE reference=jobs.receipt),0) FROM jobs WHERE scope=?1 AND id=?2",
                 params![json(&id.scope)?, id.id],
                 |r| r.get(0),
             )

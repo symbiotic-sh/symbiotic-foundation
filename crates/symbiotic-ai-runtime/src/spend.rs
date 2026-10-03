@@ -22,6 +22,40 @@ fn state_name(state: SpendState) -> &'static str {
     }
 }
 
+pub(crate) fn job_invocation_key(
+    scope: &symbiotic_queue::jobs::JobScope,
+    key: &str,
+) -> Result<String, ModelError> {
+    serde_json::to_string(&(scope, key)).map_err(storage)
+}
+
+// Derive the erasure fence from canonical scoped tombstones and kind bindings,
+// including confirmation after an unsent job was purged during a direct call.
+fn recovery_erased(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &SpendReceipt,
+) -> Result<bool, ModelError> {
+    let mut stmt = tx.prepare("SELECT j.scope,j.key,b.binding FROM jobs j JOIN model_job_bindings b ON b.scope=j.scope AND (j.kind=b.kind OR j.kind IS NULL) WHERE j.purged=1 OR j.final_state='\"Purged\"'").map_err(storage)?;
+    let mut rows = stmt.query([]).map_err(storage)?;
+    while let Some(row) = rows.next().map_err(storage)? {
+        let scope: symbiotic_queue::jobs::JobScope =
+            serde_json::from_str(&row.get::<_, String>(0).map_err(storage)?).map_err(storage)?;
+        let key: String = row.get(1).map_err(storage)?;
+        let (identity, _): (
+            symbiotic_core::BindingIdentity,
+            Option<symbiotic_core::AccountSharingKey>,
+        ) = serde_json::from_str(&row.get::<_, String>(2).map_err(storage)?).map_err(storage)?;
+        if symbiotic_model::execution_invocation_identity(
+            &identity,
+            &job_invocation_key(&scope, &key)?,
+        )? == receipt.reservation.invocation
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Ledger handle for the versioned queue database. Opens only current queue state.
 pub struct SqliteSpendLedger(pub(super) Mutex<Connection>, std::time::Duration);
 impl SqliteSpendLedger {
@@ -219,6 +253,7 @@ impl SqliteSpendLedger {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), ModelError> {
         let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
+        let keep = keep && !recovery_erased(tx, &old)?;
         if old.attempt_limit.is_some()
             && old.output.is_some()
             && let Some(value) = &output

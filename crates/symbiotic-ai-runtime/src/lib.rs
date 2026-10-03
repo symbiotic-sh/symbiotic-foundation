@@ -152,6 +152,12 @@ pub enum ResponseCacheMode {
 }
 
 /// A raw provider (the transport) plus how the runtime should run it.
+///
+/// ```compile_fail
+/// use symbiotic_ai_runtime::{ModelBinding, model::StaticChatProvider};
+/// let mut binding = ModelBinding::new(StaticChatProvider::new("answer"));
+/// binding.job_owner = None;
+/// ```
 #[derive(Clone)]
 pub struct ModelBinding<P> {
     /// Raw transport whose effective configuration is checked at binding.
@@ -167,7 +173,7 @@ pub struct ModelBinding<P> {
     pub attempt_context: Option<model::ExecutionAttemptContext>,
     /// Foundation-owned durable job execution seam.
     #[doc(hidden)]
-    pub job_owner: Option<Arc<dyn model::ModelJob>>,
+    pub(crate) job_owner: Option<Arc<dyn model::ModelJob>>,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
     /// Explicit quota pool. `None` isolates by tenant and concrete account.

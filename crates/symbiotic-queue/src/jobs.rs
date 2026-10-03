@@ -47,7 +47,7 @@ pub struct JobConfig {
     pub max_page: usize,
     /// Maximum serialized delivery page (1 MiB).
     pub max_page_bytes: usize,
-    /// Maximum raw handler result (16 MiB; PROVISIONAL).
+    /// Maximum retained result: raw handler bytes or encoded paid answer (16 MiB; PROVISIONAL).
     pub max_result_bytes: usize,
     /// Hard pending, running and final-but-unconfirmed population bound (1024; PROVISIONAL).
     pub max_live_jobs: usize,

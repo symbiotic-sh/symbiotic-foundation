@@ -37,8 +37,8 @@ an in-memory runtime. Every default below is
 | `max_batch` | 64 | Bound atomic enqueue and confirmation requests. |
 | `max_page` | 64 | Bound claim, delivery and diagnostic selections. |
 | `max_page_bytes` | 1 MiB | Bound serialized candidate and completion arrays. |
-| `max_result_bytes` | 16 MiB | Refuse larger raw handler results before commit. |
-| `maintenance_bytes_per_pass` | 16 MiB | Bound raw payload/result bytes erased per expiry pass. |
+| `max_result_bytes` | 16 MiB | Refuse larger raw handler results or encoded paid answers before retention. |
+| `maintenance_bytes_per_pass` | 16 MiB | Bound raw payload/result and ledger recovery bytes erased per expiry pass. |
 | `claim_lease_seconds` | 30 seconds | Permit timely handler recovery after a lost worker. |
 | `delivery_lease_seconds` | 30 seconds | Reduce overlap while retaining at-least-once delivery. |
 | `maintenance_batch` | 64 | Bound each expiry pass. |
@@ -57,7 +57,7 @@ length plus the encoded metadata tuple `(scope, key, group, owners, kind,
 execution, max_attempts)`. No pending-byte counter is stored.
 
 Expiry processes jobs in `(recovery_until, id)` order, up to `maintenance_batch`
-and `maintenance_bytes_per_pass`. The byte budget counts raw payload and result
+and `maintenance_bytes_per_pass`. The byte budget counts raw payload, handler result and paid ledger recovery
 copies erased by the pass. A nonempty pass always erases at least one job: a job
 larger than the budget is erased alone. Subsequent jobs are deferred if they
 would exceed the remaining budget; a pass stops when its budget is reached.
@@ -90,4 +90,4 @@ byte-array representation for exact page preflight, while the result limit and
 maintenance budget count raw bytes. Diagnostics and expiry maintenance use
 content-free projections; expiry deletes copies directly. Encoded lengths and
 all indexes are rebuildable from canonical rows. The unreleased SQLite schema
-version is 14; older layouts are refused without migration.
+version is 15; older layouts are refused without migration.

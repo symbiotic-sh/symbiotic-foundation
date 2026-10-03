@@ -518,6 +518,10 @@ pub trait ModelJob: Send + Sync {
     fn release(&self) -> Result<(), ModelError>;
     /// Refuse malformed input before transport or reservation.
     fn refuse(&self, code: symbiotic_core::DiagnosticCode) -> Result<(), ModelError>;
+    /// Whether this unsent candidate remains eligible and its runner is active.
+    fn eligible(&self) -> Result<bool, ModelError>;
+    /// Whether the claimed job and execution ceilings permit another attempt.
+    fn can_retry(&self, limit: u32) -> Result<bool, ModelError>;
     /// Claim ordinal for the existing configured retry backoff.
     fn attempt(&self) -> Result<u32, ModelError>;
     /// Heartbeat interval from the validated runner policy.

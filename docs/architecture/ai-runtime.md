@@ -405,10 +405,16 @@ takes a queue slot.
 spend ledger's SQLite connection. `model_job_payload` encodes the full request
 and its frozen binding identity and account sharing setting, without credentials.
 `ModelJobs::start_chat`, `start_embedding`, `start_rerank` and `start_classifier`
-start workers for one handler kind. Workers start without consumer resubmission;
+start workers for one handler kind. Each scoped kind has one canonical binding;
+registration and enqueue reject a different binding before workers consume jobs.
+`ModelJobs` accepts only Model execution; generic handlers use the generic job API.
+Workers start without consumer resubmission;
 `JobRunner::shutdown` drains sent calls and returns worker or monitoring failures.
 
-The job key is the D1 explicit invocation identity. ModelAdmission acquires the
+The D1 job invocation identity is `(scope, job key)`.
+`ModelJobs::invocation_key(key)` encodes that identity for direct `execute_*`
+recovery; bare keys do not associate direct calls with scoped jobs.
+ModelAdmission acquires the
 same account slot used by direct calls before the job claim. There is no direct-call
 queue item, nested admission or second slot. Claim and reservation commit in one
 transaction, which returns the payload passed to transport. Jobs use the same rate
@@ -417,8 +423,11 @@ Paid settlement, the ledger's saved answer and job completion commit together.
 The job record retains only a receipt reference; it never stores a paid answer.
 
 Restart inspects expired claims and Uncertain jobs in bounded pages, using ledger
-evidence before dispatch. A committed answer from a direct `execute_*` under the
-same key completes the job without another call. A reservation without an answer
+evidence for the recorded receipt before dispatch. Settled accounting without
+an answer resolves to Failed, Cancelled or Purged; it does not remain Uncertain.
+A committed answer from a direct `execute_*` under the
+same scoped invocation key completes the job without another call.
+A reservation without an answer
 or trusted zero-charge evidence becomes Uncertain and is never resent blindly.
 The frozen job claim ceiling is not renewed by a restart or a duplicate enqueue.
 
@@ -426,7 +435,10 @@ The frozen job claim ceiling is not renewed by a restart or a duplicate enqueue.
 byte bounds, preflighting the ledger answer length before loading it. A single
 oversized completion returns `CompletionTooLarge` without taking a lease. Confirm,
 owner erasure and bounded maintenance delete ledger recovery and job copies in the
-same transaction. Accounting and completion evidence remain. `recovery_until`
+same transaction. Paid answers obey `max_result_bytes`, and maintenance counts
+ledger recovery bytes alongside job-copy bytes. Oversized paid output is reported
+as `queue_result_too_large` while preserving accounting.
+Accounting and completion evidence remain. `recovery_until`
 limits final answer availability only: expired Pending jobs can run, and expired
 Uncertain jobs retain their input for reconciliation. Completion after the deadline
 settles accounting without storing an answer. Owner erasure is sticky; an in-flight
@@ -437,7 +449,9 @@ Cancel observed before transport releases the reservation. A sent paid call
 finishes under its normal timeout; cancellation keeps its answer and never retries.
 Cancellation arrives with the lease heartbeat, using the runner's configured
 interval. Version 1 has no job result cache, socket API or streaming provider
-contract. Acceptance tests are in `crates/symbiotic-ai-runtime/tests/jobs.rs`.
+contract. Job attempt receipts use the configured receipt sink. A post-provider
+trace failure reaches the runner error path while retaining the paid answer.
+Acceptance tests are in `crates/symbiotic-ai-runtime/tests/jobs.rs`.
 
 ## Explicit invocation recovery
 
