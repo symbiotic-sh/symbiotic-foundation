@@ -2115,7 +2115,8 @@ async fn execution_error_keeps_its_exact_receipt_when_a_new_attempt_is_accepted_
         symbiotic_core::DiagnosticCode::HttpTimeout,
     ));
     let identity = binding(raw.clone()).identity.unwrap();
-    let newer_reference = symbiotic_ai_runtime::SpendReceiptRef("newer-accepted-attempt".into());
+    let newer_reference =
+        symbiotic_ai_runtime::SpendReceiptRef::new("newer-accepted-attempt").unwrap();
     let sink = Arc::new(ReconcileAndReserveOnFailure {
         ledger: Arc::new(
             symbiotic_ai_runtime::spend::SqliteSpendLedger::open(

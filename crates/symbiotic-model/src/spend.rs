@@ -5,8 +5,49 @@ use serde_json::Value;
 use symbiotic_trace::UsageTrace;
 
 /// Opaque Foundation receipt identity for consumer provenance and status lookup.
+/// At most [`Self::MAX_BYTES`] UTF-8 bytes; construction and decoding refuse overflow.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendReceiptRef(pub String);
+#[serde(try_from = "String")]
+pub struct SpendReceiptRef(String);
+
+impl SpendReceiptRef {
+    /// Maximum stored reference size in UTF-8 bytes.
+    // egress: + 64 SHA-256 hex bytes = 71; runtime: + 36-byte UUID item ID
+    // + : + 10 decimal digits (u32::MAX attempt) = 55. Custom IDs are checked too.
+    pub const MAX_BYTES: usize = 71;
+
+    /// Construct a reference, refusing values longer than [`Self::MAX_BYTES`].
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
+        let value = value.into();
+        if value.len() > Self::MAX_BYTES {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::SpendReceiptRefTooLong,
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the validated reference without permitting mutation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SpendReceiptRef {
+    type Error = ModelError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+#[cfg(feature = "queue")]
+pub(crate) fn runtime_reference(
+    item_id: &str,
+    attempt: u32,
+) -> Result<SpendReceiptRef, ModelError> {
+    SpendReceiptRef::new(format!("runtime:{item_id}:{attempt}"))
+}
 
 /// Per-execution receipt pointer; accounting remains in the canonical ledger.
 #[doc(hidden)]
@@ -183,4 +224,69 @@ pub fn has_measured_usage(u: &UsageTrace) -> bool {
         || u.media_units.is_some()
         || u.cost_micro_usd.is_some()
         || u.reported_cost_usd.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_ref_over_max_refused_at_construction_and_decode() {
+        for value in ["a".repeat(SpendReceiptRef::MAX_BYTES + 1), "é".repeat(36)] {
+            assert!(matches!(
+                SpendReceiptRef::new(value.clone()),
+                Err(ModelError::InvalidRequest(
+                    DiagnosticCode::SpendReceiptRefTooLong
+                ))
+            ));
+            let error =
+                serde_json::from_value::<SpendReceiptRef>(serde_json::json!(value)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(DiagnosticCode::SpendReceiptRefTooLong.as_str())
+            );
+        }
+        for value in [
+            "a".repeat(SpendReceiptRef::MAX_BYTES),
+            format!("{}a", "é".repeat(35)),
+        ] {
+            let reference = SpendReceiptRef::new(value.clone()).unwrap();
+            assert_eq!(reference.as_str(), value);
+            let encoded = serde_json::to_value(&reference).unwrap();
+            assert_eq!(encoded, serde_json::json!(value));
+            assert_eq!(
+                serde_json::from_value::<SpendReceiptRef>(encoded).unwrap(),
+                reference
+            );
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    #[test]
+    fn emitted_egress_and_runtime_refs_within_max() {
+        let item_id = symbiotic_core::QueueItemId::new();
+        assert_eq!(item_id.0.len(), 36);
+        let reference = runtime_reference(&item_id.0, u32::MAX).unwrap();
+        assert_eq!(
+            reference.as_str(),
+            format!("runtime:{}:{}", item_id.0, u32::MAX)
+        );
+        assert_eq!(reference.as_str().len(), 55);
+        assert!(reference.as_str().len() <= SpendReceiptRef::MAX_BYTES);
+        let max_item_bytes = SpendReceiptRef::MAX_BYTES - "runtime:".len() - 1 - 10;
+        assert_eq!(
+            runtime_reference(&"a".repeat(max_item_bytes), u32::MAX)
+                .unwrap()
+                .as_str()
+                .len(),
+            SpendReceiptRef::MAX_BYTES
+        );
+        assert!(matches!(
+            runtime_reference(&"a".repeat(max_item_bytes + 1), u32::MAX),
+            Err(ModelError::InvalidRequest(
+                DiagnosticCode::SpendReceiptRefTooLong
+            ))
+        ));
+    }
 }

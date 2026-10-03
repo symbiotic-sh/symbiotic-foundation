@@ -192,7 +192,7 @@ fn accepted_receipt_identity_and_reference_round_trip_without_consumer_spend_fie
             invocation_id: "invocation".into(),
             attempt_ordinal: 1,
         },
-        reference: SpendReceiptRef("egress:accepted-attempt".into()),
+        reference: SpendReceiptRef::new("egress:accepted-attempt").unwrap(),
         status: DispatchStatus::ProviderFailed,
         usage: Default::default(),
         spend_state: SpendState::Unknown,
@@ -210,7 +210,7 @@ fn accepted_receipt_identity_and_reference_round_trip_without_consumer_spend_fie
     assert_eq!(receipt.attempt_id.invocation_id, "invocation");
     assert_eq!(
         receipt.reference,
-        SpendReceiptRef("egress:accepted-attempt".into())
+        SpendReceiptRef::new("egress:accepted-attempt").unwrap()
     );
     assert_eq!(receipt.spend_state, SpendState::Unknown);
     let value = serde_json::to_value(receipt).unwrap();

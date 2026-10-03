@@ -1045,7 +1045,7 @@ impl<Req> QueuedCall<Req> {
         run_blocking(move || {
             let mut attempts = 0;
             for claim in 1..=claims {
-                let reference = SpendReceiptRef(format!("runtime:{item_id}:{claim}"));
+                let reference = spend::runtime_reference(&item_id, claim)?;
                 if spend
                     .receipt(&reference)?
                     .is_some_and(|r| !r.pre_dispatch_released)
@@ -1084,8 +1084,7 @@ impl<Req> QueuedCall<Req> {
                 | DiagnosticCode::LeaseExpired,
             ) => {
                 let spend = self.spend.clone();
-                let reference =
-                    SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+                let reference = spend::runtime_reference(&item.item_id.0, item.attempt)?;
                 let receipt = run_blocking(move || spend.receipt(&reference)).await?;
                 let unused =
                     receipt.as_ref().is_some_and(|r| r.pre_dispatch_released) || receipt.is_none();
@@ -1807,11 +1806,10 @@ where
         Err(err) => return Err(queue_error(err)),
     };
     this.attempt_context.clear()?;
-    let reference = this
-        .accepted_spend
-        .as_ref()
-        .map(|h| h.reservation.reference.clone())
-        .unwrap_or_else(|| SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt)));
+    let reference = match &this.accepted_spend {
+        Some(handoff) => handoff.reservation.reference.clone(),
+        None => spend::runtime_reference(&item.item_id.0, item.attempt)?,
+    };
     let ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled = holding_lease(
         queue,
@@ -5125,7 +5123,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(item.status, QueueStatus::Stopped);
-            let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+            let reference = spend::runtime_reference(&item.item_id.0, item.attempt).unwrap();
             let accounted = spend.receipt(&reference).unwrap().unwrap();
             assert_eq!(accounted.state, SpendState::Released);
             assert!(accounted.pre_dispatch_released);

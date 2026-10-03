@@ -130,7 +130,7 @@ mod tests {
                             invocation_id: "i".repeat(4096),
                             attempt_ordinal: 1,
                         },
-                        reference: symbiotic_egress::SpendReceiptRef("reference".into()),
+                        reference: symbiotic_egress::SpendReceiptRef::new("reference").unwrap(),
                         status: symbiotic_egress::DispatchStatus::Succeeded,
                         usage: symbiotic_trace::UsageTrace::default(),
                         spend_state: symbiotic_egress::SpendState::Settled,
