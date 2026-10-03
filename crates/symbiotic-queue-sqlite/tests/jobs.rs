@@ -637,23 +637,25 @@ async fn runner_no_lookup_between_claim_and_completion() {
 }
 
 #[tokio::test]
-async fn runner_pending_heartbeat_does_not_block_completion() {
+async fn runner_collects_heartbeat_failure_after_handler_completion() {
     let mut s = Suite::new();
     s.now = Utc::now();
     let id = s.insert(s.spec("slow-heartbeat")).await;
     let entered = Arc::new(tokio::sync::Notify::new());
+    let heartbeat_finish = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = Arc::new(InterceptJobs {
         after: None,
         backend: s.backend.clone(),
         before: {
-            let entered = entered.clone();
+            let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
             move |request: &JobRequest| {
                 let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
-                let entered = entered.clone();
+                let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
                 Box::pin(async move {
                     if heartbeat {
                         entered.notify_one();
-                        std::future::pending::<()>().await;
+                        heartbeat_finish.acquire().await.unwrap().forget();
+                        return Err(JobError::Storage);
                     }
                     Ok(())
                 }) as futures::future::BoxFuture<'static, Result<(), JobError>>
@@ -675,11 +677,25 @@ async fn runner_pending_heartbeat_does_not_block_completion() {
         .await;
     entered.notified().await;
     finish.add_permits(1);
-    tokio::time::timeout(std::time::Duration::from_secs(2), runner.shutdown())
+    // Completion must reach the store while the heartbeat is still outstanding.
+    assert_eq!(s.final_row(&id).await.state, JobState::Succeeded);
+    let shutdown = runner.shutdown();
+    tokio::pin!(shutdown);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "runner discarded the outstanding heartbeat"
+    );
+    // Its failure arrives only after the handler's completion was committed.
+    heartbeat_finish.add_permits(1);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
         .await
-        .expect("heartbeat blocked completion")
-        .unwrap();
-    assert_eq!(s.get(&id).await.state, JobState::Succeeded);
+        .expect("runner did not collect the heartbeat")
+        .unwrap_err();
+    assert!(matches!(error, RunnerError::Workers(workers)
+        if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+            if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
 }
 
 #[tokio::test]

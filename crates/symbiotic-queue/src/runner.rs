@@ -44,6 +44,8 @@ impl Default for RunnerConfig {
 
 /// Cooperative cancellation; a handler decides how to finish work already started.
 /// Store cancellation latency is one heartbeat interval plus the heartbeat call's own time.
+/// For SQLite, this assumes timely scheduling and a successful heartbeat; its lock wait
+/// is bounded by the configured SQLite busy timeout.
 #[derive(Clone, Debug)]
 pub struct CancelToken(watch::Receiver<bool>);
 
@@ -106,7 +108,7 @@ pub enum RunnerError {
     /// Store/configuration failure.
     #[error(transparent)]
     Store(#[from] JobError),
-    /// One heartbeat failure cause and its occurrence count while the handler drains.
+    /// One heartbeat failure cause and its occurrence count for a claim.
     #[error("job heartbeat failed {count} times; cause: {cause}")]
     Monitoring {
         /// Store/configuration cause.
@@ -136,6 +138,38 @@ struct Shared {
 }
 
 impl Shared {
+    fn observe_heartbeat(
+        response: Result<JobResponse, JobError>,
+        cancel: &watch::Sender<bool>,
+        errors: &mut Vec<RunnerError>,
+    ) -> bool {
+        let error = match response {
+            Ok(JobResponse::Heartbeat(requested)) => {
+                if requested {
+                    cancel.send_replace(true);
+                }
+                return false;
+            }
+            Ok(_) => JobError::InvalidRequest,
+            Err(error) => error,
+        };
+        let fenced = matches!(error, JobError::StaleClaim);
+        match errors
+            .iter_mut()
+            .find(|entry| matches!(entry, RunnerError::Monitoring { cause, .. } if cause == &error))
+        {
+            Some(RunnerError::Monitoring { count, .. }) => *count += 1,
+            _ => errors.push(RunnerError::Monitoring {
+                cause: error,
+                count: 1,
+            }),
+        }
+        if fenced {
+            cancel.send_replace(true);
+        }
+        fenced
+    }
+
     async fn op(&self, request: JobRequest) -> Result<JobResponse, JobError> {
         self.backend
             .jobs(&self.scope, &self.jobs, Arc::new(Utc::now), request)
@@ -161,31 +195,24 @@ impl Shared {
         task.spawn(async move { shared.handler.run(&ctx, &payload).await });
         let mut renew = tokio::time::interval(self.heartbeat);
         let mut errors = Vec::new();
+        let mut heartbeat = None;
         let outcome = loop {
-            let error = tokio::select! {
+            let response = tokio::select! {
                 result = task.join_next() => break result,
-                response = async {
-                    renew.tick().await;
-                    self.op(JobRequest::Heartbeat { job: claim.id.clone(), generation: claim.generation }).await
-                } => match response {
-                    Ok(JobResponse::Heartbeat(true)) => { cancel.send_replace(true); continue; }
-                    Ok(JobResponse::Heartbeat(false)) => continue,
-                    Ok(_) => JobError::InvalidRequest,
-                    Err(error) => error,
+                _ = renew.tick() => {
+                    let mut pending = Box::pin(self.op(JobRequest::Heartbeat {
+                        job: claim.id.clone(), generation: claim.generation,
+                    }));
+                    tokio::select! {
+                        response = &mut pending => response,
+                        result = task.join_next() => {
+                            heartbeat = Some(pending);
+                            break result;
+                        }
+                    }
                 },
             };
-            let fenced = matches!(error, JobError::StaleClaim);
-            match errors.iter_mut().find(
-                |entry| matches!(entry, RunnerError::Monitoring { cause, .. } if cause == &error),
-            ) {
-                Some(RunnerError::Monitoring { count, .. }) => *count += 1,
-                _ => errors.push(RunnerError::Monitoring {
-                    cause: error,
-                    count: 1,
-                }),
-            }
-            if fenced {
-                cancel.send_replace(true);
+            if Self::observe_heartbeat(response, &cancel, &mut errors) {
                 break task.join_next().await;
             }
         };
@@ -207,13 +234,18 @@ impl Shared {
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
             }
             None => {
+                if let Some(heartbeat) = heartbeat {
+                    Self::observe_heartbeat(heartbeat.await, &cancel, &mut errors);
+                }
                 errors.push(RunnerError::WorkerTask);
                 return Err(RunnerError::Workers(errors));
             }
         };
         // Finished work, including a panic, always reaches the store's claim fence.
-        match self
-            .op(JobRequest::Complete {
+        // Retain any outstanding heartbeat and collect it alongside completion.
+        // Neither operation may hide the other's result or prevent its dispatch.
+        let (completion, heartbeat) = tokio::join!(
+            self.op(JobRequest::Complete {
                 job: claim.id,
                 generation: claim.generation,
                 state,
@@ -221,9 +253,18 @@ impl Shared {
                 output,
                 receipt: None,
                 diagnostic,
-            })
-            .await
-        {
+            }),
+            async {
+                match heartbeat {
+                    Some(heartbeat) => Some(heartbeat.await),
+                    None => None,
+                }
+            }
+        );
+        if let Some(response) = heartbeat {
+            Self::observe_heartbeat(response, &cancel, &mut errors);
+        }
+        match completion {
             Ok(JobResponse::Done) => {}
             Ok(_) => errors.push(JobError::InvalidRequest.into()),
             Err(error) => errors.push(error.into()),
