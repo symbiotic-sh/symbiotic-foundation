@@ -56,6 +56,7 @@ closed_codes! {
         TerminalQueueItemIsMissingItsErrorClass => ("terminal_queue_item_is_missing_its_error_class", "terminal queue item is missing its error class"),
         UnsupportedChatSettingsReasoningEffortRequiresThinkingAndMustBeNonempty => ("unsupported_chat_settings_reasoning_effort_requires_thinking_and_must_be_nonempty", "unsupported chat settings: reasoning effort requires thinking and must be nonempty"),
         AccountSharingKeyIsEmpty => ("account_sharing_key_is_empty", "account sharing key is empty"),
+        InvocationCompleted => ("invocation_completed", "invocation completed; recovery answer discarded or expired"),
         AttemptBudgetExhausted => ("attempt_budget_exhausted", "attempt budget exhausted"),
         AuthenticationRejected => ("authentication_rejected", "authentication rejected"),
         BindingIdentityIsRequired => ("binding_identity_is_required", "binding identity is required"),

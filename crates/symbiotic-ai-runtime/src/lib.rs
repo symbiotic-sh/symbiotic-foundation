@@ -29,8 +29,9 @@
 //!
 //! Once a provider call starts, it belongs to the runtime. A caller that
 //! stops waiting (a dropped future, a timeout around the call) does not
-//! cancel it: the call finishes, records its outcome, fills the cache and
-//! releases its queue item, and identical requests get its result.
+//! cancel it: the call finishes, records its outcome, stores any applicable cache
+//! entry and releases its queue item. Explicit invocation repeats recover their
+//! retained answer; implicit calls reuse a matching cached response or dispatch again.
 //!
 //! Every provider bound to one configured account shares one
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
@@ -58,11 +59,13 @@ mod execution;
 mod maintained;
 pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
 pub mod spend;
+#[cfg(test)]
+mod spend_tests;
 pub use model::{
     AcceptedSpendHandoff, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState,
 };
 
-use maintained::{MaintainedQueue, ResponseRetention};
+use maintained::{Maintenance, ResponseRetention, Sweep};
 
 /// The provider contracts and HTTP providers, for implementing or
 /// constructing the raw transports a [`ModelBinding`] wraps. Its `Queued*`
@@ -101,9 +104,13 @@ pub struct RuntimeConfig {
     pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     /// Persistent state older than this is retired: queue records of
     /// finished calls, and calls orphaned by a crash. Seven days by default.
-    /// Retiring a finished call only drops its deduplication record; cached
-    /// responses follow `response_max_age` and `response_max_bytes`.
+    /// Explicit recovery answers expire this long after completion; accounting
+    /// receipts and frozen attempt budgets remain. Cached responses follow
+    /// `response_max_age` and `response_max_bytes`.
     pub retention: Duration,
+    /// Time between background retention sweeps, including while idle.
+    /// Defaults to 60 seconds; zero is refused at open.
+    pub maintenance_interval: Duration,
     /// Cached responses older than this miss, and the retention sweep
     /// removes them. 30 days by default; `None` keeps them indefinitely.
     pub response_max_age: Option<Duration>,
@@ -120,7 +127,8 @@ impl Default for RuntimeConfig {
             worker_id: None,
             trace_sink: None,
             receipt_sink: None,
-            retention: Duration::from_secs(7 * 24 * 60 * 60),
+            retention: model::DEFAULT_RETENTION,
+            maintenance_interval: Duration::from_secs(60),
             response_max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
             response_max_bytes: Some(1 << 30),
         }
@@ -134,7 +142,8 @@ pub enum ResponseCacheMode {
     /// binding identity and effective transport; no cache when it is in memory.
     #[default]
     Default,
-    /// No response cache: every call reaches the provider.
+    /// No response cache: implicit calls dispatch again. Explicit invocations
+    /// still recover their own retained answers.
     Off,
     /// A host cache. Its hits must carry the runtime's matching result scope.
     /// See [`ResponseCache`].
@@ -262,6 +271,7 @@ impl SharedLimits {
 }
 
 struct Inner {
+    maintenance: Option<Arc<Maintenance>>,
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
@@ -298,21 +308,33 @@ impl Runtime {
     /// needed, opens (or creates) its queue database and retires state older
     /// than the retention window.
     pub fn open(config: RuntimeConfig) -> Result<Self, ModelError> {
-        let queue: Arc<dyn QueueBackend> = match &config.state_dir {
-            Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
-            None => Arc::new(MemoryQueue::new()),
+        if config.maintenance_interval.is_zero() {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        let (queue, maintenance): (Arc<dyn QueueBackend>, _) = match &config.state_dir {
+            Some(dir) => {
+                let (queue, maintenance) = open_persistent_queue(dir, &config)?;
+                (Arc::new(queue), Some(maintenance))
+            }
+            None => (Arc::new(MemoryQueue::new()), None),
         };
         let spend: Arc<dyn SpendLedger> = match &config.state_dir {
-            Some(dir) => Arc::new(spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?),
+            Some(dir) => Arc::new(
+                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?
+                    .with_retention(config.retention),
+            ),
             None => Arc::new(model::UnavailableSpendLedger),
         };
-        Ok(Self::from_state(config, queue, spend))
+        Ok(Self::from_state(config, queue, spend, maintenance))
     }
 
     fn from_state(
         config: RuntimeConfig,
         queue: Arc<dyn QueueBackend>,
         spend: Arc<dyn SpendLedger>,
+        maintenance: Option<Arc<Maintenance>>,
     ) -> Self {
         let worker_id = config
             .worker_id
@@ -321,6 +343,7 @@ impl Runtime {
         let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
         Self {
             inner: Arc::new(Inner {
+                maintenance,
                 spend,
                 queue,
                 admission: ModelAdmission::new(),
@@ -334,6 +357,16 @@ impl Runtime {
                 receipt_sink: config.receipt_sink,
             }),
         }
+    }
+
+    /// Most recent background maintenance failure since this runtime opened.
+    /// Successful later sweeps do not erase it. Only static diagnostics are exposed.
+    /// Maintenance ends after the last runtime, provider or active attempt drops.
+    pub fn last_maintenance_error(&self) -> Option<ModelError> {
+        self.inner
+            .maintenance
+            .as_ref()
+            .and_then(|owner| owner.last_error())
     }
 
     /// Canonical receipt lookup. Consumer commit refusal never alters this receipt.
@@ -360,6 +393,7 @@ impl Runtime {
             RuntimeConfig::default(),
             Arc::new(MemoryQueue::new()),
             Arc::new(model::UnavailableSpendLedger),
+            None,
         )
     }
 
@@ -376,14 +410,50 @@ impl Runtime {
     /// is erased. It sees what the response's trace records: the request's
     /// `source` and `role_binding`, and the model. Returns how many
     /// responses were removed; an in-memory runtime keeps none.
+    /// The predicate runs under the ledger lock when matching recovery answers
+    /// and must not call back into the runtime, including `spend_receipt` or
+    /// `invocation_status`.
     pub fn purge_responses(
         &self,
         matches: impl Fn(&CachedResponse) -> bool,
     ) -> Result<usize, ModelError> {
-        match &self.inner.state_dir {
-            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR)).purge(matches),
-            None => Ok(0),
-        }
+        let cache = self
+            .inner
+            .state_dir
+            .as_ref()
+            .map(|dir| DirResponseCache::new(dir.join(RESPONSES_DIR)));
+        // The cache purge validates the whole tree before deleting anything, so an
+        // unsafe path refuses before either store changes.
+        let cached = match &cache {
+            Some(cache) => cache.purge(&matches)?,
+            None => 0,
+        };
+        let recoveries = if self.is_persistent() {
+            self.inner.spend.purge_recovery(&|value| {
+                let trace: symbiotic_trace::ModelInvocationTrace =
+                    serde_json::from_value(value.get("trace").cloned().ok_or(
+                        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable),
+                    )?)
+                    .map_err(|_| {
+                        ModelError::Queue(symbiotic_core::DiagnosticCode::SpendLedgerUnavailable)
+                    })?;
+                let response = CachedResponse::from_value(
+                    value,
+                    trace.timestamp.into(),
+                    serde_json::to_vec(value)
+                        .map_err(|_| {
+                            ModelError::Queue(
+                                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+                            )
+                        })?
+                        .len() as u64,
+                )?;
+                Ok(matches(&response))
+            })?
+        } else {
+            0
+        };
+        Ok(cached + recoveries)
     }
 
     /// Inspect the immutable deployment registry without resolving credentials.
@@ -762,6 +832,7 @@ impl Runtime {
             worker_id: self.inner.worker_id.clone(),
             policy,
             sinks: Sinks {
+                maintenance: self.inner.maintenance.clone(),
                 invocation: binding.invocation.clone(),
                 attempt_context: binding.attempt_context.clone(),
                 queue_id,
@@ -812,6 +883,7 @@ struct Bound {
 }
 
 struct Sinks {
+    maintenance: Option<Arc<Maintenance>>,
     invocation: Option<String>,
     attempt_context: Option<model::ExecutionAttemptContext>,
     queue_id: QueueId,
@@ -827,6 +899,9 @@ macro_rules! apply_sinks {
             provider = provider
                 .with_queue_id(self.queue_id)
                 .with_binding_identity(self.identity);
+            if let Some(owner) = self.maintenance {
+                provider = provider.with_maintenance_owner(owner);
+            }
             if let Some(invocation) = self.invocation {
                 provider = provider.with_invocation(invocation);
             }
@@ -857,20 +932,13 @@ impl Sinks {
 fn open_persistent_queue(
     dir: &Path,
     config: &RuntimeConfig,
-) -> Result<MaintainedQueue, ModelError> {
+) -> Result<(SqliteQueue, Arc<Maintenance>), ModelError> {
     // The state directory is the host's: it must already be private, or be
     // created so. Inside it, everything is the runtime's own: owner-only,
     // with wider permissions from earlier versions tightened, and no
     // symlinks.
     private_fs::ensure_private_dir(dir).map_err(|err| io_error(dir, err))?;
     let responses = dir.join(RESPONSES_DIR);
-    match std::fs::symlink_metadata(&responses) {
-        Ok(_) => {
-            private_fs::ensure_owned_tree(&responses).map_err(|err| io_error(&responses, err))?
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(io_error(&responses, err)),
-    }
     let path = dir.join(QUEUE_DATABASE);
     private_fs::ensure_private_file(&path).map_err(|err| io_error(&path, err))?;
     // SQLite gives its journal files the database's mode; adopt any that
@@ -883,17 +951,29 @@ fn open_persistent_queue(
     }
     let queue = SqliteQueue::open(&path)
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
-    let queue = MaintainedQueue::new(
-        queue,
+    let sweep = Sweep::new(
+        queue.clone(),
         config.retention,
         ResponseRetention {
-            cache: DirResponseCache::new(responses),
+            cache: DirResponseCache::new(responses.clone()),
             max_age: config.response_max_age,
             max_bytes: config.response_max_bytes,
         },
+        spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention),
     );
-    queue.maintain()?;
-    Ok(queue)
+    // Recovery expiry must run even when the cache path refuses this open.
+    // Keep the existing path diagnostic and permission tightening at startup.
+    let maintained = sweep.maintain();
+    match std::fs::symlink_metadata(&responses) {
+        Ok(_) => {
+            private_fs::ensure_owned_tree(&responses).map_err(|err| io_error(&responses, err))?
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error(&responses, err)),
+    }
+    maintained?;
+    let maintenance = Maintenance::start(sweep, config.maintenance_interval)?;
+    Ok((queue, maintenance))
 }
 
 fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {

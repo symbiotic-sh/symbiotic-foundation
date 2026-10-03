@@ -49,7 +49,7 @@ the same state.
 | `identity` | Required | Tenant, provider principal, configuration revision and concrete account |
 | `account_sharing_key` | None | Tenant/account execution state; an explicit key pools accounts across bindings or tenants |
 | `policy` | Required explicit policy, or the configured registry account | Concurrency, rate limits, retries, timeout |
-| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: no response cache; same-attempt ledger recovery still applies. `Custom(cache)`: a host `ResponseCache` |
+| `response_cache` | `Default` | `Default`: the runtime's own cache when persistent, no cache in memory. `Off`: no response cache; explicit invocations can recover only their own retained answer. `Custom(cache)`: a host `ResponseCache` |
 | `receipt_sink` / `trace_sink` | The runtime's sinks | Per-binding override |
 
 ## Configured registry
@@ -175,9 +175,10 @@ for every `u32` attempt: at most 237 UTF-8 bytes. Oversized IDs are refused with
 claiming abort before dispatch, recording the refusal and releasing the lease.
 Queue settlement errors propagate to the caller.
 `QueueReceipt::spend_receipt` carries a typed `SpendReceiptRef`, looked up through
-`Runtime::spend_receipt` even after queue retention. Same-attempt output recovery is
-independent of cache purge/expiry; callers identify new invocations through request
-identity (including `source`). Consumer commit refusal never releases spend.
+`Runtime::spend_receipt` even after queue retention. Explicit invocation recovery
+is separate from the response cache. Implicit calls retain only a content-free
+completion marker in the ledger and never recover ledger answers. Consumer commit
+refusal never releases spend.
 Queue claims that fail before reservation, or whose reservations are atomically
 released before transport, do not consume the provider-attempt allowance. The
 ledger records pre-dispatch release separately from ordinary `Released` accounting:
@@ -188,17 +189,24 @@ reconsider a pre-dispatch storage failure once the ledger is available again.
 counts against the absolute account request allowance until reconciliation; unknown
 replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
 
-Ledger receipts and saved runtime outputs are retained indefinitely. Cache expiry,
-byte sweeps and source purge do not erase those outputs. Output erasure requires a
-separate lifecycle policy that preserves accounting and replay protection; that
-policy remains deferred with lifecycle/bounds work.
+Ledger accounting receipts survive queue retention. Only explicit invocations save
+recovery answers, until completion time plus `RuntimeConfig::retention`, host acceptance
+through `Runtime::discard_invocation_output`, or matching input erasure through
+`Runtime::purge_responses`. Reads treat an expired answer as absent without writing.
+The maintenance sweep clears the expired backlog through the recovery expiry
+index in batches of at most 64 answers. Discard, expiry and erasure preserve
+completion markers, receipts, usage and account spend. Replaying a completed invocation returns its retained answer,
+then the typed `InvocationCompleted` diagnostic with its receipt once the answer is gone.
 
-**Current retention settings.** At open, and after every 10,000 finished calls, a persistent
-runtime retires state older than `RuntimeConfig::retention` (seven days by
-default):
+**Current retention settings.** At open, and on a runtime-owned background timer,
+a persistent runtime retires state older than `RuntimeConfig::retention` (seven
+days by default). `RuntimeConfig::maintenance_interval` defaults to 60 seconds
+and must be nonzero; sweeps continue while idle. Runtime handles, returned
+providers and active attempts share one maintenance owner per opened ledger.
+The timer holds only a weak reference and ends when the last holder drops. Each sweep:
 
 - calls orphaned by a crash are marked dead;
-- finished calls' queue records are deleted, along with queue events;
+- finished calls' queue records are deleted;
 - cached responses older than `RuntimeConfig::response_max_age` (30 days by
   default) are deleted, then the oldest ones until the rest fit in
   `response_max_bytes` (1 GiB by default). `None` disables either limit.
@@ -207,12 +215,14 @@ An expired response also misses on read, before any sweep removes it.
 These are sweep-based soft cache limits, not hard byte admission bounds. Pending
 count/bytes and per-batch/idle work remain unbounded by these settings; see
 [boundary.md](boundary.md#bounds-as-labelled-settings).
-Periodic sweeps run on the blocking pool. A failed sweep is logged as a
-`tracing` warning and retried at the next interval; it never fails a call.
-This is a visibility gap: retention can stop without a caller-visible error.
-Visible maintenance failure reporting remains implementation work alongside the
-soft limits and unbounded maintenance noted above.
-A sweep or purge checks the whole cache tree before it deletes anything.
+Periodic sweeps run on a dedicated background thread. Maintenance failures are
+logged at WARN and exposed through `Runtime::last_maintenance_error`, which retains
+the most recent failure since open even if later sweeps succeed. Open-time
+maintenance errors refuse the open.
+Recovery expiry runs independently of cache-path validation; unsafe cache paths
+keep their visible errors for cache operations. A purge checks the whole cache tree
+before it deletes anything, including retained recovery answers. A purge refused
+for a filesystem path (symlink or path outside the cache root) removes nothing.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
 
@@ -222,7 +232,9 @@ source or tenant is erased, the host purges its responses. Each entry is
 matched by what its response's trace records: the request's `source` and
 `role_binding`, model, and typed binding identity (`CachedResponse::binding`).
 Tenant erasure matches `binding.tenant`, independently of free-text source labels. The purge reads every entry once, so it suits erasure, not a
-hot path.
+hot path. Until the Foundation job queue implements its purge flag and settlement
+without an answer (queue PR 3), the host drains in-flight calls for the affected
+input before declaring erasure complete.
 
 ## Calls in flight
 
@@ -238,8 +250,14 @@ Dropping the caller's future (a job timeout, `tokio::time::timeout` around
 - keeps its model slot until then, so an abandoned call still counts against
   `max_in_flight`.
 
-An identical caller waiting on the item, or a later identical request, gets
-the result through deduplication, the cache or ledger recovery.
+Implicit calls share results only through the response cache: cache-off calls never
+join another caller's running item or result, and cache hits resolve before provider
+execution is registered. Accepted-handoff calls never join another call and each
+consumes its own handoff through `acquire_handoff`, with identity mismatch and reuse
+refused; explicit invocations deduplicate by their invocation identity.
+A cache-off call still passes the accounting guards: while an identical call has an
+Unknown reservation, the next identical call is refused until that reservation
+settles, rather than dispatched.
 
 The attempt renews its lease every third of `lease_seconds`, from its claim
 until the item is completed or failed. That covers the provider call and
@@ -360,13 +378,19 @@ with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporti
   attempt, both queue backends allow another claim, but the ledger refuses a
   new dispatch until the uncertain charge is reconciled.
 
-- `budget_renewal_seconds` (default `None`): once a request has exhausted
-  its budget, later calls for the same request fail without a provider call
-  while the queue remembers it. On a persistent runtime that includes calls
+- `budget_renewal_seconds` (default `None`): applies to cache-enabled implicit
+  calls. Once a request has exhausted its budget, later calls for the same
+  request fail without a provider call while the queue remembers it.
+  Cache-off implicit calls get independent items and fresh budgets, so this
+  setting does not stop them; explicit invocations follow their frozen ceilings. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
   `Some(0)` gives every call its own budget. These are current queue mechanics;
   renewal does not prove zero charge or authorize resending an uncertain attempt.
-  Ledger recovery still returns a completed same attempt even with caching off.
+  Explicit invocation ceilings are frozen at first acceptance and never renew;
+  their attempt count survives queue pruning and restart. Explicit calls carry no
+  logical retry counter in queue payloads. Their latest receipt carries the original
+  ceiling and cumulative provider attempts; confirmed pre-dispatch releases subtract
+  the unused attempt, while known-zero provider failures consume one.
   Renewing (and continuing a retry chain) replaces the dead item
   only while it is still the newest for the request
   (`QueueBackend::enqueue_replacing`), so a delayed caller cannot start a
@@ -389,10 +413,15 @@ the full tenant/provider/configuration binding, including when accounts share qu
 Within that binding, reusing an invocation with different inputs or a changed
 provider descriptor is refused. Explicit invocations, including bindings made with
 `ModelBinding::with_invocation`, never read or write the response cache. They recover
-only their own accepted attempt's durable ledger output. Implicit calls retain caching.
+only their own accepted attempt's retained recovery answer. Implicit calls retain caching.
+Receipt acceptance order is SQLite rowid order: a predecessor must be released before
+another attempt is accepted, and a completion is terminal. The latest receipt therefore
+carries the original ceiling and cumulative attempts without scanning receipt history.
+Request lookups use the receipt primary key, the latest-receipt index seek, or the exact
+Unknown predicate on the unique partial index.
 
-One immutable `(account, invocation) -> input/binding digest` record is created or
-validated inside every reservation transaction, including credential acceptance.
+Every reservation transaction validates the immutable input/binding digest against
+the invocation's latest receipt, including credential acceptance.
 Released predecessors retain this binding, so concurrent delayed reservations cannot
 change an invocation's inputs. Credential retries retain this invocation binding while
 their ordinal and signed record establish distinct attempt identities.

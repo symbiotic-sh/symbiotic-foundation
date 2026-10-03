@@ -230,6 +230,45 @@ pub struct CachedResponse {
     pub bytes: u64,
 }
 
+impl CachedResponse {
+    /// Decode the shared trace ownership fields for cache and invocation erasure.
+    pub fn from_value(
+        value: &Value,
+        modified: std::time::SystemTime,
+        bytes: u64,
+    ) -> Result<Self, ModelError> {
+        let trace = value.get("trace");
+        let text = |key: &str| {
+            trace
+                .and_then(|trace| trace.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let decode = |value: &Value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
+        };
+        Ok(Self {
+            binding: trace
+                .and_then(|trace| trace.pointer("/metadata/binding"))
+                .map(decode)
+                .transpose()?,
+            source: text("source"),
+            role_binding: text("role_binding"),
+            model: trace
+                .and_then(|trace| trace.get("model"))
+                .map(|model| {
+                    serde_json::from_value(model.clone()).map_err(|_| {
+                        ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
+                    })
+                })
+                .transpose()?,
+            modified,
+            bytes,
+        })
+    }
+}
+
 impl DirResponseCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -294,35 +333,11 @@ impl DirResponseCache {
             let raw = std::fs::read(&path).map_err(|err| cache_io(&path, err))?;
             let value: Value = serde_json::from_slice(&raw)
                 .map_err(|_err| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))?;
-            let trace = value.get("trace");
-            let text = |key: &str| {
-                trace
-                    .and_then(|trace| trace.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            };
-            let decode = |value: &Value| {
-                serde_json::from_value(value.clone())
-                    .map_err(|_| ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure))
-            };
-            let response = CachedResponse {
-                binding: trace
-                    .and_then(|trace| trace.pointer("/metadata/binding"))
-                    .map(decode)
-                    .transpose()?,
-                source: text("source"),
-                role_binding: text("role_binding"),
-                model: trace
-                    .and_then(|trace| trace.get("model"))
-                    .map(|model| {
-                        serde_json::from_value(model.clone()).map_err(|_| {
-                            ModelError::Cache(symbiotic_core::DiagnosticCode::CacheFailure)
-                        })
-                    })
-                    .transpose()?,
-                modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                bytes: meta.len(),
-            };
+            let response = CachedResponse::from_value(
+                &value,
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+            )?;
             if matches(&response) {
                 remove_entry(&path)?;
                 removed += 1;
@@ -479,6 +494,7 @@ impl ResponseCache for DirResponseCache {
 #[derive(Clone)]
 pub(crate) struct QueueRuntime {
     pub(crate) queue: Arc<dyn QueueBackend>,
+    pub(crate) maintenance: Option<Arc<dyn Send + Sync>>,
     pub(crate) trace_sink: Option<Arc<dyn TraceSink>>,
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
@@ -503,6 +519,7 @@ impl QueueRuntime {
     ) -> Self {
         Self {
             queue,
+            maintenance: None,
             trace_sink: None,
             receipt_sink: None,
             admission: None,
@@ -554,6 +571,13 @@ macro_rules! queue_runtime_builders {
         ) -> Self {
             self.runtime.spend = ledger;
             self.runtime.accepted_spend = accepted;
+            self
+        }
+
+        /// Keep the opened ledger's maintenance alive while this provider can write.
+        #[doc(hidden)]
+        pub fn with_maintenance_owner(mut self, owner: Arc<dyn Send + Sync>) -> Self {
+            self.runtime.maintenance = Some(owner);
             self
         }
 

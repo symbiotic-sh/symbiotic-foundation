@@ -787,7 +787,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 8;
+pub const QUEUE_SCHEMA_VERSION: u32 = 9;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -827,11 +827,15 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
             reference text primary key, account text not null, invocation text not null,
             binding text not null, reservation text not null, state text not null,
             usage text, output text, handoff_input text, dispatch_owner text,
-            pre_dispatch_released integer not null default 0
+            pre_dispatch_released integer not null default 0,
+            attempt_limit integer, attempts_used integer not null default 0,
+            recovery text, recovery_expires_at text
         );
         create unique index spend_active_invocation on spend_receipts(account, invocation)
-            where state != 'released';
+            where state = 'unknown';
         create index spend_invocation_lookup on spend_receipts(account, invocation);
+        create index spend_recovery_expiry on spend_receipts(recovery_expires_at)
+            where recovery is not null;
         create table queue_items (
             item_id text primary key,
             queue_id text not null,
@@ -1145,6 +1149,39 @@ mod tests {
                     .unwrap()
             );
         }
+        for column in [
+            "attempt_limit",
+            "attempts_used",
+            "recovery",
+            "recovery_expires_at",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM pragma_table_info('spend_receipts') WHERE name=?1",
+                    [column],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='spend_invocations'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let active: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='spend_active_invocation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(active.contains("where state = 'unknown'"));
         assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('spend_accounts') WHERE name='request_limit'", [], |r| r.get::<_, u32>(0)).unwrap(), 0);
     }
 
@@ -1232,6 +1269,7 @@ mod tests {
             5,
             6,
             7,
+            8,
             i64::from(QUEUE_SCHEMA_VERSION) + 1,
         ] {
             for existing in [false, true] {

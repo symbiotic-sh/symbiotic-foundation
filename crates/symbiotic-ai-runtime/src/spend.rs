@@ -23,7 +23,7 @@ fn state_name(state: SpendState) -> &'static str {
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
-pub struct SqliteSpendLedger(Mutex<Connection>);
+pub struct SqliteSpendLedger(pub(super) Mutex<Connection>, std::time::Duration);
 impl SqliteSpendLedger {
     /// Open an already initialized Foundation queue database.
     pub fn open(path: &Path) -> Result<Self, ModelError> {
@@ -41,7 +41,32 @@ impl SqliteSpendLedger {
         if version != symbiotic_queue_sqlite::QUEUE_SCHEMA_VERSION {
             return Err(storage(()));
         }
-        Ok(Self(Mutex::new(conn)))
+        Ok(Self(Mutex::new(conn), symbiotic_model::DEFAULT_RETENTION))
+    }
+
+    /// Use the runtime's existing retention window for saved answers.
+    pub fn with_retention(mut self, retention: std::time::Duration) -> Self {
+        self.1 = retention;
+        self
+    }
+
+    /// Clear all expired answers in indexed batches of at most 64 rows.
+    pub fn expire_recovery(&self) -> Result<usize, ModelError> {
+        let conn = self.0.lock().map_err(storage)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut removed = 0;
+        loop {
+            let batch = conn.execute(
+                "UPDATE spend_receipts SET recovery=NULL, recovery_expires_at=NULL WHERE rowid IN (
+                SELECT rowid FROM spend_receipts WHERE recovery IS NOT NULL AND recovery_expires_at<=?1
+                ORDER BY recovery_expires_at LIMIT 64)",
+                [&now],
+            ).map_err(storage)?;
+            removed += batch;
+            if batch == 0 {
+                return Ok(removed);
+            }
+        }
     }
 
     /// Reserve inside the caller's immediate transaction (permit/replay acceptance).
@@ -50,19 +75,21 @@ impl SqliteSpendLedger {
         conn: &rusqlite::Transaction<'_>,
         r: &SpendReservation,
     ) -> Result<bool, ModelError> {
-        // All reservation paths fix the invocation's input binding in this same
-        // immediate transaction. Released predecessors never erase the binding.
-        let binding: Option<String> = conn
-            .query_row(
-                "SELECT binding FROM spend_receipts WHERE account=?1 AND invocation=?2 LIMIT 1",
-                params![r.account, r.invocation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        if binding
+        Self::reserve_with_limit_in(conn, r, None, false)
+    }
+
+    fn reserve_with_limit_in(
+        conn: &rusqlite::Transaction<'_>,
+        r: &SpendReservation,
+        attempt_limit: Option<u32>,
+        handoff: bool,
+    ) -> Result<bool, ModelError> {
+        // The rowid order is acceptance order: each predecessor must be released
+        // before another attempt is accepted. Carry the original ceiling and count.
+        let previous = invocation_in(conn, &r.account, &r.invocation)?;
+        if previous
             .as_ref()
-            .is_some_and(|binding| binding != &r.binding)
+            .is_some_and(|p| p.reservation.binding != r.binding)
         {
             return Err(conflict());
         }
@@ -73,6 +100,42 @@ impl SqliteSpendLedger {
                 Err(conflict())
             };
         }
+        let explicit =
+            attempt_limit.is_some() || previous.as_ref().is_some_and(|p| p.attempt_limit.is_some());
+        if (explicit || handoff)
+            && let Some(previous) = &previous
+        {
+            if previous.output.is_some() {
+                return if explicit {
+                    Err(ModelError::Queue(DiagnosticCode::InvocationCompleted))
+                } else {
+                    Err(conflict())
+                };
+            }
+            if previous.state == SpendState::Settled {
+                return Err(conflict());
+            }
+        }
+        // Exactly matches the unique partial index; settled implicit history is irrelevant.
+        let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE account=?1 AND invocation=?2 AND state='unknown')", params![r.account, r.invocation], |row| row.get(0)).map_err(storage)?;
+        if active {
+            return Err(conflict());
+        }
+        let frozen = previous
+            .as_ref()
+            .and_then(|p| p.attempt_limit)
+            .or(attempt_limit);
+        let used = previous.as_ref().map_or(0, |p| p.attempts_used);
+        if frozen.is_some_and(|limit| used >= limit) {
+            return Err(ModelError::BudgetExhausted(
+                DiagnosticCode::AttemptBudgetExhausted,
+            ));
+        }
+        let used = if frozen.is_some() {
+            used.checked_add(1).ok_or_else(|| storage(()))?
+        } else {
+            0
+        };
         let limit = r
             .request_limit
             .map(i64::try_from)
@@ -83,10 +146,6 @@ impl SqliteSpendLedger {
             [&r.account],
         )
         .map_err(storage)?;
-        let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE account=?1 AND invocation=?2 AND state!='released')", params![r.account, r.invocation], |row| row.get(0)).map_err(storage)?;
-        if active {
-            return Err(conflict());
-        }
         let changed = conn.execute("UPDATE spend_accounts SET used=used+1 WHERE account=?1 AND used<9223372036854775807 AND (?2 IS NULL OR used<?2)", params![r.account, limit]).map_err(storage)?;
         if changed != 1 {
             return Err(ModelError::BudgetExhausted(
@@ -94,7 +153,7 @@ impl SqliteSpendLedger {
             ));
         }
         let json = serde_json::to_string(r).map_err(storage)?;
-        conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown')", params![r.reference.as_str(), r.account, r.invocation, r.binding, json]).map_err(storage)?;
+        conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state, attempt_limit, attempts_used) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', ?6, ?7)", params![r.reference.as_str(), r.account, r.invocation, r.binding, json, frozen, used]).map_err(storage)?;
         Ok(true)
     }
 
@@ -106,7 +165,7 @@ impl SqliteSpendLedger {
         if handoff.input_identity.is_empty() {
             return Err(conflict());
         }
-        if !Self::reserve_in(conn, &handoff.reservation)? {
+        if !Self::reserve_with_limit_in(conn, &handoff.reservation, None, true)? {
             let input: Option<String> = conn
                 .query_row(
                     "SELECT handoff_input FROM spend_receipts WHERE reference=?1",
@@ -149,7 +208,10 @@ impl SqliteSpendLedger {
         {
             return Err(conflict());
         }
-        let output = output.or_else(|| old.output.clone());
+        // One owner converts all successful outputs to content-free accounting evidence.
+        let output = output
+            .map(|_| serde_json::json!({"output_received": true}))
+            .or_else(|| old.output.clone());
         let usage = usage
             .map(|u| serde_json::to_string(&u))
             .transpose()
@@ -195,8 +257,8 @@ fn receipt_in(
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let row = conn
         .query_row(
-            "SELECT reservation, state, usage, output, pre_dispatch_released FROM spend_receipts WHERE reference=?1",
-            [reference.as_str()],
+            "SELECT reservation, state, usage, output, pre_dispatch_released, attempt_limit, attempts_used, CASE WHEN recovery_expires_at>?2 THEN recovery ELSE NULL END FROM spend_receipts WHERE reference=?1",
+            params![reference.as_str(), chrono::Utc::now().to_rfc3339()],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -204,31 +266,51 @@ fn receipt_in(
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, bool>(4)?,
+                    r.get::<_, Option<u32>>(5)?,
+                    r.get::<_, u32>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             },
         )
         .optional()
         .map_err(storage)?;
-    row.map(|(r, state, usage, output, pre_dispatch_released)| {
-        Ok(SpendReceipt {
-            reservation: serde_json::from_str(&r).map_err(storage)?,
+    row.map(
+        |(
+            r,
+            state,
+            usage,
+            output,
             pre_dispatch_released,
-            state: match state.as_str() {
-                "unknown" => SpendState::Unknown,
-                "released" => SpendState::Released,
-                "settled" => SpendState::Settled,
-                _ => return Err(storage(())),
-            },
-            usage: usage
-                .map(|u| serde_json::from_str(&u))
-                .transpose()
-                .map_err(storage)?,
-            output: output
-                .map(|o| serde_json::from_str(&o))
-                .transpose()
-                .map_err(storage)?,
-        })
-    })
+            attempt_limit,
+            attempts_used,
+            recovery,
+        )| {
+            Ok(SpendReceipt {
+                reservation: serde_json::from_str(&r).map_err(storage)?,
+                pre_dispatch_released,
+                attempt_limit,
+                attempts_used,
+                recovery: recovery
+                    .map(|v| serde_json::from_str(&v))
+                    .transpose()
+                    .map_err(storage)?,
+                state: match state.as_str() {
+                    "unknown" => SpendState::Unknown,
+                    "released" => SpendState::Released,
+                    "settled" => SpendState::Settled,
+                    _ => return Err(storage(())),
+                },
+                usage: usage
+                    .map(|u| serde_json::from_str(&u))
+                    .transpose()
+                    .map_err(storage)?,
+                output: output
+                    .map(|o| serde_json::from_str(&o))
+                    .transpose()
+                    .map_err(storage)?,
+            })
+        },
+    )
     .transpose()
 }
 fn invocation_in(
@@ -244,6 +326,56 @@ fn invocation_in(
 }
 
 impl SpendLedger for SqliteSpendLedger {
+    fn reserve_explicit(&self, r: &SpendReservation, limit: u32) -> Result<bool, ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let accepted = Self::reserve_with_limit_in(&tx, r, Some(limit), false)?;
+        tx.commit().map_err(storage)?;
+        Ok(accepted)
+    }
+    fn discard_recovery(&self, account: &str, invocation: &str) -> Result<(), ModelError> {
+        let conn = self.0.lock().map_err(storage)?;
+        conn.execute("UPDATE spend_receipts SET recovery=NULL, recovery_expires_at=NULL WHERE reference=(
+            SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1)", params![account, invocation]).map_err(storage)?;
+        Ok(())
+    }
+    fn purge_recovery(
+        &self,
+        matches: &dyn Fn(&serde_json::Value) -> Result<bool, ModelError>,
+    ) -> Result<usize, ModelError> {
+        let mut conn = self.0.lock().map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let mut references = Vec::new();
+        {
+            // Only live payload rows, never accounting history or implicit markers.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT reference, recovery FROM spend_receipts WHERE recovery IS NOT NULL",
+                )
+                .map_err(storage)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(storage)?;
+            for row in rows {
+                let (reference, output) = row.map_err(storage)?;
+                let value = serde_json::from_str(&output).map_err(storage)?;
+                if matches(&value)? {
+                    references.push(reference);
+                }
+            }
+        }
+        // Finish the indexed read before deleting its entries.
+        let mut removed = 0;
+        for reference in references {
+            removed += tx.execute("UPDATE spend_receipts SET recovery=NULL, recovery_expires_at=NULL WHERE reference=?1", [reference]).map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(removed)
+    }
     fn release_before_dispatch(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
@@ -255,7 +387,9 @@ impl SpendLedger for SqliteSpendLedger {
         }
         Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
         tx.execute(
-            "UPDATE spend_receipts SET pre_dispatch_released=1 WHERE reference=?1",
+            "UPDATE spend_receipts SET pre_dispatch_released=1,
+                attempts_used=CASE WHEN attempt_limit IS NOT NULL AND pre_dispatch_released=0 THEN attempts_used-1 ELSE attempts_used END
+                WHERE reference=?1",
             [reference.as_str()],
         )
         .map_err(storage)?;
@@ -329,6 +463,32 @@ impl SpendLedger for SqliteSpendLedger {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
+        let old = receipt_in(&tx, r)?.ok_or_else(conflict)?;
+        if old.attempt_limit.is_some()
+            && old.output.is_some()
+            && let Some(value) = &output
+            && old.recovery.as_ref() != Some(value)
+        {
+            return Err(conflict());
+        }
+        if old.attempt_limit.is_some()
+            && old.output.is_none()
+            && let Some(value) = &output
+        {
+            let expires = chrono::Duration::from_std(self.1)
+                .ok()
+                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+                .ok_or_else(|| storage(()))?;
+            tx.execute(
+                "UPDATE spend_receipts SET recovery=?2, recovery_expires_at=?3 WHERE reference=?1",
+                params![
+                    r.as_str(),
+                    serde_json::to_string(value).map_err(storage)?,
+                    expires.to_rfc3339()
+                ],
+            )
+            .map_err(storage)?;
+        }
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
     }

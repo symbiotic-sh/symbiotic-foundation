@@ -196,7 +196,7 @@ fn spend_missing_usage_never_fabricates_zero_or_releases_successful_output() {
         .unwrap();
     assert_eq!(
         ledger.receipt(&r.reference).unwrap().unwrap().output,
-        Some(serde_json::json!("output"))
+        Some(serde_json::json!({"output_received": true}))
     );
 }
 #[test]
@@ -346,4 +346,83 @@ fn spend_allowance_follows_configuration_and_keeps_usage() {
             .unwrap(),
         3
     );
+}
+
+#[test]
+fn fdn_carried_attempts_count_known_zero_but_not_pre_dispatch_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let ledger = open(&path);
+    for n in 0..100 {
+        let mut r = reservation(&format!("aborted-{n}"), "explicit", "account");
+        r.request_limit = None;
+        ledger.reserve_explicit(&r, 2).unwrap();
+        for _ in 0..2 {
+            ledger.release_before_dispatch(&r.reference).unwrap();
+        }
+        let latest = ledger.invocation("account", "explicit").unwrap().unwrap();
+        assert_eq!((latest.attempt_limit, latest.attempts_used), (Some(2), 0));
+    }
+    for n in 0..2 {
+        let mut r = reservation(&format!("known-zero-{n}"), "explicit", "account");
+        r.request_limit = None;
+        ledger.reserve_explicit(&r, 20).unwrap();
+        ledger
+            .finish(&r.reference, SpendState::Released, None, None)
+            .unwrap();
+        let latest = ledger.invocation("account", "explicit").unwrap().unwrap();
+        assert_eq!(
+            (latest.attempt_limit, latest.attempts_used),
+            (Some(2), n + 1)
+        );
+    }
+    drop(ledger);
+    let ledger = open(&path);
+    let mut r = reservation("over", "explicit", "account");
+    r.request_limit = None;
+    assert!(matches!(
+        ledger.reserve_explicit(&r, 20),
+        Err(ModelError::BudgetExhausted(
+            DiagnosticCode::AttemptBudgetExhausted
+        ))
+    ));
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE pre_dispatch_released=0",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn fdn_explicit_completion_blocks_new_receipts_after_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let ledger = open(&path);
+    let first = reservation("first", "explicit", "account");
+    ledger.reserve_explicit(&first, 3).unwrap();
+    ledger
+        .finish(
+            &first.reference,
+            SpendState::Settled,
+            Some(UsageTrace {
+                input_tokens: Some(7),
+                ..Default::default()
+            }),
+            Some(serde_json::json!({"answer": "paid"})),
+        )
+        .unwrap();
+    ledger.discard_recovery("account", "explicit").unwrap();
+    assert!(matches!(
+        ledger.reserve_explicit(&reservation("second", "explicit", "account"), 30),
+        Err(ModelError::Queue(DiagnosticCode::InvocationCompleted))
+    ));
+    let receipt = ledger.invocation("account", "explicit").unwrap().unwrap();
+    assert!(receipt.output.is_some());
+    assert!(receipt.recovery.is_none());
+    assert_eq!(receipt.attempts_used, 1);
 }
