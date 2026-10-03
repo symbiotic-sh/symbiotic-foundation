@@ -161,7 +161,7 @@ impl Registry {
                 let ledger_state: Option<String> = tx
                     .query_row(
                         "SELECT state FROM spend_receipts WHERE reference=?1",
-                        [&receipt.reference.0],
+                        [receipt.reference.as_str()],
                         |row| row.get(0),
                     )
                     .optional()
@@ -458,7 +458,7 @@ impl Registry {
             .0
             .query_row(
                 "SELECT state, usage FROM spend_receipts WHERE reference=?1",
-                [&receipt.reference.0],
+                [receipt.reference.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(state)?;
@@ -520,7 +520,7 @@ fn ledger_error(err: symbiotic_ai_runtime::ModelError) -> EgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symbiotic_ai_runtime::{SpendReceiptRef, SpendReservation};
+    use symbiotic_ai_runtime::SpendReservation;
 
     thread_local! {
         pub(super) static CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -556,7 +556,7 @@ mod tests {
     fn reservation(a: &DurableAttempt) -> AcceptedSpendHandoff {
         AcceptedSpendHandoff {
             reservation: SpendReservation {
-                reference: SpendReceiptRef(format!("egress:{}", digest(a).unwrap())),
+                reference: crate::egress_reference(a).unwrap(),
                 account: "test-account".into(),
                 invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id)).unwrap(),
                 binding: crate::invocation_binding(a).unwrap(),
@@ -564,6 +564,20 @@ mod tests {
             },
             input_identity: "test-input".into(),
         }
+    }
+
+    #[test]
+    fn emitted_egress_and_runtime_refs_within_max() {
+        let mut attempt = attempt();
+        attempt.attempt_ordinal = u32::MAX;
+        attempt.record_sequence = u64::MAX;
+        attempt.invocation_id = "é".repeat(4096);
+        let reference = crate::egress_reference(&attempt).unwrap();
+        assert_eq!(
+            reference.as_str(),
+            format!("egress:{}", digest(&attempt).unwrap())
+        );
+        assert_eq!(reference.as_str().len(), 71);
     }
 
     fn finish_released(registry: &mut Registry, mut receipt: DispatchReceipt) {

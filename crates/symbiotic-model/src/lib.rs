@@ -971,6 +971,7 @@ impl<Req> QueuedCall<Req> {
             })
             .await
             .map_err(queue_error)
+            .and_then(validate_runtime_enqueue)
     }
 
     async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
@@ -1045,7 +1046,7 @@ impl<Req> QueuedCall<Req> {
         run_blocking(move || {
             let mut attempts = 0;
             for claim in 1..=claims {
-                let reference = SpendReceiptRef(format!("runtime:{item_id}:{claim}"));
+                let reference = spend::runtime_reference(&item_id, claim)?;
                 if spend
                     .receipt(&reference)?
                     .is_some_and(|r| !r.pre_dispatch_released)
@@ -1084,8 +1085,7 @@ impl<Req> QueuedCall<Req> {
                 | DiagnosticCode::LeaseExpired,
             ) => {
                 let spend = self.spend.clone();
-                let reference =
-                    SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+                let reference = spend::runtime_reference(&item.item_id.0, item.attempt)?;
                 let receipt = run_blocking(move || spend.receipt(&reference)).await?;
                 let unused =
                     receipt.as_ref().is_some_and(|r| r.pre_dispatch_released) || receipt.is_none();
@@ -1130,8 +1130,9 @@ impl<Req> QueuedCall<Req> {
                 &item.item_id,
             )
             .await
-            .map(Some)
             .map_err(queue_error)
+            .and_then(validate_runtime_enqueue)
+            .map(Some)
     }
 
     /// The next item of the request's retry chain after `dead`, or `None`
@@ -1806,12 +1807,21 @@ where
         Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
         Err(err) => return Err(queue_error(err)),
     };
-    this.attempt_context.clear()?;
     let reference = this
-        .accepted_spend
-        .as_ref()
-        .map(|h| h.reservation.reference.clone())
-        .unwrap_or_else(|| SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt)));
+        .attempt_context
+        .clear()
+        .and_then(|()| match &this.accepted_spend {
+            Some(handoff) => Ok(handoff.reservation.reference.clone()),
+            None => spend::runtime_reference(&item.item_id.0, item.attempt),
+        });
+    let reference = match reference {
+        Ok(reference) => reference,
+        Err(err) => {
+            let (err, failed) = this.abort_before_dispatch(&item, None, err).await;
+            failed.map_err(queue_error)?;
+            return Err(err);
+        }
+    };
     let ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled = holding_lease(
         queue,
@@ -2672,7 +2682,8 @@ async fn reenqueue_dead_item(
             &item.item_id,
         )
         .await
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+        .and_then(validate_runtime_enqueue)?;
     Ok(Some(outcome))
 }
 
@@ -2716,6 +2727,14 @@ async fn reenqueue_with_fresh_budget(
         )
         .await
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+        .and_then(validate_runtime_enqueue)
+}
+
+// All model enqueue paths refuse IDs that cannot represent every u32 attempt.
+#[cfg(feature = "queue")]
+fn validate_runtime_enqueue(outcome: EnqueueOutcome) -> Result<EnqueueOutcome, ModelError> {
+    spend::runtime_reference(&outcome.item.item_id.0, u32::MAX)?;
+    Ok(outcome)
 }
 
 #[cfg(feature = "queue")]
@@ -5125,7 +5144,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(item.status, QueueStatus::Stopped);
-            let reference = SpendReceiptRef(format!("runtime:{}:{}", item.item_id.0, item.attempt));
+            let reference = spend::runtime_reference(&item.item_id.0, item.attempt).unwrap();
             let accounted = spend.receipt(&reference).unwrap().unwrap();
             assert_eq!(accounted.state, SpendState::Released);
             assert!(accounted.pre_dispatch_released);

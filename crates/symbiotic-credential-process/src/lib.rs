@@ -651,12 +651,19 @@ fn invocation_binding(a: &DurableAttempt) -> Result<String, EgressError> {
     digest(&immutable)
 }
 
+fn egress_reference(
+    a: &DurableAttempt,
+) -> Result<symbiotic_ai_runtime::SpendReceiptRef, EgressError> {
+    symbiotic_ai_runtime::SpendReceiptRef::new(format!("egress:{}", digest(a)?))
+        .map_err(|_| EgressError::LimitExceeded)
+}
+
 fn spend_reservation(
     a: &DurableAttempt,
     route: &RouteConfig,
 ) -> Result<symbiotic_ai_runtime::SpendReservation, EgressError> {
     Ok(symbiotic_ai_runtime::SpendReservation {
-        reference: symbiotic_ai_runtime::SpendReceiptRef(format!("egress:{}", digest(a)?)),
+        reference: egress_reference(a)?,
         account: symbiotic_ai_runtime::account_scope(
             &symbiotic_ai_runtime::BindingIdentity::new(
                 &route.tenant,

@@ -101,6 +101,7 @@ closed_codes! {
         SqliteQueueLockPoisoned => ("sqlite_queue_lock_poisoned", "sqlite queue lock poisoned"),
         StaleQueueItem => ("stale_queue_item", "stale queue item"),
         StorageFailure => ("storage_failure", "storage failure"),
+        SpendReceiptRefTooLong => ("spend_receipt_ref_too_long", "spend receipt reference exceeds maximum byte length"),
         SpendLedgerUnavailable => ("spend_ledger_unavailable", "spend ledger unavailable"),
         SpendReconciliationRequired => ("spend_reconciliation_required", "spend reconciliation required"),
         SpendBudgetExhausted => ("spend_budget_exhausted", "account request budget exhausted"),

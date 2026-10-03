@@ -10,7 +10,7 @@ use symbiotic_trace::UsageTrace;
 
 fn reservation(id: &str, invocation: &str, account: &str) -> SpendReservation {
     SpendReservation {
-        reference: SpendReceiptRef(id.into()),
+        reference: SpendReceiptRef::new(id).unwrap(),
         invocation: invocation.into(),
         account: account.into(),
         binding: invocation.into(),
@@ -299,7 +299,7 @@ fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() 
         .finish(&original.reference, SpendState::Released, None, None)
         .unwrap();
     let mut changed = original.clone();
-    changed.reference = SpendReceiptRef("delayed".into());
+    changed.reference = SpendReceiptRef::new("delayed").unwrap();
     changed.binding = "changed-input".into();
     assert!(matches!(
         delayed.reserve(&changed),

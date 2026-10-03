@@ -94,7 +94,7 @@ impl SqliteSpendLedger {
             ));
         }
         let json = serde_json::to_string(r).map_err(storage)?;
-        conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown')", params![r.reference.0, r.account, r.invocation, r.binding, json]).map_err(storage)?;
+        conn.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown')", params![r.reference.as_str(), r.account, r.invocation, r.binding, json]).map_err(storage)?;
         Ok(true)
     }
 
@@ -110,7 +110,7 @@ impl SqliteSpendLedger {
             let input: Option<String> = conn
                 .query_row(
                     "SELECT handoff_input FROM spend_receipts WHERE reference=?1",
-                    [&handoff.reservation.reference.0],
+                    [handoff.reservation.reference.as_str()],
                     |row| row.get(0),
                 )
                 .map_err(storage)?;
@@ -122,7 +122,10 @@ impl SqliteSpendLedger {
         }
         conn.execute(
             "UPDATE spend_receipts SET handoff_input=?2 WHERE reference=?1",
-            params![handoff.reservation.reference.0, handoff.input_identity],
+            params![
+                handoff.reservation.reference.as_str(),
+                handoff.input_identity
+            ],
         )
         .map_err(storage)?;
         Ok(true)
@@ -179,7 +182,7 @@ impl SqliteSpendLedger {
         }
         conn.execute(
             "UPDATE spend_receipts SET state=?2, usage=?3, output=?4 WHERE reference=?1",
-            params![reference.0, state_name(state), usage, output],
+            params![reference.as_str(), state_name(state), usage, output],
         )
         .map_err(storage)?;
         Ok(())
@@ -193,7 +196,7 @@ fn receipt_in(
     let row = conn
         .query_row(
             "SELECT reservation, state, usage, output, pre_dispatch_released FROM spend_receipts WHERE reference=?1",
-            [&reference.0],
+            [reference.as_str()],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -235,7 +238,7 @@ fn invocation_in(
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
     reference
-        .map(|r| receipt_in(conn, &SpendReceiptRef(r)))
+        .map(|r| receipt_in(conn, &SpendReceiptRef::new(r).map_err(storage)?))
         .transpose()
         .map(Option::flatten)
 }
@@ -253,7 +256,7 @@ impl SpendLedger for SqliteSpendLedger {
         Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
         tx.execute(
             "UPDATE spend_receipts SET pre_dispatch_released=1 WHERE reference=?1",
-            [&reference.0],
+            [reference.as_str()],
         )
         .map_err(storage)?;
         tx.commit().map_err(storage)
@@ -291,7 +294,11 @@ impl SpendLedger for SqliteSpendLedger {
             .execute(
                 "UPDATE spend_receipts SET dispatch_owner=?3 WHERE reference=?1
              AND handoff_input=?2 AND dispatch_owner IS NULL AND state='unknown'",
-                params![handoff.reservation.reference.0, input_identity, owner],
+                params![
+                    handoff.reservation.reference.as_str(),
+                    input_identity,
+                    owner
+                ],
             )
             .map_err(storage)?;
         if changed != 1 {

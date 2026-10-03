@@ -11,7 +11,7 @@ fn accepted(path: &Path) -> AcceptedSpendHandoff {
     symbiotic_queue_sqlite::SqliteQueue::open(path).unwrap();
     let handoff = AcceptedSpendHandoff {
         reservation: SpendReservation {
-            reference: SpendReceiptRef("accepted:attempt-1".into()),
+            reference: SpendReceiptRef::new("accepted:attempt-1").unwrap(),
             account: "account-a".into(),
             invocation: "invocation-1".into(),
             binding: "exact-attempt-1".into(),
@@ -142,7 +142,7 @@ fn ordinary_or_released_reservations_do_not_authorize_an_accepted_handoff() {
             .is_err()
     );
     let mut ordinary = handoff;
-    ordinary.reservation.reference = SpendReceiptRef("ordinary".into());
+    ordinary.reservation.reference = SpendReceiptRef::new("ordinary").unwrap();
     ordinary.reservation.invocation = "ordinary".into();
     ledger.reserve(&ordinary.reservation).unwrap();
     assert!(
@@ -174,7 +174,7 @@ fn handoff_reservation_rejects_changed_binding_after_release_and_changed_reattac
             None,
         )
         .unwrap();
-    changed.reservation.reference = SpendReceiptRef("next-attempt".into());
+    changed.reservation.reference = SpendReceiptRef::new("next-attempt").unwrap();
     changed.reservation.binding = "changed-binding".into();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -182,7 +182,7 @@ fn handoff_reservation_rejects_changed_binding_after_release_and_changed_reattac
     assert!(SqliteSpendLedger::reserve_handoff_in(&tx, &changed).is_err());
     drop(tx);
     changed = first;
-    changed.reservation.reference = SpendReceiptRef("next-attempt".into());
+    changed.reservation.reference = SpendReceiptRef::new("next-attempt").unwrap();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
