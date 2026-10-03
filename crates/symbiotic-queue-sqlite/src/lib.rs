@@ -376,10 +376,15 @@ impl QueueBackend for SqliteQueue {
         &self,
         scope: &symbiotic_queue::jobs::JobScope,
         config: &symbiotic_queue::jobs::JobConfig,
-        now: DateTime<Utc>,
+        clock: symbiotic_queue::jobs::JobClock,
         request: symbiotic_queue::jobs::JobRequest,
     ) -> Result<symbiotic_queue::jobs::JobResponse, symbiotic_queue::jobs::JobError> {
-        self.job_operation(scope, config, now, request)
+        let (backend, scope, config) = (self.clone(), scope.clone(), config.clone());
+        tokio::task::spawn_blocking(move || {
+            backend.job_operation(&scope, &config, || clock(), request)
+        })
+        .await
+        .map_err(|_| symbiotic_queue::jobs::JobError::Storage)?
     }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.enqueue_inner(request, None).await

@@ -10,6 +10,20 @@ Payloads and handler results are opaque bytes (`Vec<u8>` in memory, SQLite
 `BLOB`), preserved exactly. Paid answers remain exclusively in the spend ledger;
 the store retains only their receipt reference and reconciliation state.
 
+Following §16, the claim is the handoff: one transaction marks the job Running
+for its claim generation and returns its payload. The runner passes that payload
+directly to the handler, with no entry lookup or snapshot checks. Cancellation
+or owner erasure committed before the claim prevents it; after the claim, the
+heartbeat signals the running handler. Erasure permits in-flight work to finish
+but stores no output or recovery copy.
+
+After a crash, an expired handler lease can be claimed again only within the
+job's frozen attempt ceiling. A crash between claim and handler entry consumes
+an attempt; with `max_attempts = 1`, recovery ends Refused without running the
+handler. Handlers with side effects must deduplicate by the stable scoped job
+key, which stays the same across claims. The claim generation
+(`JobContext::attempt`) is only a fencing token for queue writes.
+
 Later: admission attempts/notices → PR 4 (Memory egress); checkpoints → Warden adoption PR; cache-origin results → the caching consumer PR; priority/background share → the shared-scheduler consumer PR; group summaries/resumable rebuild → Memory adoption PR (D5b Q3).
 
 The store uses `JobConfig` version 1 on SQLite only, including `:memory:` for

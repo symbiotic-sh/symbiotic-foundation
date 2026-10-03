@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use symbiotic_core::DiagnosticCode;
 use thiserror::Error;
 
+/// Trusted host clock, sampled once after acquiring the operation's write transaction.
+pub type JobClock = std::sync::Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
 /// Authorization namespace supplied by the trusted host, never by an unverified client.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -379,7 +382,7 @@ pub enum JobRequest {
     /// Claim the inspected job inside the account owner's acceptance transaction.
     /// The trusted caller holds its account/handler slot; the store is not a limiter.
     ClaimJob(JobId),
-    /// Extend a live claim without changing its generation.
+    /// Extend a live claim and return cancellation intent without reading content.
     Heartbeat { job: JobId, generation: u64 },
     /// Set a final result or Uncertain under a live generation.
     Complete {
@@ -438,12 +441,14 @@ pub enum JobResponse {
     Diagnostics(DiagnosticPage),
     /// Pending utilization.
     Usage(PendingUsage),
+    /// Renewed live claim; true means cancellation or owner erasure was requested.
+    Heartbeat(bool),
     /// Successful single-row write.
     Done,
 }
 
 /// Visible failures; messages contain static codes or scoped IDs, never content.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum JobError {
     /// Request crossed tenant/incarnation/queue authorization scope.
     #[error("job scope refused")]

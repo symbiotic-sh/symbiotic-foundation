@@ -21,6 +21,7 @@ use thiserror::Error;
 pub mod conformance;
 pub mod jobs;
 mod memory;
+pub mod runner;
 
 pub use memory::{DEFAULT_RETAINED_TERMINAL_ITEMS, MemoryQueue};
 
@@ -169,16 +170,23 @@ impl QueueError {
     }
 }
 
+/// Provider-neutral queue and generic job-store operations.
+///
+/// Job-store access performs blocking storage work. Async callers must run that
+/// work off executor threads, as the runner does through its SQLite backend's
+/// blocking-task dispatch in [`Self::jobs`].
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
     /// Execute an atomic generic-job operation using the trusted host's clock
     /// and versioned configuration. Authority verification belongs to the host
-    /// inside the acceptance transaction. Backends without a job store fail visibly.
+    /// inside the acceptance transaction. Sample the clock once after acquiring
+    /// the write transaction; use that time for every fence and deadline.
+    /// Backends without a job store fail visibly.
     async fn jobs(
         &self,
         _scope: &jobs::JobScope,
         _config: &jobs::JobConfig,
-        _now: DateTime<Utc>,
+        _clock: jobs::JobClock,
         _request: jobs::JobRequest,
     ) -> Result<jobs::JobResponse, jobs::JobError> {
         Err(jobs::JobError::Unavailable)
