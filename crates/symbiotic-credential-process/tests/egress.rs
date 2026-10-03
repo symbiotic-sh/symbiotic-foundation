@@ -129,6 +129,7 @@ impl Fixture {
             max_frame_bytes: 262144,
             max_connections: 8,
             io_timeout_seconds: 2,
+            clock_rollback_warning_tolerance_seconds: 5,
             routes: vec![RouteConfig {
                 tenant: "tenant".into(),
                 account: "account".into(),
@@ -1090,24 +1091,55 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
 
 #[tokio::test]
 async fn executable_recovery_lost_permit_and_completion_replies() {
-    executable_dispatch(None, None).await;
+    executable_dispatch(None, None, None).await;
 }
 
 #[tokio::test]
 async fn executable_preserves_numeric_provider_cost_after_restart() {
     // Run this package alone (also a separate CI step): workspace tests unify
     // serde_json dev features that the production executable does not inherit.
-    executable_dispatch(None, Some("0.1234567890123456789")).await;
+    executable_dispatch(None, Some("0.1234567890123456789"), None).await;
 }
 
 #[tokio::test]
 async fn ambient_proxies_cannot_receive_credentials_or_private_inputs() {
     let proxy = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
-    executable_dispatch(Some(&proxy.config.routes[0].destination), None).await;
+    executable_dispatch(Some(&proxy.config.routes[0].destination), None, None).await;
     assert_eq!(proxy.calls.load(Ordering::SeqCst), 0);
 }
 
-async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static str>) {
+#[tokio::test]
+async fn signed_attempt_time_ahead_beyond_tolerance_warns_and_accepts() {
+    executable_dispatch(None, None, Some((3600, 5, true))).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_within_tolerance_accepts_without_warning() {
+    executable_dispatch(None, None, Some((5, 5, false))).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_uses_configured_warning_tolerance() {
+    executable_dispatch(None, None, Some((3600, 7200, false))).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_warning_tolerance_defaults_to_five_seconds() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let mut value = serde_json::to_value(&fixture.config).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("clock_rollback_warning_tolerance_seconds");
+    let config: ProcessConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(config.clock_rollback_warning_tolerance_seconds, 5);
+}
+
+async fn executable_dispatch(
+    proxy: Option<&str>,
+    numeric_cost: Option<&'static str>,
+    clock_case: Option<(u64, u64, bool)>,
+) {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -1135,13 +1167,16 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
         .await
         .unwrap()
     }
-    let fixture = Fixture::with_cost(
+    let mut fixture = Fixture::with_cost(
         200,
         "process answer".into(),
         Duration::ZERO,
         numeric_cost.unwrap_or(r#""0.00001234567890123456789""#),
     )
     .await;
+    if let Some((_, tolerance_seconds, _)) = clock_case {
+        fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
+    }
     let config_path = fixture.dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1186,7 +1221,15 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
         max_frame_bytes: fixture.config.max_frame_bytes,
         timeout: Duration::from_secs(3),
     };
-    let (admission, payload) = fixture.attempt("executable", 1, 1);
+    let (mut admission, payload) = fixture.attempt("executable", 1, 1);
+    if let Some((ahead_seconds, _, _)) = clock_case {
+        admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
+        admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
+        admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(admission.attempt)
+            .unwrap();
+    }
     let signed_id = AdmissionKey::new(KEY.to_vec())
         .unwrap()
         .sign_attempt_id(admission.attempt.attempt_id())
@@ -1265,6 +1308,35 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
     assert!(
         matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
     );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    if let Some((_, tolerance_seconds, should_warn)) = clock_case {
+        use std::io::Read;
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let warnings: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // Fresh issuance, replayed issuance, and accepted dispatch all report.
+        assert_eq!(warnings.len(), if should_warn { 3 } else { 0 });
+        for warning in warnings {
+            assert_eq!(warning["level"], "warn");
+            assert_eq!(warning["event"], "signed_attempt_time_ahead");
+            assert_eq!(warning["tolerance_seconds"], tolerance_seconds);
+            let recorded_at = warning["recorded_at"].as_u64().unwrap();
+            let foundation_now = warning["foundation_now"].as_u64().unwrap();
+            assert_eq!(warning["ahead_seconds"], recorded_at - foundation_now);
+            assert!(recorded_at - foundation_now > tolerance_seconds);
+            assert_eq!(warning.as_object().unwrap().len(), 6);
+        }
+    }
     drop(child);
     std::fs::remove_file(&fixture.config.socket_path).unwrap();
     let mut child = Child(command.spawn().unwrap());
