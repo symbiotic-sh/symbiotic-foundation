@@ -1258,7 +1258,7 @@ pub fn apply_job_request(
                     && origin != ResultOrigin::Paid
                     && output.is_none()
                     && !row.purged
-                    && !row.recovery_until.is_some_and(|until| until <= now)
+                    && row.recovery_until.is_none_or(|until| until > now)
             {
                 return Err(JobError::InvalidRequest);
             }
