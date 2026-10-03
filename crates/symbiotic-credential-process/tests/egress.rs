@@ -108,13 +108,11 @@ impl Fixture {
                                     assert!(
                                         !headers.to_ascii_lowercase().contains("authorization:")
                                     );
+                                } else if headers.starts_with("POST /v1/messages ") {
+                                    assert!(headers.contains(&format!("x-api-key: {SECRET}")));
+                                    assert!(headers.contains("anthropic-version: 2023-06-01"));
                                 } else {
-                                    if headers.starts_with("POST /v1/messages ") {
-                                        assert!(headers.contains(&format!("x-api-key: {SECRET}")));
-                                        assert!(headers.contains("anthropic-version: 2023-06-01"));
-                                    } else {
-                                        assert!(headers.contains(&format!("Bearer {SECRET}")));
-                                    }
+                                    assert!(headers.contains(&format!("Bearer {SECRET}")));
                                 }
                                 assert!(
                                     !String::from_utf8_lossy(&data[header_end + 4..])
