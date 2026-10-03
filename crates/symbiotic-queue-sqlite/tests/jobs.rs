@@ -255,6 +255,38 @@ async fn runner_case_15_product_handler_recovers_without_spend_receipt() {
 }
 
 #[tokio::test]
+async fn runner_crash_before_entry_consumes_frozen_attempt_ceiling() {
+    let mut s = Suite::new();
+    s.now = Utc::now() - Duration::seconds(31);
+    let mut spec = s.spec("crash-before-entry");
+    spec.limits.max_attempts = 1;
+    let id = s.insert(spec).await;
+    let claim = s.claim().await;
+    assert_eq!(claim.generation, 1);
+    assert_eq!(claim.max_attempts, 1);
+    // The worker crashes after the handoff without ever invoking its handler.
+    drop(claim);
+    s.now = Utc::now();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = s
+        .runner(1, {
+            let calls = calls.clone();
+            move |_, bytes| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(bytes) }
+            }
+        })
+        .await;
+    let row = s.final_row(&id).await;
+    runner.shutdown().await.unwrap();
+    assert_eq!(row.state, JobState::Refused);
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.max_attempts, 1);
+    assert!(row.output.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn runner_worker_loop_preserves_opaque_bytes_and_handler_failures_are_final() {
     let mut s = Suite::new();
     s.now = Utc::now();
@@ -372,6 +404,78 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
     assert_eq!(claims.load(Ordering::SeqCst), stopped_claims);
 }
 
+#[tokio::test(start_paused = true)]
+async fn runner_first_heartbeat_storage_error_before_entry_does_not_cancel() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    let id = s.insert(s.spec("pre-entry-storage-error")).await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let heartbeats = Arc::new(AtomicUsize::new(0));
+    let recovered = Arc::new(tokio::sync::Notify::new());
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (entered, heartbeats) = (entered.clone(), heartbeats.clone());
+            move |request: &JobRequest| {
+                let first = matches!(request, JobRequest::Heartbeat { .. })
+                    && heartbeats.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
+                    assert!(!entered.load(Ordering::SeqCst));
+                }
+                Box::pin(async move {
+                    if first {
+                        Err(JobError::Storage)
+                    } else {
+                        Ok(())
+                    }
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+        after: Some(Box::new({
+            let recovered = recovered.clone();
+            move |request, response| {
+                if matches!(request, JobRequest::Heartbeat { .. }) {
+                    assert!(matches!(response, JobResponse::Heartbeat(false)));
+                    recovered.notify_one();
+                }
+                Box::pin(async { Ok(()) })
+            }
+        })),
+    });
+    let runner = s
+        .runner_with_backend(backend, 1, {
+            let entered = entered.clone();
+            move |ctx, bytes| {
+                let (entered, recovered) = (entered.clone(), recovered.clone());
+                async move {
+                    entered.store(true, Ordering::SeqCst);
+                    assert!(!ctx.cancel.is_cancelled());
+                    recovered.notified().await;
+                    assert!(!ctx.cancel.is_cancelled());
+                    Ok(bytes)
+                }
+            }
+        })
+        .await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "claim skipped handler entry"
+    );
+    assert!(heartbeats.load(Ordering::SeqCst) >= 2);
+    assert!(matches!(error, RunnerError::Workers(workers)
+        if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+            if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
+    let row = s.get(&id).await;
+    assert_eq!(row.state, JobState::Succeeded);
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.output, Some(s.spec("pre-entry-storage-error").payload));
+}
+
 #[tokio::test]
 async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     let mut s = Suite::new();
@@ -380,12 +484,14 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     let id = s.insert(s.spec("draining-lease")).await;
     let started = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
+    let failure_observed = Arc::new(tokio::sync::Notify::new());
     let renewals = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
         after: None,
         backend: s.backend.clone(),
         before: {
             let (started, failed, renewals) = (started.clone(), failed.clone(), renewals.clone());
+            let failure_observed = failure_observed.clone();
             move |request: &JobRequest| {
                 let monitoring = matches!(request, JobRequest::Heartbeat { .. });
                 if matches!(request, JobRequest::Heartbeat { .. }) && failed.load(Ordering::SeqCst)
@@ -395,8 +501,10 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
                 let error = monitoring
                     && started.load(Ordering::SeqCst)
                     && !failed.swap(true, Ordering::SeqCst);
+                let failure_observed = failure_observed.clone();
                 Box::pin(async move {
                     if error {
+                        failure_observed.notify_one();
                         Err(JobError::Storage)
                     } else {
                         Ok(())
@@ -405,27 +513,27 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
             }
         },
     });
-    let cancelled = Arc::new(tokio::sync::Notify::new());
     let finish = Arc::new(tokio::sync::Semaphore::new(0));
     let runner = s
         .runner_with_backend(backend, 1, {
-            let (cancelled, finish) = (cancelled.clone(), finish.clone());
+            let finish = finish.clone();
             move |ctx, bytes| {
-                let (started, cancelled, finish) =
-                    (started.clone(), cancelled.clone(), finish.clone());
+                let (started, finish) = (started.clone(), finish.clone());
                 async move {
                     started.store(true, Ordering::SeqCst);
-                    ctx.cancel.cancelled().await;
-                    cancelled.notify_one();
                     finish.acquire().await.unwrap().forget();
+                    assert!(!ctx.cancel.is_cancelled());
                     Ok(bytes)
                 }
             }
         })
         .await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        failure_observed.notified(),
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     s.now = Utc::now();
     assert!(
@@ -655,6 +763,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
     let id = s.insert(s.spec("storage-error")).await;
     let started = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
+    let failure_observed = Arc::new(tokio::sync::Notify::new());
     let completions = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
         after: None,
@@ -662,6 +771,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
         before: {
             let (started, failed, completions) =
                 (started.clone(), failed.clone(), completions.clone());
+            let failure_observed = failure_observed.clone();
             move |request: &JobRequest| {
                 if matches!(request, JobRequest::Complete { .. }) {
                     completions.fetch_add(1, Ordering::SeqCst);
@@ -670,8 +780,10 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
                 let error = monitoring
                     && started.load(Ordering::SeqCst)
                     && !failed.swap(true, Ordering::SeqCst);
+                let failure_observed = failure_observed.clone();
                 Box::pin(async move {
                     if error {
+                        failure_observed.notify_one();
                         Err(JobError::Storage)
                     } else {
                         Ok(())
@@ -683,6 +795,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
     let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
     let runner = s
         .runner_with_backend(backend, 1, move |ctx, bytes| {
+            let failure_observed = failure_observed.clone();
             let (started, store, scope, config) = (
                 started.clone(),
                 store.clone(),
@@ -691,7 +804,8 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
             );
             async move {
                 started.store(true, Ordering::SeqCst);
-                ctx.cancel.cancelled().await;
+                failure_observed.notified().await;
+                assert!(!ctx.cancel.is_cancelled());
                 match fence {
                     CompletionFence::Live => {}
                     CompletionFence::Expired => {
@@ -990,9 +1104,9 @@ async fn runner_accepts_heartbeat_at_half_the_claim_lease_and_derived_default() 
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat() {
-    for purge in [false, true] {
+    for (purge, before_entry) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut s = Suite::new();
         s.now = Utc::now();
         let spec = s.spec("claimed-handoff");
@@ -1007,7 +1121,7 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
                     let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
                     let gate = gate.clone();
                     Box::pin(async move {
-                        if heartbeat {
+                        if heartbeat && !before_entry {
                             gate.acquire().await.unwrap().forget();
                         }
                         Ok(())
@@ -1051,7 +1165,7 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
             .runner_with_backend(backend, 1, move |ctx, bytes| {
                 let tx = tx.clone();
                 async move {
-                    assert!(!ctx.cancel.is_cancelled());
+                    assert_eq!(ctx.cancel.is_cancelled(), before_entry);
                     tx.send(bytes.clone()).unwrap();
                     ctx.cancel.cancelled().await;
                     Ok(bytes)
@@ -1064,9 +1178,11 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
                 .expect("claim payload did not reach the handler"),
             Some(payload.clone())
         );
-        // The mutation committed before entry, but only the heartbeat signals it.
-        assert_eq!(s.get(&id).await.state, JobState::Running);
-        heartbeat_gate.add_permits(1);
+        if !before_entry {
+            // The mutation committed before entry, but only the heartbeat signals it.
+            assert_eq!(s.get(&id).await.state, JobState::Running);
+            heartbeat_gate.add_permits(1);
+        }
         let row = s.final_row(&id).await;
         runner.shutdown().await.unwrap();
         assert_eq!(row.generation, 1);

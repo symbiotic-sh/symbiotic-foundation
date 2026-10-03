@@ -69,9 +69,9 @@ impl CancelToken {
 pub struct JobContext {
     /// Scoped durable identity.
     pub id: JobId,
-    /// Caller idempotency key.
+    /// Stable caller idempotency key within `id.scope`, preserved across claims.
     pub key: String,
-    /// One-based claim ordinal; also the stale-write fence.
+    /// One-based claim generation, used only to fence queue writes.
     pub attempt: u64,
     /// Cancellation requested by the consumer or input erasure.
     pub cancel: CancelToken,
@@ -87,9 +87,12 @@ pub struct JobFailure {
 
 /// Product work with opaque, exactly round-tripping bytes and no spend receipt.
 /// Handler failures are final; cancellation never causes a retry.
-/// Execution is at least once: after a crash, an expired lease can be claimed again.
-/// Handlers with external side effects must deduplicate by the job's scoped key
-/// and claim generation ([`JobContext::attempt`]), or fence downstream writes.
+/// After a crash, an expired lease can be claimed again only within the job's
+/// frozen attempt ceiling. A crash between claim and handler entry consumes an
+/// attempt; with `max_attempts = 1`, recovery ends Refused without running the handler.
+/// Handlers with side effects must deduplicate by the stable scoped job key,
+/// which stays the same across claims. The claim generation ([`JobContext::attempt`])
+/// is only a fencing token for queue writes.
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     /// Execute one claim. Work already sent must finish under its own timeout;
@@ -155,12 +158,7 @@ impl Shared {
         // JoinSet supplies the panic boundary and aborts the task if its owning
         // worker is itself aborted. Ordinary cancel/shutdown always drains it.
         let mut task = JoinSet::new();
-        task.spawn(async move {
-            if ctx.cancel.is_cancelled() {
-                return None;
-            }
-            Some(shared.handler.run(&ctx, &payload).await)
-        });
+        task.spawn(async move { shared.handler.run(&ctx, &payload).await });
         let mut renew = tokio::time::interval(self.heartbeat);
         let mut errors = Vec::new();
         let outcome = loop {
@@ -186,13 +184,13 @@ impl Shared {
                     count: 1,
                 }),
             }
-            cancel.send_replace(true);
             if fenced {
+                cancel.send_replace(true);
                 break task.join_next().await;
             }
         };
         let (state, output, diagnostic) = match outcome {
-            Some(Ok(Some(Ok(output)))) if output.len() > self.jobs.max_result_bytes => {
+            Some(Ok(Ok(output))) if output.len() > self.jobs.max_result_bytes => {
                 errors.push(
                     JobError::ResultTooLarge {
                         job: claim.id.clone(),
@@ -202,9 +200,8 @@ impl Shared {
                 );
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
             }
-            Some(Ok(Some(Ok(output)))) => (JobState::Succeeded, Some(output), None),
-            Some(Ok(Some(Err(failure)))) => (JobState::Failed, None, Some(failure.code)),
-            Some(Ok(None)) => (JobState::Cancelled, None, None),
+            Some(Ok(Ok(output))) => (JobState::Succeeded, Some(output), None),
+            Some(Ok(Err(failure))) => (JobState::Failed, None, Some(failure.code)),
             Some(Err(_)) => {
                 errors.push(RunnerError::HandlerPanicked(claim.id.clone()));
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))

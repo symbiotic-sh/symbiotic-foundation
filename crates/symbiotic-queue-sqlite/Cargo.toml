@@ -22,4 +22,4 @@ symbiotic-queue = { path = "../symbiotic-queue" }
 symbiotic-queue = { path = "../symbiotic-queue", features = ["conformance"] }
 futures = "0.3"
 tempfile = "3"
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
