@@ -2725,6 +2725,60 @@ async fn fdn_saved_answer_expires_at_retention_without_reopening() {
 }
 
 #[tokio::test]
+async fn execution_exhausted_invocation_preserves_failure_class_on_replay_and_restart() {
+    let dir = private_tempdir();
+    let runtime = persistent(dir.path());
+    let raw = Loopback::new(unique_identity()).unavailable();
+    let configured = binding(raw.clone())
+        .with_policy(policy())
+        .with_response_cache(ResponseCacheMode::Off);
+    let first = runtime
+        .execute_chat(
+            configured.clone(),
+            "exhausted-unavailable",
+            request("retry"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        first.source,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
+    let status = first.attempt.unwrap().unwrap();
+    assert_eq!(status.state, symbiotic_ai_runtime::SpendState::Released);
+    assert!(!status.output_available);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+
+    let replay = runtime
+        .execute_chat(
+            configured.clone(),
+            "exhausted-unavailable",
+            request("retry"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        replay.source,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
+    assert_eq!(replay.attempt.unwrap().unwrap(), status);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    drop(runtime);
+
+    let restarted = persistent(dir.path());
+    let replay = restarted
+        .execute_chat(configured, "exhausted-unavailable", request("retry"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        replay.source,
+        ModelError::Unavailable(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
+    assert_eq!(replay.attempt.unwrap().unwrap(), status);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn fdn_explicit_limit_survives_pruning_and_never_renews() {
     let dir = private_tempdir();
     let raw = Loopback::new(unique_identity()).unavailable();
@@ -2746,10 +2800,14 @@ async fn fdn_explicit_limit_survives_pruning_and_never_renews() {
         .unwrap()
         .execute("DELETE FROM queue_items", [])
         .unwrap();
-    persistent(dir.path())
+    let error = persistent(dir.path())
         .execute_chat(configured, "exhausted", request("retry"))
         .await
         .unwrap_err();
+    assert!(matches!(
+        error.source,
+        ModelError::BudgetExhausted(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted)
+    ));
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
 

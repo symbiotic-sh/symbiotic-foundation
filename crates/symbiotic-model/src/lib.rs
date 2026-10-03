@@ -944,9 +944,9 @@ impl<Req> QueuedCall<Req> {
                     .is_some_and(|limit| receipt.attempts_used >= limit)
             {
                 context.capture(&receipt.reservation.reference)?;
-                return Err(ModelError::BudgetExhausted(
-                    DiagnosticCode::AttemptBudgetExhausted,
-                ));
+                // Let retained queue items restore the last failure class.
+                // If history was pruned, the atomic ledger ceiling still
+                // refuses another reservation before provider dispatch.
             }
             Ok(None)
         })
