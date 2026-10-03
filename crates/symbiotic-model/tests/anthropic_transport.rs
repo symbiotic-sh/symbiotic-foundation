@@ -97,10 +97,10 @@ fn answer() -> Value {
     json!({"id":"fixture-id", "model":"served-model", "stop_reason":"end_turn",
         "content":[{"type":"thinking","thinking":"private reasoning","signature":"sig"},
         {"type":"text","text":"first"},{"type":"redacted_thinking","data":"private redacted"},{"type":"text","text":"second"}],
-        "usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}})
+        "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312},"cache_read_input_tokens":5,"cache_creation_input_tokens":2}})
 }
 #[tokio::test]
-async fn messages_headers_default_tokens_thinking_and_usage() {
+async fn messages_headers_default_tokens_without_thinking_and_usage() {
     let (url, server) = fixture(200, &answer().to_string(), false);
     let response = provider(&format!("{url}/v1/"))
         .chat(request())
@@ -115,12 +115,13 @@ async fn messages_headers_default_tokens_thinking_and_usage() {
     assert_eq!(
         body,
         json!({"model":"fixture-model","max_tokens":16000,"system":"system\n\"é",
-        "messages":[{"role":"user","content":"evidence"}],"thinking":{"type":"adaptive"},"stream":false})
+        "messages":[{"role":"user","content":"evidence"}],"stream":false})
     );
     assert_eq!(response.text, "firstsecond");
     assert_eq!(response.finish_reason.as_deref(), Some("end_turn"));
     assert_eq!(response.trace.usage.input_tokens, Some(14));
-    assert_eq!(response.trace.usage.output_tokens, Some(3));
+    assert_eq!(response.trace.usage.output_tokens, Some(348));
+    assert_eq!(response.trace.usage.reasoning_tokens, Some(312));
     assert_eq!(response.trace.cache.cached_input_tokens, Some(5));
     assert_eq!(response.trace.cache.prompt_cache, CacheStatus::PartialHit);
     assert_eq!(response.trace.metadata["cache_miss_tokens"], 9);
@@ -160,7 +161,13 @@ async fn disabled_thinking_and_explicit_output_limit_preserve_conversation_order
             .await
             .unwrap();
         let (_, body) = server.join().unwrap();
-        assert!(body.get("thinking").is_none());
+        match thinking {
+            None => assert!(body.get("thinking").is_none()),
+            Some(ThinkingMode::Disabled) => {
+                assert_eq!(body["thinking"], json!({"type":"disabled"}))
+            }
+            Some(ThinkingMode::Enabled) => unreachable!(),
+        }
         assert_eq!(body["max_tokens"], 128);
         assert_eq!(body["temperature"], 0.0);
         assert_eq!(
@@ -221,6 +228,7 @@ async fn exact_encoded_request_boundary_includes_system_escaping_and_thinking() 
     let (url, server) = fixture(200, &answer().to_string(), false);
     provider(&url)
         .with_request_limit(bytes.len())
+        .with_thinking(Some(ThinkingMode::Enabled))
         .chat(req.clone())
         .await
         .unwrap();
@@ -324,4 +332,103 @@ async fn max_tokens_finish_reason_and_missing_usage_remain_visible() {
     assert_eq!(response.text, "");
     assert_eq!(response.finish_reason.as_deref(), Some("max_tokens"));
     assert_eq!(response.trace.usage.input_tokens, None);
+}
+
+#[tokio::test]
+async fn context_window_exhaustion_preserves_answer_finish_reason_and_measured_usage() {
+    let mut body = answer();
+    body["stop_reason"] = json!("model_context_window_exceeded");
+    let (url, server) = fixture(200, &body.to_string(), false);
+    let response = provider(&url).chat(request()).await;
+    server.join().unwrap();
+    let response = response.unwrap();
+    assert_eq!(response.text, "firstsecond");
+    assert_eq!(
+        response.finish_reason.as_deref(),
+        Some("model_context_window_exceeded")
+    );
+    assert_eq!(response.trace.usage.input_tokens, Some(14));
+    assert_eq!(response.trace.usage.output_tokens, Some(348));
+    assert_eq!(response.trace.usage.reasoning_tokens, Some(312));
+}
+
+#[tokio::test]
+async fn explicit_enabled_thinking_preserves_default_temperature() {
+    for temperature in [None, Some(1.0)] {
+        let (url, server) = fixture(200, &answer().to_string(), false);
+        let mut req = request();
+        req.temperature = temperature;
+        provider(&url)
+            .with_thinking(Some(ThinkingMode::Enabled))
+            .chat(req)
+            .await
+            .unwrap();
+        let (_, body) = server.join().unwrap();
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(
+            body.get("temperature"),
+            temperature.map(|v| json!(v)).as_ref()
+        );
+    }
+}
+
+#[tokio::test]
+async fn enabled_thinking_refuses_incompatible_temperature_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+        let mut req = request();
+        req.temperature = Some(0.0);
+        let original = serde_json::to_value(&req).unwrap();
+        assert!(matches!(
+            wire::anthropic_chat_body(model, &req, Some(ThinkingMode::Enabled), None),
+            Err(ModelError::InvalidRequest(_))
+        ));
+        assert_eq!(serde_json::to_value(&req).unwrap(), original);
+        let p = AnthropicChatProvider::new("fixture", model, &url, KEY)
+            .with_request_limit(65536)
+            .with_response_limit(65536)
+            .with_thinking(Some(ThinkingMode::Enabled));
+        assert!(matches!(
+            p.chat(req).await,
+            Err(ModelError::InvalidRequest(_))
+        ));
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn assistant_prefill_is_refused_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    for thinking in [
+        None,
+        Some(ThinkingMode::Enabled),
+        Some(ThinkingMode::Disabled),
+    ] {
+        let mut req = request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: "Answer:".into(),
+        });
+        let original = serde_json::to_value(&req).unwrap();
+        assert!(matches!(
+            wire::anthropic_chat_body("claude-opus-4-6", &req, thinking, None),
+            Err(ModelError::InvalidRequest(_))
+        ));
+        assert_eq!(serde_json::to_value(&req).unwrap(), original);
+        assert!(matches!(
+            provider(&url).with_thinking(thinking).chat(req).await,
+            Err(ModelError::InvalidRequest(_))
+        ));
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

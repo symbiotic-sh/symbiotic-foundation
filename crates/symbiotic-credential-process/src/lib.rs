@@ -33,7 +33,7 @@ pub enum RouteProvider {
     AnthropicChat {
         /// Provider identity.
         operator: String,
-        /// Enabled maps to adaptive thinking; disabled/None omits it.
+        /// Enabled maps to adaptive thinking; Disabled is explicit; None omits it.
         thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
     },
     /// Existing Gemini embedding adapter, pinned to Google's service.

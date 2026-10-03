@@ -161,8 +161,9 @@ pub fn gemini_embedding_body(
 }
 
 /// Encode a Messages request with an optional leading system prompt, followed
-/// by user/assistant messages in their original order. Other roles and response
-/// formats are refused rather than omitted.
+/// by user/assistant messages in their original order, ending with a user turn.
+/// Other roles, response formats, and non-default temperature with enabled
+/// thinking are refused rather than omitted.
 pub fn anthropic_chat_body(
     model: &str,
     request: &ChatRequest,
@@ -187,7 +188,11 @@ pub fn anthropic_chat_body(
         _ => (None, request.messages.as_slice()),
     };
     if request.response_format.is_some()
-        || messages.is_empty()
+        || messages.last().is_none_or(|message| message.role != "user")
+        || (thinking == Some(ThinkingMode::Enabled)
+            && request
+                .temperature
+                .is_some_and(|temperature| temperature != 1.0))
         || messages
             .iter()
             .any(|m| !matches!(m.role.as_str(), "user" | "assistant"))
@@ -203,8 +208,10 @@ pub fn anthropic_chat_body(
             system,
             messages,
             temperature: request.temperature,
-            thinking: (thinking == Some(ThinkingMode::Enabled))
-                .then(|| serde_json::json!({"type":"adaptive"})),
+            thinking: thinking.map(|mode| match mode {
+                ThinkingMode::Enabled => serde_json::json!({"type":"adaptive"}),
+                ThinkingMode::Disabled => serde_json::json!({"type":"disabled"}),
+            }),
             stream: false,
         },
         max_bytes,

@@ -9,7 +9,7 @@ pub struct AnthropicChatProvider {
 }
 
 impl AnthropicChatProvider {
-    /// Construct a Foundation-owned transport with adaptive thinking enabled.
+    /// Construct a Foundation-owned transport without an optional thinking setting.
     pub fn new(
         operator: impl Into<String>,
         model: impl Into<String>,
@@ -17,8 +17,7 @@ impl AnthropicChatProvider {
         api_key: impl Into<SecretValue<String>>,
     ) -> Self {
         let mut transport = OpenAiCompatibleChatProvider::new(operator, model, base_url, api_key)
-            .with_output_limit(16000)
-            .with_thinking(Some(ThinkingMode::Enabled));
+            .with_output_limit(16000);
         transport.descriptor.metadata["wire"] = serde_json::json!("anthropic-messages");
         Self { transport }
     }
@@ -47,7 +46,7 @@ impl AnthropicChatProvider {
         self
     }
 
-    /// Enable adaptive thinking, or omit thinking for disabled/unspecified mode.
+    /// Enable adaptive thinking, explicitly disable it, or omit it with `None`.
     pub fn with_thinking(mut self, thinking: Option<ThinkingMode>) -> Self {
         self.transport = self.transport.with_thinking(thinking);
         self
@@ -89,8 +88,14 @@ enum ContentBlock {
 struct MessagesUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    output_tokens_details: Option<OutputTokensDetails>,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OutputTokensDetails {
+    thinking_tokens: Option<u64>,
 }
 
 #[async_trait]
@@ -140,7 +145,7 @@ impl ChatProvider for AnthropicChatProvider {
                 // Unsupported tool/pause/refusal outcomes cannot become a partial answer.
                 if !matches!(
                     parsed.stop_reason.as_str(),
-                    "end_turn" | "max_tokens" | "stop_sequence"
+                    "end_turn" | "max_tokens" | "stop_sequence" | "model_context_window_exceeded"
                 ) {
                     return Err(ModelError::Provider(DiagnosticCode::ProviderFailure));
                 }
@@ -183,6 +188,7 @@ impl ChatProvider for AnthropicChatProvider {
                 trace.usage = UsageTrace {
                     input_tokens: input,
                     output_tokens: usage.output_tokens,
+                    reasoning_tokens: usage.output_tokens_details.and_then(|d| d.thinking_tokens),
                     ..UsageTrace::default()
                 };
                 let (hit, miss) =

@@ -3145,42 +3145,114 @@ async fn anthropic_route_dispatches_only_through_the_credential_permit_and_recov
         Some(symbiotic_ai_runtime::model::ThinkingMode::Enabled),
         Some(symbiotic_ai_runtime::model::ThinkingMode::Disabled),
     ] {
-        let mut fixture = Fixture::with_http_response(200,
-            serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn",
-                "usage":{"input_tokens":7,"output_tokens":3}}).to_string(),
+        for stop_reason in ["end_turn", "model_context_window_exceeded"] {
+            let mut fixture = Fixture::with_http_response(200,
+            serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":stop_reason,
+                "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312}}}).to_string(),
             Duration::ZERO, "0", true, false).await;
-        fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
-            operator: "anthropic".into(),
-            thinking,
-        };
-        let process = fixture.process().await;
-        let (admission, payload) = fixture.attempt("anthropic", 1, 1);
-        let granted = permit(&process, &admission).await;
-        let result = dispatched(
-            exchange(&process, inject(admission.clone(), payload, granted))
+            fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+                operator: "anthropic".into(),
+                thinking,
+            };
+            let process = fixture.process().await;
+            let (admission, payload) = fixture.attempt("anthropic", 1, 1);
+            let granted = permit(&process, &admission).await;
+            let result = dispatched(
+                exchange(&process, inject(admission.clone(), payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                matches!(&result.output, Some(ProviderOutput::Chat {text}) if text == "answer")
+            );
+            assert_eq!(result.receipt.usage.input_tokens, Some(7));
+            assert_eq!(result.receipt.usage.output_tokens, Some(348));
+            assert_eq!(result.receipt.usage.reasoning_tokens, Some(312));
+            assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+            assert_eq!(result.receipt.spend_state, SpendState::Settled);
+            assert!(result.receipt_persisted);
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            drop(process);
+            let process = fixture.process().await;
+            let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await
+            else {
+                panic!("missing recovered answer");
+            };
+            assert_eq!(
+                serde_json::to_value(&result).unwrap(),
+                serde_json::to_value(recovered).unwrap()
+            );
+            assert!(
+                matches!(exchange(&process, Operation::Receipt(signed_id(&admission))).await,
+            Ok(Reply::Receipt(Some(receipt))) if receipt.usage.reasoning_tokens == Some(312) && receipt.usage.output_tokens == Some(348) && receipt.spend_state == SpendState::Settled)
+            );
+            let recovered = exchange(&process, Operation::IssuePermit(admission.into()))
                 .await
-                .unwrap(),
-        );
-        assert!(matches!(result.output, Some(ProviderOutput::Chat {text}) if text == "answer"));
-        assert_eq!(result.receipt.usage.input_tokens, Some(7));
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-        drop(process);
-        let process = fixture.process().await;
-        let recovered = exchange(&process, Operation::IssuePermit(admission.into()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            recovered,
-            Reply::Permit(PermitGrant {
-                status: AttemptStatus::Completed { .. },
-                ..
-            })
-        ));
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                .unwrap();
+            assert!(matches!(
+                recovered,
+                Reply::Permit(PermitGrant {
+                    status: AttemptStatus::Completed { .. },
+                    ..
+                })
+            ));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }
 
 #[tokio::test]
 async fn expanded_anthropic_wire_payload_is_refused_before_consumption() {
     expanded_wire_payload_is_refused(2).await;
+}
+
+#[tokio::test]
+async fn anthropic_enabled_thinking_temperature_is_refused_before_consumption() {
+    anthropic_invalid_conversation_is_refused(false).await;
+}
+
+#[tokio::test]
+async fn anthropic_assistant_prefill_is_refused_before_consumption() {
+    anthropic_invalid_conversation_is_refused(true).await;
+}
+
+async fn anthropic_invalid_conversation_is_refused(prefill: bool) {
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+        operator: "anthropic".into(),
+        thinking: Some(symbiotic_ai_runtime::model::ThinkingMode::Enabled),
+    };
+    let process = fixture.process().await;
+    let (mut admission, mut payload) = fixture.attempt("invalid-anthropic", 1, 1);
+    let ProviderPayload::Chat(request) = &mut payload else {
+        panic!("chat expected")
+    };
+    if prefill {
+        request.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: "Answer:".into(),
+        });
+    } else {
+        request.temperature = Some(0.0);
+    }
+    admission.attempt.input_digest = payload.digest().unwrap();
+    let admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    let granted = permit(&process, &admission).await;
+    assert!(matches!(
+        exchange(&process, inject(admission.clone(), payload, granted)).await,
+        Err(EgressError::InvalidRequest)
+    ));
+    assert!(matches!(
+        exchange(&process, Operation::Receipt(signed_id(&admission))).await,
+        Ok(Reply::Receipt(None))
+    ));
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Permitted
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 0));
 }
