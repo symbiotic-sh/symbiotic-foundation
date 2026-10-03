@@ -1,8 +1,11 @@
 //! Backend-owned job SQL, also usable on the ledger's caller-supplied transaction.
 use super::SqliteQueue;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use symbiotic_core::{DiagnosticCode, QueueItemId};
 use symbiotic_queue::jobs::*;
 
 type SqlProjection<'a, T> = (&'a str, fn(&Row<'_>) -> rusqlite::Result<T>);
@@ -58,6 +61,42 @@ fn read_optional_json<T: DeserializeOwned>(
     .transpose()
 }
 fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
+    let state: JobState = read_json(row, 8)?;
+    if state.acked() {
+        // Only these scoped tombstone fields survive confirmation. The shared
+        // record API fills absent operational fields with neutral values.
+        return Ok(JobRecord {
+            id: JobId {
+                scope: read_json(row, 0)?,
+                id: row.get(1)?,
+            },
+            key: row.get(2)?,
+            digest: row.get(3)?,
+            state,
+            final_state: read_optional_json(row, 9)?,
+            receipt: row.get(18)?,
+            delivery_generation: row.get(23)?,
+            group: None,
+            owners: Vec::new(),
+            kind: String::new(),
+            execution: Execution::Handler,
+            payload: None,
+            max_attempts: 0,
+            generation: 0,
+            lease_until: None,
+            cancel_requested: false,
+            purged: false,
+            output: None,
+            output_bytes: 0,
+            origin: None,
+            recovery_until: None,
+            result_expired: false,
+            created_at: DateTime::UNIX_EPOCH,
+            finished_at: None,
+            delivery_until: None,
+            diagnostic: None,
+        });
+    }
     Ok(JobRecord {
         id: JobId {
             scope: read_json(row, 0)?,
@@ -100,36 +139,34 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
         key TEXT NOT NULL,
         digest TEXT NOT NULL,
         job_group TEXT,
-        owners TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        execution TEXT NOT NULL,
+        owners TEXT,
+        kind TEXT,
+        execution TEXT,
         state TEXT NOT NULL,
         final_state TEXT,
         payload BLOB,
-        max_attempts INTEGER NOT NULL,
-        generation INTEGER NOT NULL,
+        max_attempts INTEGER,
+        generation INTEGER,
         lease_until INTEGER,
-        cancel_requested INTEGER NOT NULL,
-        purged INTEGER NOT NULL,
+        cancel_requested INTEGER,
+        purged INTEGER,
         output BLOB,
         origin TEXT,
         receipt TEXT,
         recovery_until INTEGER,
-        result_expired INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
+        result_expired INTEGER,
+        created_at INTEGER,
         finished_at INTEGER,
         delivery_generation INTEGER NOT NULL,
         delivery_until INTEGER,
         diagnostic TEXT,
-        output_bytes INTEGER NOT NULL,
+        output_bytes INTEGER,
         PRIMARY KEY(scope, id), UNIQUE(scope, key)
     );
     CREATE INDEX jobs_claim ON jobs(scope, created_at, id)
         WHERE state IN ('\"Pending\"','\"Running\"','\"Uncertain\"');
     CREATE INDEX jobs_delivery ON jobs(scope, finished_at, id)
         WHERE state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"');
-    CREATE INDEX jobs_leased ON jobs(scope, delivery_until)
-        WHERE delivery_until IS NOT NULL AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"');
     CREATE INDEX jobs_expiry ON jobs(scope, recovery_until, id)
         WHERE result_expired=0 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"');
     CREATE INDEX jobs_unfinished_group ON jobs(scope, job_group, id)
@@ -181,7 +218,7 @@ impl<'a> SqlRows<'a> {
         }
     }
 }
-impl JobRows for SqlRows<'_> {
+impl SqlRows<'_> {
     fn get(&mut self, id: &JobId) -> Result<Option<JobRecord>, JobError> {
         self.conn
             .query_row(
@@ -283,6 +320,19 @@ impl JobRows for SqlRows<'_> {
         Ok(())
     }
     fn save(&mut self, row: JobRecord) -> Result<(), JobError> {
+        if row.state.acked() {
+            // One persistence owner narrows every confirmed write, including
+            // future callers of save, without retaining operational defaults.
+            self.conn.execute("INSERT INTO jobs (scope,id,key,digest,state,final_state,receipt,delivery_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key,digest=excluded.digest,state=excluded.state,final_state=excluded.final_state,receipt=excluded.receipt,delivery_generation=excluded.delivery_generation,job_group=NULL,owners=NULL,kind=NULL,execution=NULL,payload=NULL,max_attempts=NULL,generation=NULL,lease_until=NULL,cancel_requested=NULL,purged=NULL,output=NULL,origin=NULL,recovery_until=NULL,result_expired=NULL,created_at=NULL,finished_at=NULL,delivery_until=NULL,diagnostic=NULL,output_bytes=NULL",
+                params![json(&row.id.scope)?, row.id.id, row.key, row.digest, json(&row.state)?, optional_json(&row.final_state)?, row.receipt, i64::try_from(row.delivery_generation).map_err(storage)?]).map_err(storage)?;
+            self.conn
+                .execute(
+                    "DELETE FROM job_owners WHERE scope=?1 AND job_id=?2",
+                    params![json(&row.id.scope)?, row.id.id],
+                )
+                .map_err(storage)?;
+            return Ok(());
+        }
         // Validate before touching SQL, also when used directly by backend tests.
         millisecond_time(row.created_at)?;
         for time in [
@@ -351,11 +401,9 @@ impl JobRows for SqlRows<'_> {
         self.conn.query_row("SELECT count(*), coalesce(sum(length(CAST(json_array(json(scope),key,job_group,json(owners),kind,json(execution),max_attempts) AS BLOB))+coalesce(length(payload),0)),0) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')",
             [json(scope)?], |r| Ok(PendingUsage { items: r.get(0)?, bytes: r.get(1)? })).map_err(storage)
     }
-    fn leased(&mut self, scope: &JobScope, now: DateTime<Utc>) -> Result<usize, JobError> {
-        self.conn.query_row("SELECT count(*) FROM jobs INDEXED BY jobs_leased WHERE scope=?1 AND delivery_until IS NOT NULL AND delivery_until>?2 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"')", params![json(scope)?, stamp(now)], |r| r.get(0)).map_err(storage)
+    fn live_count(&self, scope: &JobScope) -> Result<usize, JobError> {
+        self.conn.query_row("SELECT (SELECT count(*) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')) + (SELECT count(*) FROM jobs INDEXED BY jobs_delivery WHERE scope=?1 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"'))", [json(scope)?], |r| r.get(0)).map_err(storage)
     }
-}
-impl SqlRows<'_> {
     fn select_with<T>(
         &mut self,
         scope: &JobScope,
@@ -366,32 +414,31 @@ impl SqlRows<'_> {
     ) -> Result<Vec<T>, JobError> {
         let (columns, decode) = projection;
         let bound = i64::try_from(limit).map_err(|_| JobError::InvalidRequest)?;
-        if let JobQuery::Owner { owner, after } = query {
+        if let JobQuery::Owner(owner) = query {
             let columns = columns
                 .split(", ")
                 .map(|c| format!("jobs.{c}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT {columns} FROM job_owners JOIN jobs ON jobs.scope=job_owners.scope AND jobs.id=job_owners.job_id WHERE job_owners.scope=?1 AND job_owners.owner=?2 AND job_owners.job_id>?3 ORDER BY job_owners.job_id LIMIT ?4"
+                "SELECT {columns} FROM job_owners JOIN jobs ON jobs.scope=job_owners.scope AND jobs.id=job_owners.job_id WHERE job_owners.scope=?1 AND job_owners.owner=?2 ORDER BY job_owners.job_id LIMIT ?3"
             );
             return self.read(
                 &sql,
-                vec![
-                    json(scope)?.into(),
-                    owner.into(),
-                    after.unwrap_or_default().into(),
-                    bound.into(),
-                ],
+                vec![json(scope)?.into(), owner.into(), bound.into()],
                 decode,
             );
         }
         let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
         let (filter, order, index) = match query {
-            JobQuery::Group { group, after } => {
+            JobQuery::Group(group) => {
                 args.push(group.into());
-                args.push(after.unwrap_or_default().into());
-                ("job_group=?2 AND id>?3 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')".to_string(), "id", "jobs_unfinished_group")
+                (
+                    "job_group=?2 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')"
+                        .to_string(),
+                    "id",
+                    "jobs_unfinished_group",
+                )
             }
             JobQuery::Pending { kinds } => {
                 args.push(json(&kinds)?.into());
@@ -417,7 +464,7 @@ impl SqlRows<'_> {
                     "jobs_diagnostics",
                 )
             }
-            JobQuery::Owner { .. } => return Err(JobError::InvalidRequest),
+            JobQuery::Owner(_) => return Err(JobError::InvalidRequest),
         };
         args.push(bound.into());
         let sql = format!(
@@ -476,6 +523,735 @@ impl SqliteQueue {
     }
 }
 
+/// Backend row selection; all operational pages are bounded at the storage read.
+#[derive(Clone, Debug)]
+enum JobQuery {
+    /// Unfinished scoped group scan for atomic group cancellation.
+    Group(String),
+    /// Indexed owner membership, chunked in ascending ID order.
+    Owner(String),
+    /// Waiting claims within handler kinds, FIFO.
+    Pending { kinds: Vec<String> },
+    /// Unleased final deliveries, oldest first.
+    Final,
+    /// Final recovery copies past deadline.
+    Expired,
+    /// Static diagnostic states, ascending ID.
+    Diagnostics {
+        group: String,
+        after: Option<String>,
+    },
+}
+
+/// Content-free operational projection from canonical rows.
+#[derive(Clone, Debug)]
+struct JobInfo {
+    /// Scoped identity.
+    pub id: JobId,
+    /// Lifecycle.
+    pub state: JobState,
+    /// Static diagnostic.
+    pub diagnostic: Option<DiagnosticCode>,
+    /// Encoded saved-answer length.
+    pub output_bytes: usize,
+}
+
+// Waiting work and expired unpaid claims can stop without ledger reconciliation.
+// Cancel and erasure use the same rule so neither strands an expired handler.
+fn claimable(row: &JobRecord, now: DateTime<Utc>) -> bool {
+    row.state == JobState::Pending
+        || row.state == JobState::Running
+            && row.execution == Execution::Handler
+            && row.lease_until.is_some_and(|until| until <= now)
+}
+
+// Cancellation and reclaim share the sticky erasure precedence.
+fn stopped_state(row: &JobRecord) -> JobState {
+    if row.purged {
+        JobState::Purged
+    } else {
+        JobState::Cancelled
+    }
+}
+
+/// Ordered store timestamps use Unix milliseconds within chrono's supported range.
+/// Ordinary submillisecond clock precision is quantized; leap seconds are refused.
+fn millisecond_time(time: DateTime<Utc>) -> Result<DateTime<Utc>, JobError> {
+    if time.timestamp_subsec_nanos() >= 1_000_000_000 {
+        return Err(JobError::InvalidRequest);
+    }
+    DateTime::from_timestamp_millis(time.timestamp_millis()).ok_or(JobError::InvalidRequest)
+}
+
+fn deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, JobError> {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(Duration::try_seconds)
+        .and_then(|d| now.checked_add_signed(d))
+        .ok_or(JobError::InvalidRequest)
+}
+
+fn scoped(scope: &JobScope, job: &JobId) -> Result<(), JobError> {
+    if &job.scope == scope {
+        Ok(())
+    } else {
+        Err(JobError::Scope)
+    }
+}
+
+fn get(rows: &mut SqlRows<'_>, scope: &JobScope, id: &JobId) -> Result<JobRecord, JobError> {
+    scoped(scope, id)?;
+    rows.get(id)?.ok_or(JobError::NotFound)
+}
+
+fn live(row: &JobRecord, generation: u64, now: DateTime<Utc>) -> Result<(), JobError> {
+    if row.state == JobState::Running
+        && row.generation == generation
+        && row.lease_until.is_some_and(|until| until > now)
+    {
+        Ok(())
+    } else {
+        Err(JobError::StaleClaim)
+    }
+}
+
+fn delete_copies(row: &mut JobRecord) {
+    row.payload = None;
+    row.output = None;
+    row.output_bytes = 0;
+}
+
+fn finish(
+    row: &mut JobRecord,
+    state: JobState,
+    now: DateTime<Utc>,
+    config: &JobConfig,
+) -> Result<(), JobError> {
+    row.state = state;
+    row.finished_at = Some(now);
+    row.lease_until = None;
+    if row.recovery_until.is_none() {
+        row.recovery_until = Some(deadline(now, config.retention_seconds)?);
+    }
+    if row.recovery_until.is_some_and(|until| until <= now) {
+        row.result_expired = true;
+        delete_copies(row);
+    }
+    Ok(())
+}
+
+fn page(config: &JobConfig, limit: usize) -> Result<(), JobError> {
+    if limit == 0 || limit > config.max_page {
+        Err(JobError::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
+// One byte-bound owner for all JSON-array pages: reject an individually oversized
+// row, and defer a row that only exceeds the remaining aggregate page budget.
+fn page_bytes(
+    item: &impl Serialize,
+    used: usize,
+    max_bytes: usize,
+    comma: bool,
+    oversized: impl FnOnce(usize) -> JobError,
+) -> Result<Option<usize>, JobError> {
+    admit_page_bytes(encoded_bytes(item)?, used, max_bytes, comma, oversized)
+}
+
+fn admit_page_bytes(
+    size: usize,
+    used: usize,
+    max_bytes: usize,
+    comma: bool,
+    oversized: impl FnOnce(usize) -> JobError,
+) -> Result<Option<usize>, JobError> {
+    let individual = size.checked_add(2).ok_or(JobError::InvalidRequest)?;
+    if individual > max_bytes {
+        return Err(oversized(individual));
+    }
+    let required = used
+        .checked_add(size)
+        .and_then(|b| b.checked_add(usize::from(comma)))
+        .ok_or(JobError::InvalidRequest)?;
+    Ok((required <= max_bytes).then_some(required))
+}
+
+// Enqueue is the sole creator of live rows and retained input. Both utilization
+// checks derive from canonical rows under the same IMMEDIATE transaction.
+fn insert_job(rows: &mut SqlRows<'_>, config: &JobConfig, row: JobRecord) -> Result<(), JobError> {
+    if rows.live_count(&row.id.scope)? >= config.max_live_jobs
+        || rows
+            .usage(&row.id.scope)?
+            .bytes
+            .checked_add(job_input_bytes(&row)?)
+            .ok_or(JobError::Storage)?
+            > config.max_pending_bytes
+    {
+        return Err(JobError::QueueFull);
+    }
+    rows.save(row)
+}
+
+fn claim_job(
+    rows: &mut SqlRows<'_>,
+    config: &JobConfig,
+    now: DateTime<Utc>,
+    mut row: JobRecord,
+) -> Result<Option<JobRecord>, JobError> {
+    if !claimable(&row, now) {
+        return Ok(None);
+    }
+    if row.cancel_requested {
+        let state = stopped_state(&row);
+        finish(&mut row, state, now, config)?;
+        delete_copies(&mut row);
+        rows.save(row)?;
+        return Ok(None);
+    }
+    if row.generation >= u64::from(row.max_attempts) {
+        finish(&mut row, JobState::Refused, now, config)?;
+        rows.save(row)?;
+        return Ok(None);
+    }
+    row.state = JobState::Running;
+    row.generation = row
+        .generation
+        .checked_add(1)
+        .ok_or(JobError::InvalidRequest)?;
+    row.lease_until = Some(deadline(now, config.claim_lease_seconds)?);
+    rows.save(row.clone())?;
+    Ok(Some(row))
+}
+
+/// Apply one SQLite operation with scoped lifecycle, bounds and fences.
+/// Errors require rollback, including delivery leases.
+fn apply_job_request(
+    rows: &mut SqlRows<'_>,
+    scope: &JobScope,
+    config: &JobConfig,
+    now: DateTime<Utc>,
+    request: JobRequest,
+) -> Result<JobResponse, JobError> {
+    let now = millisecond_time(now)?;
+    if config.version != 1
+        || config.max_batch == 0
+        || config.max_page == 0
+        || config.max_live_jobs == 0
+        || config.max_page_bytes < 2
+        || config.max_result_bytes == 0
+        || config.maintenance_batch == 0
+        || config.maintenance_bytes_per_pass == 0
+        || config.claim_lease_seconds == 0
+        || config.delivery_lease_seconds == 0
+        || [&scope.tenant, &scope.incarnation, &scope.queue]
+            .iter()
+            .any(|s| s.is_empty())
+    {
+        return Err(JobError::InvalidRequest);
+    }
+    // Reject overflowing time policies before any writes or attempt consumption.
+    deadline(now, config.claim_lease_seconds)?;
+    deadline(now, config.delivery_lease_seconds)?;
+    deadline(now, config.retention_seconds)?;
+    match request {
+        JobRequest::Enqueue(specs) => {
+            if specs.len() > config.max_batch {
+                return Err(JobError::InvalidRequest);
+            }
+            let mut outcomes = Vec::with_capacity(specs.len());
+            for mut spec in specs {
+                if spec.key.is_empty() || spec.kind.is_empty() || spec.limits.max_attempts == 0 {
+                    return Err(JobError::InvalidRequest);
+                }
+                spec.recovery_until = spec.recovery_until.map(millisecond_time).transpose()?;
+                let digest = hex::encode(Sha256::digest(&spec.payload));
+                if let Some(row) = rows.by_key(scope, &spec.key)? {
+                    if row.digest != digest {
+                        return Err(JobError::KeyConflict);
+                    }
+                    outcomes.push(if row.state.acked() {
+                        Enqueued::AlreadyDone(Box::new(row))
+                    } else {
+                        Enqueued::Joined(row.id)
+                    });
+                    continue;
+                }
+                let id = JobId {
+                    scope: scope.clone(),
+                    id: QueueItemId::new().0,
+                };
+                insert_job(
+                    rows,
+                    config,
+                    JobRecord {
+                        id: id.clone(),
+                        key: spec.key,
+                        digest,
+                        group: spec.group,
+                        owners: spec.owners,
+                        kind: spec.kind,
+                        execution: spec.execution,
+                        state: JobState::Pending,
+                        final_state: None,
+                        payload: Some(spec.payload),
+                        max_attempts: spec.limits.max_attempts,
+                        generation: 0,
+                        lease_until: None,
+                        cancel_requested: false,
+                        purged: false,
+                        output: None,
+                        output_bytes: 0,
+                        origin: None,
+                        receipt: None,
+                        recovery_until: spec.recovery_until,
+                        result_expired: false,
+                        created_at: now,
+                        finished_at: None,
+                        delivery_generation: 0,
+                        delivery_until: None,
+                        diagnostic: None,
+                    },
+                )?;
+                outcomes.push(Enqueued::Inserted(id));
+            }
+            Ok(JobResponse::Enqueued(outcomes))
+        }
+        JobRequest::Claim {
+            kinds,
+            slots_available,
+        } => {
+            if kinds.is_empty() {
+                return Err(JobError::InvalidRequest);
+            }
+            if slots_available == 0 {
+                return Ok(JobResponse::Job(None));
+            }
+            let candidates =
+                rows.select(scope, JobQuery::Pending { kinds }, now, config.max_page)?;
+            for row in candidates {
+                if let Some(row) = claim_job(rows, config, now, row)? {
+                    return Ok(JobResponse::Job(Some(Box::new(row))));
+                }
+            }
+            Ok(JobResponse::Job(None))
+        }
+        JobRequest::Candidates {
+            kinds,
+            limit,
+            max_bytes,
+        } => {
+            page(config, limit)?;
+            if kinds.is_empty() {
+                return Err(JobError::InvalidRequest);
+            }
+            if max_bytes < 2 || max_bytes > config.max_page_bytes {
+                return Err(JobError::InvalidRequest);
+            }
+            let selected = rows.select(scope, JobQuery::Pending { kinds }, now, limit)?;
+            let mut page = Vec::new();
+            let mut bytes: usize = 2;
+            for row in selected {
+                let Some(required) =
+                    page_bytes(&row, bytes, max_bytes, !page.is_empty(), |bytes| {
+                        JobError::CandidateTooLarge {
+                            job: row.id.clone(),
+                            bytes,
+                        }
+                    })?
+                else {
+                    break;
+                };
+                bytes = required;
+                page.push(row);
+            }
+            Ok(JobResponse::Candidates(page))
+        }
+        JobRequest::ClaimJob(job) => {
+            let row = get(rows, scope, &job)?;
+            Ok(JobResponse::Job(
+                claim_job(rows, config, now, row)?.map(Box::new),
+            ))
+        }
+        JobRequest::Heartbeat { job, generation } => {
+            let mut row = get(rows, scope, &job)?;
+            live(&row, generation, now)?;
+            row.lease_until = Some(deadline(now, config.claim_lease_seconds)?);
+            rows.save(row)?;
+            Ok(JobResponse::Done)
+        }
+        JobRequest::Complete {
+            job,
+            generation,
+            state,
+            origin,
+            output,
+            receipt,
+            diagnostic,
+        } => {
+            let mut row = get(rows, scope, &job)?;
+            if let Some(output) = &output {
+                let bytes = output.len();
+                if bytes > config.max_result_bytes {
+                    return Err(JobError::ResultTooLarge {
+                        job: row.id.clone(),
+                        bytes,
+                    });
+                }
+            }
+            live(&row, generation, now)?;
+            if origin == ResultOrigin::Paid && row.execution != Execution::Model
+                || origin == ResultOrigin::Handler && row.execution != Execution::Handler
+                || state == JobState::Uncertain && row.execution != Execution::Model
+            {
+                return Err(JobError::InvalidRequest);
+            }
+            if !matches!(
+                state,
+                JobState::Succeeded
+                    | JobState::Failed
+                    | JobState::Cancelled
+                    | JobState::Refused
+                    | JobState::Uncertain
+            ) || origin == ResultOrigin::Paid && output.is_some()
+                || origin == ResultOrigin::Paid && receipt.is_none()
+                || origin != ResultOrigin::Paid && receipt.is_some()
+                || state == JobState::Succeeded
+                    && origin != ResultOrigin::Paid
+                    && output.is_none()
+                    && !row.purged
+                    && row.recovery_until.is_none_or(|until| until > now)
+            {
+                return Err(JobError::InvalidRequest);
+            }
+            row.origin = Some(origin);
+            row.receipt = receipt;
+            row.diagnostic = diagnostic;
+            if state == JobState::Uncertain {
+                row.state = state;
+                row.lease_until = None;
+                if row.purged {
+                    delete_copies(&mut row);
+                }
+            } else if row.purged {
+                finish(&mut row, JobState::Purged, now, config)?;
+                delete_copies(&mut row);
+            } else {
+                row.output = output;
+                let state = if row.cancel_requested {
+                    JobState::Cancelled
+                } else {
+                    state
+                };
+                finish(&mut row, state, now, config)?;
+            }
+            rows.save(row)?;
+            Ok(JobResponse::Done)
+        }
+        JobRequest::Resolve {
+            job,
+            generation,
+            resolution,
+        } => {
+            let mut row = get(rows, scope, &job)?;
+            if row.execution != Execution::Model
+                || !row.state.unfinished()
+                || row.generation != generation
+            {
+                return Err(JobError::StaleClaim);
+            }
+            row.origin = Some(ResultOrigin::Paid);
+            match resolution {
+                JobResolution::Uncertain { receipt } => {
+                    if row.state != JobState::Running && row.state != JobState::Uncertain {
+                        return Err(JobError::InvalidRequest);
+                    }
+                    row.receipt = Some(receipt);
+                    row.state = JobState::Uncertain;
+                    row.lease_until = None;
+                    row.diagnostic = Some(DiagnosticCode::SpendReconciliationRequired);
+                }
+                JobResolution::KnownZeroCharge { receipt } => {
+                    if row.state != JobState::Running && row.state != JobState::Uncertain {
+                        return Err(JobError::InvalidRequest);
+                    }
+                    row.receipt = Some(receipt);
+                    row.lease_until = None;
+                    row.diagnostic = None;
+                    if row.purged {
+                        finish(&mut row, JobState::Purged, now, config)?;
+                    } else if row.cancel_requested {
+                        finish(&mut row, JobState::Cancelled, now, config)?;
+                        delete_copies(&mut row);
+                    } else if row.generation >= u64::from(row.max_attempts) {
+                        row.diagnostic = Some(DiagnosticCode::AttemptBudgetExhausted);
+                        finish(&mut row, JobState::Refused, now, config)?;
+                    } else {
+                        row.state = JobState::Pending;
+                    }
+                }
+                JobResolution::PaidResult {
+                    receipt,
+                    recovery_until,
+                } => {
+                    row.receipt = Some(receipt);
+                    row.diagnostic = None;
+                    if let Some(until) = recovery_until {
+                        let until = millisecond_time(until)?;
+                        row.recovery_until = Some(
+                            row.recovery_until
+                                .map_or(until, |current| current.min(until)),
+                        );
+                    }
+                    let state = if row.purged {
+                        JobState::Purged
+                    } else if row.cancel_requested {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Succeeded
+                    };
+                    finish(&mut row, state, now, config)?;
+                }
+                JobResolution::Failed {
+                    receipt,
+                    diagnostic,
+                } => {
+                    row.receipt = Some(receipt);
+                    row.diagnostic = Some(diagnostic);
+                    let state = if row.purged {
+                        JobState::Purged
+                    } else if row.cancel_requested {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Failed
+                    };
+                    finish(&mut row, state, now, config)?;
+                }
+            }
+            if row.purged {
+                delete_copies(&mut row);
+            }
+            rows.save(row)?;
+            Ok(JobResponse::Done)
+        }
+        JobRequest::Completions { limit, max_bytes } => {
+            page(config, limit)?;
+            if max_bytes < 2 || max_bytes > config.max_page_bytes {
+                return Err(JobError::InvalidRequest);
+            }
+            let candidates = rows.inspect(scope, JobQuery::Final, now, limit)?;
+            let mut admitted = Vec::new();
+            let mut bytes: usize = 2; // JSON array brackets, plus commas between deliveries.
+            for info in candidates {
+                let mut row = rows.delivery_metadata(&info.id)?;
+                if row.recovery_until.is_some_and(|until| until <= now) {
+                    row.result_expired = true;
+                    delete_copies(&mut row);
+                }
+                row.delivery_generation = row
+                    .delivery_generation
+                    .checked_add(1)
+                    .ok_or(JobError::InvalidRequest)?;
+                row.delivery_until = Some(deadline(now, config.delivery_lease_seconds)?);
+                let token = DeliveryToken {
+                    job: row.id.clone(),
+                    generation: row.delivery_generation,
+                };
+                let delivery = Delivery {
+                    completion: row.clone(),
+                    token,
+                };
+                let has_output = info.output_bytes > 0 && !row.result_expired;
+                let size = encoded_bytes(&delivery)?
+                    .checked_add(if has_output {
+                        // A present output adds `,"output":` plus its encoded value.
+                        info.output_bytes.checked_add(10).ok_or(JobError::Storage)?
+                    } else {
+                        0
+                    })
+                    .ok_or(JobError::Storage)?;
+                let Some(required) =
+                    admit_page_bytes(size, bytes, max_bytes, !admitted.is_empty(), |bytes| {
+                        JobError::CompletionTooLarge {
+                            job: row.id.clone(),
+                            bytes,
+                        }
+                    })?
+                else {
+                    break;
+                };
+                bytes = required;
+                admitted.push((row, delivery, has_output));
+            }
+            let mut deliveries = Vec::with_capacity(admitted.len());
+            for (row, mut delivery, has_output) in admitted {
+                if has_output {
+                    delivery.completion.output = rows.output(&row.id)?;
+                    if delivery.completion.output.is_none() {
+                        return Err(JobError::Storage);
+                    }
+                }
+                rows.deliver(&row, row.result_expired)?;
+                deliveries.push(delivery);
+            }
+            Ok(JobResponse::Deliveries(CompletionPage {
+                items: deliveries,
+            }))
+        }
+        JobRequest::Ack(acks) => {
+            if acks.len() > config.max_batch
+                || serde_json::to_vec(&acks)
+                    .map_err(|_| JobError::Storage)?
+                    .len()
+                    > config.max_page_bytes
+            {
+                return Err(JobError::InvalidRequest);
+            }
+            // Scope checks for the entire request precede every lookup/write.
+            for (token, _) in &acks {
+                scoped(scope, &token.job)?;
+            }
+            let mut results = Vec::with_capacity(acks.len());
+            for (token, disposition) in acks {
+                let mut row = get(rows, scope, &token.job)?;
+                if row.state.unfinished() {
+                    return Err(JobError::NotFinal);
+                }
+                if token.generation == 0 || token.generation > row.delivery_generation {
+                    return Err(JobError::InvalidRequest);
+                }
+                if row.state.acked() {
+                    results.push(AckResult::AlreadyAcked(
+                        if row.state == JobState::Accepted {
+                            Disposition::Accepted
+                        } else {
+                            Disposition::Discarded
+                        },
+                    ));
+                } else {
+                    row.final_state = Some(row.state);
+                    row.state = match disposition {
+                        Disposition::Accepted => JobState::Accepted,
+                        Disposition::Discarded => JobState::Discarded,
+                    };
+                    rows.save(row)?;
+                    results.push(AckResult::Acked(disposition));
+                }
+            }
+            Ok(JobResponse::Acks(results))
+        }
+        JobRequest::Cancel(selector) => {
+            let selected = match selector {
+                Selector::Ids(ids) => {
+                    if ids.len() > config.max_batch {
+                        return Err(JobError::InvalidRequest);
+                    }
+                    for id in &ids {
+                        scoped(scope, id)?;
+                    }
+                    let unique: BTreeSet<_> = ids.into_iter().map(|id| id.id).collect();
+                    unique
+                        .into_iter()
+                        .map(|id| {
+                            get(
+                                rows,
+                                scope,
+                                &JobId {
+                                    scope: scope.clone(),
+                                    id,
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+                Selector::Group(group) => {
+                    let live = rows.live_count(scope)?;
+                    rows.select(scope, JobQuery::Group(group), now, live)?
+                }
+            };
+            let mut changed = 0;
+            for mut row in selected {
+                if !row.state.unfinished() {
+                    continue;
+                }
+                if claimable(&row, now) {
+                    let state = stopped_state(&row);
+                    finish(&mut row, state, now, config)?;
+                    delete_copies(&mut row);
+                } else {
+                    row.cancel_requested = true;
+                }
+                rows.save(row)?;
+                changed += 1;
+            }
+            Ok(JobResponse::Changed(changed))
+        }
+        JobRequest::PurgeOwner(owner) => {
+            let live = rows.live_count(scope)?;
+            let selected = rows.select(scope, JobQuery::Owner(owner), now, live)?;
+            let count = selected.len();
+            for mut row in selected {
+                row.purged = true;
+                row.owners.clear();
+                row.cancel_requested = true;
+                delete_copies(&mut row);
+                if claimable(&row, now)
+                    || row.state != JobState::Running
+                        && row.state != JobState::Uncertain
+                        && !row.state.acked()
+                {
+                    finish(&mut row, JobState::Purged, now, config)?;
+                }
+                rows.save(row)?;
+            }
+            Ok(JobResponse::Changed(count))
+        }
+        JobRequest::Diagnostics {
+            group,
+            after,
+            limit,
+        } => {
+            page(config, limit)?;
+            let selected =
+                rows.inspect(scope, JobQuery::Diagnostics { group, after }, now, limit)?;
+            let after = selected.last().map(|r| r.id.id.clone());
+            let items = selected
+                .into_iter()
+                .map(|r| JobDiagnostic {
+                    id: r.id,
+                    state: r.state,
+                    code: r.diagnostic,
+                })
+                .collect();
+            Ok(JobResponse::Diagnostics(DiagnosticPage { items, after }))
+        }
+        JobRequest::Maintain => {
+            let selected = rows.inspect(scope, JobQuery::Expired, now, config.maintenance_batch)?;
+            let mut count = 0;
+            let mut bytes: usize = 0;
+            for row in selected {
+                let required = bytes
+                    .checked_add(rows.recovery_bytes(&row.id)?)
+                    .ok_or(JobError::Storage)?;
+                // Always admit the first job, including one larger than the budget.
+                if count > 0 && required > config.maintenance_bytes_per_pass {
+                    break;
+                }
+                rows.expire(&row.id)?;
+                count += 1;
+                bytes = required;
+                if bytes >= config.maintenance_bytes_per_pass {
+                    break;
+                }
+            }
+            Ok(JobResponse::Changed(count))
+        }
+        JobRequest::Get(id) => Ok(JobResponse::Job(Some(Box::new(get(rows, scope, &id)?)))),
+        JobRequest::PendingUsage => Ok(JobResponse::Usage(rows.usage(scope)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +1279,137 @@ mod tests {
     fn count(conn: &Connection, table: &str) -> usize {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn jobs_confirmation_retains_only_authorized_tombstone_fields() {
+        for disposition in [Disposition::Accepted, Disposition::Discarded] {
+            let queue = SqliteQueue::in_memory().unwrap();
+            let scope = scope();
+            let config = JobConfig::default();
+            let now = Utc::now();
+            let mut spec = spec("tombstone");
+            spec.execution = Execution::Model;
+            queue
+                .job_operation(
+                    &scope,
+                    &config,
+                    now,
+                    JobRequest::Enqueue(vec![spec.clone()]),
+                )
+                .unwrap();
+            let mut row = SqlRows::new(&queue.conn.lock().unwrap())
+                .by_key(&scope, &spec.key)
+                .unwrap()
+                .unwrap();
+            // Populate every operational field so incomplete narrowing is visible.
+            row.state = JobState::Failed;
+            row.final_state = Some(JobState::Failed);
+            row.generation = 3;
+            row.lease_until = Some(now);
+            row.cancel_requested = true;
+            row.purged = true;
+            row.output = Some(b"result".to_vec());
+            row.origin = Some(ResultOrigin::Paid);
+            row.receipt = Some("receipt-reference".into());
+            row.recovery_until = Some(now + Duration::seconds(60));
+            row.result_expired = true;
+            row.finished_at = Some(now);
+            row.delivery_generation = 2;
+            row.delivery_until = Some(now);
+            row.diagnostic = Some(DiagnosticCode::AttemptBudgetExhausted);
+            SqlRows::new(&queue.conn.lock().unwrap())
+                .save(row.clone())
+                .unwrap();
+            let token = DeliveryToken {
+                job: row.id.clone(),
+                generation: 1,
+            };
+            assert!(
+                matches!(queue.job_operation(&scope, &config, now, JobRequest::Ack(vec![(token.clone(), disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::Acked(disposition)])
+            );
+            {
+                let conn = queue.conn.lock().unwrap();
+                let cleared = COLUMNS
+                    .split(", ")
+                    .filter(|column| {
+                        ![
+                            "scope",
+                            "id",
+                            "key",
+                            "digest",
+                            "state",
+                            "final_state",
+                            "receipt",
+                            "delivery_generation",
+                        ]
+                        .contains(column)
+                    })
+                    .map(|column| format!("{column} IS NULL"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                assert!(
+                    conn.query_row(
+                        &format!("SELECT {cleared} FROM jobs WHERE scope=?1 AND id=?2"),
+                        params![json(&scope).unwrap(), row.id.id],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap(),
+                    "operational metadata survived confirmation"
+                );
+                assert_eq!(count(&conn, "job_owners"), 0);
+            }
+            let tombstone = match queue
+                .job_operation(
+                    &scope,
+                    &config,
+                    now,
+                    JobRequest::Enqueue(vec![spec.clone()]),
+                )
+                .unwrap()
+            {
+                JobResponse::Enqueued(mut results) => match results.remove(0) {
+                    Enqueued::AlreadyDone(row) => row,
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(tombstone.id, row.id);
+            assert_eq!(tombstone.digest, row.digest);
+            assert_eq!(tombstone.final_state, Some(JobState::Failed));
+            assert_eq!(tombstone.receipt, row.receipt);
+            assert_eq!(tombstone.delivery_generation, 2);
+            assert!(
+                tombstone.group.is_none()
+                    && tombstone.kind.is_empty()
+                    && tombstone.owners.is_empty()
+            );
+            assert!(
+                matches!(queue.job_operation(&scope, &config, now, JobRequest::Ack(vec![(token, disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::AlreadyAcked(disposition)])
+            );
+            for generation in [0, 3] {
+                assert!(matches!(
+                    queue.job_operation(
+                        &scope,
+                        &config,
+                        now,
+                        JobRequest::Ack(vec![(
+                            DeliveryToken {
+                                job: row.id.clone(),
+                                generation
+                            },
+                            disposition
+                        )])
+                    ),
+                    Err(JobError::InvalidRequest)
+                ));
+            }
+            spec.payload.push(0);
+            assert!(matches!(
+                queue.job_operation(&scope, &config, now, JobRequest::Enqueue(vec![spec])),
+                Err(JobError::KeyConflict)
+            ));
+        }
     }
 
     #[test]
@@ -697,7 +1604,7 @@ mod tests {
         let a = SqliteQueue::open(&path).unwrap();
         let b = SqliteQueue::open(&path).unwrap();
         let config = JobConfig {
-            max_pending_items: 1,
+            max_live_jobs: 1,
             ..JobConfig::default()
         };
         let scope = scope();
@@ -834,8 +1741,8 @@ mod tests {
                 .count(),
             1
         );
-        // A confirmation and an enqueue must overlap safely without losing
-        // the retained-input bound check.
+        // With one live slot, admission depends on which writer wins: enqueue
+        // before confirmation must refuse, and enqueue after it must succeed.
         let cross_id = match a
             .job_operation(
                 &scope,
@@ -892,9 +1799,38 @@ mod tests {
             })
         })
         .collect();
-        for handle in handles {
-            handle.await.unwrap().unwrap();
-        }
+        let mut handles = handles.into_iter();
+        let confirmed = handles.next().unwrap().await.unwrap().unwrap();
+        assert!(
+            matches!(confirmed, JobResponse::Acks(ref results) if results == &[AckResult::Acked(Disposition::Accepted)])
+        );
+        let admitted = match handles.next().unwrap().await.unwrap() {
+            Ok(JobResponse::Enqueued(results)) => {
+                assert!(matches!(results.as_slice(), [Enqueued::Inserted(_)]));
+                true
+            }
+            Err(JobError::QueueFull) => false,
+            other => panic!("{other:?}"),
+        };
+        // Confirmation has now committed. A replay joins an admitted job; the
+        // previously refused key inserts once, proving refusal left no row.
+        let result = b
+            .job_operation(
+                &scope,
+                &config,
+                now,
+                JobRequest::Enqueue(vec![spec("cross-admitted")]),
+            )
+            .unwrap();
+        assert!(
+            matches!(result, JobResponse::Enqueued(ref results) if matches!(results.as_slice(), [Enqueued::Joined(_)]) == admitted && matches!(results.as_slice(), [Enqueued::Inserted(_)]) != admitted)
+        );
+        assert_eq!(
+            SqlRows::new(&b.conn.lock().unwrap())
+                .live_count(&scope)
+                .unwrap(),
+            1
+        );
     }
     #[test]
     fn jobs_indexed_pages_have_flat_work_and_cursor_plans() {
@@ -963,28 +1899,12 @@ mod tests {
             assert_eq!(diagnostics[0].id, eligible.id);
             let diagnostic_steps = metrics.steps.replace(0);
             let owner = store
-                .select(
-                    &scope(),
-                    JobQuery::Owner {
-                        owner: "target".into(),
-                        after: None,
-                    },
-                    now,
-                    1,
-                )
+                .select(&scope(), JobQuery::Owner("target".into()), now, 1)
                 .unwrap();
             assert_eq!(owner[0].id, eligible.id);
             let owner_steps = metrics.steps.replace(0);
             let unfinished = store
-                .select(
-                    &scope(),
-                    JobQuery::Group {
-                        group: "group".into(),
-                        after: None,
-                    },
-                    now,
-                    1,
-                )
+                .select(&scope(), JobQuery::Group("group".into()), now, 1)
                 .unwrap();
             assert_eq!(unfinished[0].id, template.id);
             let group_steps = metrics.steps.get();

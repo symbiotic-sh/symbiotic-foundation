@@ -51,7 +51,7 @@ use symbiotic_model::{
     ModelAdmission, QueuedChatProvider, QueuedClassifierProvider, QueuedEmbeddingProvider,
     QueuedRerankProvider,
 };
-use symbiotic_queue::{MemoryQueue, QueueBackend};
+use symbiotic_queue::QueueBackend;
 use symbiotic_queue_sqlite::SqliteQueue;
 use symbiotic_trace::TraceSink;
 
@@ -318,7 +318,12 @@ impl Runtime {
                 let (queue, maintenance) = open_persistent_queue(dir, &config)?;
                 (Arc::new(queue), Some(maintenance))
             }
-            None => (Arc::new(MemoryQueue::new()), None),
+            None => (
+                Arc::new(SqliteQueue::in_memory().map_err(|_| {
+                    ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
+                })?),
+                None,
+            ),
         };
         let spend: Arc<dyn SpendLedger> = match &config.state_dir {
             Some(dir) => Arc::new(
@@ -388,13 +393,8 @@ impl Runtime {
     }
 
     /// An in-memory runtime for configuration inspection; dispatch is refused.
-    pub fn in_memory() -> Self {
-        Self::from_state(
-            RuntimeConfig::default(),
-            Arc::new(MemoryQueue::new()),
-            Arc::new(model::UnavailableSpendLedger),
-            None,
-        )
+    pub fn in_memory() -> Result<Self, ModelError> {
+        Self::open(RuntimeConfig::default())
     }
 
     pub fn state_dir(&self) -> Option<&Path> {
@@ -999,4 +999,40 @@ pub fn account_scope(
         "account:{}",
         model::configuration_revision(&scope)?.0
     ))
+}
+
+#[cfg(test)]
+mod job_store_tests {
+    use super::*;
+    use symbiotic_queue::jobs::*;
+
+    #[tokio::test]
+    async fn jobs_in_memory_runtime_uses_initialized_sqlite() {
+        for runtime in [
+            Runtime::in_memory().unwrap(),
+            Runtime::open(RuntimeConfig::default()).unwrap(),
+        ] {
+            assert!(!runtime.is_persistent());
+            let scope = JobScope {
+                tenant: "tenant".into(),
+                incarnation: "restore".into(),
+                queue: "jobs".into(),
+            };
+            let result = runtime
+                .inner
+                .queue
+                .jobs(
+                    &scope,
+                    &JobConfig::default(),
+                    chrono::Utc::now(),
+                    JobRequest::PendingUsage,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, JobResponse::Usage(usage) if usage == PendingUsage::default())
+            );
+            assert!(runtime.last_maintenance_error().is_none());
+        }
+    }
 }
