@@ -87,6 +87,9 @@ pub struct JobFailure {
 
 /// Product work with opaque, exactly round-tripping bytes and no spend receipt.
 /// Handler failures are final; cancellation never causes a retry.
+/// Execution is at least once: after a crash, an expired lease can be claimed again.
+/// Handlers with external side effects must deduplicate by the job's scoped key
+/// and claim generation ([`JobContext::attempt`]), or fence downstream writes.
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     /// Execute one claim. Work already sent must finish under its own timeout;
@@ -140,39 +143,23 @@ impl Shared {
         if claim.execution != Execution::Handler {
             return Err(JobError::InvalidRequest.into());
         }
-        claim.payload = None;
+        let payload = claim.payload.take().ok_or(JobError::InvalidRequest)?;
         let (cancel, rx) = watch::channel(false);
         let shared = self.clone();
-        let row = claim.clone();
+        let ctx = JobContext {
+            id: claim.id.clone(),
+            key: claim.key.clone(),
+            attempt: claim.generation,
+            cancel: CancelToken(rx),
+        };
         // JoinSet supplies the panic boundary and aborts the task if its owning
         // worker is itself aborted. Ordinary cancel/shutdown always drains it.
         let mut task = JoinSet::new();
         task.spawn(async move {
-            let current = match shared.op(JobRequest::Get(row.id.clone())).await? {
-                JobResponse::Job(Some(current))
-                    if current.state == JobState::Running
-                        && current.generation == row.generation
-                        && current.lease_until.is_some_and(|until| until > Utc::now()) =>
-                {
-                    current
-                }
-                JobResponse::Job(_) => return Err(JobError::StaleClaim),
-                _ => return Err(JobError::InvalidRequest),
-            };
-            if current.cancel_requested || current.purged {
-                return Ok::<_, JobError>(None);
-            }
-            let payload = current.payload.as_deref().ok_or(JobError::InvalidRequest)?;
-            let ctx = JobContext {
-                id: row.id,
-                key: row.key,
-                attempt: row.generation,
-                cancel: CancelToken(rx),
-            };
             if ctx.cancel.is_cancelled() {
-                return Ok(None);
+                return None;
             }
-            Ok(Some(shared.handler.run(&ctx, payload).await))
+            Some(shared.handler.run(&ctx, &payload).await)
         });
         let mut renew = tokio::time::interval(self.heartbeat);
         let mut errors = Vec::new();
@@ -205,7 +192,7 @@ impl Shared {
             }
         };
         let (state, output, diagnostic) = match outcome {
-            Some(Ok(Ok(Some(Ok(output))))) if output.len() > self.jobs.max_result_bytes => {
+            Some(Ok(Some(Ok(output)))) if output.len() > self.jobs.max_result_bytes => {
                 errors.push(
                     JobError::ResultTooLarge {
                         job: claim.id.clone(),
@@ -215,13 +202,9 @@ impl Shared {
                 );
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
             }
-            Some(Ok(Ok(Some(Ok(output))))) => (JobState::Succeeded, Some(output), None),
-            Some(Ok(Ok(Some(Err(failure))))) => (JobState::Failed, None, Some(failure.code)),
-            Some(Ok(Ok(None))) => (JobState::Cancelled, None, None),
-            Some(Ok(Err(error))) => {
-                errors.push(error.into());
-                return Err(RunnerError::Workers(errors));
-            }
+            Some(Ok(Some(Ok(output)))) => (JobState::Succeeded, Some(output), None),
+            Some(Ok(Some(Err(failure)))) => (JobState::Failed, None, Some(failure.code)),
+            Some(Ok(None)) => (JobState::Cancelled, None, None),
             Some(Err(_)) => {
                 errors.push(RunnerError::HandlerPanicked(claim.id.clone()));
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))

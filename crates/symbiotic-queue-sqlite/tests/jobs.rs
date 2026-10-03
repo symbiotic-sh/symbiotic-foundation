@@ -451,7 +451,7 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
 }
 
 #[tokio::test]
-async fn runner_running_no_lookup_can_block_renewal_or_completion() {
+async fn runner_no_lookup_between_claim_and_completion() {
     let mut s = Suite::new();
     s.now = Utc::now();
     s.config.claim_lease_seconds = 1;
@@ -465,8 +465,7 @@ async fn runner_running_no_lookup_can_block_renewal_or_completion() {
         before: {
             let (started, lookups, renewals) = (started.clone(), lookups.clone(), renewals.clone());
             move |request: &JobRequest| {
-                let running_lookup =
-                    matches!(request, JobRequest::Get(_)) && started.load(Ordering::SeqCst);
+                let running_lookup = matches!(request, JobRequest::Get(_));
                 if running_lookup {
                     lookups.fetch_add(1, Ordering::SeqCst);
                 }
@@ -476,7 +475,7 @@ async fn runner_running_no_lookup_can_block_renewal_or_completion() {
                 }
                 Box::pin(async move {
                     if running_lookup {
-                        std::future::pending::<()>().await;
+                        return Err(JobError::InvalidRequest);
                     }
                     Ok(())
                 }) as futures::future::BoxFuture<'static, Result<(), JobError>>
@@ -499,7 +498,9 @@ async fn runner_running_no_lookup_can_block_renewal_or_completion() {
             }
         })
         .await;
-    entered.notified().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("runner did not hand the claim directly to the handler");
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     assert!(
         renewals.load(Ordering::SeqCst) >= 2,
@@ -990,75 +991,54 @@ async fn runner_accepts_heartbeat_at_half_the_claim_lease_and_derived_default() 
 }
 
 #[tokio::test]
-async fn runner_cancel_between_claim_and_entry_deletes_input() {
-    for after_snapshot in [false, true] {
+async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat() {
+    for purge in [false, true] {
         let mut s = Suite::new();
         s.now = Utc::now();
-        let id = s.insert(s.spec("cancel-before-entry")).await;
-        let observed = Arc::new(tokio::sync::Notify::new());
+        let spec = s.spec("claimed-handoff");
+        let payload = spec.payload.clone();
+        let id = s.insert(spec).await;
+        let heartbeat_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let backend = Arc::new(InterceptJobs {
             backend: s.backend.clone(),
             before: {
-                let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
+                let gate = heartbeat_gate.clone();
                 move |request: &JobRequest| {
-                    let job = match request {
-                        JobRequest::Get(job) if !after_snapshot => Some(job.clone()),
-                        _ => None,
-                    };
-                    let (store, scope, config) = (store.clone(), scope.clone(), config.clone());
+                    let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
+                    let gate = gate.clone();
                     Box::pin(async move {
-                        if let Some(job) = job {
-                            store
-                                .jobs(
-                                    &scope,
-                                    &config,
-                                    Utc::now(),
-                                    JobRequest::Cancel(Selector::Ids(vec![job])),
-                                )
-                                .await?;
+                        if heartbeat {
+                            gate.acquire().await.unwrap().forget();
                         }
                         Ok(())
                     })
                         as futures::future::BoxFuture<'static, Result<(), JobError>>
                 }
             },
-            after: after_snapshot.then(|| {
+            after: Some({
                 let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
                 Box::new(move |request: &JobRequest, response: &JobResponse| {
                     let job = match (request, response) {
-                        (JobRequest::Get(job), JobResponse::Job(Some(row))) => {
-                            assert!(!row.cancel_requested && row.payload.is_some());
-                            Some(job.clone())
-                        }
-                        (_, JobResponse::Heartbeat(true)) => {
-                            observed.notify_one();
-                            None
+                        (JobRequest::Claim { .. }, JobResponse::Job(Some(row))) => {
+                            assert_eq!(row.state, JobState::Running);
+                            assert_eq!(row.generation, 1);
+                            assert!(row.payload.is_some());
+                            Some(row.id.clone())
                         }
                         _ => None,
                     };
-                    let (store, scope, config, observed) = (
-                        store.clone(),
-                        scope.clone(),
-                        config.clone(),
-                        observed.clone(),
-                    );
+                    let (store, scope, config) = (store.clone(), scope.clone(), config.clone());
                     Box::pin(async move {
                         if let Some(job) = job {
-                            store
-                                .jobs(
-                                    &scope,
-                                    &config,
-                                    Utc::now(),
-                                    JobRequest::Cancel(Selector::Ids(vec![job])),
-                                )
-                                .await?;
-                            // Hold the uncancelled snapshot until the heartbeat signals the token.
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                observed.notified(),
-                            )
-                            .await
-                            .expect("heartbeat did not observe post-snapshot cancellation");
+                            let request = if purge {
+                                JobRequest::PurgeOwner("owner-a".into())
+                            } else {
+                                JobRequest::Cancel(Selector::Ids(vec![job]))
+                            };
+                            assert!(matches!(
+                                store.jobs(&scope, &config, Utc::now(), request).await?,
+                                JobResponse::Changed(1)
+                            ));
                         }
                         Ok(())
                     })
@@ -1066,30 +1046,78 @@ async fn runner_cancel_between_claim_and_entry_deletes_input() {
                 }) as Box<AfterJob>
             }),
         });
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runner = s
-            .runner_with_config(
-                backend,
-                RunnerConfig {
-                    worker_count: 1,
-                    heartbeat_interval_ms: Some(10),
-                    ..RunnerConfig::default()
-                },
-                {
-                    let calls = calls.clone();
-                    move |_, bytes| {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        async { Ok(bytes) }
-                    }
-                },
-            )
+            .runner_with_backend(backend, 1, move |ctx, bytes| {
+                let tx = tx.clone();
+                async move {
+                    assert!(!ctx.cancel.is_cancelled());
+                    tx.send(bytes.clone()).unwrap();
+                    ctx.cancel.cancelled().await;
+                    Ok(bytes)
+                }
+            })
             .await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("claim payload did not reach the handler"),
+            Some(payload.clone())
+        );
+        // The mutation committed before entry, but only the heartbeat signals it.
+        assert_eq!(s.get(&id).await.state, JobState::Running);
+        heartbeat_gate.add_permits(1);
         let row = s.final_row(&id).await;
         runner.shutdown().await.unwrap();
-        assert_eq!(row.state, JobState::Cancelled);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(row.generation, 1);
         assert!(row.payload.is_none());
+        if purge {
+            assert_eq!(row.state, JobState::Purged);
+            assert!(row.output.is_none());
+            assert!(row.owners.is_empty());
+            let delivery = s.deliveries(1, 100_000).await.remove(0);
+            assert!(delivery.completion.output.is_none());
+        } else {
+            assert_eq!(row.state, JobState::Cancelled);
+            assert_eq!(row.output, Some(payload));
+        }
+    }
+}
+
+#[tokio::test]
+async fn jobs_cancel_or_purge_before_claim_is_never_claimed() {
+    for purge in [false, true] {
+        let s = Suite::new();
+        let id = s.insert(s.spec("before-claim")).await;
+        let request = if purge {
+            JobRequest::PurgeOwner("owner-a".into())
+        } else {
+            JobRequest::Cancel(Selector::Ids(vec![id.clone()]))
+        };
+        assert_eq!(s.changed(request).await, 1);
+        for request in [
+            JobRequest::Claim {
+                kinds: vec!["handler".into()],
+                slots_available: 1,
+            },
+            JobRequest::ClaimJob(id.clone()),
+        ] {
+            assert!(matches!(
+                s.op(request).await.unwrap(),
+                JobResponse::Job(None)
+            ));
+        }
+        let row = s.get(&id).await;
+        assert_eq!(row.generation, 0);
+        assert_eq!(
+            row.state,
+            if purge {
+                JobState::Purged
+            } else {
+                JobState::Cancelled
+            }
+        );
+        assert!(row.payload.is_none() && row.output.is_none());
     }
 }
 
@@ -1132,52 +1160,46 @@ async fn runner_oversized_result_is_terminal_and_typed() {
 }
 
 #[tokio::test]
-async fn runner_claim_payload_is_dropped_before_entry_fetch() {
+async fn runner_handoff_retains_only_one_payload_buffer() {
+    struct BorrowedHandler(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl JobHandler for BorrowedHandler {
+        async fn run(&self, _: &JobContext, payload: &[u8]) -> Result<Vec<u8>, JobFailure> {
+            assert_eq!(payload.len(), CLAIM_BYTES);
+            assert!(payload.iter().all(|byte| *byte == 42));
+            assert_eq!(
+                LARGE_BUFFERS.load(Ordering::SeqCst),
+                1,
+                "runner copied the claim payload"
+            );
+            self.0.notify_one();
+            Ok(Vec::new())
+        }
+    }
     let mut s = Suite::new();
     s.now = Utc::now();
     let mut spec = s.spec("large-claim");
     spec.payload = vec![42; CLAIM_BYTES];
     let id = s.insert(spec).await;
-    let checked = Arc::new(AtomicBool::new(false));
-    let backend = Arc::new(InterceptJobs {
-        after: None,
-        backend: s.backend.clone(),
-        before: {
-            let checked = checked.clone();
-            move |request: &JobRequest| {
-                if matches!(request, JobRequest::Get(_)) && !checked.swap(true, Ordering::SeqCst) {
-                    assert_eq!(
-                        LARGE_BUFFERS.load(Ordering::SeqCst),
-                        0,
-                        "runner copied or retained the unused claim payload"
-                    );
-                }
-                Box::pin(async { Ok(()) })
-                    as futures::future::BoxFuture<'static, Result<(), JobError>>
-            }
-        },
-    });
     let entered = Arc::new(tokio::sync::Notify::new());
-    let runner = s
-        .runner_with_backend(backend, 1, {
-            let entered = entered.clone();
-            move |_, bytes| {
-                let entered = entered.clone();
-                async move {
-                    assert_eq!(bytes.len(), CLAIM_BYTES);
-                    assert!(bytes.iter().all(|byte| *byte == 42));
-                    entered.notify_one();
-                    Ok(Vec::new())
-                }
-            }
-        })
-        .await;
+    let runner = JobRunner::start(
+        s.backend.clone(),
+        s.scope.clone(),
+        s.config.clone(),
+        RunnerConfig {
+            worker_count: 1,
+            ..RunnerConfig::default()
+        },
+        "handler".into(),
+        Arc::new(BorrowedHandler(entered.clone())),
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
         .await
         .unwrap();
     let row = s.final_row(&id).await;
     runner.shutdown().await.unwrap();
-    assert!(checked.load(Ordering::SeqCst));
     assert_eq!(row.state, JobState::Succeeded);
 }
 
