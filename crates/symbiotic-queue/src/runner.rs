@@ -24,6 +24,7 @@ pub struct RunnerConfig {
     /// Store polling period for new work (100 ms; PROVISIONAL).
     pub poll_interval_ms: u64,
     /// Heartbeat/cancel interval in milliseconds; None derives lease/3 (PROVISIONAL).
+    /// The effective interval must be positive and at most half the claim lease.
     pub heartbeat_interval_ms: Option<u64>,
     /// Independent bounded maintenance period (60 seconds; PROVISIONAL).
     pub maintenance_interval_ms: u64,
@@ -42,6 +43,7 @@ impl Default for RunnerConfig {
 }
 
 /// Cooperative cancellation; a handler decides how to finish work already started.
+/// Store cancellation latency is one heartbeat interval plus the heartbeat call's own time.
 #[derive(Clone, Debug)]
 pub struct CancelToken(watch::Receiver<bool>);
 
@@ -167,6 +169,9 @@ impl Shared {
                 attempt: row.generation,
                 cancel: CancelToken(rx),
             };
+            if ctx.cancel.is_cancelled() {
+                return Ok(None);
+            }
             Ok(Some(shared.handler.run(&ctx, payload).await))
         });
         let mut renew = tokio::time::interval(self.heartbeat);
@@ -316,20 +321,25 @@ impl JobRunner {
         kind: String,
         handler: Arc<dyn JobHandler>,
     ) -> Result<Self, RunnerError> {
+        let lease = Duration::from_secs(jobs.claim_lease_seconds);
+        let heartbeat = config
+            .heartbeat_interval_ms
+            .map(Duration::from_millis)
+            .unwrap_or(lease / 3);
         if config.version != 1
             || config.worker_count == 0
             || config.poll_interval_ms == 0
-            || config.heartbeat_interval_ms == Some(0)
+            || heartbeat.is_zero()
+            || heartbeat > lease / 2
             || config.maintenance_interval_ms == 0
             || kind.is_empty()
         {
             return Err(JobError::InvalidRequest.into());
         }
-        let heartbeat = config.heartbeat_interval_ms.map(Duration::from_millis);
         let shared = Arc::new(Shared {
             backend,
             scope,
-            heartbeat: heartbeat.unwrap_or(Duration::from_secs(jobs.claim_lease_seconds) / 3),
+            heartbeat,
             jobs,
             kind,
             handler,

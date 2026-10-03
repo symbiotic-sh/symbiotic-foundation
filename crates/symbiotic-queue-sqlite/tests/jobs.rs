@@ -47,9 +47,14 @@ where
     }
 }
 
+type AfterJob = dyn Fn(&JobRequest, &JobResponse) -> futures::future::BoxFuture<'static, Result<(), JobError>>
+    + Send
+    + Sync;
+
 struct InterceptJobs<F> {
     backend: Arc<symbiotic_queue_sqlite::SqliteQueue>,
     before: F,
+    after: Option<Box<AfterJob>>,
 }
 
 #[async_trait::async_trait]
@@ -65,7 +70,14 @@ where
         request: JobRequest,
     ) -> Result<JobResponse, JobError> {
         (self.before)(&request).await?;
-        self.backend.jobs(scope, config, now, request).await
+        let response = self
+            .backend
+            .jobs(scope, config, now, request.clone())
+            .await?;
+        if let Some(after) = &self.after {
+            after(&request, &response).await?;
+        }
+        Ok(response)
     }
 
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
@@ -323,6 +335,7 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
     let resume = Arc::new(tokio::sync::Semaphore::new(0));
     let claims = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: idle.backend.clone(),
         before: {
             let (entered, resume, claims) = (entered.clone(), resume.clone(), claims.clone());
@@ -369,6 +382,7 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     let failed = Arc::new(AtomicBool::new(false));
     let renewals = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let (started, failed, renewals) = (started.clone(), failed.clone(), renewals.clone());
@@ -446,6 +460,7 @@ async fn runner_running_no_lookup_can_block_renewal_or_completion() {
     let lookups = Arc::new(AtomicUsize::new(0));
     let renewals = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let (started, lookups, renewals) = (started.clone(), lookups.clone(), renewals.clone());
@@ -515,6 +530,7 @@ async fn runner_pending_heartbeat_does_not_block_completion() {
     let id = s.insert(s.spec("slow-heartbeat")).await;
     let entered = Arc::new(tokio::sync::Notify::new());
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let entered = entered.clone();
@@ -640,6 +656,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
     let failed = Arc::new(AtomicBool::new(false));
     let completions = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let (started, failed, completions) =
@@ -788,6 +805,7 @@ async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
     let heartbeat_entered = Arc::new(tokio::sync::Notify::new());
     let heartbeat_gate = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let (entered, gate) = (heartbeat_entered.clone(), heartbeat_gate.clone());
@@ -909,52 +927,170 @@ async fn runner_handler_panic_is_final_and_visible() {
 }
 
 #[tokio::test]
-async fn runner_cancel_between_claim_and_entry_deletes_input() {
+async fn runner_rejects_heartbeat_longer_than_half_the_claim_lease() {
     let mut s = Suite::new();
-    s.now = Utc::now();
-    let id = s.insert(s.spec("cancel-before-entry")).await;
+    s.config.claim_lease_seconds = 1;
+    let operations = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
         backend: s.backend.clone(),
+        after: None,
         before: {
-            let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
-            move |request: &JobRequest| {
-                let job = match request {
-                    JobRequest::Get(job) => Some(job.clone()),
-                    _ => None,
-                };
-                let (store, scope, config) = (store.clone(), scope.clone(), config.clone());
-                Box::pin(async move {
-                    if let Some(job) = job {
-                        store
-                            .jobs(
-                                &scope,
-                                &config,
-                                Utc::now(),
-                                JobRequest::Cancel(Selector::Ids(vec![job])),
-                            )
-                            .await?;
-                    }
-                    Ok(())
-                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            let operations = operations.clone();
+            move |_: &JobRequest| {
+                operations.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+                    as futures::future::BoxFuture<'static, Result<(), JobError>>
             }
         },
     });
-    let calls = Arc::new(AtomicUsize::new(0));
-    let runner = s
-        .runner_with_backend(backend, 1, {
-            let calls = calls.clone();
-            move |_, bytes| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok(bytes) }
-            }
-        })
+    for interval in [Some(501), Some(1_000), Some(1_001), Some(u64::MAX), None] {
+        if interval.is_none() {
+            s.config.claim_lease_seconds = 0;
+        }
+        let result = JobRunner::start(
+            backend.clone(),
+            s.scope.clone(),
+            s.config.clone(),
+            RunnerConfig {
+                heartbeat_interval_ms: interval,
+                ..RunnerConfig::default()
+            },
+            "handler".into(),
+            Arc::new(Handler(|_, _| async {
+                panic!("invalid policy started a handler")
+            })),
+        )
         .await;
-    let row = s.final_row(&id).await;
-    runner.shutdown().await.unwrap();
-    assert_eq!(row.state, JobState::Cancelled);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(row.generation, 1);
-    assert!(row.payload.is_none());
+        let rejected = matches!(result, Err(RunnerError::Store(JobError::InvalidRequest)));
+        if let Ok(runner) = result {
+            runner.shutdown().await.unwrap();
+        }
+        assert!(rejected, "accepted heartbeat {interval:?}");
+    }
+    assert_eq!(operations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn runner_accepts_heartbeat_at_half_the_claim_lease_and_derived_default() {
+    let mut s = Suite::new();
+    s.config.claim_lease_seconds = 1;
+    for interval in [Some(500), None] {
+        let runner = s
+            .runner_with_config(
+                s.backend.clone(),
+                RunnerConfig {
+                    heartbeat_interval_ms: interval,
+                    ..RunnerConfig::default()
+                },
+                |_, bytes| async { Ok(bytes) },
+            )
+            .await;
+        runner.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn runner_cancel_between_claim_and_entry_deletes_input() {
+    for after_snapshot in [false, true] {
+        let mut s = Suite::new();
+        s.now = Utc::now();
+        let id = s.insert(s.spec("cancel-before-entry")).await;
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(InterceptJobs {
+            backend: s.backend.clone(),
+            before: {
+                let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
+                move |request: &JobRequest| {
+                    let job = match request {
+                        JobRequest::Get(job) if !after_snapshot => Some(job.clone()),
+                        _ => None,
+                    };
+                    let (store, scope, config) = (store.clone(), scope.clone(), config.clone());
+                    Box::pin(async move {
+                        if let Some(job) = job {
+                            store
+                                .jobs(
+                                    &scope,
+                                    &config,
+                                    Utc::now(),
+                                    JobRequest::Cancel(Selector::Ids(vec![job])),
+                                )
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                        as futures::future::BoxFuture<'static, Result<(), JobError>>
+                }
+            },
+            after: after_snapshot.then(|| {
+                let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
+                Box::new(move |request: &JobRequest, response: &JobResponse| {
+                    let job = match (request, response) {
+                        (JobRequest::Get(job), JobResponse::Job(Some(row))) => {
+                            assert!(!row.cancel_requested && row.payload.is_some());
+                            Some(job.clone())
+                        }
+                        (_, JobResponse::Heartbeat(true)) => {
+                            observed.notify_one();
+                            None
+                        }
+                        _ => None,
+                    };
+                    let (store, scope, config, observed) = (
+                        store.clone(),
+                        scope.clone(),
+                        config.clone(),
+                        observed.clone(),
+                    );
+                    Box::pin(async move {
+                        if let Some(job) = job {
+                            store
+                                .jobs(
+                                    &scope,
+                                    &config,
+                                    Utc::now(),
+                                    JobRequest::Cancel(Selector::Ids(vec![job])),
+                                )
+                                .await?;
+                            // Hold the uncancelled snapshot until the heartbeat signals the token.
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                observed.notified(),
+                            )
+                            .await
+                            .expect("heartbeat did not observe post-snapshot cancellation");
+                        }
+                        Ok(())
+                    })
+                        as futures::future::BoxFuture<'static, Result<(), JobError>>
+                }) as Box<AfterJob>
+            }),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = s
+            .runner_with_config(
+                backend,
+                RunnerConfig {
+                    worker_count: 1,
+                    heartbeat_interval_ms: Some(10),
+                    ..RunnerConfig::default()
+                },
+                {
+                    let calls = calls.clone();
+                    move |_, bytes| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        async { Ok(bytes) }
+                    }
+                },
+            )
+            .await;
+        let row = s.final_row(&id).await;
+        runner.shutdown().await.unwrap();
+        assert_eq!(row.state, JobState::Cancelled);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(row.generation, 1);
+        assert!(row.payload.is_none());
+    }
 }
 
 #[tokio::test]
@@ -1004,6 +1140,7 @@ async fn runner_claim_payload_is_dropped_before_entry_fetch() {
     let id = s.insert(spec).await;
     let checked = Arc::new(AtomicBool::new(false));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let checked = checked.clone();
@@ -1054,6 +1191,7 @@ async fn runner_repeated_monitoring_errors_are_bounded_and_completion_is_separat
     let failures = Arc::new(AtomicUsize::new(0));
     let finish = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = Arc::new(InterceptJobs {
+        after: None,
         backend: s.backend.clone(),
         before: {
             let (started, failures, finish) = (started.clone(), failures.clone(), finish.clone());
