@@ -71,6 +71,8 @@ mod secrets;
 pub use secrets::{CredentialBoundary, SecretValue};
 mod registry;
 pub use registry::*;
+mod anthropic;
+pub use anthropic::AnthropicChatProvider;
 mod retrieval;
 pub use retrieval::{CohereRerankProvider, CompatibleEmbeddingProvider};
 mod classify;
@@ -3660,6 +3662,21 @@ pub enum ThinkingMode {
     Disabled,
 }
 
+fn chat_output_tokens(requested: Option<u32>, ceiling: Option<u32>) -> Result<u32, ModelError> {
+    let output = requested
+        .or(ceiling)
+        .filter(|n| *n > 0)
+        .ok_or(ModelError::InvalidRequest(
+            DiagnosticCode::FiniteOutputTokensAreRequired,
+        ))?;
+    if ceiling.is_some_and(|limit| output > limit) {
+        return Err(ModelError::InvalidRequest(
+            DiagnosticCode::OutputTokenLimitExceeded,
+        ));
+    }
+    Ok(output)
+}
+
 /// Refuse settings that would otherwise be silently omitted from the wire.
 fn validate_chat_settings(
     thinking: Option<ThinkingMode>,
@@ -3890,21 +3907,10 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
         secrets::credential_boundary(
             (async {
                 self.validate_configuration()?;
-                let output = request
-                    .max_output_tokens
-                    .or(self.max_output_tokens)
-                    .filter(|n| *n > 0)
-                    .ok_or({
-                        ModelError::InvalidRequest(
-                            symbiotic_core::DiagnosticCode::FiniteOutputTokensAreRequired,
-                        )
-                    })?;
-                if self.max_output_tokens.is_some_and(|limit| output > limit) {
-                    return Err(ModelError::InvalidRequest(
-                        symbiotic_core::DiagnosticCode::OutputTokenLimitExceeded,
-                    ));
-                }
-                request.max_output_tokens = Some(output);
+                request.max_output_tokens = Some(chat_output_tokens(
+                    request.max_output_tokens,
+                    self.max_output_tokens,
+                )?);
                 let body = wire::openai_chat_body(
                     &self.descriptor.identity.model.0,
                     &request,

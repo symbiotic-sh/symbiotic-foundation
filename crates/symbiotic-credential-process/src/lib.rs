@@ -29,6 +29,13 @@ use symbiotic_egress::*;
 pub enum RouteProvider {
     /// Existing OpenAI-compatible chat adapter.
     OpenAiChat { operator: String },
+    /// Anthropic Messages with explicit thinking mode.
+    AnthropicChat {
+        /// Provider identity.
+        operator: String,
+        /// Enabled maps to adaptive thinking; disabled/None omits it.
+        thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
+    },
     /// Existing Gemini embedding adapter, pinned to Google's service.
     GeminiEmbedding { dimensions: usize },
     /// Compatible embedding protocol and explicit dimensions, resolved by the registry.
@@ -559,7 +566,9 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         {
             Err(EgressError::InvalidRequest)
         }
-        RouteProvider::OpenAiChat { operator } if operator.is_empty() => {
+        RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. }
+            if operator.is_empty() =>
+        {
             Err(EgressError::InvalidRequest)
         }
         _ => Ok(()),
@@ -595,26 +604,38 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
             .map(|_| ())
             .map_err(payload_error)
         }
-        (RouteProvider::OpenAiChat { .. }, ProviderPayload::Chat(request))
-            if !request.messages.is_empty()
-                && request.messages.len() <= 128
-                && request
-                    .messages
-                    .iter()
-                    .all(|message| message.role.len() <= route.max_field_bytes)
-                && request
-                    .max_output_tokens
-                    .is_some_and(|limit| limit > 0 && limit <= route.max_output_tokens) =>
+        (
+            RouteProvider::OpenAiChat { .. } | RouteProvider::AnthropicChat { .. },
+            ProviderPayload::Chat(request),
+        ) if !request.messages.is_empty()
+            && request.messages.len() <= 128
+            && request
+                .messages
+                .iter()
+                .all(|message| message.role.len() <= route.max_field_bytes)
+            && request
+                .max_output_tokens
+                .is_some_and(|limit| limit > 0 && limit <= route.max_output_tokens) =>
         {
-            symbiotic_ai_runtime::model::wire::openai_chat_body(
-                &route.model,
-                request,
-                None,
-                None,
-                Some(route.max_input_bytes),
-            )
+            match &route.provider {
+                RouteProvider::AnthropicChat { thinking, .. } => {
+                    symbiotic_ai_runtime::model::wire::anthropic_chat_body(
+                        &route.model,
+                        request,
+                        *thinking,
+                        Some(route.max_input_bytes),
+                    )
+                }
+                _ => symbiotic_ai_runtime::model::wire::openai_chat_body(
+                    &route.model,
+                    request,
+                    None,
+                    None,
+                    Some(route.max_input_bytes),
+                ),
+            }
             .map(|_| ())
-            .map_err(|_| EgressError::LimitExceeded)
+            .map_err(payload_error)
         }
         (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request))
             if !request.inputs.is_empty()

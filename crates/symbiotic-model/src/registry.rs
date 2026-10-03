@@ -12,6 +12,8 @@ use symbiotic_core::{
 pub enum ModelAdapter {
     /// Compatible chat completions over HTTP.
     OpenAiChat,
+    /// Anthropic non-streaming Messages API.
+    AnthropicChat,
     /// Gemini single and batch embedding requests.
     GeminiEmbedding,
     /// OpenAI/OpenRouter compatible batch embeddings, including Qwen.
@@ -27,7 +29,7 @@ impl ModelAdapter {
     /// Operation implemented by this adapter.
     pub fn capability(self) -> ModelCapability {
         match self {
-            Self::OpenAiChat => ModelCapability::Chat,
+            Self::OpenAiChat | Self::AnthropicChat => ModelCapability::Chat,
             Self::GeminiEmbedding | Self::OpenAiEmbedding | Self::OllamaEmbedding => {
                 ModelCapability::Embedding
             }
@@ -37,7 +39,7 @@ impl ModelAdapter {
     }
     fn operation(self) -> &'static str {
         match self {
-            Self::OpenAiChat => "chat",
+            Self::OpenAiChat | Self::AnthropicChat => "chat",
             Self::GeminiEmbedding | Self::OpenAiEmbedding | Self::OllamaEmbedding => "embedding",
             Self::CohereRerank => "rerank",
             Self::JevClassifier => "classify",
@@ -335,9 +337,9 @@ impl ModelRegistry {
             }
             validate_endpoint(&binding.endpoint)?;
             let model = registry.model(&binding.model)?;
-            if (model.adapter == ModelAdapter::OpenAiChat
+            if (model.adapter.capability() == ModelCapability::Chat
                 && binding.limits.max_output_tokens.is_none())
-                || (model.adapter != ModelAdapter::OpenAiChat
+                || (model.adapter.capability() != ModelCapability::Chat
                     && binding.limits.max_output_tokens.is_some())
             {
                 return Err(invalid());
@@ -351,14 +353,17 @@ impl ModelRegistry {
             {
                 return Err(invalid());
             }
-            if model.adapter == ModelAdapter::OpenAiChat {
+            if model.adapter.capability() == ModelCapability::Chat {
                 crate::validate_chat_settings(
                     settings.thinking,
                     settings.reasoning_effort.as_deref(),
                 )?;
             }
             match model.adapter {
-                ModelAdapter::OpenAiChat
+                ModelAdapter::AnthropicChat if settings.reasoning_effort.is_some() => {
+                    return Err(invalid());
+                }
+                ModelAdapter::OpenAiChat | ModelAdapter::AnthropicChat
                     if settings.dimensions.is_some() || settings.served_model.is_some() =>
                 {
                     return Err(invalid());

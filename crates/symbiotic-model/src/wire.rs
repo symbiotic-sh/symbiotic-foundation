@@ -160,6 +160,57 @@ pub fn gemini_embedding_body(
     }
 }
 
+/// Encode a Messages request with an optional leading system prompt, followed
+/// by user/assistant messages in their original order. Other roles and response
+/// formats are refused rather than omitted.
+pub fn anthropic_chat_body(
+    model: &str,
+    request: &ChatRequest,
+    thinking: Option<ThinkingMode>,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ModelError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        model: &'a str,
+        max_tokens: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<&'a str>,
+        messages: &'a [ChatMessage],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<Value>,
+        stream: bool,
+    }
+    let (system, messages) = match request.messages.split_first() {
+        Some((first, rest)) if first.role == "system" => (Some(first.content.as_str()), rest),
+        _ => (None, request.messages.as_slice()),
+    };
+    if request.response_format.is_some()
+        || messages.is_empty()
+        || messages
+            .iter()
+            .any(|m| !matches!(m.role.as_str(), "user" | "assistant"))
+    {
+        return Err(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration,
+        ));
+    }
+    encode(
+        &Body {
+            model,
+            max_tokens: request.max_output_tokens,
+            system,
+            messages,
+            temperature: request.temperature,
+            thinking: (thinking == Some(ThinkingMode::Enabled))
+                .then(|| serde_json::json!({"type":"adaptive"})),
+            stream: false,
+        },
+        max_bytes,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

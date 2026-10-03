@@ -545,6 +545,26 @@ impl Runtime {
                     self.rerank(self.registry_binding(tenant, principal, raw)?)?,
                 ))
             }
+            model::ModelAdapter::AnthropicChat => {
+                let raw = model::AnthropicChatProvider::new(
+                    &resolved.model.identity.operator.0,
+                    &resolved.model.identity.model.0,
+                    &config.endpoint,
+                    key,
+                )
+                .with_timeout(timeout_seconds)?
+                .with_request_limit(limits.max_request_bytes)
+                .with_response_limit(limits.max_response_bytes)
+                .with_output_limit(limits.max_output_tokens.ok_or({
+                    ModelError::InvalidRequest(
+                        symbiotic_core::DiagnosticCode::ChatOutputLimitRequired,
+                    )
+                })?)
+                .with_thinking(settings.thinking);
+                Ok(ConfiguredProvider::Chat(
+                    self.chat(self.registry_binding(tenant, principal, raw)?)?,
+                ))
+            }
             model::ModelAdapter::OpenAiChat => {
                 let mut raw = model::OpenAiCompatibleChatProvider::new(
                     &resolved.model.identity.operator.0,
@@ -770,7 +790,7 @@ impl Runtime {
                     .get("max_response_bytes")
                     .and_then(serde_json::Value::as_u64)
                     != Some(resolved.binding.limits.max_response_bytes as u64)
-                || (resolved.model.adapter == model::ModelAdapter::OpenAiChat
+                || (resolved.model.adapter.capability() == model::ModelCapability::Chat
                     && descriptor
                         .metadata
                         .get("max_output_tokens")
@@ -798,6 +818,22 @@ impl Runtime {
                         )
                     })?))
             {
+                return Err(ModelError::InvalidRequest(
+                    symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding,
+                ));
+            }
+            let chat_wire = match resolved.model.adapter {
+                model::ModelAdapter::OpenAiChat => Some("openai-compatible"),
+                model::ModelAdapter::AnthropicChat => Some("anthropic-messages"),
+                _ => None,
+            };
+            if chat_wire.is_some_and(|wire| {
+                descriptor
+                    .metadata
+                    .get("wire")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(wire)
+            }) {
                 return Err(ModelError::InvalidRequest(
                     symbiotic_core::DiagnosticCode::EffectiveTransportDiffersFromConfiguredBinding,
                 ));

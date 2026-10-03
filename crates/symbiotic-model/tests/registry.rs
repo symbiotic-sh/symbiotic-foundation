@@ -162,3 +162,30 @@ fn regression_policy_rejects_unrepresentable_durations() {
     config["accounts"][0]["policy"]["budget_renewal_seconds"] = json!(0);
     assert!(load(&config).is_ok());
 }
+
+#[test]
+fn anthropic_registration_requires_chat_limits_and_refuses_unsupported_settings() {
+    let mut config = config();
+    config["models"][0]["adapter"] = json!("anthropic_chat");
+    for thinking in [Value::Null, json!("enabled"), json!("disabled")] {
+        config["bindings"][0]["settings"]["thinking"] = thinking;
+        assert_eq!(
+            load(&config)
+                .unwrap()
+                .model("example-chat")
+                .unwrap()
+                .adapter,
+            symbiotic_model::ModelAdapter::AnthropicChat
+        );
+    }
+    for (path, value) in [
+        ("/bindings/0/settings/reasoning_effort", json!("high")),
+        ("/bindings/0/settings/dimensions", json!(3)),
+        ("/bindings/0/limits/max_output_tokens", Value::Null),
+        ("/bindings/0/limits/max_output_tokens", json!(0)),
+    ] {
+        let mut invalid = config.clone();
+        *invalid.pointer_mut(path).unwrap() = value;
+        assert!(load(&invalid).is_err(), "{path}");
+    }
+}
