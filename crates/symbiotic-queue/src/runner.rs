@@ -44,7 +44,7 @@ impl Default for RunnerConfig {
 
 /// Cooperative cancellation; a handler decides how to finish work already started.
 /// Store cancellation latency depends on heartbeat scheduling and successful store-call
-/// time, including connection-mutex waits; it has no numeric bound.
+/// time, including storage busy-timeout and connection-mutex waits; it has no numeric bound.
 #[derive(Clone, Debug)]
 pub struct CancelToken(watch::Receiver<bool>);
 

@@ -1078,7 +1078,7 @@ async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
     let row = s.final_row(&running).await;
     assert_eq!(row.state, JobState::Cancelled);
     assert_eq!(row.output, Some(b"already sent finished".to_vec()));
-    assert!(row.payload.is_none());
+    assert_eq!(row.payload, Some(s.spec("running").payload));
     assert_eq!(row.generation, 1);
     runner.shutdown().await.unwrap();
 }
@@ -1278,15 +1278,16 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
         let row = s.final_row(&id).await;
         runner.shutdown().await.unwrap();
         assert_eq!(row.generation, 1);
-        assert!(row.payload.is_none());
         if purge {
             assert_eq!(row.state, JobState::Purged);
+            assert!(row.payload.is_none());
             assert!(row.output.is_none());
             assert!(row.owners.is_empty());
             let delivery = s.deliveries(1, 100_000).await.remove(0);
             assert!(delivery.completion.output.is_none());
         } else {
             assert_eq!(row.state, JobState::Cancelled);
+            assert_eq!(row.payload, Some(payload.clone()));
             assert_eq!(row.output, Some(payload));
         }
     }
@@ -2024,7 +2025,7 @@ async fn jobs_cancel_and_result_origins() {
     let row = s.get(&running).await;
     assert_eq!(row.state, JobState::Cancelled);
     assert_eq!(row.output, Some(data!("answer retained")));
-    assert!(row.payload.is_none());
+    assert_eq!(row.payload, Some(s.spec("running").payload));
     assert_eq!(row.origin, Some(ResultOrigin::Handler));
     assert!(row.receipt.is_none());
     let mut paid = s.spec("paid");
@@ -2058,6 +2059,46 @@ async fn jobs_cancel_and_result_origins() {
     let row = s.get(&id).await;
     assert_eq!(row.origin, Some(ResultOrigin::Paid));
     assert_eq!(row.receipt.as_deref(), Some("receipt"));
+}
+
+#[tokio::test]
+async fn jobs_running_cancel_retains_payload_until_confirm_expiry_or_purge() {
+    for cleanup in ["confirm", "expiry", "purge"] {
+        let mut s = Suite::new();
+        let spec = s.spec("running-cancel");
+        let payload = spec.payload.clone();
+        let id = s.insert(spec).await;
+        let claim = s.claim().await;
+        s.changed(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+            .await;
+        s.complete(&claim, data!("answer")).await;
+        let row = s.get(&id).await;
+        assert_eq!(row.state, JobState::Cancelled);
+        assert_eq!(row.payload, Some(payload.clone()));
+        assert_eq!(row.output, Some(data!("answer")));
+        let delivery = s.deliveries(1, 100_000).await.remove(0);
+        assert_eq!(s.get(&id).await.payload, Some(payload));
+        match cleanup {
+            "confirm" => {
+                assert_eq!(
+                    s.ack(delivery.token, Disposition::Accepted).await,
+                    AckResult::Acked(Disposition::Accepted)
+                );
+            }
+            "expiry" => {
+                s.now = row.recovery_until.unwrap();
+                assert_eq!(s.changed(JobRequest::Maintain).await, 1);
+                assert!(s.get(&id).await.result_expired);
+            }
+            "purge" => {
+                assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 1);
+                assert!(s.get(&id).await.purged);
+            }
+            _ => unreachable!(),
+        }
+        let row = s.get(&id).await;
+        assert!(row.payload.is_none() && row.output.is_none());
+    }
 }
 
 /// Expired handler claims can be cancelled/erased without stranding unfinished rows.
