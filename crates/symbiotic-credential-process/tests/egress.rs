@@ -1443,7 +1443,8 @@ async fn executable_dispatch(
         stderr.read_to_string(&mut logs).unwrap();
     }
     drop(child);
-    std::fs::remove_file(&fixture.config.socket_path).unwrap();
+    // SIGKILL leaves the socket behind: restart must remove it under the state lock.
+    assert!(fixture.config.socket_path.exists());
     let mut child = Child(command.spawn().unwrap());
     let recovered = ready_status(&mut child, &client, &signed_id).await;
     let AttemptStatus::Completed { result: recovered } = recovered else {
@@ -2538,4 +2539,324 @@ async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response(
     }
     fixture.config.max_frame_bytes = 4118;
     CredentialProcess::open(fixture.config.clone()).unwrap();
+}
+
+#[tokio::test]
+async fn supervision_socket_recovery_preserves_live_owner_and_non_socket_paths() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let listener = server::bind(&process).unwrap();
+    assert!(
+        server::bind(&process).is_err(),
+        "a clone must not unlink its own live listener"
+    );
+    assert!(matches!(
+        CredentialProcess::open(fixture.config.clone()),
+        Err(EgressError::StateUnavailable)
+    ));
+    let mut other_config = fixture.config.clone();
+    other_config.state_dir = fixture.dir.path().join("other-state");
+    let other = CredentialProcess::open(other_config).unwrap();
+    assert!(
+        server::bind(&other).is_err(),
+        "another state lock must not authorize unlinking an active listener"
+    );
+    drop(other);
+    let task = tokio::spawn(server::serve(process, listener));
+    let client = socket::UnixEgressClient {
+        path: fixture.config.socket_path.clone(),
+        max_frame_bytes: fixture.config.max_frame_bytes,
+        timeout: Duration::from_secs(2),
+    };
+    let (admission, _) = fixture.attempt("readiness", 1, 1);
+    let id = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt_id(admission.attempt.attempt_id())
+        .unwrap();
+    assert!(matches!(
+        client.attempt_status(id).await.unwrap(),
+        AttemptStatus::NotIssued
+    ));
+    task.abort();
+    let _ = task.await;
+    let process = CredentialProcess::open(fixture.config.clone()).unwrap();
+    std::fs::remove_file(&fixture.config.socket_path).unwrap();
+    std::fs::write(&fixture.config.socket_path, b"keep").unwrap();
+    assert!(server::bind(&process).is_err());
+    assert_eq!(std::fs::read(&fixture.config.socket_path).unwrap(), b"keep");
+    std::fs::remove_file(&fixture.config.socket_path).unwrap();
+    std::os::unix::fs::symlink(
+        fixture.dir.path().join("admission"),
+        &fixture.config.socket_path,
+    )
+    .unwrap();
+    assert!(server::bind(&process).is_err());
+    assert!(
+        std::fs::symlink_metadata(&fixture.config.socket_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+fn supervision_policy() -> symbiotic_supervise::Policy {
+    symbiotic_supervise::Policy {
+        version: 1,
+        max_restarts: 2,
+        crash_window_ms: 10_000,
+        backoff_ms: 10,
+        stop_grace_ms: 100,
+        poll_ms: 5,
+    }
+}
+
+#[test]
+fn supervised_credential_parent_entrypoint() {
+    let Some(config) = std::env::var_os("CREDENTIAL_PARENT_CONFIG") else {
+        return;
+    };
+    let pid_path = std::env::var_os("CREDENTIAL_CHILD_PID").unwrap();
+    let supervisor = symbiotic_supervise::Supervisor::start(
+        move || {
+            let mut command =
+                std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"));
+            command.arg("--child").arg(&config);
+            command
+        },
+        supervision_policy(),
+    )
+    .unwrap();
+    let symbiotic_supervise::Event::Started(pid) = supervisor.next_event().unwrap() else {
+        panic!("expected child");
+    };
+    std::fs::write(pid_path, pid.to_string()).unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[tokio::test]
+async fn supervision_credential_child_exits_when_app_is_killed() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let config = fixture.dir.path().join("config.json");
+    std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pid_path = fixture.dir.path().join("child.pid");
+    let mut parent = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervised_credential_parent_entrypoint",
+                "--nocapture",
+            ])
+            .env("CREDENTIAL_PARENT_CONFIG", &config)
+            .env("CREDENTIAL_CHILD_PID", &pid_path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = socket::UnixEgressClient {
+        path: fixture.config.socket_path.clone(),
+        max_frame_bytes: fixture.config.max_frame_bytes,
+        timeout: Duration::from_secs(2),
+    };
+    let (attempt, _) = fixture.attempt("child-ready", 1, 1);
+    let id = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt_id(attempt.attempt.attempt_id())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.attempt_status(id.clone()).await {
+                Ok(AttemptStatus::NotIssued) => break,
+                Err(EgressError::Transport) => tokio::time::sleep(Duration::from_millis(5)).await,
+                _ => panic!("readiness refused"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let pid: u32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+    parent.0.kill().unwrap();
+    parent.0.wait().unwrap();
+    // Lock release, rather than PID disappearance, also works with Linux orphan zombies.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(process) = CredentialProcess::open(fixture.config.clone()) {
+                assert!(server::bind(&process).is_ok());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // SAFETY: signal 0 checks only; on Linux the exited child may await PID 1's reap.
+    #[cfg(not(target_os = "linux"))]
+    assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+    #[cfg(target_os = "linux")]
+    let _ = pid;
+}
+
+#[test]
+fn supervision_child_mode_requires_parent_pipe_before_configuration() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"))
+        .args(["--child", "/nonexistent-config"])
+        .env_remove("SYMBIOTIC_PARENT_FD")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        EgressError::StateUnavailable.to_string()
+    );
+}
+
+#[tokio::test]
+async fn supervised_engine_entrypoint() {
+    let Some(dir) = std::env::var_os("SUPERVISED_ENGINE_DIR") else {
+        return;
+    };
+    symbiotic_supervise::watch_parent(|| Ok(())).unwrap();
+    let dir = std::path::PathBuf::from(dir);
+    let id: SignedAttemptId =
+        serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap()).unwrap();
+    let client = socket::UnixEgressClient {
+        path: dir.join("egress.sock"),
+        max_frame_bytes: 262144,
+        timeout: Duration::from_secs(2),
+    };
+    std::fs::write(dir.join("engine.ready"), "ready").unwrap();
+    loop {
+        match client.attempt_status(id.clone()).await.unwrap() {
+            AttemptStatus::Completed { result } => {
+                std::fs::write(
+                    dir.join("engine.result.pending"),
+                    serde_json::to_vec(&result).unwrap(),
+                )
+                .unwrap();
+                std::fs::rename(dir.join("engine.result.pending"), dir.join("engine.result"))
+                    .unwrap();
+                std::future::pending::<()>().await;
+            }
+            AttemptStatus::NotIssued
+            | AttemptStatus::Permitted
+            | AttemptStatus::Dispatched { .. } => {}
+            _ => panic!("unexpected engine recovery state"),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn supervision_engine_restart_consumes_saved_completion_without_second_payment() {
+    let fixture = Fixture::new(200, "saved completion".into(), Duration::from_millis(250)).await;
+    let process = fixture.process().await;
+    let listener = server::bind(&process).unwrap();
+    let task = tokio::spawn(server::serve(process, listener));
+    let client = socket::UnixEgressClient {
+        path: fixture.config.socket_path.clone(),
+        max_frame_bytes: fixture.config.max_frame_bytes,
+        timeout: Duration::from_secs(2),
+    };
+    let (admission, payload) = fixture.attempt("engine-restart", 1, 1);
+    let id = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt_id(admission.attempt.attempt_id())
+        .unwrap();
+    std::fs::write(
+        fixture.dir.path().join("status.json"),
+        serde_json::to_vec(&id).unwrap(),
+    )
+    .unwrap();
+    let dir = fixture.dir.path().to_owned();
+    let supervisor = symbiotic_supervise::Supervisor::start(
+        move || {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "supervised_engine_entrypoint", "--nocapture"])
+                .env("SUPERVISED_ENGINE_DIR", &dir)
+                .stdout(std::process::Stdio::null());
+            command
+        },
+        supervision_policy(),
+    )
+    .unwrap();
+    let symbiotic_supervise::Event::Started(first_pid) = supervisor.next_event().unwrap() else {
+        panic!("missing engine");
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture.dir.path().join("engine.ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = client
+        .exchange(Request {
+            version: PROTOCOL_VERSION,
+            operation: Operation::IssuePermit(admission.clone().into()),
+        })
+        .await
+        .unwrap();
+    let Reply::Permit(grant) = response.result.unwrap() else {
+        panic!("missing permit");
+    };
+    let dispatch_client = client.clone();
+    let dispatch = tokio::spawn(async move {
+        dispatch_client
+            .exchange(Request {
+                version: PROTOCOL_VERSION,
+                operation: inject(admission, payload, grant.permit),
+            })
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !dispatch.is_finished(),
+        "engine crash must occur during the paid call"
+    );
+    // SAFETY: the supervisor still owns this child; SIGKILL models a native engine fault.
+    assert_eq!(unsafe { libc::kill(first_pid as i32, libc::SIGKILL) }, 0);
+    assert!(matches!(
+        supervisor.next_event().unwrap(),
+        symbiotic_supervise::Event::Exited(_)
+    ));
+    let symbiotic_supervise::Event::Started(second_pid) = supervisor.next_event().unwrap() else {
+        panic!("engine not restarted");
+    };
+    assert_ne!(first_pid, second_pid);
+    let result = dispatched(dispatch.await.unwrap().result.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture.dir.path().join("engine.result").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovered: DispatchResult =
+        serde_json::from_slice(&std::fs::read(fixture.dir.path().join("engine.result")).unwrap())
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    supervisor.stop().unwrap();
+    task.abort();
+    let _ = task.await;
 }

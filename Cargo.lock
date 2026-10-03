@@ -1449,9 +1449,11 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "socket2",
  "symbiotic-ai-runtime",
  "symbiotic-egress",
  "symbiotic-queue-sqlite",
+ "symbiotic-supervise",
  "symbiotic-trace",
  "tempfile",
  "tokio",
@@ -1551,6 +1553,16 @@ dependencies = [
  "symbiotic-queue",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "symbiotic-supervise"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

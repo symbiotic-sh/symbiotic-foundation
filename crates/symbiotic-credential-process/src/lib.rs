@@ -1,6 +1,11 @@
 //! Credential-owning WP14 daemon. Memory depends on `symbiotic-egress`, not this crate.
 //! Credentials are resolved only after a single-use permit is durably consumed.
 
+#[cfg(unix)]
+mod process_security;
+#[cfg(unix)]
+pub use process_security::protect_process;
+
 mod provider;
 mod registry;
 pub mod secrets;
@@ -154,7 +159,10 @@ pub struct CredentialProcess {
 
 impl CredentialProcess {
     /// Open bounded, protected state and configured local secret backends.
+    /// Embedded callers must also call [`protect_process`] before reading configuration.
     pub fn open(config: ProcessConfig) -> Result<Self, EgressError> {
+        #[cfg(unix)]
+        protect_process().map_err(|_| EgressError::StateUnavailable)?;
         if config.version != PROTOCOL_VERSION {
             return Err(EgressError::Version);
         }

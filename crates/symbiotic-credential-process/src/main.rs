@@ -1,8 +1,5 @@
 //! Launch with one protected JSON configuration path; diagnostics contain static codes only.
 #[cfg(unix)]
-mod process_security;
-
-#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -17,6 +14,7 @@ async fn run() -> Result<(), symbiotic_egress::EgressError> {
         CredentialProcess, ProcessConfig, secrets::SecretSource, server,
     };
     use symbiotic_egress::EgressError;
+    symbiotic_credential_process::protect_process().map_err(|_| EgressError::StateUnavailable)?;
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .with_writer(std::io::stderr)
@@ -25,9 +23,14 @@ async fn run() -> Result<(), symbiotic_egress::EgressError> {
         .log_internal_errors(false)
         .try_init()
         .map_err(|_| EgressError::StateUnavailable)?;
-    process_security::disable_core_dumps().map_err(|_| EgressError::StateUnavailable)?;
     let mut args = std::env::args_os().skip(1);
-    let path = args.next().ok_or(EgressError::InvalidRequest)?;
+    let first = args.next().ok_or(EgressError::InvalidRequest)?;
+    let path = if first == "--child" {
+        symbiotic_supervise::watch_parent(|| Ok(())).map_err(|_| EgressError::StateUnavailable)?;
+        args.next().ok_or(EgressError::InvalidRequest)?
+    } else {
+        first
+    };
     if args.next().is_some() {
         return Err(EgressError::InvalidRequest);
     }
