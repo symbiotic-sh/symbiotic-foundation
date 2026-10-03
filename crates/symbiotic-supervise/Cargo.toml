@@ -14,3 +14,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+# Run lifecycle fixtures on the executable's initial thread, outside libtest.
+[[bin]]
+name = "symbiotic-supervise-test-fixture"
+test = false
+doc = false
+path = "tests/fixtures/process_fixture.rs"

@@ -1,60 +1,23 @@
 #![cfg(unix)]
 use std::{
     fs,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::Path,
+    process::{Child, Command},
     time::{Duration, Instant},
 };
-use symbiotic_supervise::{Error, Event, Policy, Supervisor, watch_parent};
+mod common;
+use common::{alive, policy, started, until};
 
-fn policy() -> Policy {
-    Policy {
-        version: 1,
-        max_restarts: 2,
-        crash_window_ms: 10_000,
-        backoff_ms: 40,
-        stop_grace_ms: 100,
-        poll_ms: 5,
-    }
-}
+use symbiotic_supervise::{Error, Event, Supervisor};
+
 fn fixture(role: &str, dir: &Path) -> Command {
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args(["--exact", "process_fixture", "--nocapture"])
-        .env("SUPERVISE_TEST_ROLE", role)
-        .env("SUPERVISE_TEST_DIR", dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    command
+    common::fixture(
+        Path::new(env!("CARGO_BIN_EXE_symbiotic-supervise-test-fixture")),
+        role,
+        dir,
+    )
 }
-fn until(mut check: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !check() {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "process deadline exceeded"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-fn started(supervisor: &Supervisor) -> u32 {
-    match supervisor.next_event().unwrap() {
-        Event::Started(pid) => pid,
-        event => panic!("expected spawn, got {event:?}"),
-    }
-}
-fn alive(pid: u32) -> bool {
-    // Linux containers may leave an exited orphan as a zombie until PID 1 reaps it.
-    #[cfg(target_os = "linux")]
-    if fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.rsplit_once(") ")
-            .is_some_and(|(_, fields)| fields.starts_with('Z'))
-    }) {
-        return false;
-    }
-    // SAFETY: signal 0 only probes the process.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
+
 struct Reap(Child);
 impl Drop for Reap {
     fn drop(&mut self) {
@@ -65,182 +28,6 @@ impl Drop for Reap {
 fn read_pid(path: &Path) -> u32 {
     until(|| fs::read_to_string(path).is_ok_and(|text| text.trim().parse::<u32>().is_ok()));
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
-}
-
-// A real executable entrypoint in the test binary, never a fork of a running engine.
-#[test]
-fn process_fixture() {
-    let Ok(role) = std::env::var("SUPERVISE_TEST_ROLE") else {
-        return;
-    };
-    let dir = PathBuf::from(std::env::var_os("SUPERVISE_TEST_DIR").unwrap());
-    if role == "closed-stdin-parent" {
-        // Close all standard streams so both pipe ends need relocation.
-        // SAFETY: this isolated fixture owns its standard descriptors.
-        unsafe {
-            for fd in 0..3 {
-                libc::close(fd);
-            }
-        }
-        let child_dir = dir.clone();
-        let child = Supervisor::start(
-            move || {
-                let mut command = fixture("busy", &child_dir);
-                command.stdin(Stdio::null()).stderr(Stdio::null());
-                command
-            },
-            policy(),
-        )
-        .unwrap();
-        until(|| dir.join("busy.ready").exists());
-        child.stop().unwrap();
-        std::process::exit(0);
-    }
-    if role == "shutdown-error-parent" {
-        let child_dir = dir.clone();
-        let child = Supervisor::start(move || fixture("busy", &child_dir), policy()).unwrap();
-        let pid = started(&child);
-        until(|| dir.join("busy.ready").exists());
-        assert!(
-            matches!(child.stop(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EPERM))
-        );
-        assert!(!alive(pid), "shutdown failure must still kill and reap");
-        std::process::exit(0);
-    }
-    if role == "broken-stderr" {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        let mut fds = [-1; 2];
-        // SAFETY: this fixture owns both pipe descriptors; disconnect the reader
-        // and replace stderr with the writer (closing stderr alone is insufficient).
-        unsafe {
-            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-            let reader = OwnedFd::from_raw_fd(fds[0]);
-            let writer = OwnedFd::from_raw_fd(fds[1]);
-            assert_eq!(libc::dup2(fds[1], libc::STDERR_FILENO), libc::STDERR_FILENO);
-            drop(reader);
-            drop(writer);
-        }
-        watch_parent(|| Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap();
-        fs::write(dir.join("broken-stderr.ready"), "ready").unwrap();
-        loop {
-            std::hint::spin_loop();
-        }
-    }
-    #[cfg(target_os = "linux")]
-    if role == "linux-parent" {
-        let child_dir = dir.clone();
-        let child = Supervisor::start(move || fixture("unwatched", &child_dir), policy()).unwrap();
-        fs::write(dir.join("child.pid"), started(&child).to_string()).unwrap();
-        until(|| dir.join("unwatched.ready").exists());
-        fs::write(dir.join("parent.ready"), "ready").unwrap();
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if role != "parent" && role != "crash" {
-            let mut signal = 0;
-            // SAFETY: PR_GET_PDEATHSIG writes the signal to the supplied integer.
-            assert_eq!(
-                unsafe {
-                    libc::prctl(
-                        libc::PR_GET_PDEATHSIG,
-                        &mut signal,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    )
-                },
-                0
-            );
-            assert_eq!(signal, libc::SIGKILL);
-        }
-        if role == "unwatched" {
-            fs::write(dir.join("unwatched.ready"), "ready").unwrap();
-            loop {
-                std::hint::spin_loop();
-            }
-        }
-    }
-    if role == "parent" {
-        let wrapped = std::env::var_os("SUPERVISE_TEST_WRAPPER").is_some();
-        let first_dir = dir.clone();
-        let first = Supervisor::start(
-            move || fixture(if wrapped { "wrapper" } else { "grandchild" }, &first_dir),
-            policy(),
-        )
-        .unwrap();
-        fs::write(dir.join("child.pid"), started(&first).to_string()).unwrap();
-        let second_dir = dir.clone();
-        let second = Supervisor::start(move || fixture("busy", &second_dir), policy()).unwrap();
-        fs::write(dir.join("sibling.pid"), started(&second).to_string()).unwrap();
-        until(|| dir.join("grandchild.pid").exists() && dir.join("busy.ready").exists());
-        fs::write(dir.join("parent.ready"), "ready").unwrap();
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-    if role == "crash" {
-        std::process::exit(7);
-    }
-    if role == "wrapper" {
-        use std::os::unix::process::CommandExt;
-        let mut tool = Command::new("/bin/sh")
-            .args(["-c", "sleep 20 & echo $! > \"$1\"; wait", "fixture"])
-            .arg(dir.join("tool-descendant.pid"))
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = tool.id();
-        watch_parent(move || {
-            // SAFETY: the wrapper owns this still-unreaped tool's process group.
-            if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            tool.wait()?;
-            Ok(())
-        })
-        .unwrap();
-        fs::write(dir.join("grandchild.pid"), pid.to_string()).unwrap();
-    } else {
-        watch_parent(|| Ok(())).unwrap();
-    }
-    assert!(
-        watch_parent(|| Ok(())).is_err(),
-        "a second watcher must not own the same FD"
-    );
-    // Exercise the pipe even on Linux: PDEATHSIG must not mask inherited writers.
-    #[cfg(target_os = "linux")]
-    if role == "grandchild" || role == "busy" {
-        // Disable only in the pipe-specific fixture, to distinguish EOF from SIGKILL.
-        unsafe {
-            assert_eq!(libc::prctl(libc::PR_SET_PDEATHSIG, 0 as libc::c_ulong), 0);
-        }
-    }
-    if role == "grandchild" {
-        let mut child = Command::new("/bin/sleep").arg("20").spawn().unwrap();
-        fs::write(dir.join("grandchild.pid"), child.id().to_string()).unwrap();
-        std::thread::spawn(move || child.wait().unwrap());
-    }
-    if role == "graceful" {
-        // The shell's trap tests that SIGTERM arrives before forced stop.
-        use std::os::unix::process::CommandExt;
-        let error = Command::new("/bin/sh").args(["-c", "trap 'echo stopped > \"$1\"; exit 0' TERM; echo ready > \"$2\"; while :; do sleep 0.01; done", "fixture"])
-            .arg(dir.join("stopped")).arg(dir.join("graceful.ready")).exec();
-        panic!("exec failed: {error}");
-    }
-    if role == "stubborn" {
-        // SAFETY: install the OS's signal-ignore disposition, with no callback.
-        unsafe {
-            libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        }
-    }
-    fs::write(dir.join(format!("{role}.ready")), "ready").unwrap();
-    // Parent watcher runs independently while the main thread is occupied.
-    loop {
-        std::hint::spin_loop();
-    }
 }
 
 #[test]
@@ -496,4 +283,15 @@ fn shutdown_error_returns_after_emergency_cleanup() {
     let mut parent = Reap(command.spawn().unwrap());
     until(|| parent.0.try_wait().unwrap().is_some());
     assert!(parent.0.wait().unwrap().success());
+}
+
+#[test]
+fn fixture_runs_on_the_executable_entry_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        fixture("entry-thread", dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
 }
