@@ -56,7 +56,7 @@ pub mod private_fs;
 mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
-    CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission,
+    CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission, ModelJob,
     QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
@@ -1425,7 +1425,7 @@ async fn run_queued<P, Req, Res, F, Fut>(
 ) -> Result<Res, ModelError>
 where
     P: ModelProvider + Clone + Send + Sync + 'static,
-    Req: Clone + Serialize + Send + Sync + 'static,
+    Req: Clone + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
     Req: BudgetedModelRequest,
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
@@ -1528,6 +1528,9 @@ where
             DirResponseCache::new(dir).store(&call.cache_entry(), &call.request_value)
         })
         .await?;
+    }
+    if let Some(job) = &runtime.job {
+        return run_job(runtime, job.clone(), call_state, provider, call).await;
     }
     // Ordinary cache hits retain their cache provenance and need no dispatch
     // store. Explicit invocation replay must validate its exact binding first.
@@ -2096,6 +2099,219 @@ enum Settled<Res> {
     },
 }
 
+/// Shared transport boundary for direct calls and jobs already holding their slot.
+#[cfg(feature = "queue")]
+async fn dispatch_model<P: ModelProvider, T: Serialize + for<'de> Deserialize<'de>>(
+    queue: &QueueId,
+    config: &ModelQueueConfig,
+    provider: &P,
+    call: impl std::future::Future<Output = Result<T, ModelError>>,
+) -> Result<T, ModelError> {
+    secrets::composed_result(
+        provider,
+        within_timeout(queue, config.request_timeout_seconds, call).await,
+    )
+}
+
+#[cfg(feature = "queue")]
+async fn run_job<P, Req, Res, F, Fut>(
+    runtime: &QueueRuntime,
+    job: Arc<dyn ModelJob>,
+    mut this: Arc<QueuedCall<Req>>,
+    provider: P,
+    call: F,
+) -> Result<Res, ModelError>
+where
+    P: ModelProvider + Clone + Send + Sync + 'static,
+    Req: Clone
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Send
+        + Sync
+        + 'static
+        + BudgetedModelRequest,
+    Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
+    F: FnOnce(P, Req) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
+{
+    let reservation = SpendReservation {
+        reference: SpendReceiptRef::new(format!("job:{}", QueueItemId::new().0))?,
+        account: this.queue_id.0.clone(),
+        invocation: this.invocation.clone(),
+        binding: this.attempt_binding.clone(),
+        request_limit: this.config.provider_request_limit,
+    };
+    let owner = job.clone();
+    let recover = reservation.clone();
+    if run_blocking(move || owner.recover(&recover)).await? {
+        return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+    }
+    // Rate waits happen before claim/reservation. The one admission owner is
+    // shared with direct calls; the permit remains held through settlement.
+    let permit = runtime.admission.as_ref().ok_or_else(spend::storage)?;
+    let (_slot, rate) = loop {
+        let slot = permit
+            .acquire(&this.queue_id, this.config.max_in_flight)
+            .await?;
+        wait_for_model_cooldown(this.queue.as_ref(), &this.queue_id).await?;
+        match check_model_budget(
+            &runtime.rate_state,
+            &this.queue_id,
+            &this.config,
+            &this.request,
+        )
+        .await?
+        {
+            RateCheck::Cleared(rate) => break (slot, rate),
+            RateCheck::Wait(wait) => {
+                drop(slot);
+                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+            }
+        }
+    };
+    let reference = reservation.reference.clone();
+    let owner = job.clone();
+    let limit = logical_max_attempts(&this.config);
+    let payload = run_blocking(move || owner.claim(&reservation, limit)).await?;
+    let Some(payload) = payload else {
+        return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+    };
+    // All preparation failures share the durable no-dispatch release path.
+    // No provider future exists until this block succeeds.
+    let prepared = async {
+        let request: Req = serde_json::from_slice(&payload)
+            .map_err(|_| ModelError::InvalidRequest(DiagnosticCode::InvalidConfiguration))?;
+        if hash_json(&request)? != this.request_hash {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        Arc::get_mut(&mut this).ok_or_else(spend::storage)?.request = request;
+        this.attempt_context.capture(&reference)?;
+        let owner = job.clone();
+        if run_blocking(move || owner.heartbeat()).await? {
+            return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+        }
+        if let Some(rate) = rate {
+            rate.charge()?;
+        }
+        Ok::<_, ModelError>(())
+    }
+    .await;
+    if let Err(error) = prepared {
+        let owner = job.clone();
+        run_blocking(move || owner.release()).await?;
+        return Err(error);
+    }
+    let transport = async {
+        let result = dispatch_model(
+            &this.queue_id,
+            &this.config,
+            &provider,
+            call(provider.clone(), this.request.clone()),
+        )
+        .await;
+        let mut side_error = None;
+        if let Err(error) = &result
+            && !matches!(error, ModelError::Timeout(_))
+            && provider.failure_charge(error) == FailureCharge::KnownZero
+            && is_retryable(error, &this.config)
+        {
+            let delay = retry_delay_ms(
+                job.attempt()?,
+                &this.config,
+                &QueueItemId(reference.as_str().into()),
+                &this.request_hash,
+                error,
+            )?;
+            if is_transient(error) {
+                side_error = note_model_cooldown(this.queue.as_ref(), &this.queue_id, error, delay)
+                    .await
+                    .err();
+            }
+            if side_error.is_none() {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+        Ok::<_, ModelError>((result, side_error))
+    };
+    tokio::pin!(transport);
+    let mut timer = tokio::time::interval(job.heartbeat_interval());
+    timer.tick().await;
+    let mut monitoring: Vec<ModelError> = Vec::new();
+    let mut fenced = false;
+    let (mut result, side_error) = loop {
+        tokio::select! {
+            result = &mut transport => break result?,
+            _ = timer.tick(), if !fenced => {
+                let owner = job.clone();
+                if let Err(error) = run_blocking(move || owner.heartbeat()).await {
+                    if !monitoring.iter().any(|cause| cause.code() == error.code()) {
+                        tracing::warn!(code = %error.code(), "model job heartbeat failed");
+                        monitoring.push(error);
+                    }
+                    fenced = error.code() == DiagnosticCode::QueueFailure;
+                }
+            }
+        }
+    };
+    let known_zero = result.as_ref().err().is_some_and(|error| {
+        !matches!(error, ModelError::Timeout(_))
+            && provider.failure_charge(error) == FailureCharge::KnownZero
+    });
+    let retry = result.as_ref().err().is_some_and(|error| {
+        known_zero && side_error.is_none() && is_retryable(error, &this.config)
+    });
+    if let Ok(response) = &mut result {
+        let mut trace = response.trace().clone();
+        trace.request_hash = this.request_hash.clone();
+        if !trace.metadata.is_object() {
+            trace.metadata = serde_json::json!({"value": trace.metadata});
+        }
+        trace.metadata["spend_receipt"] = serde_json::json!(reference);
+        trace.metadata["binding"] = serde_json::json!(this.binding_identity);
+        response.set_trace(trace);
+    }
+    let (state, usage, output, failure) = match &result {
+        Ok(response) => {
+            let usage = response.trace().usage.clone();
+            let measured = has_measured_usage(&usage);
+            (
+                if measured {
+                    SpendState::Settled
+                } else {
+                    SpendState::Unknown
+                },
+                measured.then_some(usage),
+                Some(serde_json::to_value(response).map_err(|_| spend::storage())?),
+                None,
+            )
+        }
+        Err(error) => (
+            if known_zero {
+                SpendState::Released
+            } else {
+                SpendState::Unknown
+            },
+            None,
+            None,
+            Some(error.code()),
+        ),
+    };
+    let owner = job.clone();
+    run_blocking(move || owner.finish(state, usage, output, failure, retry)).await?;
+    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
+        return Err(error);
+    }
+    match result {
+        Ok(response) => Ok(this.record_success(response).await),
+        Err(error) => {
+            this.trace_failure(None, &error).await;
+            Err(error)
+        }
+    }
+}
+
 /// The leased part of an attempt: the running receipt, the provider call,
 /// and recording its outcome up to completing or failing the item. Every
 /// path ends with `complete` or `fail_with`, whatever the writes before it
@@ -2160,13 +2376,13 @@ where
         return Settled::Failed { err, failed };
     }
     let provider_started = std::time::Instant::now();
-    let result = within_timeout(
+    let result = dispatch_model(
         &this.queue_id,
-        config.request_timeout_seconds,
+        config,
+        &provider,
         call(provider.clone(), this.request.clone()),
     )
     .await;
-    let result = secrets::composed_result(&provider, result);
     let provider_ms = elapsed_ms(provider_started);
     let failed_timing = || AttemptTiming {
         queue_wait_ms: None,

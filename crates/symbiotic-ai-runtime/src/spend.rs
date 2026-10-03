@@ -50,6 +50,24 @@ impl SqliteSpendLedger {
         self
     }
 
+    pub(crate) fn retention(&self) -> std::time::Duration {
+        self.1
+    }
+
+    pub(crate) fn release_in(
+        tx: &rusqlite::Transaction<'_>,
+        reference: &SpendReceiptRef,
+    ) -> Result<(), ModelError> {
+        let old = receipt_in(tx, reference)?.ok_or_else(conflict)?;
+        if old.state != SpendState::Unknown && !old.pre_dispatch_released {
+            return Err(conflict());
+        }
+        Self::finish_in(tx, reference, SpendState::Released, None, None)?;
+        tx.execute("UPDATE spend_receipts SET pre_dispatch_released=1,
+            attempts_used=CASE WHEN attempt_limit IS NOT NULL AND pre_dispatch_released=0 THEN attempts_used-1 ELSE attempts_used END WHERE reference=?1", [reference.as_str()]).map_err(storage)?;
+        Ok(())
+    }
+
     /// Clear all expired answers in indexed batches of at most 64 rows.
     pub fn expire_recovery(&self) -> Result<usize, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
@@ -78,7 +96,7 @@ impl SqliteSpendLedger {
         Self::reserve_with_limit_in(conn, r, None, false)
     }
 
-    fn reserve_with_limit_in(
+    pub(crate) fn reserve_with_limit_in(
         conn: &rusqlite::Transaction<'_>,
         r: &SpendReservation,
         attempt_limit: Option<u32>,
@@ -190,6 +208,49 @@ impl SqliteSpendLedger {
         Ok(true)
     }
 
+    /// Sole saved-answer writer, shared by direct invocations and durable jobs.
+    pub(crate) fn save_recovery_in(
+        tx: &rusqlite::Transaction<'_>,
+        r: &SpendReceiptRef,
+        output: &Option<serde_json::Value>,
+        retention: std::time::Duration,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        keep: bool,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ModelError> {
+        let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
+        if old.attempt_limit.is_some()
+            && old.output.is_some()
+            && let Some(value) = &output
+            && old.recovery.as_ref() != Some(value)
+        {
+            return Err(conflict());
+        }
+        if old.attempt_limit.is_some()
+            && old.output.is_none()
+            && let Some(value) = &output
+        {
+            let expires = chrono::Duration::from_std(retention)
+                .ok()
+                .and_then(|d| now.checked_add_signed(d))
+                .ok_or_else(|| storage(()))?;
+            let expires = deadline.map_or(expires, |until| until.min(expires));
+            if !keep || expires <= now {
+                return Ok(());
+            }
+            tx.execute(
+                "UPDATE spend_receipts SET recovery=?2, recovery_expires_at=?3 WHERE reference=?1",
+                params![
+                    r.as_str(),
+                    serde_json::to_string(value).map_err(storage)?,
+                    expires.to_rfc3339()
+                ],
+            )
+            .map_err(storage)?;
+        }
+        Ok(())
+    }
+
     /// Settle or reconcile in the same transaction as execution/recovery state.
     /// Repeating an identical settlement is harmless; conflicting evidence is refused.
     pub fn finish_in(
@@ -251,7 +312,7 @@ impl SqliteSpendLedger {
     }
 }
 
-fn receipt_in(
+pub(crate) fn receipt_in(
     conn: &Connection,
     reference: &SpendReceiptRef,
 ) -> Result<Option<SpendReceipt>, ModelError> {
@@ -313,7 +374,7 @@ fn receipt_in(
     )
     .transpose()
 }
-fn invocation_in(
+pub(crate) fn invocation_in(
     conn: &Connection,
     account: &str,
     invocation: &str,
@@ -381,18 +442,7 @@ impl SpendLedger for SqliteSpendLedger {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let old = receipt_in(&tx, reference)?.ok_or_else(conflict)?;
-        if old.state != SpendState::Unknown && !old.pre_dispatch_released {
-            return Err(conflict());
-        }
-        Self::finish_in(&tx, reference, SpendState::Released, None, None)?;
-        tx.execute(
-            "UPDATE spend_receipts SET pre_dispatch_released=1,
-                attempts_used=CASE WHEN attempt_limit IS NOT NULL AND pre_dispatch_released=0 THEN attempts_used-1 ELSE attempts_used END
-                WHERE reference=?1",
-            [reference.as_str()],
-        )
-        .map_err(storage)?;
+        Self::release_in(&tx, reference)?;
         tx.commit().map_err(storage)
     }
     fn reserve(&self, r: &SpendReservation) -> Result<bool, ModelError> {
@@ -463,32 +513,7 @@ impl SpendLedger for SqliteSpendLedger {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let old = receipt_in(&tx, r)?.ok_or_else(conflict)?;
-        if old.attempt_limit.is_some()
-            && old.output.is_some()
-            && let Some(value) = &output
-            && old.recovery.as_ref() != Some(value)
-        {
-            return Err(conflict());
-        }
-        if old.attempt_limit.is_some()
-            && old.output.is_none()
-            && let Some(value) = &output
-        {
-            let expires = chrono::Duration::from_std(self.1)
-                .ok()
-                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
-                .ok_or_else(|| storage(()))?;
-            tx.execute(
-                "UPDATE spend_receipts SET recovery=?2, recovery_expires_at=?3 WHERE reference=?1",
-                params![
-                    r.as_str(),
-                    serde_json::to_string(value).map_err(storage)?,
-                    expires.to_rfc3339()
-                ],
-            )
-            .map_err(storage)?;
-        }
+        Self::save_recovery_in(&tx, r, &output, self.1, None, true, chrono::Utc::now())?;
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
     }
