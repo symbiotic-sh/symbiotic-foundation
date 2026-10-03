@@ -43,9 +43,8 @@ impl Default for RunnerConfig {
 }
 
 /// Cooperative cancellation; a handler decides how to finish work already started.
-/// Store cancellation latency is one heartbeat interval plus the heartbeat call's own time.
-/// For SQLite, this assumes timely scheduling and a successful heartbeat; its lock wait
-/// is bounded by the configured SQLite busy timeout.
+/// Store cancellation latency depends on heartbeat scheduling and successful store-call
+/// time, including connection-mutex waits; it has no numeric bound.
 #[derive(Clone, Debug)]
 pub struct CancelToken(watch::Receiver<bool>);
 
@@ -216,6 +215,11 @@ impl Shared {
                 break task.join_next().await;
             }
         };
+        // Stop scheduling heartbeats when the handler finishes, then drain any
+        // outstanding call before completion so the two store operations never race.
+        if let Some(heartbeat) = heartbeat {
+            Self::observe_heartbeat(heartbeat.await, &cancel, &mut errors);
+        }
         let (state, output, diagnostic) = match outcome {
             Some(Ok(Ok(output))) if output.len() > self.jobs.max_result_bytes => {
                 errors.push(
@@ -234,18 +238,14 @@ impl Shared {
                 (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
             }
             None => {
-                if let Some(heartbeat) = heartbeat {
-                    Self::observe_heartbeat(heartbeat.await, &cancel, &mut errors);
-                }
                 errors.push(RunnerError::WorkerTask);
                 return Err(RunnerError::Workers(errors));
             }
         };
         // Finished work, including a panic, always reaches the store's claim fence.
-        // Retain any outstanding heartbeat and collect it alongside completion.
-        // Neither operation may hide the other's result or prevent its dispatch.
-        let (completion, heartbeat) = tokio::join!(
-            self.op(JobRequest::Complete {
+        // A heartbeat failure is recorded above but never prevents this attempt.
+        let completion = self
+            .op(JobRequest::Complete {
                 job: claim.id,
                 generation: claim.generation,
                 state,
@@ -253,17 +253,8 @@ impl Shared {
                 output,
                 receipt: None,
                 diagnostic,
-            }),
-            async {
-                match heartbeat {
-                    Some(heartbeat) => Some(heartbeat.await),
-                    None => None,
-                }
-            }
-        );
-        if let Some(response) = heartbeat {
-            Self::observe_heartbeat(response, &cancel, &mut errors);
-        }
+            })
+            .await;
         match completion {
             Ok(JobResponse::Done) => {}
             Ok(_) => errors.push(JobError::InvalidRequest.into()),

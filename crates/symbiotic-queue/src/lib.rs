@@ -170,6 +170,11 @@ impl QueueError {
     }
 }
 
+/// Provider-neutral queue and generic job-store operations.
+///
+/// Job-store access performs blocking storage work. Async callers must run that
+/// work off executor threads, as the runner does through its SQLite backend's
+/// blocking-task dispatch in [`Self::jobs`].
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
     /// Execute an atomic generic-job operation using the trusted host's clock

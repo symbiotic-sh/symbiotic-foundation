@@ -637,65 +637,130 @@ async fn runner_no_lookup_between_claim_and_completion() {
 }
 
 #[tokio::test]
-async fn runner_collects_heartbeat_failure_after_handler_completion() {
-    let mut s = Suite::new();
-    s.now = Utc::now();
-    let id = s.insert(s.spec("slow-heartbeat")).await;
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let heartbeat_finish = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend = Arc::new(InterceptJobs {
-        after: None,
-        backend: s.backend.clone(),
-        before: {
-            let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
-            move |request: &JobRequest| {
-                let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
-                let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
-                Box::pin(async move {
-                    if heartbeat {
-                        entered.notify_one();
-                        heartbeat_finish.acquire().await.unwrap().forget();
-                        return Err(JobError::Storage);
+async fn runner_drains_heartbeat_before_completion() {
+    for failure in [None, Some(JobError::Storage), Some(JobError::StaleClaim)] {
+        let mut s = Suite::new();
+        s.now = Utc::now();
+        let id = s.insert(s.spec("slow-heartbeat")).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let completions = Arc::new(AtomicUsize::new(0));
+        let completion_entered = Arc::new(tokio::sync::Notify::new());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let committed = Arc::new(tokio::sync::Notify::new());
+        let failing = failure.is_some();
+        let stale = matches!(failure, Some(JobError::StaleClaim));
+        let backend = Arc::new(InterceptJobs {
+            after: Some(Box::new({
+                let (commits, committed) = (commits.clone(), committed.clone());
+                move |request, response| {
+                    if matches!(request, JobRequest::Complete { .. }) {
+                        assert!(matches!(response, JobResponse::Done));
+                        commits.fetch_add(1, Ordering::SeqCst);
+                        committed.notify_one();
                     }
-                    Ok(())
-                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
-            }
-        },
-    });
-    let finish = Arc::new(tokio::sync::Semaphore::new(0));
-    let runner = s
-        .runner_with_backend(backend, 1, {
-            let finish = finish.clone();
-            move |_, bytes| {
-                let finish = finish.clone();
-                async move {
-                    finish.acquire().await.unwrap().forget();
-                    Ok(bytes)
+                    Box::pin(async { Ok(()) })
                 }
-            }
-        })
-        .await;
-    entered.notified().await;
-    finish.add_permits(1);
-    // Completion must reach the store while the heartbeat is still outstanding.
-    assert_eq!(s.final_row(&id).await.state, JobState::Succeeded);
-    let shutdown = runner.shutdown();
-    tokio::pin!(shutdown);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+            })),
+            backend: s.backend.clone(),
+            before: {
+                let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
+                let (heartbeats, completions, completion_entered) = (
+                    heartbeats.clone(),
+                    completions.clone(),
+                    completion_entered.clone(),
+                );
+                move |request: &JobRequest| {
+                    let heartbeat = matches!(request, JobRequest::Heartbeat { .. })
+                        && heartbeats.fetch_add(1, Ordering::SeqCst) == 0;
+                    if matches!(request, JobRequest::Complete { .. }) {
+                        completions.fetch_add(1, Ordering::SeqCst);
+                        completion_entered.notify_one();
+                    }
+                    let (entered, heartbeat_finish) = (entered.clone(), heartbeat_finish.clone());
+                    Box::pin(async move {
+                        if heartbeat {
+                            entered.notify_one();
+                            heartbeat_finish.acquire().await.unwrap().forget();
+                            if failing {
+                                return Err(if stale {
+                                    JobError::StaleClaim
+                                } else {
+                                    JobError::Storage
+                                });
+                            }
+                        }
+                        Ok(())
+                    })
+                        as futures::future::BoxFuture<'static, Result<(), JobError>>
+                }
+            },
+        });
+        let finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let runner = s
+            .runner_with_config(
+                backend,
+                RunnerConfig {
+                    worker_count: 1,
+                    poll_interval_ms: 10,
+                    heartbeat_interval_ms: Some(10),
+                    ..RunnerConfig::default()
+                },
+                {
+                    let (finish, finished) = (finish.clone(), finished.clone());
+                    move |_, bytes| {
+                        let (finish, finished) = (finish.clone(), finished.clone());
+                        async move {
+                            finish.acquire().await.unwrap().forget();
+                            finished.notify_one();
+                            Ok(bytes)
+                        }
+                    }
+                },
+            )
+            .await;
+        entered.notified().await;
+        finish.add_permits(1);
+        finished.notified().await;
+        // The handler has finished, but completion must wait for the in-flight heartbeat.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                completion_entered.notified()
+            )
             .await
             .is_err(),
-        "runner discarded the outstanding heartbeat"
-    );
-    // Its failure arrives only after the handler's completion was committed.
-    heartbeat_finish.add_permits(1);
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
-        .await
-        .expect("runner did not collect the heartbeat")
-        .unwrap_err();
-    assert!(matches!(error, RunnerError::Workers(workers)
+            "completion raced the outstanding heartbeat"
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 1);
+        heartbeat_finish.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), committed.notified())
+            .await
+            .expect("runner did not attempt completion after draining the heartbeat");
+        assert_eq!(s.get(&id).await.state, JobState::Succeeded);
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        if let Some(cause) = failure {
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
+                .await
+                .expect("runner did not report the heartbeat failure")
+                .unwrap_err();
+            assert!(matches!(error, RunnerError::Workers(workers)
         if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
-            if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: JobError::Storage, count: 1 }]))));
+            if matches!(errors.as_slice(), [RunnerError::Monitoring { cause: actual, count: 1 }] if actual == &cause))));
+        } else {
+            // A successful delayed heartbeat must not fence the completed claim or stop the worker.
+            let next = s.insert(s.spec("after-slow-heartbeat")).await;
+            finish.add_permits(1);
+            assert_eq!(s.final_row(&next).await.state, JobState::Succeeded);
+            runner.shutdown().await.unwrap();
+            assert_eq!(completions.load(Ordering::SeqCst), 2);
+            assert_eq!(commits.load(Ordering::SeqCst), 2);
+        }
+    }
 }
 
 #[tokio::test]
