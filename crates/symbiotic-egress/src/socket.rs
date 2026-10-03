@@ -31,33 +31,13 @@ pub async fn write_frame(
     value: &impl Serialize,
     max_bytes: u32,
 ) -> Result<(), EgressError> {
-    struct Capped {
-        bytes: Vec<u8>,
-        max: usize,
-    }
-    impl std::io::Write for Capped {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.bytes.len().saturating_add(buf.len()) > self.max {
-                return Err(std::io::Error::other("frame limit"));
-            }
-            self.bytes.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut buffer = Capped {
-        bytes: Vec::new(),
-        max: max_bytes as usize,
-    };
-    serde_json::to_writer(&mut buffer, value).map_err(|_| EgressError::LimitExceeded)?;
+    let bytes = crate::encode_frame(value, max_bytes)?;
     writer
-        .write_u32(buffer.bytes.len() as u32)
+        .write_u32(bytes.len() as u32)
         .await
         .map_err(|_| EgressError::Transport)?;
     writer
-        .write_all(&buffer.bytes)
+        .write_all(&bytes)
         .await
         .map_err(|_| EgressError::Transport)?;
     Ok(())

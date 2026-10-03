@@ -15,6 +15,32 @@ use zeroize::Zeroizing;
 #[cfg(unix)]
 pub mod socket;
 
+/// Encode a bounded JSON frame body using a capped writer.
+pub fn encode_frame(value: &impl Serialize, max_bytes: u32) -> Result<Vec<u8>, EgressError> {
+    struct Capped {
+        bytes: Vec<u8>,
+        max: usize,
+    }
+    impl std::io::Write for Capped {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.len().saturating_add(buf.len()) > self.max {
+                return Err(std::io::Error::other("frame limit"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Capped {
+        bytes: Vec::new(),
+        max: max_bytes as usize,
+    };
+    serde_json::to_writer(&mut buffer, value).map_err(|_| EgressError::LimitExceeded)?;
+    Ok(buffer.bytes)
+}
+
 /// Current wire and operation version. Unknown versions fail closed.
 pub const PROTOCOL_VERSION: u16 = 3;
 
@@ -497,7 +523,7 @@ pub enum Reply {
     Receipt(Option<DispatchReceipt>),
 }
 
-/// Memory's only egress dependency: use the socket implementation or a test double.
+/// Memory's egress boundary: use a socket or in-process implementation, or a test double.
 #[async_trait]
 pub trait EgressClient: Send + Sync {
     /// Submit one versioned operation. Transport failures after dispatch are unknown charges.

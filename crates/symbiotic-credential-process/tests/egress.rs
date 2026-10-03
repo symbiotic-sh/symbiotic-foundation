@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 use symbiotic_credential_process::{
-    CredentialProcess, ProcessConfig, RouteConfig, RouteProvider, secrets::SecretSource, server,
+    CredentialProcess, InProcessEgressClient, ProcessConfig, RouteConfig, RouteProvider,
+    secrets::SecretSource, server,
 };
 use symbiotic_egress::*;
 use tokio::{
@@ -258,9 +259,9 @@ async fn exchange_wire(
         operation,
     })
     .unwrap();
-    let response = process
-        .handle(serde_json::from_slice(&bytes).unwrap())
-        .await;
+    let response = InProcessEgressClient::new(process.clone())
+        .exchange(serde_json::from_slice(&bytes).unwrap())
+        .await?;
     serde_json::from_slice::<Response>(&serde_json::to_vec(&response).unwrap())
         .unwrap()
         .result
@@ -291,9 +292,10 @@ async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthori
         while unix_seconds() < first.attempt.expires_at {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let response = process
-            .handle(serde_json::from_slice(&bytes).unwrap())
-            .await;
+        let response = InProcessEgressClient::new(process.clone())
+            .exchange(serde_json::from_slice(&bytes).unwrap())
+            .await
+            .unwrap();
         let response: Response =
             serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
         assert!(matches!(
@@ -407,12 +409,19 @@ async fn accepted_handoff_completes_and_recovers_after_authority_deadline() {
 }
 
 async fn exchange(process: &CredentialProcess, operation: Operation) -> Result<Reply, EgressError> {
-    process
-        .handle(Request {
+    exchange_client(&InProcessEgressClient::new(process.clone()), operation).await
+}
+
+async fn exchange_client(
+    client: &dyn EgressClient,
+    operation: Operation,
+) -> Result<Reply, EgressError> {
+    client
+        .exchange(Request {
             version: PROTOCOL_VERSION,
             operation,
         })
-        .await
+        .await?
         .result
 }
 async fn permit(process: &CredentialProcess, admission: &SignedAttempt) -> DispatchPermit {
@@ -1192,16 +1201,37 @@ async fn signed_attempt_time_warning(
         .unwrap()
         .sign_attempt(admission.attempt)
         .unwrap();
-    async {
-        let granted = permit(&process, &admission).await;
-        let replayed = permit(&process, &admission).await;
-        assert!(replayed.token == granted.token);
-        assert_eq!(replayed.attempt_digest, granted.attempt_digest);
-        let result = dispatched(
-            exchange(&process, inject(admission, payload, granted))
+    // These handler logging/reentrancy checks use a scoped subscriber, which
+    // Tokio does not inherit in the in-process client's detached task.
+    let handle = |operation| {
+        let process = &process;
+        async move {
+            process
+                .handle(Request {
+                    version: PROTOCOL_VERSION,
+                    operation,
+                })
                 .await
-                .unwrap(),
+                .result
+                .unwrap()
+        }
+    };
+    async {
+        let Reply::Permit(granted) = handle(Operation::IssuePermit(admission.clone().into())).await
+        else {
+            panic!("missing permit")
+        };
+        let Reply::Permit(replayed) =
+            handle(Operation::IssuePermit(admission.clone().into())).await
+        else {
+            panic!("missing replayed permit")
+        };
+        assert!(replayed.permit.token == granted.permit.token);
+        assert_eq!(
+            replayed.permit.attempt_digest,
+            granted.permit.attempt_digest
         );
+        let result = dispatched(handle(inject(admission, payload, granted.permit)).await);
         assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
         assert!(result.receipt_persisted);
     }
@@ -2139,7 +2169,11 @@ async fn recovery_concurrent_permit_requests_share_one_capability() {
         operation: Operation::IssuePermit(admission.into()),
     };
     assert!(matches!(
-        process.handle(request).await.result,
+        InProcessEgressClient::new(process.clone())
+            .exchange(request)
+            .await
+            .unwrap()
+            .result,
         Err(EgressError::Version)
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
@@ -3289,4 +3323,279 @@ async fn anthropic_invalid_conversation_is_refused(
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     assert_eq!(ledger_totals(&fixture), (0, 0));
+}
+
+#[tokio::test]
+async fn both_clients_refuse_deeply_nested_requests_before_permit_consumption() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let listener = server::bind(&process).unwrap();
+    let task = tokio::spawn(server::serve(process.clone(), listener));
+    let socket_client = socket::UnixEgressClient {
+        path: fixture.config.socket_path.clone(),
+        max_frame_bytes: fixture.config.max_frame_bytes,
+        timeout: Duration::from_secs(3),
+    };
+    let in_process_client = InProcessEgressClient::new(process.clone());
+    let (admission, mut payload) = fixture.attempt("nested-metadata", 1, 1);
+    let ProviderPayload::Chat(chat) = &mut payload else {
+        panic!("wrong payload")
+    };
+    let mut metadata = serde_json::json!(0);
+    for _ in 0..200 {
+        metadata = serde_json::Value::Array(vec![metadata]);
+    }
+    chat.metadata = metadata;
+    assert!(
+        serde_json::to_vec(&payload).unwrap().len() <= fixture.config.routes[0].max_input_bytes
+    );
+    let mut attempt = admission.attempt;
+    attempt.input_digest = payload.digest().unwrap();
+    let admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(attempt)
+        .unwrap();
+    let granted = permit(&process, &admission).await;
+    let request = Request {
+        version: PROTOCOL_VERSION,
+        operation: inject(admission.clone(), payload, granted.clone()),
+    };
+    encode_frame(&request, fixture.config.max_frame_bytes).unwrap();
+    let db = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    for client in [
+        &socket_client as &dyn EgressClient,
+        &in_process_client as &dyn EgressClient,
+    ] {
+        let response = client.exchange(request.clone()).await.unwrap();
+        assert_eq!(response.version, PROTOCOL_VERSION);
+        assert!(matches!(response.result, Err(EgressError::InvalidRequest)));
+        assert!(matches!(
+            status(&process, &admission).await,
+            AttemptStatus::Permitted
+        ));
+        assert_eq!(
+            db.query_row(
+                "SELECT consumed, accepted_attempts FROM egress_permits WHERE token=?1",
+                [&granted.token],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, u32>(1)?))
+            )
+            .unwrap(),
+            (false, 0)
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger_totals(&fixture), (0, 0));
+    }
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn in_process_oversized_requests_are_refused_before_handler_execution() {
+    let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process.clone());
+    let tenant = "t".repeat(fixture.config.max_frame_bytes as usize + 1);
+    let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+    let oversized_grant = key
+        .sign_grant_revision(GrantRevision {
+            tenant: tenant.clone(),
+            incarnation: "incarnation".into(),
+            revision: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange_client(&client, Operation::PublishGrantRevision(oversized_grant)).await,
+        Err(EgressError::LimitExceeded)
+    ));
+    // A rejected publication must not have reached the canonical grant registry.
+    let db = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    let published: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM egress_grant_revisions WHERE grant_key=?1)",
+            [digest(&(tenant, "incarnation")).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!published);
+    let (admission, mut payload) = fixture.attempt("oversized-frame", 1, 1);
+    let ProviderPayload::Chat(chat) = &mut payload else {
+        panic!("wrong payload")
+    };
+    chat.messages[0].content = "x".repeat(fixture.config.max_frame_bytes as usize + 1);
+    let mut attempt = admission.attempt;
+    attempt.input_digest = payload.digest().unwrap();
+    let admission = key.sign_attempt(attempt).unwrap();
+    let granted = permit(&process, &admission).await;
+    assert!(matches!(
+        exchange_client(&client, inject(admission.clone(), payload, granted)).await,
+        Err(EgressError::LimitExceeded)
+    ));
+    assert!(matches!(
+        status(&process, &admission).await,
+        AttemptStatus::Permitted
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 0));
+}
+
+#[tokio::test]
+async fn in_process_oversized_recovered_response_is_refused_without_losing_the_answer() {
+    let answer = "a".repeat(20 * 1024);
+    let fixture = Fixture::new(200, answer.clone(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let (admission, payload) = fixture.attempt("large-recovery", 1, 1);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(&process, inject(admission.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert!(result.receipt_persisted);
+    assert!(matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == &answer));
+    drop(process);
+
+    let mut smaller = fixture.config.clone();
+    smaller.max_frame_bytes = 8192;
+    smaller.routes[0].max_field_bytes = 64;
+    smaller.routes[0].max_response_bytes = 256;
+    smaller.routes[0].max_input_bytes = 4096;
+    let client = InProcessEgressClient::new(CredentialProcess::open(smaller).unwrap());
+    for operation in [
+        Operation::AttemptStatus(signed_id(&admission)),
+        Operation::IssuePermit(admission.clone().into()),
+    ] {
+        let response = client
+            .exchange(Request {
+                version: PROTOCOL_VERSION,
+                operation,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.version, PROTOCOL_VERSION);
+        assert!(matches!(response.result, Err(EgressError::LimitExceeded)));
+    }
+    drop(client);
+
+    let client = InProcessEgressClient::new(fixture.process().await);
+    let AttemptStatus::Completed { result: recovered } =
+        client.attempt_status(signed_id(&admission)).await.unwrap()
+    else {
+        panic!("missing stored answer")
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::to_value(recovered).unwrap()
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
+#[tokio::test]
+async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_resending() {
+    use std::{future::Future, task::Poll};
+    use symbiotic_credential_process::InProcessEgressClient;
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fixture = Fixture::with_response_gate(
+        200,
+        "thread answer".into(),
+        Duration::ZERO,
+        "0",
+        false,
+        true,
+        Some(gate.clone()),
+    )
+    .await;
+    fixture.config.routes[0].secret = SecretSource::None;
+    fixture.config.routes[0].secret_ref.clear();
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process.clone());
+    let (admission, payload) = fixture.attempt("thread-cancel", 1, 1);
+    let response = client
+        .exchange(Request {
+            version: PROTOCOL_VERSION,
+            operation: Operation::IssuePermit(admission.clone().into()),
+        })
+        .await
+        .unwrap();
+    let Reply::Permit(grant) = response.result.unwrap() else {
+        panic!("missing permit")
+    };
+    let mut caller = Box::pin(client.exchange(Request {
+        version: PROTOCOL_VERSION,
+        operation: inject(admission.clone(), payload, grant.permit),
+    }));
+    // Poll once on this single-thread runtime, then drop before the spawned
+    // Foundation handler can run. The exchange must still reach acceptance.
+    let polled = std::future::poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx))).await;
+    assert!(polled.is_pending());
+    // No runtime yield has occurred: acceptance must not have run in the caller.
+    let consumed: bool = rusqlite::Connection::open_with_flags(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT consumed FROM egress_permits WHERE attempt_digest=?1",
+        [digest(&admission.attempt).unwrap()],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert!(
+        !consumed,
+        "acceptance ran on the caller instead of the Foundation task"
+    );
+    drop(caller);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.add_permits(1);
+    let id = signed_id(&admission);
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match client.attempt_status(id.clone()).await.unwrap() {
+                AttemptStatus::Completed { result } => break result,
+                AttemptStatus::Dispatched { .. } => tokio::task::yield_now().await,
+                _ => panic!("unexpected recovery status"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
+    );
+    assert!(result.receipt_persisted);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    drop(client);
+    drop(process);
+    let reopened = InProcessEgressClient::new(fixture.process().await);
+    let AttemptStatus::Completed { result: recovered } = reopened.attempt_status(id).await.unwrap()
+    else {
+        panic!("missing recovered answer")
+    };
+    assert_eq!(result.receipt.reference, recovered.receipt.reference);
+    assert!(
+        matches!(recovered.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }

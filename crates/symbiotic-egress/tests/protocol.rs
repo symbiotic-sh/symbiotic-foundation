@@ -249,3 +249,204 @@ fn admissions_reject_removed_consumer_spend_and_marking_fields() {
         );
     }
 }
+
+#[cfg(unix)]
+mod clients {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    use symbiotic_credential_process::{
+        CredentialProcess, InProcessEgressClient, ProcessConfig, RouteConfig, RouteProvider,
+        secrets::SecretSource, server,
+    };
+
+    async fn protocol_checks(client: &dyn EgressClient) {
+        let key = AdmissionKey::new(vec![42; 32]).unwrap();
+        let grant = GrantRevision {
+            tenant: "tenant".into(),
+            incarnation: "incarnation".into(),
+            revision: 10,
+        };
+        let publish = |revision| {
+            Operation::PublishGrantRevision(
+                key.sign_grant_revision(GrantRevision {
+                    revision,
+                    ..grant.clone()
+                })
+                .unwrap(),
+            )
+        };
+        let send = |operation| Request {
+            version: PROTOCOL_VERSION,
+            operation,
+        };
+        let mut bad_grant = key.sign_grant_revision(grant.clone()).unwrap();
+        bad_grant.grant.revision += 1;
+        assert!(matches!(
+            client
+                .exchange(send(Operation::PublishGrantRevision(bad_grant)))
+                .await
+                .unwrap()
+                .result,
+            Err(EgressError::Unauthorized)
+        ));
+        assert!(matches!(
+            client.exchange(send(publish(10))).await.unwrap().result,
+            Ok(Reply::GrantRevisionPublished)
+        ));
+        let mut attempt = protocol_attempt();
+        attempt.expires_at = 4_000_000_000;
+        attempt.recovery_expires_at = 4_000_000_001;
+        attempt.secret_ref.clear();
+        let admission = key.sign_attempt(attempt).unwrap();
+        let id = key.sign_attempt_id(admission.attempt.attempt_id()).unwrap();
+        assert!(matches!(
+            client.attempt_status(id.clone()).await.unwrap(),
+            AttemptStatus::NotIssued
+        ));
+        let mut bad_attempt = admission.clone();
+        bad_attempt.attempt.input_digest = "c".repeat(64);
+        assert!(matches!(
+            client
+                .exchange(send(Operation::IssuePermit(bad_attempt.into())))
+                .await
+                .unwrap()
+                .result,
+            Err(EgressError::Unauthorized)
+        ));
+        let response = client
+            .exchange(send(Operation::IssuePermit(admission.clone().into())))
+            .await
+            .unwrap();
+        assert_eq!(response.version, PROTOCOL_VERSION);
+        let Reply::Permit(first) = response.result.unwrap() else {
+            panic!("missing permit")
+        };
+        assert!(matches!(first.status, AttemptStatus::Permitted));
+        let Reply::Permit(replay) = client
+            .exchange(send(Operation::IssuePermit(admission.into())))
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+        else {
+            panic!("missing replay")
+        };
+        assert_eq!(first.permit.token, replay.permit.token);
+        assert!(matches!(
+            client.attempt_status(id.clone()).await.unwrap(),
+            AttemptStatus::Permitted
+        ));
+        let mut bad_id = id.clone();
+        bad_id.attempt_id.invocation_id = "foreign".into();
+        assert!(matches!(
+            client.attempt_status(bad_id).await,
+            Err(EgressError::Unauthorized)
+        ));
+        assert!(matches!(
+            client.exchange(send(publish(11))).await.unwrap().result,
+            Ok(Reply::GrantRevisionPublished)
+        ));
+        assert!(matches!(
+            client.attempt_status(id.clone()).await.unwrap(),
+            AttemptStatus::Invalidated
+        ));
+        assert!(matches!(
+            client.exchange(send(publish(10))).await.unwrap().result,
+            Err(EgressError::RouteRefused)
+        ));
+        assert!(matches!(
+            client
+                .exchange(send(Operation::Receipt(id.clone())))
+                .await
+                .unwrap()
+                .result,
+            Ok(Reply::Receipt(None))
+        ));
+        assert!(matches!(
+            client
+                .exchange(Request {
+                    version: PROTOCOL_VERSION - 1,
+                    operation: Operation::AttemptStatus(id)
+                })
+                .await
+                .unwrap()
+                .result,
+            Err(EgressError::Version)
+        ));
+    }
+
+    async fn run(in_process: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let admission = dir.path().join("admission");
+        std::fs::write(&admission, vec![42; 32]).unwrap();
+        std::fs::set_permissions(&admission, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = ProcessConfig {
+            version: PROTOCOL_VERSION,
+            state_dir: dir.path().join("state"),
+            socket_path: dir.path().join(if in_process {
+                "absent/egress.sock"
+            } else {
+                "egress.sock"
+            }),
+            admission_key: SecretSource::OwnerOnlyFile { path: admission },
+            max_secret_bytes: 4096,
+            max_frame_bytes: 262144,
+            max_connections: 8,
+            io_timeout_seconds: 2,
+            clock_rollback_warning_tolerance_seconds: 5,
+            routes: vec![RouteConfig {
+                tenant: "tenant".into(),
+                account: "account".into(),
+                account_sharing_key: None,
+                provider_request_limit: None,
+                max_attempts: 3,
+                route: "provider".into(),
+                secret_ref: String::new(),
+                secret: SecretSource::None,
+                destination: "https://example.test".into(),
+                model: "model".into(),
+                provider: RouteProvider::OpenAiChat {
+                    operator: "test".into(),
+                },
+                allow_loopback_http: false,
+                max_input_bytes: 32768,
+                max_response_bytes: 32768,
+                max_field_bytes: 1024,
+                max_output_tokens: 100,
+                max_in_flight: 4,
+                requests_per_minute: None,
+                input_units_per_minute: None,
+                timeout_seconds: 1,
+            }],
+        };
+        let process = CredentialProcess::open(config.clone()).unwrap();
+        if in_process {
+            // Thread mode needs no socket, including no socket parent directory.
+            let client = InProcessEgressClient::new(process);
+            protocol_checks(&client).await;
+            assert!(!config.socket_path.exists());
+        } else {
+            let listener = server::bind(&process).unwrap();
+            let task = tokio::spawn(server::serve(process, listener));
+            let client = socket::UnixEgressClient {
+                path: config.socket_path,
+                max_frame_bytes: config.max_frame_bytes,
+                timeout: Duration::from_secs(3),
+            };
+            protocol_checks(&client).await;
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_client_preserves_the_egress_protocol() {
+        run(true).await;
+    }
+
+    #[tokio::test]
+    async fn socket_client_preserves_the_egress_protocol() {
+        run(false).await;
+    }
+}
