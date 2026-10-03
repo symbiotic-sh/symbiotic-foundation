@@ -3148,7 +3148,7 @@ async fn anthropic_route_dispatches_only_through_the_credential_permit_and_recov
         for stop_reason in ["end_turn", "model_context_window_exceeded"] {
             let mut fixture = Fixture::with_http_response(200,
             serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":stop_reason,
-                "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312}}}).to_string(),
+                "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312},"cost_usd":"0.000000125"}}).to_string(),
             Duration::ZERO, "0", true, false).await;
             fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
                 operator: "anthropic".into(),
@@ -3168,6 +3168,10 @@ async fn anthropic_route_dispatches_only_through_the_credential_permit_and_recov
             assert_eq!(result.receipt.usage.input_tokens, Some(7));
             assert_eq!(result.receipt.usage.output_tokens, Some(348));
             assert_eq!(result.receipt.usage.reasoning_tokens, Some(312));
+            assert_eq!(
+                result.receipt.usage.reported_cost_usd.as_deref(),
+                Some("0.000000125")
+            );
             assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
             assert_eq!(result.receipt.spend_state, SpendState::Settled);
             assert!(result.receipt_persisted);
@@ -3179,12 +3183,16 @@ async fn anthropic_route_dispatches_only_through_the_credential_permit_and_recov
                 panic!("missing recovered answer");
             };
             assert_eq!(
+                recovered.receipt.usage.reported_cost_usd.as_deref(),
+                Some("0.000000125")
+            );
+            assert_eq!(
                 serde_json::to_value(&result).unwrap(),
                 serde_json::to_value(recovered).unwrap()
             );
             assert!(
                 matches!(exchange(&process, Operation::Receipt(signed_id(&admission))).await,
-            Ok(Reply::Receipt(Some(receipt))) if receipt.usage.reasoning_tokens == Some(312) && receipt.usage.output_tokens == Some(348) && receipt.spend_state == SpendState::Settled)
+            Ok(Reply::Receipt(Some(receipt))) if receipt.usage.reasoning_tokens == Some(312) && receipt.usage.output_tokens == Some(348) && receipt.usage.reported_cost_usd.as_deref() == Some("0.000000125") && receipt.spend_state == SpendState::Settled)
             );
             let recovered = exchange(&process, Operation::IssuePermit(admission.into()))
                 .await
@@ -3208,19 +3216,48 @@ async fn expanded_anthropic_wire_payload_is_refused_before_consumption() {
 
 #[tokio::test]
 async fn anthropic_enabled_thinking_temperature_is_refused_before_consumption() {
-    anthropic_invalid_conversation_is_refused(false).await;
+    anthropic_invalid_conversation_is_refused(
+        false,
+        Some(0.0),
+        Some(symbiotic_ai_runtime::model::ThinkingMode::Enabled),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn anthropic_assistant_prefill_is_refused_before_consumption() {
-    anthropic_invalid_conversation_is_refused(true).await;
+    anthropic_invalid_conversation_is_refused(
+        true,
+        None,
+        Some(symbiotic_ai_runtime::model::ThinkingMode::Enabled),
+    )
+    .await;
 }
 
-async fn anthropic_invalid_conversation_is_refused(prefill: bool) {
+#[tokio::test]
+async fn anthropic_invalid_temperatures_are_refused_before_consumption() {
+    for thinking in [
+        None,
+        Some(symbiotic_ai_runtime::model::ThinkingMode::Disabled),
+    ] {
+        for temperature in [-0.1, 1.5, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            anthropic_invalid_conversation_is_refused(false, Some(temperature), thinking).await;
+        }
+    }
+}
+
+async fn anthropic_invalid_conversation_is_refused(
+    prefill: bool,
+    temperature: Option<f32>,
+    thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
+) {
     let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
     fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
         operator: "anthropic".into(),
-        thinking: Some(symbiotic_ai_runtime::model::ThinkingMode::Enabled),
+        thinking,
+    };
+    fixture.config.routes[0].secret = SecretSource::OwnerOnlyFile {
+        path: fixture.dir.path().join("missing-provider"),
     };
     let process = fixture.process().await;
     let (mut admission, mut payload) = fixture.attempt("invalid-anthropic", 1, 1);
@@ -3232,9 +3269,8 @@ async fn anthropic_invalid_conversation_is_refused(prefill: bool) {
             role: "assistant".into(),
             content: "Answer:".into(),
         });
-    } else {
-        request.temperature = Some(0.0);
     }
+    request.temperature = temperature;
     admission.attempt.input_digest = payload.digest().unwrap();
     let admission = AdmissionKey::new(KEY.to_vec())
         .unwrap()

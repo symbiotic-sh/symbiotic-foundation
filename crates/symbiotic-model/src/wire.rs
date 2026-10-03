@@ -188,6 +188,9 @@ pub fn anthropic_chat_body(
         _ => (None, request.messages.as_slice()),
     };
     if request.response_format.is_some()
+        || request.temperature.is_some_and(|temperature| {
+            !temperature.is_finite() || !(0.0..=1.0).contains(&temperature)
+        })
         || messages.last().is_none_or(|message| message.role != "user")
         || (thinking == Some(ThinkingMode::Enabled)
             && request

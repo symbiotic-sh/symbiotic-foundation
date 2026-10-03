@@ -97,7 +97,7 @@ fn answer() -> Value {
     json!({"id":"fixture-id", "model":"served-model", "stop_reason":"end_turn",
         "content":[{"type":"thinking","thinking":"private reasoning","signature":"sig"},
         {"type":"text","text":"first"},{"type":"redacted_thinking","data":"private redacted"},{"type":"text","text":"second"}],
-        "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312},"cache_read_input_tokens":5,"cache_creation_input_tokens":2}})
+        "usage":{"input_tokens":7,"output_tokens":348,"output_tokens_details":{"thinking_tokens":312},"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"cost_usd":"0.000000125"}})
 }
 #[tokio::test]
 async fn messages_headers_default_tokens_without_thinking_and_usage() {
@@ -122,6 +122,10 @@ async fn messages_headers_default_tokens_without_thinking_and_usage() {
     assert_eq!(response.trace.usage.input_tokens, Some(14));
     assert_eq!(response.trace.usage.output_tokens, Some(348));
     assert_eq!(response.trace.usage.reasoning_tokens, Some(312));
+    assert_eq!(
+        response.trace.usage.reported_cost_usd.as_deref(),
+        Some("0.000000125")
+    );
     assert_eq!(response.trace.cache.cached_input_tokens, Some(5));
     assert_eq!(response.trace.cache.prompt_cache, CacheStatus::PartialHit);
     assert_eq!(response.trace.metadata["cache_miss_tokens"], 9);
@@ -399,6 +403,45 @@ async fn enabled_thinking_refuses_incompatible_temperature_before_connecting() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[tokio::test]
+async fn invalid_temperatures_are_refused_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    for thinking in [
+        None,
+        Some(ThinkingMode::Disabled),
+        Some(ThinkingMode::Enabled),
+    ] {
+        for temperature in [-0.1, 1.5, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let mut req = request();
+            req.max_output_tokens = Some(128);
+            req.temperature = Some(temperature);
+            assert!(matches!(
+                wire::anthropic_chat_body("fixture-model", &req, thinking, None),
+                Err(ModelError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                provider(&url).with_thinking(thinking).chat(req).await,
+                Err(ModelError::InvalidRequest(_))
+            ));
+        }
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    for thinking in [None, Some(ThinkingMode::Disabled)] {
+        for temperature in [0.0, 0.5, 1.0] {
+            let mut req = request();
+            req.temperature = Some(temperature);
+            let bytes = wire::anthropic_chat_body("fixture-model", &req, thinking, None).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["temperature"], json!(temperature));
+        }
+    }
 }
 
 #[tokio::test]

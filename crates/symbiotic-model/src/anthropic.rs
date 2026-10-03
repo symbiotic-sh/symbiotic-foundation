@@ -189,6 +189,7 @@ impl ChatProvider for AnthropicChatProvider {
                     input_tokens: input,
                     output_tokens: usage.output_tokens,
                     reasoning_tokens: usage.output_tokens_details.and_then(|d| d.thinking_tokens),
+                    reported_cost_usd: reported_cost_usd(&raw),
                     ..UsageTrace::default()
                 };
                 let (hit, miss) =
