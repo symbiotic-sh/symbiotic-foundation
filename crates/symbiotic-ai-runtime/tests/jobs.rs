@@ -1096,6 +1096,60 @@ async fn review_4_direct_settlement_respects_purge_even_after_confirmation() {
 }
 
 #[tokio::test]
+async fn purging_one_binding_preserves_another_bindings_recovery_answer() {
+    for confirmed in [false, true] {
+        for answer_before_purge in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let r = runtime(dir.path());
+            let j = jobs(&r, JobConfig::default());
+            let p = Provider::new();
+            let id = enqueue(&j, spec("binding-purge", &p)).await;
+            let key = j.invocation_key("binding-purge").unwrap();
+            let mut other = binding(p.clone());
+            other.identity.as_mut().unwrap().revision.0 = "2".into();
+            if answer_before_purge {
+                r.execute_chat(other.clone(), &key, request())
+                    .await
+                    .unwrap();
+            }
+            j.request(JobRequest::PurgeOwner("owner-a".into()))
+                .await
+                .unwrap();
+            assert_eq!(row(&j, &id).await.state, JobState::Purged);
+            if confirmed {
+                let page = j.completions(1, 10000).await.unwrap();
+                j.request(JobRequest::Ack(vec![(
+                    page[0].delivery.token.clone(),
+                    Disposition::Discarded,
+                )]))
+                .await
+                .unwrap();
+                assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
+            }
+            if !answer_before_purge {
+                r.execute_chat(other.clone(), &key, request())
+                    .await
+                    .unwrap();
+            }
+            let status = r
+                .invocation_status(other.identity.as_ref().unwrap(), None, &key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, SpendState::Settled);
+            assert!(status.output_available);
+            assert_eq!(copies(dir.path()), 1);
+            drop(j);
+            drop(r);
+            let reopened = runtime(dir.path());
+            let recovered = reopened.execute_chat(other, &key, request()).await.unwrap();
+            assert_eq!(recovered.output.text, "paid answer");
+            assert_eq!(recovered.attempt.unwrap().unwrap(), status);
+            assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn review_6_reconciled_paid_without_answer_finalizes() {
     for disposition in ["failed", "cancelled", "purged"] {
         let dir = tempfile::tempdir().unwrap();
