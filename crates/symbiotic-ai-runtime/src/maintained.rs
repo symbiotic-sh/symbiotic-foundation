@@ -43,19 +43,18 @@ impl Sweep {
         }
     }
 
-    /// Drain expired recovery independently of cache validation, then retire
-    /// old queue state and prune cached responses.
+    /// Drain expired recovery independently of cache validation, prune cached
+    /// responses (which validates the cache tree first), then retire old queue state.
     pub(crate) fn maintain(&self) -> Result<(), ModelError> {
         self.recovery.expire_recovery()?;
-        self.responses.cache.validate_tree()?;
+        self.responses
+            .cache
+            .prune(self.responses.max_age, self.responses.max_bytes)?;
         let cutoff = chrono::Utc::now() - self.retention;
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
             .and_then(|_| self.queue.prune_terminal_before(cutoff))
             .map_err(|_err| ModelError::Queue(DiagnosticCode::QueueFailure))?;
-        self.responses
-            .cache
-            .prune(self.responses.max_age, self.responses.max_bytes)?;
         Ok(())
     }
 }
