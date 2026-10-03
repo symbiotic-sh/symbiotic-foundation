@@ -170,8 +170,8 @@ impl Shared {
                 _ = poll.tick() => self.signal_cancel(&claim, &cancel).await,
             };
             if let Err(error) = check {
-                // Lost storage/ownership is visible. Ask work to stop, await its
-                // own finish, and never attempt a completion under this claim.
+                // Lost storage/ownership is visible. Ask work to stop and await
+                // its own finish; the store fences any resulting completion.
                 errors.push(RunnerError::Store(error));
                 cancel.send_replace(true);
                 break task.join_next().await;
@@ -183,7 +183,7 @@ impl Shared {
             Some(Ok(Ok(None))) => (JobState::Cancelled, None, None),
             Some(Ok(Err(error))) => {
                 errors.push(error.into());
-                (JobState::Failed, None, None)
+                return Err(RunnerError::Workers(errors));
             }
             Some(Err(_)) => {
                 errors.push(RunnerError::HandlerPanicked(claim.id.clone()));
@@ -191,27 +191,25 @@ impl Shared {
             }
             None => {
                 errors.push(RunnerError::WorkerTask);
-                (JobState::Failed, None, None)
+                return Err(RunnerError::Workers(errors));
             }
         };
-        // Panic still records a terminal failure while the generation is live.
-        if errors.is_empty() || matches!(errors.as_slice(), [RunnerError::HandlerPanicked(_)]) {
-            match self
-                .op(JobRequest::Complete {
-                    job: claim.id,
-                    generation: claim.generation,
-                    state,
-                    origin: ResultOrigin::Handler,
-                    output,
-                    receipt: None,
-                    diagnostic,
-                })
-                .await
-            {
-                Ok(JobResponse::Done) => {}
-                Ok(_) => errors.push(JobError::InvalidRequest.into()),
-                Err(error) => errors.push(error.into()),
-            }
+        // Finished work, including a panic, always reaches the store's claim fence.
+        match self
+            .op(JobRequest::Complete {
+                job: claim.id,
+                generation: claim.generation,
+                state,
+                origin: ResultOrigin::Handler,
+                output,
+                receipt: None,
+                diagnostic,
+            })
+            .await
+        {
+            Ok(JobResponse::Done) => {}
+            Ok(_) => errors.push(JobError::InvalidRequest.into()),
+            Err(error) => errors.push(error.into()),
         }
         if errors.is_empty() {
             Ok(())
@@ -248,6 +246,9 @@ impl Shared {
                 )
             {
                 return Err(JobError::InvalidRequest.into());
+            }
+            if *stop.borrow() {
+                return Ok(());
             }
             match self
                 .op(JobRequest::Claim {

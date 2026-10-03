@@ -2,12 +2,15 @@
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
-use symbiotic_queue::QueueBackend;
 use symbiotic_queue::jobs::*;
+use symbiotic_queue::*;
 macro_rules! data {
     ($($t:tt)*) => { serde_json::to_vec(&serde_json::json!($($t)*)).unwrap() };
 }
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use symbiotic_queue::runner::*;
 
 struct Handler<F>(F);
@@ -22,14 +25,112 @@ where
     }
 }
 
+struct InterceptJobs<F> {
+    backend: Arc<symbiotic_queue_sqlite::SqliteQueue>,
+    before: F,
+}
+
+#[async_trait::async_trait]
+impl<F> QueueBackend for InterceptJobs<F>
+where
+    F: Fn(&JobRequest) -> futures::future::BoxFuture<'static, Result<(), JobError>> + Send + Sync,
+{
+    async fn jobs(
+        &self,
+        scope: &JobScope,
+        config: &JobConfig,
+        now: DateTime<Utc>,
+        request: JobRequest,
+    ) -> Result<JobResponse, JobError> {
+        (self.before)(&request).await?;
+        self.backend.jobs(scope, config, now, request).await
+    }
+
+    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+        self.backend.enqueue(request).await
+    }
+    async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
+        self.backend.claim(request).await
+    }
+    async fn claim_item(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+        worker: &str,
+        lease: u64,
+        max_in_flight: Option<usize>,
+    ) -> Result<Option<QueueItem>, QueueError> {
+        self.backend
+            .claim_item(id, worker, lease, max_in_flight)
+            .await
+    }
+    async fn get_item(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+    ) -> Result<Option<QueueItem>, QueueError> {
+        self.backend.get_item(id).await
+    }
+    async fn heartbeat(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+        worker: &str,
+        lease: u64,
+    ) -> Result<(), QueueError> {
+        self.backend.heartbeat(id, worker, lease).await
+    }
+    async fn complete(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+        worker: &str,
+    ) -> Result<(), QueueError> {
+        self.backend.complete(id, worker).await
+    }
+    async fn fail(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+        worker: &str,
+        error: symbiotic_core::DiagnosticCode,
+        retry: Option<u64>,
+    ) -> Result<FailOutcome, QueueError> {
+        self.backend.fail(id, worker, error, retry).await
+    }
+    async fn fail_with(
+        &self,
+        id: &symbiotic_core::QueueItemId,
+        worker: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        self.backend.fail_with(id, worker, failure).await
+    }
+    async fn reclaim_expired_leases(
+        &self,
+        queue: &symbiotic_core::QueueId,
+    ) -> Result<usize, QueueError> {
+        self.backend.reclaim_expired_leases(queue).await
+    }
+}
+
 impl Suite {
     async fn runner<F, Fut>(&self, workers: usize, handler: F) -> JobRunner
     where
         F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
     {
+        self.runner_with_backend(self.backend.clone(), workers, handler)
+            .await
+    }
+
+    async fn runner_with_backend<F, Fut>(
+        &self,
+        backend: Arc<dyn QueueBackend>,
+        workers: usize,
+        handler: F,
+    ) -> JobRunner
+    where
+        F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
+    {
         JobRunner::start(
-            self.backend.clone(),
+            backend,
             self.scope.clone(),
             self.config.clone(),
             RunnerConfig {
@@ -174,6 +275,196 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
     assert_eq!(s.get(pending).await.generation, 0);
     assert_eq!(s.get(&first).await.state, JobState::Succeeded);
     assert_eq!(s.get(&second).await.state, JobState::Succeeded);
+
+    // Stop while maintenance is suspended, before the worker can claim again.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Semaphore::new(0));
+    let claims = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (entered, resume, claims) = (entered.clone(), resume.clone(), claims.clone());
+            move |request: &JobRequest| {
+                let (entered, resume) = (entered.clone(), resume.clone());
+                let maintenance = matches!(request, JobRequest::Maintain);
+                if matches!(request, JobRequest::Claim { .. }) {
+                    claims.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    if maintenance {
+                        entered.notify_one();
+                        resume.acquire().await.unwrap().forget();
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let runner = s
+        .runner_with_backend(backend, 1, |_, bytes| async { Ok(bytes) })
+        .await;
+    entered.notified().await;
+    let shutdown = runner.shutdown();
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        result = &mut shutdown => panic!("shutdown finished before maintenance: {result:?}"),
+        _ = tokio::task::yield_now() => {},
+    }
+    resume.add_permits(1);
+    shutdown.await.unwrap();
+    assert_eq!(claims.load(Ordering::SeqCst), 0);
+    assert_eq!(s.get(pending).await.state, JobState::Pending);
+    assert_eq!(s.get(pending).await.generation, 0);
+}
+
+#[derive(Clone, Copy)]
+enum CompletionFence {
+    Live,
+    Expired,
+    Superseded,
+}
+
+#[tokio::test]
+async fn runner_monitoring_storage_error_still_completes_finished_handler() {
+    for heartbeat in [true, false] {
+        for state in [JobState::Succeeded, JobState::Failed] {
+            monitoring_error_completion_case(heartbeat, state, CompletionFence::Live).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn runner_monitoring_storage_error_completion_keeps_lease_and_generation_fences() {
+    for heartbeat in [true, false] {
+        for fence in [CompletionFence::Expired, CompletionFence::Superseded] {
+            monitoring_error_completion_case(heartbeat, JobState::Succeeded, fence).await;
+        }
+    }
+}
+
+async fn monitoring_error_completion_case(
+    heartbeat: bool,
+    state: JobState,
+    fence: CompletionFence,
+) {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 3;
+    let id = s.insert(s.spec("storage-error")).await;
+    let started = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+    let completions = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(InterceptJobs {
+        backend: s.backend.clone(),
+        before: {
+            let (started, failed, completions) =
+                (started.clone(), failed.clone(), completions.clone());
+            move |request: &JobRequest| {
+                if matches!(request, JobRequest::Complete { .. }) {
+                    completions.fetch_add(1, Ordering::SeqCst);
+                }
+                let monitoring = if heartbeat {
+                    matches!(request, JobRequest::Heartbeat { .. })
+                } else {
+                    matches!(request, JobRequest::Get(_))
+                };
+                let error = monitoring
+                    && started.load(Ordering::SeqCst)
+                    && !failed.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if error {
+                        Err(JobError::Storage)
+                    } else {
+                        Ok(())
+                    }
+                }) as futures::future::BoxFuture<'static, Result<(), JobError>>
+            }
+        },
+    });
+    let (store, scope, config) = (s.backend.clone(), s.scope.clone(), s.config.clone());
+    let runner = s
+        .runner_with_backend(backend, 1, move |ctx, bytes| {
+            let (started, store, scope, config) = (
+                started.clone(),
+                store.clone(),
+                scope.clone(),
+                config.clone(),
+            );
+            async move {
+                started.store(true, Ordering::SeqCst);
+                ctx.cancel.cancelled().await;
+                match fence {
+                    CompletionFence::Live => {}
+                    CompletionFence::Expired => {
+                        // An older trusted clock makes the lease expire before completion.
+                        store
+                            .jobs(
+                                &scope,
+                                &config,
+                                Utc::now() - Duration::seconds(4),
+                                JobRequest::Heartbeat {
+                                    job: ctx.id.clone(),
+                                    generation: ctx.attempt,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    CompletionFence::Superseded => {
+                        assert!(
+                            matches!(store.jobs(&scope, &config, Utc::now() + Duration::seconds(4),
+                            JobRequest::ClaimJob(ctx.id.clone())).await.unwrap(),
+                            JobResponse::Job(Some(row)) if row.generation == ctx.attempt + 1)
+                        );
+                    }
+                }
+                if state == JobState::Failed {
+                    Err(JobFailure {
+                        code: symbiotic_core::DiagnosticCode::QueueFailure,
+                    })
+                } else {
+                    Ok(bytes)
+                }
+            }
+        })
+        .await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(15), runner.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, RunnerError::Workers(workers)
+    if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+        if match fence {
+            CompletionFence::Live => matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage)]),
+            _ => matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage), RunnerError::Store(JobError::StaleClaim)]),
+        })));
+    assert!(failed.load(Ordering::SeqCst));
+    assert_eq!(completions.load(Ordering::SeqCst), 1);
+    let row = s.get(&id).await;
+    if !matches!(fence, CompletionFence::Live) {
+        assert_eq!(row.state, JobState::Running);
+        assert!(row.output.is_none());
+        assert_eq!(
+            row.generation,
+            if matches!(fence, CompletionFence::Superseded) {
+                2
+            } else {
+                1
+            }
+        );
+        return;
+    }
+    assert_eq!(row.state, state);
+    assert_eq!(row.generation, 1);
+    if state == JobState::Succeeded {
+        assert_eq!(row.output, Some(s.spec("storage-error").payload));
+    } else {
+        assert_eq!(
+            row.diagnostic,
+            Some(symbiotic_core::DiagnosticCode::QueueFailure)
+        );
+    }
 }
 
 #[tokio::test]
