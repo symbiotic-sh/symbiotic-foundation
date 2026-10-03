@@ -58,6 +58,8 @@ mod execution;
 mod maintained;
 pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
 pub mod spend;
+#[cfg(test)]
+mod spend_tests;
 pub use model::{
     AcceptedSpendHandoff, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState,
 };
@@ -384,6 +386,14 @@ impl Runtime {
         &self,
         matches: impl Fn(&CachedResponse) -> bool,
     ) -> Result<usize, ModelError> {
+        let cache = self
+            .inner
+            .state_dir
+            .as_ref()
+            .map(|dir| DirResponseCache::new(dir.join(RESPONSES_DIR)));
+        if let Some(cache) = &cache {
+            cache.validate_tree()?;
+        }
         let recoveries = if self.is_persistent() {
             self.inner.spend.purge_recovery(&|value| {
                 let trace: symbiotic_trace::ModelInvocationTrace =
@@ -409,10 +419,8 @@ impl Runtime {
         } else {
             0
         };
-        match &self.inner.state_dir {
-            Some(dir) => DirResponseCache::new(dir.join(RESPONSES_DIR))
-                .purge(matches)
-                .map(|n| n + recoveries),
+        match cache {
+            Some(cache) => cache.purge(matches).map(|n| n + recoveries),
             None => Ok(recoveries),
         }
     }

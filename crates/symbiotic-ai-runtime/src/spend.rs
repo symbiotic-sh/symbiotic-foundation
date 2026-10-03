@@ -23,7 +23,7 @@ fn state_name(state: SpendState) -> &'static str {
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
-pub struct SqliteSpendLedger(Mutex<Connection>, std::time::Duration);
+pub struct SqliteSpendLedger(pub(super) Mutex<Connection>, std::time::Duration);
 impl SqliteSpendLedger {
     /// Open an already initialized Foundation queue database.
     pub fn open(path: &Path) -> Result<Self, ModelError> {
@@ -50,21 +50,23 @@ impl SqliteSpendLedger {
         self
     }
 
-    /// Clear at most 64 expired answers through the live recovery index.
+    /// Clear all expired answers in indexed batches of at most 64 rows.
     pub fn expire_recovery(&self) -> Result<usize, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let due: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM spend_receipts WHERE recovery IS NOT NULL AND recovery_expires_at<=?1)", [&now], |row| row.get(0)).map_err(storage)?;
-        if !due {
-            return Ok(0);
+        let mut removed = 0;
+        loop {
+            let batch = conn.execute(
+                "UPDATE spend_receipts SET recovery=NULL, recovery_expires_at=NULL WHERE rowid IN (
+                SELECT rowid FROM spend_receipts WHERE recovery IS NOT NULL AND recovery_expires_at<=?1
+                ORDER BY recovery_expires_at LIMIT 64)",
+                [&now],
+            ).map_err(storage)?;
+            removed += batch;
+            if batch == 0 {
+                return Ok(removed);
+            }
         }
-        conn.execute(
-            "UPDATE spend_receipts SET recovery=NULL, recovery_expires_at=NULL WHERE rowid IN (
-            SELECT rowid FROM spend_receipts WHERE recovery IS NOT NULL AND recovery_expires_at<=?1
-            ORDER BY recovery_expires_at LIMIT 64)",
-            [now],
-        )
-        .map_err(storage)
     }
 
     /// Reserve inside the caller's immediate transaction (permit/replay acceptance).
@@ -489,111 +491,5 @@ impl SpendLedger for SqliteSpendLedger {
         }
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    fn reservation(id: &str) -> SpendReservation {
-        SpendReservation {
-            reference: SpendReceiptRef::new(id).unwrap(),
-            account: "account".into(),
-            invocation: "invocation".into(),
-            binding: "binding".into(),
-            request_limit: None,
-        }
-    }
-
-    fn steps(history: usize, explicit: bool) -> Vec<usize> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.sqlite");
-        symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
-        let ledger = SqliteSpendLedger::open(&path)
-            .unwrap()
-            .with_retention(std::time::Duration::ZERO);
-        {
-            let mut conn = ledger.0.lock().unwrap();
-            let tx = conn.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO spend_accounts(account,used) VALUES ('account',?1)",
-                [if explicit { 0 } else { history }],
-            )
-            .unwrap();
-            for n in 0..history {
-                let r = reservation(&format!("runtime:old-item-{n}:1"));
-                tx.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state, output, pre_dispatch_released, attempt_limit, attempts_used) VALUES (?1,'account','invocation','binding',?2,?3,?4,?5,?6,0)",
-                    params![r.reference.as_str(), serde_json::to_string(&r).unwrap(), if explicit { "released" } else { "settled" },
-                        (!explicit).then_some("{\"output_received\":true}"), explicit, explicit.then_some(3)]).unwrap();
-            }
-            tx.commit().unwrap();
-        }
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        ledger.0.lock().unwrap().progress_handler(
-            1,
-            Some(move || {
-                c.fetch_add(1, Ordering::Relaxed);
-                false
-            }),
-        );
-        let mut result = Vec::new();
-        let r = reservation("runtime:current:1");
-        if explicit {
-            ledger.reserve_explicit(&r, 3).unwrap();
-        } else {
-            ledger.reserve(&r).unwrap();
-        }
-        result.push(count.swap(0, Ordering::Relaxed));
-        ledger
-            .finish(
-                &r.reference,
-                SpendState::Settled,
-                Some(UsageTrace {
-                    input_tokens: Some(7),
-                    ..Default::default()
-                }),
-                Some(serde_json::json!({"answer":"private"})),
-            )
-            .unwrap();
-        result.push(count.swap(0, Ordering::Relaxed));
-        ledger.invocation("account", "invocation").unwrap();
-        result.push(count.swap(0, Ordering::Relaxed));
-        ledger.receipt(&r.reference).unwrap();
-        result.push(count.swap(0, Ordering::Relaxed));
-        // Implicit counting uses only the current item's bounded claim keys.
-        for claim in 1..=3 {
-            ledger
-                .receipt(&SpendReceiptRef::new(format!("runtime:current:{claim}")).unwrap())
-                .unwrap();
-        }
-        result.push(count.swap(0, Ordering::Relaxed));
-        assert_eq!(ledger.expire_recovery().unwrap(), usize::from(explicit));
-        result.push(count.swap(0, Ordering::Relaxed));
-        ledger.discard_recovery("account", "invocation").unwrap();
-        result.push(count.swap(0, Ordering::Relaxed));
-        result
-    }
-
-    #[test]
-    fn request_and_expiry_work_is_independent_of_retained_history() {
-        for explicit in [false, true] {
-            let small = steps(10, explicit);
-            let large = steps(10_000, explicit);
-            eprintln!(
-                "explicit={explicit}: VM steps at 10 receipts={small:?}, at 10,000={large:?}"
-            );
-            for (operation, (small, large)) in small.iter().zip(&large).enumerate() {
-                assert!(
-                    *large <= small + 20,
-                    "explicit={explicit}, operation={operation}: {small} -> {large}"
-                );
-            }
-        }
     }
 }

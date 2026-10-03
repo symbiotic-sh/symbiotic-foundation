@@ -2846,3 +2846,51 @@ async fn fdn_unknown_replay_attaches_to_its_receipt_after_queue_pruning() {
     assert_eq!(replay.attempt.unwrap().unwrap().reference, reference);
     assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_purge_preserves_retained_answers_and_cache_files() {
+    for linked_root in [true, false] {
+        let dir = private_tempdir();
+        let runtime = persistent(dir.path());
+        let raw = Loopback::new(unique_identity());
+        let configured = binding(raw.clone()).with_policy(policy());
+        let paid = runtime
+            .execute_chat(configured.clone(), "retained", request("private"))
+            .await
+            .unwrap();
+        let reference = paid.attempt.unwrap().unwrap().reference;
+        let before = runtime.spend_receipt(&reference).unwrap().unwrap();
+        assert!(before.recovery.is_some());
+        let responses = dir.path().join(symbiotic_ai_runtime::RESPONSES_DIR);
+        let bystander = private_tempdir();
+        let file = bystander.path().join("precious.json");
+        std::fs::write(&file, "private cache answer").unwrap();
+        if linked_root {
+            std::os::unix::fs::symlink(bystander.path(), &responses).unwrap();
+        } else {
+            std::fs::create_dir(&responses).unwrap();
+            std::fs::write(responses.join("own.json"), "private cache answer").unwrap();
+            std::os::unix::fs::symlink(bystander.path(), responses.join("linked")).unwrap();
+        }
+        assert!(matches!(
+            runtime.purge_responses(|_| true),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        let after = runtime.spend_receipt(&reference).unwrap().unwrap();
+        assert_eq!(after.recovery, before.recovery);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.output, before.output);
+        assert!(file.exists());
+        if !linked_root {
+            assert!(responses.join("own.json").exists());
+        }
+        runtime
+            .execute_chat(configured, "retained", request("private"))
+            .await
+            .unwrap();
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    }
+}

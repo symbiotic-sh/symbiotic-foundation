@@ -193,9 +193,9 @@ Ledger accounting receipts survive queue retention. Only explicit invocations sa
 recovery answers, until completion time plus `RuntimeConfig::retention`, host acceptance
 through `Runtime::discard_invocation_output`, or matching input erasure through
 `Runtime::purge_responses`. Reads treat an expired answer as absent without writing.
-The maintenance sweep clears at most 64 expired answers through the recovery expiry
-index per pass. Discard, expiry and erasure preserve completion markers, receipts,
-usage and account spend. Replaying a completed invocation returns its retained answer,
+The maintenance sweep clears the expired backlog through the recovery expiry
+index in batches of at most 64 answers. Discard, expiry and erasure preserve
+completion markers, receipts, usage and account spend. Replaying a completed invocation returns its retained answer,
 then the typed `InvocationCompleted` diagnostic with its receipt once the answer is gone.
 
 **Current retention settings.** At open, and after every 10,000 finished calls, a persistent
@@ -215,7 +215,8 @@ count/bytes and per-batch/idle work remain unbounded by these settings; see
 Periodic sweeps run on the blocking pool. Sweep errors reach the queue operation
 that triggered maintenance; a successful paid answer preserves that error in its
 `queue_complete_failed` diagnostic. Open-time maintenance errors refuse the open.
-A sweep or purge checks the whole cache tree before it deletes anything.
+A sweep or purge checks the whole cache tree before it deletes anything, including
+retained recovery answers. A refused purge removes nothing.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
 

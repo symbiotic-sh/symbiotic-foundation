@@ -45,6 +45,7 @@ impl Sweep {
     /// Mark calls orphaned by a crash dead, then drop finished calls, both
     /// older than the retention window; then prune the response cache.
     fn run(&self) -> Result<(), ModelError> {
+        self.responses.cache.validate_tree()?;
         self.recovery.expire_recovery()?;
         let cutoff = Utc::now() - self.retention;
         self.queue
@@ -252,5 +253,114 @@ mod tests {
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
             ))
         ));
+    }
+
+    #[test]
+    fn runtime_maintenance_deletes_the_entire_expired_answer_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.path().join(crate::QUEUE_DATABASE);
+        let runtime = crate::Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..crate::RuntimeConfig::default()
+        })
+        .unwrap();
+        let ledger = crate::spend::SqliteSpendLedger::open(&path)
+            .unwrap()
+            .with_retention(Duration::ZERO);
+        for n in 0..129 {
+            let r = SpendReservation {
+                reference: SpendReceiptRef::new(format!("paid-{n}")).unwrap(),
+                account: "account".into(),
+                invocation: format!("explicit-{n}"),
+                binding: "input".into(),
+                request_limit: None,
+            };
+            ledger.reserve_explicit(&r, 3).unwrap();
+            ledger
+                .finish(
+                    &r.reference,
+                    SpendState::Unknown,
+                    None,
+                    Some(serde_json::json!({"answer":"private"})),
+                )
+                .unwrap();
+        }
+        drop(runtime);
+        let _runtime = crate::Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..crate::RuntimeConfig::default()
+        })
+        .unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL",
+            [], |r| r.get::<_, usize>(0)).unwrap(), 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            129
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_maintenance_preserves_expired_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = SqliteQueue::open(&path).unwrap();
+        let ledger = crate::spend::SqliteSpendLedger::open(&path)
+            .unwrap()
+            .with_retention(Duration::ZERO);
+        let r = SpendReservation {
+            reference: SpendReceiptRef::new("paid").unwrap(),
+            account: "account".into(),
+            invocation: "explicit".into(),
+            binding: "input".into(),
+            request_limit: None,
+        };
+        ledger.reserve_explicit(&r, 3).unwrap();
+        ledger
+            .finish(
+                &r.reference,
+                SpendState::Unknown,
+                None,
+                Some(serde_json::json!({"answer":"private"})),
+            )
+            .unwrap();
+        let cache_root = dir.path().join("responses");
+        std::os::unix::fs::symlink(dir.path().join("bystander"), &cache_root).unwrap();
+        let maintained = MaintainedQueue::new(
+            queue,
+            Duration::from_secs(60),
+            ResponseRetention {
+                cache: DirResponseCache::new(cache_root),
+                max_age: None,
+                max_bytes: None,
+            },
+            ledger,
+        );
+        assert!(matches!(
+            maintained.maintain(),
+            Err(ModelError::Cache(
+                symbiotic_core::DiagnosticCode::CachePathRefused
+            ))
+        ));
+        assert_eq!(
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+                    [],
+                    |r| r.get::<_, usize>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 }

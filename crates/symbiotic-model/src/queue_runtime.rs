@@ -346,6 +346,12 @@ impl DirResponseCache {
         Ok(removed)
     }
 
+    /// Validate ownership and refuse symlinks throughout the cache tree before
+    /// a caller removes related state outside this cache.
+    pub fn validate_tree(&self) -> Result<(), ModelError> {
+        self.entries().map(|_| ())
+    }
+
     /// Every entry file under the root. The whole tree is checked before
     /// anyone deletes from it: the root and every component in it must be
     /// the current user's own and not a symlink, or the walk is refused, so
