@@ -2345,6 +2345,7 @@ impl ObservedSpend {
             symbiotic_model::SpendState::Released,
             None,
             None,
+            None,
         )
         .unwrap();
     }
@@ -2428,13 +2429,15 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         state: symbiotic_model::SpendState,
         usage: Option<UsageTrace>,
         output: Option<Value>,
+        invocation: Option<&str>,
     ) -> Result<(), ModelError> {
         if self.fail_settlement.load(Ordering::SeqCst) && output.is_some() {
             return Err(ModelError::Queue(
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
         }
-        self.inner.finish(reference, state, usage, output)
+        self.inner
+            .finish(reference, state, usage, output, invocation)
     }
 }
 

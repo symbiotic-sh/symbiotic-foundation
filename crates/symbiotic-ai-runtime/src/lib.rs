@@ -414,7 +414,7 @@ impl Runtime {
         state: SpendState,
         usage: Option<symbiotic_trace::UsageTrace>,
     ) -> Result<(), ModelError> {
-        self.inner.spend.finish(reference, state, usage, None)
+        self.inner.spend.finish(reference, state, usage, None, None)
     }
 
     /// An in-memory runtime for configuration inspection; dispatch is refused.

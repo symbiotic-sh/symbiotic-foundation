@@ -897,7 +897,7 @@ struct QueuedCall<Req> {
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
-    explicit_invocation: bool,
+    invocation_key: Option<String>,
     attempt_binding: String,
     attempt_context: ExecutionAttemptContext,
     worker_id: String,
@@ -924,7 +924,7 @@ impl<Req> QueuedCall<Req> {
     async fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<Res>, ModelError> {
-        if !self.explicit_invocation || self.accepted_spend.is_some() {
+        if self.invocation_key.is_none() || self.accepted_spend.is_some() {
             return Ok(None);
         }
         let spend = self.spend.clone();
@@ -978,7 +978,7 @@ impl<Req> QueuedCall<Req> {
     }
 
     async fn retry_state(&self, item: Option<&QueueItem>) -> Result<LogicalRetryState, ModelError> {
-        if self.explicit_invocation {
+        if self.invocation_key.is_some() {
             let spend = self.spend.clone();
             let account = self.queue_id.0.clone();
             let invocation = self.invocation.clone();
@@ -1011,7 +1011,7 @@ impl<Req> QueuedCall<Req> {
             &self.capability,
             &self.request_hash,
             &self.descriptor,
-            (!self.explicit_invocation).then_some(state),
+            (self.invocation_key.is_none()).then_some(state),
         )
     }
 
@@ -1037,7 +1037,7 @@ impl<Req> QueuedCall<Req> {
                     &self.capability,
                     &self.request_hash,
                     &self.descriptor,
-                    (!self.explicit_invocation).then(|| LogicalRetryState {
+                    (self.invocation_key.is_none()).then(|| LogicalRetryState {
                         attempts_used: 0,
                         max_attempts: logical_max_attempts(&self.config),
                     }),
@@ -1053,7 +1053,7 @@ impl<Req> QueuedCall<Req> {
     }
 
     async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
-        if self.explicit_invocation {
+        if self.invocation_key.is_some() {
             return Err(ModelError::BudgetExhausted(
                 DiagnosticCode::AttemptBudgetExhausted,
             ));
@@ -1181,7 +1181,7 @@ impl<Req> QueuedCall<Req> {
         let state = self.retry_state(Some(item)).await?;
         let attempts_used = state.attempts_used;
         if attempts_used >= state.max_attempts {
-            return if !self.explicit_invocation && budget_renewed(item, &self.config)? {
+            return if self.invocation_key.is_none() && budget_renewed(item, &self.config)? {
                 self.renew_budget(&item.item_id).await.map(Some)
             } else {
                 Ok(None)
@@ -1227,7 +1227,7 @@ impl<Req> QueuedCall<Req> {
             &self.config,
             err,
             self.retry_state(Some(dead)).await?,
-            self.explicit_invocation,
+            self.invocation_key.is_some(),
         )
         .await
     }
@@ -1519,7 +1519,7 @@ where
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         invocation,
-        explicit_invocation: runtime.invocation.is_some(),
+        invocation_key: runtime.invocation.clone(),
         attempt_binding,
         attempt_context: attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
@@ -1605,7 +1605,7 @@ where
                 }
             }
             QueueStatus::Dead
-                if !this.explicit_invocation && budget_renewed(&enqueue.item, config)? =>
+                if this.invocation_key.is_none() && budget_renewed(&enqueue.item, config)? =>
             {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
@@ -1781,7 +1781,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                     Err(dead_item_retry_error(&current))
                 }
             }
-            QueueStatus::Dead if !self.explicit_invocation && budget_renewed(&current, config)? => {
+            QueueStatus::Dead
+                if self.invocation_key.is_none() && budget_renewed(&current, config)? =>
+            {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1975,7 +1977,7 @@ where
                         binding: state.attempt_binding.clone(),
                         request_limit: state.config.provider_request_limit,
                     };
-                    if state.explicit_invocation {
+                    if state.invocation_key.is_some() {
                         state
                             .spend
                             .reserve_explicit(&reservation, logical_max_attempts(&state.config))
@@ -2223,6 +2225,8 @@ where
     };
     // All preparation failures share the durable no-dispatch release path.
     // No provider future exists until this block succeeds.
+    let attempt = job.attempt()?;
+    let item_id = QueueItemId(reference.as_str().into());
     let prepared = async {
         let request: Req = serde_json::from_slice(&payload)
             .map_err(|_| ModelError::InvalidRequest(DiagnosticCode::InvalidConfiguration))?;
@@ -2233,6 +2237,24 @@ where
         }
         Arc::get_mut(&mut this).ok_or_else(spend::storage)?.request = request;
         this.attempt_context.capture(&reference)?;
+        this.receipts
+            .record_attempt(
+                ReceiptStatus::Queued,
+                Some((&item_id, 0)),
+                None,
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
+        this.receipts
+            .record_attempt(
+                ReceiptStatus::Running,
+                Some((&item_id, attempt)),
+                None,
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
         let owner = job.clone();
         if run_blocking(move || owner.heartbeat()).await? {
             return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
@@ -2248,26 +2270,6 @@ where
         run_blocking(move || owner.release()).await?;
         return Err(error);
     }
-    let attempt = job.attempt()?;
-    let item_id = QueueItemId(reference.as_str().into());
-    this.receipts
-        .record_attempt(
-            ReceiptStatus::Queued,
-            Some((&item_id, 0)),
-            None,
-            None,
-            AttemptTiming::NONE,
-        )
-        .await;
-    this.receipts
-        .record_attempt(
-            ReceiptStatus::Running,
-            Some((&item_id, attempt)),
-            None,
-            None,
-            AttemptTiming::NONE,
-        )
-        .await;
     let provider_started = Instant::now();
     let dispatch = this.clone();
     let transport_provider = provider.clone();
@@ -2520,7 +2522,7 @@ where
     let released = if known_zero && this.accepted_spend.is_none() {
         let spend = this.spend.clone();
         let reference = reference.clone();
-        run_blocking(move || spend.finish(&reference, SpendState::Released, None, None)).await
+        run_blocking(move || spend.finish(&reference, SpendState::Released, None, None, None)).await
     } else {
         Ok(())
     };
@@ -2568,18 +2570,17 @@ where
                 let response_to_save = response.clone();
                 let spend = this.spend.clone();
                 let reference = reference.clone();
+                let invocation_key = this.invocation_key.clone();
                 let saved = run_blocking(move || {
                     let output =
                         serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?;
+                    let usage = has_measured_usage(&usage).then_some(usage);
                     spend.finish(
                         &reference,
                         state,
-                        if has_measured_usage(&usage) {
-                            Some(usage)
-                        } else {
-                            None
-                        },
+                        usage,
                         Some(output),
+                        invocation_key.as_deref(),
                     )
                 })
                 .await;

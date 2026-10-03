@@ -29,31 +29,22 @@ pub(crate) fn job_invocation_key(
     serde_json::to_string(&(scope, key)).map_err(storage)
 }
 
-// Derive the erasure fence from canonical scoped tombstones and kind bindings,
-// including confirmation after an unsent job was purged during a direct call.
+// Scoped invocation keys address the canonical job row through UNIQUE(scope,key).
+// Confirmation preserves final_state, so erasure needs no history scan or mirror.
 fn recovery_erased(
     tx: &rusqlite::Transaction<'_>,
-    receipt: &SpendReceipt,
+    invocation: Option<&str>,
 ) -> Result<bool, ModelError> {
-    let mut stmt = tx.prepare("SELECT j.scope,j.key,b.binding FROM jobs j JOIN model_job_bindings b ON b.scope=j.scope AND (j.kind=b.kind OR j.kind IS NULL) WHERE j.purged=1 OR j.final_state='\"Purged\"'").map_err(storage)?;
-    let mut rows = stmt.query([]).map_err(storage)?;
-    while let Some(row) = rows.next().map_err(storage)? {
-        let scope: symbiotic_queue::jobs::JobScope =
-            serde_json::from_str(&row.get::<_, String>(0).map_err(storage)?).map_err(storage)?;
-        let key: String = row.get(1).map_err(storage)?;
-        let (identity, _): (
-            symbiotic_core::BindingIdentity,
-            Option<symbiotic_core::AccountSharingKey>,
-        ) = serde_json::from_str(&row.get::<_, String>(2).map_err(storage)?).map_err(storage)?;
-        if symbiotic_model::execution_invocation_identity(
-            &identity,
-            &job_invocation_key(&scope, &key)?,
-        )? == receipt.reservation.invocation
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let Some((scope, key)) = invocation.and_then(|key| {
+        serde_json::from_str::<(symbiotic_queue::jobs::JobScope, String)>(key).ok()
+    }) else {
+        return Ok(false);
+    };
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE scope=?1 AND key=?2 AND (purged=1 OR final_state='\"Purged\"'))",
+        params![serde_json::to_string(&scope).map_err(storage)?, key],
+        |row| row.get(0),
+    ).map_err(storage)
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
@@ -249,11 +240,11 @@ impl SqliteSpendLedger {
         output: &Option<serde_json::Value>,
         retention: std::time::Duration,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
-        keep: bool,
+        invocation: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), ModelError> {
         let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
-        let keep = keep && !recovery_erased(tx, &old)?;
+        let keep = !recovery_erased(tx, invocation)?;
         if old.attempt_limit.is_some()
             && old.output.is_some()
             && let Some(value) = &output
@@ -543,12 +534,21 @@ impl SpendLedger for SqliteSpendLedger {
         state: SpendState,
         usage: Option<UsageTrace>,
         output: Option<serde_json::Value>,
+        invocation: Option<&str>,
     ) -> Result<(), ModelError> {
         let mut conn = self.0.lock().map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        Self::save_recovery_in(&tx, r, &output, self.1, None, true, chrono::Utc::now())?;
+        Self::save_recovery_in(
+            &tx,
+            r,
+            &output,
+            self.1,
+            None,
+            invocation,
+            chrono::Utc::now(),
+        )?;
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
     }

@@ -39,7 +39,7 @@ fn pre_dispatch_release_survives_restart_and_cannot_erase_a_provider_attempt() {
     let attempted = reservation("attempted", "invocation", "account");
     assert!(ledger.reserve(&attempted).unwrap());
     ledger
-        .finish(&attempted.reference, SpendState::Released, None, None)
+        .finish(&attempted.reference, SpendState::Released, None, None, None)
         .unwrap();
     assert!(
         ledger
@@ -109,7 +109,7 @@ fn spend_crash_retains_unknown_and_refuses_a_second_attempt_until_reconciliation
         ))
     ));
     ledger
-        .finish(&original.reference, SpendState::Released, None, None)
+        .finish(&original.reference, SpendState::Released, None, None, None)
         .unwrap();
     let retry = reservation("retry", "invocation", "account");
     assert!(ledger.reserve(&retry).unwrap());
@@ -121,10 +121,10 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
     let failed = reservation("failed", "failure", "account");
     ledger.reserve(&failed).unwrap();
     ledger
-        .finish(&failed.reference, SpendState::Released, None, None)
+        .finish(&failed.reference, SpendState::Released, None, None, None)
         .unwrap();
     ledger
-        .finish(&failed.reference, SpendState::Released, None, None)
+        .finish(&failed.reference, SpendState::Released, None, None, None)
         .unwrap();
     let paid = reservation("paid", "success", "account");
     ledger.reserve(&paid).unwrap();
@@ -141,6 +141,7 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
                 SpendState::Settled,
                 Some(usage.clone()),
                 Some(output.clone()),
+                None,
             )
             .unwrap();
     }
@@ -149,7 +150,7 @@ fn spend_zero_charge_releases_and_success_settles_once_without_consumer_commit()
     assert_eq!(receipt.usage.unwrap().input_tokens, Some(7));
     assert!(
         ledger
-            .finish(&paid.reference, SpendState::Released, None, None)
+            .finish(&paid.reference, SpendState::Released, None, None, None)
             .is_err()
     );
     let over = reservation("over", "over", "account");
@@ -169,16 +170,17 @@ fn spend_missing_usage_never_fabricates_zero_or_releases_successful_output() {
             SpendState::Unknown,
             None,
             Some(serde_json::json!("output")),
+            None,
         )
         .unwrap();
     assert!(
         ledger
-            .finish(&r.reference, SpendState::Released, None, None)
+            .finish(&r.reference, SpendState::Released, None, None, None)
             .is_err()
     );
     assert!(
         ledger
-            .finish(&r.reference, SpendState::Settled, None, None)
+            .finish(&r.reference, SpendState::Settled, None, None, None)
             .is_err()
     );
     let another = reservation("another", "other", "account");
@@ -191,6 +193,7 @@ fn spend_missing_usage_never_fabricates_zero_or_releases_successful_output() {
                 input_tokens: Some(0),
                 ..Default::default()
             }),
+            None,
             None,
         )
         .unwrap();
@@ -243,12 +246,12 @@ fn spend_invocation_lookup_uses_an_index_for_retained_history_and_latest_release
     let first = reservation("first", "invocation", "account");
     ledger.reserve(&first).unwrap();
     ledger
-        .finish(&first.reference, SpendState::Released, None, None)
+        .finish(&first.reference, SpendState::Released, None, None, None)
         .unwrap();
     let latest = reservation("latest", "invocation", "account");
     ledger.reserve(&latest).unwrap();
     ledger
-        .finish(&latest.reference, SpendState::Released, None, None)
+        .finish(&latest.reference, SpendState::Released, None, None, None)
         .unwrap();
     assert_eq!(
         ledger
@@ -296,7 +299,7 @@ fn spend_delayed_reservation_refuses_changed_inputs_after_predecessor_release() 
     );
     ledger.reserve(&original).unwrap();
     ledger
-        .finish(&original.reference, SpendState::Released, None, None)
+        .finish(&original.reference, SpendState::Released, None, None, None)
         .unwrap();
     let mut changed = original.clone();
     changed.reference = SpendReceiptRef::new("delayed").unwrap();
@@ -368,7 +371,7 @@ fn fdn_carried_attempts_count_known_zero_but_not_pre_dispatch_releases() {
         r.request_limit = None;
         ledger.reserve_explicit(&r, 20).unwrap();
         ledger
-            .finish(&r.reference, SpendState::Released, None, None)
+            .finish(&r.reference, SpendState::Released, None, None, None)
             .unwrap();
         let latest = ledger.invocation("account", "explicit").unwrap().unwrap();
         assert_eq!(
@@ -414,6 +417,7 @@ fn fdn_explicit_completion_blocks_new_receipts_after_discard() {
                 ..Default::default()
             }),
             Some(serde_json::json!({"answer": "paid"})),
+            None,
         )
         .unwrap();
     ledger.discard_recovery("account", "explicit").unwrap();

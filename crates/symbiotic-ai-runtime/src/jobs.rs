@@ -666,7 +666,7 @@ impl model::ModelJob for ClaimOwner {
                     &output,
                     self.jobs.ledger.retention(),
                     current.recovery_until,
-                    !current.purged,
+                    Some(&self.jobs.invocation_key(&current.key)?),
                     now,
                 )
                 .map_err(|_| JobError::Storage)?;

@@ -66,6 +66,7 @@ fn steps(history: usize, explicit: bool) -> Vec<usize> {
                 ..Default::default()
             }),
             Some(serde_json::json!({"answer":"private"})),
+            None,
         )
         .unwrap();
     result.push(count.swap(0, Ordering::Relaxed));
@@ -100,4 +101,68 @@ fn request_and_expiry_work_is_independent_of_retained_history() {
             );
         }
     }
+}
+
+#[test]
+fn settlement_work_does_not_grow_with_confirmed_purge_history() {
+    let mut steps = Vec::new();
+    for history in [0, 2048] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        let mut conn = ledger.0.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        let job_scope = symbiotic_queue::jobs::JobScope {
+            tenant: "tenant".into(),
+            incarnation: "1".into(),
+            queue: "model".into(),
+        };
+        let scope = serde_json::to_string(&job_scope).unwrap();
+        let identity = symbiotic_core::BindingIdentity::new("tenant", "provider", "1", "account");
+        let invocation = crate::spend::job_invocation_key(&job_scope, "unrelated").unwrap();
+        let binding =
+            serde_json::to_string(&(&identity, None::<symbiotic_core::AccountSharingKey>)).unwrap();
+        tx.execute(
+            "INSERT INTO model_job_bindings VALUES (?1,'chat',?2)",
+            params![scope, binding],
+        )
+        .unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO jobs(scope,id,key,digest,state,final_state,delivery_generation) VALUES (?1,?2,?2,'digest','\"Discarded\"','\"Purged\"',0)", params![scope, n.to_string()]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        let reservation = SpendReservation {
+            reference: SpendReceiptRef::new("direct").unwrap(),
+            account: "account".into(),
+            invocation: symbiotic_model::execution_invocation_identity(&identity, &invocation)
+                .unwrap(),
+            binding: "binding".into(),
+            request_limit: None,
+        };
+        ledger.reserve_explicit(&reservation, 1).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        ledger.0.lock().unwrap().progress_handler(
+            1,
+            Some({
+                let counter = counter.clone();
+                move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            }),
+        );
+        ledger
+            .finish(
+                &reservation.reference,
+                SpendState::Unknown,
+                None,
+                Some(serde_json::json!({"answer": "retained"})),
+                Some(&invocation),
+            )
+            .unwrap();
+        steps.push(counter.load(Ordering::Relaxed));
+    }
+    assert!(steps[1] <= steps[0] + 100, "settlement VM steps: {steps:?}");
 }

@@ -486,8 +486,8 @@ async fn case_13_killed_after_dispatch_before_commit_is_uncertain_never_retried(
     killed_app("case_13_killed_after_dispatch_before_commit_is_uncertain_never_retried").await;
 }
 
-// Case 22 owns queue state here. Registry format refusal is covered by
-// symbiotic-model/tests/registry.rs::invalid_configuration_is_refused_as_a_whole.
+// Case 22 covers queue schema refusal only. On-disk egress registry stamp
+// refusal is not covered here; the model registry test validates JSON config.
 // Memory state belongs to the Memory runtime, which Foundation never opens.
 fn database_snapshot(
     conn: &rusqlite::Connection,
@@ -874,6 +874,77 @@ async fn pre_dispatch_heartbeat_failure_releases_accounting_without_transport() 
     assert_eq!(receipt.state, SpendState::Released);
     assert!(receipt.pre_dispatch_released);
     assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+}
+
+struct DelayedReceipt {
+    status: ReceiptStatus,
+    entered: Notify,
+    resume: Notify,
+}
+#[async_trait]
+impl QueueReceiptSink for DelayedReceipt {
+    async fn record_receipt(&self, receipt: QueueReceipt) {
+        if receipt.status == self.status {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn slow_receipt_sink_cannot_dispatch_an_expired_or_cancelled_claim() {
+    for status in [ReceiptStatus::Queued, ReceiptStatus::Running] {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(runtime(dir.path()));
+            let sink = Arc::new(DelayedReceipt {
+                status,
+                entered: Notify::new(),
+                resume: Notify::new(),
+            });
+            let r = Runtime::open(RuntimeConfig {
+                state_dir: Some(dir.path().into()),
+                receipt_sink: Some(sink.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            let j = jobs(&r, JobConfig::default());
+            let p = Provider::new();
+            let id = enqueue(&j, spec("slow-receipt", &p)).await;
+            let runner = start(&j, p.clone()).await;
+            tokio::time::timeout(Duration::from_secs(5), sink.entered.notified())
+                .await
+                .unwrap();
+            if cancel {
+                j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+                    .await
+                    .unwrap();
+            } else {
+                // Expire the lease deterministically while receipt emission is blocked.
+                sql(dir.path())
+                    .execute("UPDATE jobs SET lease_until=0", [])
+                    .unwrap();
+            }
+            sink.resume.notify_one();
+            if cancel {
+                wait_state(&j, &id, JobState::Cancelled).await;
+                runner.shutdown().await.unwrap();
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = p.started.notified() => panic!("transport started after claim expiry"),
+                    result = tokio::time::timeout(Duration::from_secs(5), runner.wait()) => {
+                        assert!(result.unwrap().is_err());
+                    }
+                }
+            }
+            assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+            let receipt = row(&j, &id).await.receipt.unwrap();
+            let receipt = j_runtime_receipt(dir.path(), &SpendReceiptRef::new(receipt).unwrap());
+            assert_eq!(receipt.state, SpendState::Released);
+            assert!(receipt.pre_dispatch_released);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1335,6 +1406,7 @@ async fn review_1_recovery_uses_recorded_attempt_not_latest_invocation() {
                 ..Default::default()
             }),
             Some(serde_json::json!({"text": "later answer"})),
+            Some(&scoped_invocation("same-attempt").unwrap()),
         )
         .unwrap();
     // An exhausted claim must resolve its recorded zero-charge receipt, not
