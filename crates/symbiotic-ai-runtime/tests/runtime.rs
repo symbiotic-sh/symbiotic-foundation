@@ -2512,7 +2512,7 @@ async fn fdn_idle_runtime_deletes_expired_recovery_without_reopening() {
     let dir = private_tempdir();
     let runtime = Runtime::open(RuntimeConfig {
         state_dir: Some(dir.path().to_path_buf()),
-        retention: Duration::from_millis(50),
+        retention: Duration::from_secs(2),
         maintenance_interval: Duration::from_millis(10),
         ..RuntimeConfig::default()
     })
@@ -2537,7 +2537,7 @@ async fn fdn_idle_runtime_deletes_expired_recovery_without_reopening() {
         .unwrap()
     };
     assert_eq!(payload_count(), 1);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while payload_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

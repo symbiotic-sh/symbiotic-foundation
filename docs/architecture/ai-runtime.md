@@ -206,7 +206,7 @@ providers and active attempts share one maintenance owner per opened ledger.
 The timer holds only a weak reference and ends when the last holder drops. Each sweep:
 
 - calls orphaned by a crash are marked dead;
-- finished calls' queue records are deleted, along with queue events;
+- finished calls' queue records are deleted;
 - cached responses older than `RuntimeConfig::response_max_age` (30 days by
   default) are deleted, then the oldest ones until the rest fit in
   `response_max_bytes` (1 GiB by default). `None` disables either limit.
@@ -378,9 +378,11 @@ with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporti
   attempt, both queue backends allow another claim, but the ledger refuses a
   new dispatch until the uncertain charge is reconciled.
 
-- `budget_renewal_seconds` (default `None`): once a request has exhausted
-  its budget, later calls for the same request fail without a provider call
-  while the queue remembers it. On a persistent runtime that includes calls
+- `budget_renewal_seconds` (default `None`): applies to cache-enabled implicit
+  calls. Once a request has exhausted its budget, later calls for the same
+  request fail without a provider call while the queue remembers it.
+  Cache-off implicit calls get independent items and fresh budgets, so this
+  setting does not stop them; explicit invocations follow their frozen ceilings. On a persistent runtime that includes calls
   after a restart. `Some(n)` gives a new call a fresh budget after `n` seconds;
   `Some(0)` gives every call its own budget. These are current queue mechanics;
   renewal does not prove zero charge or authorize resending an uncertain attempt.

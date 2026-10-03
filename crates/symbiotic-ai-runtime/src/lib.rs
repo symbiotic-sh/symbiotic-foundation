@@ -422,9 +422,12 @@ impl Runtime {
             .state_dir
             .as_ref()
             .map(|dir| DirResponseCache::new(dir.join(RESPONSES_DIR)));
-        if let Some(cache) = &cache {
-            cache.validate_tree()?;
-        }
+        // The cache purge validates the whole tree before deleting anything, so an
+        // unsafe path refuses before either store changes.
+        let cached = match &cache {
+            Some(cache) => cache.purge(&matches)?,
+            None => 0,
+        };
         let recoveries = if self.is_persistent() {
             self.inner.spend.purge_recovery(&|value| {
                 let trace: symbiotic_trace::ModelInvocationTrace =
@@ -450,10 +453,7 @@ impl Runtime {
         } else {
             0
         };
-        match cache {
-            Some(cache) => cache.purge(matches).map(|n| n + recoveries),
-            None => Ok(recoveries),
-        }
+        Ok(cached + recoveries)
     }
 
     /// Inspect the immutable deployment registry without resolving credentials.
