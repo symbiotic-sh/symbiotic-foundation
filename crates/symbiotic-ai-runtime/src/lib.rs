@@ -271,7 +271,7 @@ impl SharedLimits {
 }
 
 struct Inner {
-    maintenance: Option<Maintenance>,
+    maintenance: Option<Arc<Maintenance>>,
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
@@ -334,7 +334,7 @@ impl Runtime {
         config: RuntimeConfig,
         queue: Arc<dyn QueueBackend>,
         spend: Arc<dyn SpendLedger>,
-        maintenance: Option<Maintenance>,
+        maintenance: Option<Arc<Maintenance>>,
     ) -> Self {
         let worker_id = config
             .worker_id
@@ -361,12 +361,12 @@ impl Runtime {
 
     /// Most recent background maintenance failure since this runtime opened.
     /// Successful later sweeps do not erase it. Only static diagnostics are exposed.
-    /// Dropping the last runtime handle stops and joins the maintenance worker.
+    /// Maintenance ends after the last runtime, provider or active attempt drops.
     pub fn last_maintenance_error(&self) -> Option<ModelError> {
         self.inner
             .maintenance
             .as_ref()
-            .and_then(Maintenance::last_error)
+            .and_then(|owner| owner.last_error())
     }
 
     /// Canonical receipt lookup. Consumer commit refusal never alters this receipt.
@@ -829,6 +829,7 @@ impl Runtime {
             worker_id: self.inner.worker_id.clone(),
             policy,
             sinks: Sinks {
+                maintenance: self.inner.maintenance.clone(),
                 invocation: binding.invocation.clone(),
                 attempt_context: binding.attempt_context.clone(),
                 queue_id,
@@ -879,6 +880,7 @@ struct Bound {
 }
 
 struct Sinks {
+    maintenance: Option<Arc<Maintenance>>,
     invocation: Option<String>,
     attempt_context: Option<model::ExecutionAttemptContext>,
     queue_id: QueueId,
@@ -894,6 +896,9 @@ macro_rules! apply_sinks {
             provider = provider
                 .with_queue_id(self.queue_id)
                 .with_binding_identity(self.identity);
+            if let Some(owner) = self.maintenance {
+                provider = provider.with_maintenance_owner(owner);
+            }
             if let Some(invocation) = self.invocation {
                 provider = provider.with_invocation(invocation);
             }
@@ -924,7 +929,7 @@ impl Sinks {
 fn open_persistent_queue(
     dir: &Path,
     config: &RuntimeConfig,
-) -> Result<(SqliteQueue, Maintenance), ModelError> {
+) -> Result<(SqliteQueue, Arc<Maintenance>), ModelError> {
     // The state directory is the host's: it must already be private, or be
     // created so. Inside it, everything is the runtime's own: owner-only,
     // with wider permissions from earlier versions tightened, and no

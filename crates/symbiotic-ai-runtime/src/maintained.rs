@@ -1,6 +1,7 @@
-//! Runtime-owned timer for persistent retention sweeps.
+//! Shared maintenance owner for an opened persistent ledger.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use symbiotic_core::DiagnosticCode;
@@ -59,43 +60,52 @@ impl Sweep {
     }
 }
 
-/// Lives on the shared runtime handle, never on providers or the worker itself.
-/// A dedicated thread also supports opening a runtime outside a Tokio executor.
+/// Shared by runtime handles, bound providers and active attempts.
+/// The timer owns only a weak reference, so it cannot keep its ledger alive.
 pub(crate) struct Maintenance {
+    sweep: Sweep,
     stop: mpsc::Sender<()>,
-    worker: Option<JoinHandle<()>>,
-    last_error: watch::Receiver<Option<ModelError>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    errors: watch::Sender<Option<ModelError>>,
 }
 
 impl Maintenance {
-    /// Start the cancellable timer after the open-time sweep has succeeded.
-    pub(crate) fn start(sweep: Sweep, interval: Duration) -> Result<Self, ModelError> {
+    /// Start the timer after the open-time sweep has succeeded.
+    pub(crate) fn start(sweep: Sweep, interval: Duration) -> Result<Arc<Self>, ModelError> {
         let (stop, stopped) = mpsc::channel();
-        let (errors, last_error) = watch::channel(None);
+        let (errors, _) = watch::channel(None);
+        let owner = Arc::new(Self {
+            sweep,
+            stop,
+            worker: Mutex::new(None),
+            errors,
+        });
+        let weak = Arc::downgrade(&owner);
         let worker = std::thread::Builder::new()
             .name("ai-runtime-maintenance".into())
             .spawn(move || loop {
                 match stopped.recv_timeout(interval) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Err(error) = sweep.maintain() {
+                        let Some(owner) = weak.upgrade() else { break };
+                        if let Err(error) = owner.sweep.maintain() {
                             tracing::warn!(code = %error.code(), "AI runtime maintenance failed");
-                            errors.send_replace(Some(error));
+                            owner.errors.send_replace(Some(error));
                         }
                     }
                 }
             })
             .map_err(|_| ModelError::Queue(DiagnosticCode::SpendLedgerUnavailable))?;
-        Ok(Self {
-            stop,
-            worker: Some(worker),
-            last_error,
-        })
+        *owner
+            .worker
+            .lock()
+            .map_err(|_| ModelError::Queue(DiagnosticCode::SpendLedgerUnavailable))? = Some(worker);
+        Ok(owner)
     }
 
     /// Retain the latest static failure diagnostic for the runtime handle.
     pub(crate) fn last_error(&self) -> Option<ModelError> {
-        *self.last_error.borrow()
+        *self.errors.borrow()
     }
 }
 
@@ -103,13 +113,26 @@ impl Drop for Maintenance {
     fn drop(&mut self) {
         // A disconnected channel means the worker has already stopped.
         let _ = self.stop.send(());
-        if let Some(worker) = self.worker.take()
-            && let Err(panic) = worker.join()
-        {
-            if std::thread::panicking() {
-                tracing::warn!("AI runtime maintenance worker panicked during shutdown");
-            } else {
-                std::panic::resume_unwind(panic);
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("AI runtime maintenance worker lock poisoned during shutdown");
+                poisoned.into_inner()
+            })
+            .take();
+        if let Some(worker) = worker {
+            // The last holder can disappear during a sweep. In that case the
+            // worker drops its temporary upgrade and exits itself; never self-join.
+            if worker.thread().id() == std::thread::current().id() {
+                return;
+            }
+            if let Err(panic) = worker.join() {
+                if std::thread::panicking() {
+                    tracing::warn!("AI runtime maintenance worker panicked during shutdown");
+                } else {
+                    std::panic::resume_unwind(panic);
+                }
             }
         }
     }
@@ -119,6 +142,141 @@ impl Drop for Maintenance {
 mod tests {
     use super::*;
     use symbiotic_model::{SpendLedger, SpendReceiptRef, SpendReservation, SpendState};
+
+    #[derive(Clone)]
+    struct HeldChat {
+        descriptor: symbiotic_model::ProviderDescriptor,
+        started: Arc<tokio::sync::Notify>,
+        finish: Arc<tokio::sync::Notify>,
+    }
+
+    impl symbiotic_model::ModelProvider for HeldChat {
+        fn descriptor(&self) -> &symbiotic_model::ProviderDescriptor {
+            &self.descriptor
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl symbiotic_model::ChatProvider for HeldChat {
+        async fn chat(
+            &self,
+            _: symbiotic_model::ChatRequest,
+        ) -> Result<symbiotic_model::ChatResponse, ModelError> {
+            self.started.notify_one();
+            self.finish.notified().await;
+            Err(ModelError::Queue(
+                DiagnosticCode::SpendReconciliationRequired,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_attempt_keeps_maintenance_alive_after_runtime_and_provider_drop() {
+        use symbiotic_model::{
+            ChatMessage, ChatRequest, ModelCapability, ProviderAuthMode, ProviderClass,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let runtime = crate::Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().to_path_buf()),
+            maintenance_interval: Duration::from_millis(10),
+            ..crate::RuntimeConfig::default()
+        })
+        .unwrap();
+        let owner = runtime.inner.maintenance.as_ref().unwrap();
+        let weak = Arc::downgrade(owner);
+        let worker = owner.worker.lock().unwrap().take().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let provider = runtime
+            .chat(
+                crate::ModelBinding::new(HeldChat {
+                    descriptor: symbiotic_model::ProviderDescriptor {
+                        identity: symbiotic_core::ModelIdentity::new("chat", "test", "held"),
+                        provider_class: ProviderClass::Cloud,
+                        capabilities: vec![ModelCapability::Chat],
+                        auth_mode: ProviderAuthMode::None,
+                        metadata: serde_json::json!({}),
+                    },
+                    started: started.clone(),
+                    finish: finish.clone(),
+                })
+                .with_identity(crate::BindingIdentity::new(
+                    "tenant", "provider", "1", "account",
+                ))
+                .with_policy(crate::ModelQueueConfig::default()),
+            )
+            .unwrap();
+        let caller = tokio::spawn(async move {
+            provider
+                .chat(ChatRequest {
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "held".into(),
+                    }],
+                    max_output_tokens: Some(1),
+                    temperature: None,
+                    response_format: None,
+                    role_binding: None,
+                    source: None,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        drop(runtime);
+        assert!(
+            weak.upgrade().is_some(),
+            "owned attempt lost its maintenance owner"
+        );
+        assert!(!worker.is_finished());
+        finish.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(worker.is_finished());
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn timer_ends_when_every_holder_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let runtime = crate::Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().to_path_buf()),
+            maintenance_interval: Duration::from_millis(10),
+            ..crate::RuntimeConfig::default()
+        })
+        .unwrap();
+        let owner = runtime.inner.maintenance.as_ref().unwrap();
+        let weak = Arc::downgrade(owner);
+        let worker = owner.worker.lock().unwrap().take().unwrap();
+        let holder = owner.clone();
+        drop(runtime);
+        assert!(!worker.is_finished());
+        drop(holder);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(worker.is_finished(), "the weak timer kept itself alive");
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn idle_runtime_maintenance_deletes_the_entire_expired_answer_backlog() {

@@ -201,8 +201,9 @@ then the typed `InvocationCompleted` diagnostic with its receipt once the answer
 **Current retention settings.** At open, and on a runtime-owned background timer,
 a persistent runtime retires state older than `RuntimeConfig::retention` (seven
 days by default). `RuntimeConfig::maintenance_interval` defaults to 60 seconds
-and must be nonzero; sweeps continue while idle. Dropping the last runtime handle
-stops and joins the timer worker. Each sweep:
+and must be nonzero; sweeps continue while idle. Runtime handles, returned
+providers and active attempts share one maintenance owner per opened ledger.
+The timer holds only a weak reference and ends when the last holder drops. Each sweep:
 
 - calls orphaned by a crash are marked dead;
 - finished calls' queue records are deleted, along with queue events;
@@ -219,7 +220,8 @@ logged at WARN and exposed through `Runtime::last_maintenance_error`, which reta
 the most recent failure since open even if later sweeps succeed. Open-time
 maintenance errors refuse the open.
 A sweep or purge checks the whole cache tree before it deletes anything, including
-retained recovery answers. A refused purge removes nothing.
+retained recovery answers. A purge refused for a filesystem path (symlink or
+path outside the cache root) removes nothing.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
 
@@ -247,7 +249,10 @@ Dropping the caller's future (a job timeout, `tokio::time::timeout` around
 - keeps its model slot until then, so an abandoned call still counts against
   `max_in_flight`.
 
-An identical caller waiting on the item can share its result through deduplication.
+Every in-process caller joining an in-flight item receives its exact completion
+and receipt in memory, including reconciliation refusals, independently of the
+response cache. Missing usage preserves the leader's answer and Unknown charge
+for every joiner. Joiners never dispatch a succeeded item again.
 A repeat of the same explicit invocation recovers its retained ledger answer. A
 later implicit call reuses a matching cached response when caching is enabled and
 dispatches again when caching is off.

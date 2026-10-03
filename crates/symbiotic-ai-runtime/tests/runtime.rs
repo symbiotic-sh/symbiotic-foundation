@@ -2569,11 +2569,11 @@ async fn fdn_idle_maintenance_failure_remains_visible_after_success() {
 }
 
 #[tokio::test]
-async fn fdn_maintenance_lives_until_last_runtime_handle_not_provider_drop() {
+async fn fdn_maintenance_lives_while_a_provider_survives_every_runtime() {
     let dir = private_tempdir();
     let runtime = Runtime::open(RuntimeConfig {
         state_dir: Some(dir.path().to_path_buf()),
-        retention: Duration::from_secs(60),
+        retention: Duration::from_secs(1),
         maintenance_interval: Duration::from_millis(10),
         ..RuntimeConfig::default()
     })
@@ -2586,15 +2586,11 @@ async fn fdn_maintenance_lives_until_last_runtime_handle_not_provider_drop() {
                 .with_invocation("lifetime"),
         )
         .unwrap();
-    provider.chat(request("private")).await.unwrap();
     drop(runtime);
+    drop(retained);
+    provider.chat(request("private")).await.unwrap();
     let conn =
         rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
-    conn.execute(
-        "UPDATE spend_receipts SET recovery_expires_at='2000-01-01T00:00:00+00:00'",
-        [],
-    )
-    .unwrap();
     let payload_count = || {
         conn.query_row(
             "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
@@ -2603,20 +2599,11 @@ async fn fdn_maintenance_lives_until_last_runtime_handle_not_provider_drop() {
         )
         .unwrap()
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while payload_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(payload_count(), 0);
-    drop(retained);
-    // The bound provider still owns the queue, but not the maintenance timer.
-    conn.execute(
-        "UPDATE spend_receipts SET recovery='{}', recovery_expires_at='2000-01-01T00:00:00+00:00'",
-        [],
-    )
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(payload_count(), 1);
     drop(provider);
 }
 
@@ -3059,4 +3046,96 @@ async fn refused_purge_preserves_retained_answers_and_cache_files() {
             .unwrap();
         assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+// Poll B while A is held inside the provider, then release A. This guarantees
+// the second call joins a running item instead of arriving after completion.
+async fn joined_call_without_cache(measured: bool, abandon_leader: bool) {
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().to_path_buf()),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let mut raw = Loopback::new(unique_identity());
+    raw.measured = measured;
+    raw.start_gate = Some(gate.clone());
+    let calls = raw.calls.clone();
+    let configured = binding(raw)
+        .with_policy(policy())
+        .with_response_cache(ResponseCacheMode::Off);
+    let a = runtime.chat(configured.clone()).unwrap();
+    let b = runtime.chat(configured).unwrap();
+    let leader = tokio::spawn(async move { a.chat(request("joined")).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while calls.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let joined = b.chat(request("joined"));
+    tokio::pin!(joined);
+    // Drive B until it waits for A; A cannot finish while the barrier is held.
+    tokio::select! {
+        result = &mut joined => panic!("joiner finished before leader: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let leader = if abandon_leader {
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        None
+    } else {
+        Some(leader)
+    };
+    gate.wait().await;
+    let joined = tokio::time::timeout(Duration::from_secs(1), joined)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Some(leader) = leader {
+        assert_eq!(
+            serde_json::to_value(leader.await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&joined).unwrap()
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let reference: symbiotic_ai_runtime::SpendReceiptRef =
+        serde_json::from_value(joined.trace.metadata["spend_receipt"].clone()).unwrap();
+    let receipt = runtime.spend_receipt(&reference).unwrap().unwrap();
+    assert_eq!(
+        receipt.state,
+        if measured {
+            symbiotic_ai_runtime::SpendState::Settled
+        } else {
+            symbiotic_ai_runtime::SpendState::Unknown
+        }
+    );
+    assert!(
+        receipt.recovery.is_none(),
+        "implicit joiners need no recovery payload"
+    );
+    if !measured {
+        for _ in 0..2 {
+            assert_eq!(
+                b.chat(request("joined")).await.unwrap_err().code(),
+                symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn fdn_joined_measured_call_returns_its_own_answer_without_cache() {
+    joined_call_without_cache(true, false).await;
+}
+
+#[tokio::test]
+async fn fdn_joined_missing_usage_returns_the_leaders_unknown_outcome_without_cache() {
+    joined_call_without_cache(false, false).await;
+}
+
+#[tokio::test]
+async fn fdn_joined_answer_survives_leader_abandonment_without_cache() {
+    joined_call_without_cache(true, true).await;
 }
