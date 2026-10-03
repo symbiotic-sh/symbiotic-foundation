@@ -162,6 +162,8 @@ pub trait SpendLedger: Send + Sync {
     /// Delete only the saved answer for an authenticated account/invocation.
     fn discard_recovery(&self, account: &str, invocation: &str) -> Result<(), ModelError>;
     /// Delete matching live recovery answers, preserving accounting evidence.
+    /// The predicate runs under the ledger lock and must not call back into
+    /// the runtime, including `spend_receipt` or `invocation_status`.
     fn purge_recovery(
         &self,
         matches: &dyn Fn(&Value) -> Result<bool, ModelError>,

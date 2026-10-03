@@ -410,6 +410,9 @@ impl Runtime {
     /// is erased. It sees what the response's trace records: the request's
     /// `source` and `role_binding`, and the model. Returns how many
     /// responses were removed; an in-memory runtime keeps none.
+    /// The predicate runs under the ledger lock when matching recovery answers
+    /// and must not call back into the runtime, including `spend_receipt` or
+    /// `invocation_status`.
     pub fn purge_responses(
         &self,
         matches: impl Fn(&CachedResponse) -> bool,

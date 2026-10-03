@@ -1895,7 +1895,15 @@ where
         ownership_lost.clone(),
         async {
             // Another worker may have saved an answer since our last follow.
-            if let Some(response) = this.recovered::<Res>().await? {
+            let recovered = match this.recovered::<Res>().await {
+                Ok(recovered) => recovered,
+                Err(err) => {
+                    let (err, failed) = this.abort_before_dispatch(&item, None, err).await;
+                    failed.map_err(queue_error)?;
+                    return Err(err);
+                }
+            };
+            if let Some(response) = recovered {
                 let completed = queue.complete(&item.item_id, worker_id).await;
                 return Ok(Settled::Succeeded {
                     response,

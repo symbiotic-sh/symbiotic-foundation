@@ -78,6 +78,7 @@ struct Loopback {
     delay: Duration,
     uncertain_failures: bool,
     completion_gate: Option<Arc<tokio::sync::Notify>>,
+    credential: Option<Arc<symbiotic_model::OpenAiCompatibleChatProvider>>,
 }
 
 impl Loopback {
@@ -98,6 +99,7 @@ impl Loopback {
             delay: Duration::ZERO,
             uncertain_failures: false,
             completion_gate: None,
+            credential: None,
         }
     }
 
@@ -113,6 +115,16 @@ impl Loopback {
 }
 
 impl ModelProvider for Loopback {
+    fn credential_fingerprint(&self) -> Option<String> {
+        self.credential
+            .as_ref()
+            .and_then(|provider| provider.credential_fingerprint())
+    }
+    fn credential_boundary(&self) -> Option<&symbiotic_model::CredentialBoundary> {
+        self.credential
+            .as_ref()
+            .and_then(|provider| provider.credential_boundary())
+    }
     // Synthetic failures never perform transport or incur provider spend.
     fn failure_charge(&self, _: &ModelError) -> symbiotic_model::FailureCharge {
         if self.uncertain_failures {
@@ -926,6 +938,9 @@ struct CountsRenewals {
     fail_heartbeat_at: AtomicUsize,
     completion_state: AtomicUsize,
     running_read: tokio::sync::Notify,
+    pause_claim: std::sync::atomic::AtomicBool,
+    claim_reached: tokio::sync::Notify,
+    resume_claim: tokio::sync::Notify,
 }
 
 impl CountsRenewals {
@@ -944,6 +959,9 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         fail_heartbeat_at: AtomicUsize::new(0),
         completion_state: AtomicUsize::new(0),
         running_read: tokio::sync::Notify::new(),
+        pause_claim: std::sync::atomic::AtomicBool::new(false),
+        claim_reached: tokio::sync::Notify::new(),
+        resume_claim: tokio::sync::Notify::new(),
     })
 }
 
@@ -973,6 +991,7 @@ macro_rules! on_both_backends {
 }
 
 on_both_backends!(
+    post_claim_recovery_errors_release_capacity_without_changing_accounting,
     an_abandoned_call_completes_and_answers_the_next_identical_request,
     an_abandoned_call_that_fails_records_its_class_and_releases_its_lease,
     lease_renewal_ends_with_its_call_when_the_caller_left,
@@ -1033,9 +1052,15 @@ impl QueueBackend for CountsRenewals {
         lease_seconds: u64,
         max_in_flight: Option<usize>,
     ) -> Result<Option<QueueItem>, QueueError> {
-        self.inner
+        let item = self
+            .inner
             .claim_item(item_id, worker_id, lease_seconds, max_in_flight)
-            .await
+            .await?;
+        if item.is_some() && self.pause_claim.swap(false, Ordering::SeqCst) {
+            self.claim_reached.notify_one();
+            self.resume_claim.notified().await;
+        }
+        Ok(item)
     }
     async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
         let item = self.inner.get_item(item_id).await?;
@@ -2278,6 +2303,7 @@ struct ObservedSpend {
     fail_reservations: std::sync::atomic::AtomicBool,
     panic_reservation: std::sync::atomic::AtomicBool,
     fail_settlement: std::sync::atomic::AtomicBool,
+    fail_invocations: std::sync::atomic::AtomicBool,
 }
 
 impl ObservedSpend {
@@ -2289,6 +2315,7 @@ impl ObservedSpend {
             fail_reservations: std::sync::atomic::AtomicBool::new(false),
             panic_reservation: std::sync::atomic::AtomicBool::new(false),
             fail_settlement: std::sync::atomic::AtomicBool::new(false),
+            fail_invocations: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2378,6 +2405,11 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         account: &str,
         invocation: &str,
     ) -> Result<Option<symbiotic_model::SpendReceipt>, ModelError> {
+        if self.fail_invocations.load(Ordering::SeqCst) {
+            return Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            ));
+        }
         self.inner.invocation(account, invocation)
     }
 
@@ -2394,6 +2426,151 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
             ));
         }
         self.inner.finish(reference, state, usage, output)
+    }
+}
+
+async fn post_claim_recovery_errors_release_capacity_without_changing_accounting(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
+    use symbiotic_core::DiagnosticCode;
+    use symbiotic_model::SpendLedger;
+
+    for error in [
+        DiagnosticCode::InvocationCompleted,
+        DiagnosticCode::SpendLedgerUnavailable,
+    ] {
+        let spend = ObservedSpend::new(Duration::ZERO);
+        let receipts = Arc::new(InMemoryReceiptSink::default());
+        let completion = Arc::new(tokio::sync::Notify::new());
+        let mut first_raw = Loopback::new(unique_identity());
+        let credential_owner = || {
+            Arc::new(symbiotic_model::OpenAiCompatibleChatProvider::new(
+                "loopback",
+                "synthetic",
+                "http://127.0.0.1:1",
+                TraceId::new().0.to_string(),
+            ))
+        };
+        first_raw.credential = Some(credential_owner());
+        first_raw.completion_gate = Some(completion.clone());
+        let mut second_raw = first_raw.clone();
+        second_raw.credential = Some(credential_owner());
+        let policy = ModelQueueConfig {
+            max_in_flight: 2,
+            ..config()
+        };
+        let configure = |raw| {
+            queued(raw, queue.clone(), policy.clone())
+                .with_spend_ledger(spend.clone(), None)
+                .with_binding_identity(symbiotic_core::BindingIdentity::new(
+                    "tenant", "provider", "1", "account",
+                ))
+                .with_invocation("overlapping-repeat".into())
+                .with_receipt_sink(receipts.clone())
+        };
+        let first_provider = configure(first_raw.clone());
+        let second_provider = configure(second_raw);
+        let first =
+            tokio::spawn(async move { first_provider.chat(request("durable answer")).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first_raw.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // B passes all pre-claim recovery checks while A is still running.
+        // Pause after B's actual backend claim, before its recovery check.
+        queue.pause_claim.store(true, Ordering::SeqCst);
+        let second =
+            tokio::spawn(async move { second_provider.chat(request("durable answer")).await });
+        tokio::time::timeout(Duration::from_secs(5), queue.claim_reached.notified())
+            .await
+            .unwrap();
+        let queued_receipts: Vec<_> = receipts
+            .receipts()
+            .into_iter()
+            .filter(|r| r.status == ReceiptStatus::Queued)
+            .collect();
+        assert_eq!(queued_receipts.len(), 2, "{backend}");
+        let second_item = queued_receipts[1].item_id.as_ref().unwrap();
+        assert_ne!(queued_receipts[0].item_id.as_ref().unwrap(), second_item);
+        assert_eq!(
+            queue.get_item(second_item).await.unwrap().unwrap().status,
+            QueueStatus::Running,
+            "{backend}"
+        );
+
+        completion.notify_one();
+        let response = first.await.unwrap().unwrap();
+        assert_eq!(response.text, "durable answer");
+        let reference = receipts
+            .receipts()
+            .into_iter()
+            .find(|r| r.status == ReceiptStatus::Succeeded)
+            .unwrap()
+            .spend_receipt
+            .unwrap();
+        let paid = spend.receipt(&reference).unwrap().unwrap();
+        spend
+            .discard_recovery(&paid.reservation.account, &paid.reservation.invocation)
+            .unwrap();
+        let accounting = serde_json::to_value(spend.receipt(&reference).unwrap().unwrap()).unwrap();
+        assert_eq!(paid.state, symbiotic_model::SpendState::Settled);
+        assert_eq!(paid.attempts_used, 1);
+        assert!(paid.output.is_some());
+        if error == DiagnosticCode::SpendLedgerUnavailable {
+            spend.fail_invocations.store(true, Ordering::SeqCst);
+        }
+        queue.resume_claim.notify_one();
+        let err = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.code(), error, "{backend}");
+        let terminal = queue.get_item(second_item).await.unwrap().unwrap();
+        assert_eq!(
+            terminal.status,
+            QueueStatus::Stopped,
+            "{backend}: {error:?}"
+        );
+        assert_eq!(terminal.last_error, Some(error));
+        assert!(terminal.lease_until.is_none());
+        assert_eq!(first_raw.calls.load(Ordering::SeqCst), 1, "{backend}");
+        assert_eq!(
+            serde_json::to_value(spend.receipt(&reference).unwrap().unwrap()).unwrap(),
+            accounting,
+            "{backend}: B must not release or change A's accounting"
+        );
+
+        // A cap of one admits immediately only if neither A nor B is Running.
+        let probe = queue
+            .enqueue(EnqueueRequest {
+                queue_id: first_raw.descriptor.queue_id(),
+                kind: "chat".into(),
+                payload: json!({}),
+                idempotency_key: None,
+                run_after: None,
+                max_attempts: Some(1),
+                force: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            queue
+                .claim_item(&probe.item.item_id, "capacity-probe", 60, Some(1))
+                .await
+                .unwrap()
+                .is_some(),
+            "{backend}: account capacity must be free before lease expiry"
+        );
+        queue
+            .complete(&probe.item.item_id, "capacity-probe")
+            .await
+            .unwrap();
     }
 }
 
