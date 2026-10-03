@@ -185,6 +185,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
 /// The caller must use an IMMEDIATE transaction to serialize checks, ledger and
 /// job writes, and commit only after every participant succeeds. The connection
 /// must first have been initialized with [`SqliteQueue::initialize_connection`].
+/// Sample `now` after acquiring that transaction and reuse it across participants.
 pub fn jobs_in_transaction(
     tx: &mut Transaction<'_>,
     scope: &JobScope,
@@ -512,14 +513,14 @@ impl SqliteQueue {
         &self,
         scope: &JobScope,
         config: &JobConfig,
-        now: DateTime<Utc>,
+        clock: impl FnOnce() -> DateTime<Utc>,
         request: JobRequest,
     ) -> Result<JobResponse, JobError> {
         let mut conn = self.conn.lock().map_err(storage)?;
         let mut tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let response = jobs_in_transaction(&mut tx, scope, config, now, request)?;
+        let response = jobs_in_transaction(&mut tx, scope, config, clock(), request)?;
         tx.commit().map_err(storage)?;
         Ok(response)
     }
@@ -1300,7 +1301,7 @@ mod tests {
             .job_operation(
                 &scope,
                 &config,
-                now,
+                || now,
                 JobRequest::Enqueue(vec![spec("heartbeat")]),
             )
             .unwrap();
@@ -1308,7 +1309,7 @@ mod tests {
             .job_operation(
                 &scope,
                 &config,
-                now,
+                || now,
                 JobRequest::Claim {
                     kinds: vec!["handler".into()],
                     slots_available: 1,
@@ -1341,7 +1342,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(matches!(queue.job_operation(
-                &scope, &config, now + Duration::seconds(1),
+                &scope, &config, || now + Duration::seconds(1),
                 JobRequest::Heartbeat { job: row.id.clone(), generation: row.generation }
             ).unwrap(), JobResponse::Heartbeat(requested) if requested == (cancel || purged)));
         }
@@ -1366,7 +1367,7 @@ mod tests {
                 .job_operation(
                     &scope,
                     &config,
-                    now,
+                    || now,
                     JobRequest::Enqueue(vec![spec.clone()]),
                 )
                 .unwrap();
@@ -1398,7 +1399,7 @@ mod tests {
                 generation: 1,
             };
             assert!(
-                matches!(queue.job_operation(&scope, &config, now, JobRequest::Ack(vec![(token.clone(), disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::Acked(disposition)])
+                matches!(queue.job_operation(&scope, &config, || now, JobRequest::Ack(vec![(token.clone(), disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::Acked(disposition)])
             );
             {
                 let conn = queue.conn.lock().unwrap();
@@ -1435,7 +1436,7 @@ mod tests {
                 .job_operation(
                     &scope,
                     &config,
-                    now,
+                    || now,
                     JobRequest::Enqueue(vec![spec.clone()]),
                 )
                 .unwrap()
@@ -1457,14 +1458,14 @@ mod tests {
                     && tombstone.owners.is_empty()
             );
             assert!(
-                matches!(queue.job_operation(&scope, &config, now, JobRequest::Ack(vec![(token, disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::AlreadyAcked(disposition)])
+                matches!(queue.job_operation(&scope, &config, || now, JobRequest::Ack(vec![(token, disposition)])).unwrap(), JobResponse::Acks(results) if results == vec![AckResult::AlreadyAcked(disposition)])
             );
             for generation in [0, 3] {
                 assert!(matches!(
                     queue.job_operation(
                         &scope,
                         &config,
-                        now,
+                        || now,
                         JobRequest::Ack(vec![(
                             DeliveryToken {
                                 job: row.id.clone(),
@@ -1478,7 +1479,7 @@ mod tests {
             }
             spec.payload.push(0);
             assert!(matches!(
-                queue.job_operation(&scope, &config, now, JobRequest::Enqueue(vec![spec])),
+                queue.job_operation(&scope, &config, || now, JobRequest::Enqueue(vec![spec])),
                 Err(JobError::KeyConflict)
             ));
         }
@@ -1569,7 +1570,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Enqueue(vec![spec("durable")]),
             )
             .await
@@ -1585,7 +1586,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Claim {
                     kinds: vec!["handler".into()],
                     slots_available: 1,
@@ -1601,7 +1602,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Complete {
                     job: id.clone(),
                     generation: row.generation,
@@ -1620,7 +1621,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Completions {
                     limit: 1,
                     max_bytes: 100_000,
@@ -1640,7 +1641,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Ack(vec![(delivery.token, Disposition::Accepted)]),
             )
             .await
@@ -1651,7 +1652,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Enqueue(vec![spec("durable")]),
             )
             .await
@@ -1696,7 +1697,7 @@ mod tests {
                     queue.job_operation(
                         &scope,
                         &config,
-                        now,
+                        || now,
                         JobRequest::Enqueue(vec![spec(&format!("concurrent-{i}"))]),
                     )
                 })
@@ -1716,7 +1717,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Claim {
                     kinds: vec!["handler".into()],
                     slots_available: 1,
@@ -1731,7 +1732,7 @@ mod tests {
         a.jobs(
             &scope,
             &config,
-            now,
+            std::sync::Arc::new(move || now),
             JobRequest::Complete {
                 job: row.id.clone(),
                 generation: row.generation,
@@ -1748,7 +1749,7 @@ mod tests {
             .jobs(
                 &scope,
                 &config,
-                now,
+                std::sync::Arc::new(move || now),
                 JobRequest::Completions {
                     limit: 1,
                     max_bytes: 100_000,
@@ -1776,7 +1777,7 @@ mod tests {
                 queue.job_operation(
                     &scope,
                     &config,
-                    now,
+                    || now,
                     JobRequest::Ack(vec![(token, disposition)]),
                 )
             })
@@ -1819,7 +1820,7 @@ mod tests {
             .job_operation(
                 &scope,
                 &config,
-                now,
+                || now,
                 JobRequest::Enqueue(vec![spec("cross-final")]),
             )
             .unwrap()
@@ -1833,7 +1834,7 @@ mod tests {
         a.job_operation(
             &scope,
             &config,
-            now,
+            || now,
             JobRequest::Cancel(Selector::Ids(vec![cross_id.clone()])),
         )
         .unwrap();
@@ -1841,7 +1842,7 @@ mod tests {
             .job_operation(
                 &scope,
                 &config,
-                now,
+                || now,
                 JobRequest::Completions {
                     limit: 1,
                     max_bytes: 100_000,
@@ -1867,7 +1868,7 @@ mod tests {
             let config = config.clone();
             tokio::task::spawn_blocking(move || {
                 barrier.wait();
-                queue.job_operation(&scope, &config, now, request)
+                queue.job_operation(&scope, &config, || now, request)
             })
         })
         .collect();
@@ -1890,7 +1891,7 @@ mod tests {
             .job_operation(
                 &scope,
                 &config,
-                now,
+                || now,
                 JobRequest::Enqueue(vec![spec("cross-admitted")]),
             )
             .unwrap();

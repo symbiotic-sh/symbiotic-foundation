@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use symbiotic_core::DiagnosticCode;
 use thiserror::Error;
 
+/// Trusted host clock, sampled once after acquiring the operation's write transaction.
+pub type JobClock = std::sync::Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
 /// Authorization namespace supplied by the trusted host, never by an unverified client.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

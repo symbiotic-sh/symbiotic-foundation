@@ -47,6 +47,10 @@ where
     }
 }
 
+fn fixed_clock(now: DateTime<Utc>) -> JobClock {
+    Arc::new(move || now)
+}
+
 type AfterJob = dyn Fn(&JobRequest, &JobResponse) -> futures::future::BoxFuture<'static, Result<(), JobError>>
     + Send
     + Sync;
@@ -66,13 +70,13 @@ where
         &self,
         scope: &JobScope,
         config: &JobConfig,
-        now: DateTime<Utc>,
+        clock: JobClock,
         request: JobRequest,
     ) -> Result<JobResponse, JobError> {
         (self.before)(&request).await?;
         let response = self
             .backend
-            .jobs(scope, config, now, request.clone())
+            .jobs(scope, config, clock, request.clone())
             .await?;
         if let Some(after) = &self.after {
             after(&request, &response).await?;
@@ -814,7 +818,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
                             .jobs(
                                 &scope,
                                 &config,
-                                Utc::now() - Duration::seconds(4),
+                                fixed_clock(Utc::now() - Duration::seconds(4)),
                                 JobRequest::Heartbeat {
                                     job: ctx.id.clone(),
                                     generation: ctx.attempt,
@@ -825,7 +829,7 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
                     }
                     CompletionFence::Superseded => {
                         assert!(
-                            matches!(store.jobs(&scope, &config, Utc::now() + Duration::seconds(4),
+                            matches!(store.jobs(&scope, &config, fixed_clock(Utc::now() + Duration::seconds(4)),
                             JobRequest::ClaimJob(ctx.id.clone())).await.unwrap(),
                             JobResponse::Job(Some(row)) if row.generation == ctx.attempt + 1)
                         );
@@ -1106,7 +1110,9 @@ async fn runner_accepts_heartbeat_at_half_the_claim_lease_and_derived_default() 
 
 #[tokio::test(start_paused = true)]
 async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat() {
-    for (purge, before_entry) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (purge, observe_cancel_first) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let mut s = Suite::new();
         s.now = Utc::now();
         let spec = s.spec("claimed-handoff");
@@ -1121,7 +1127,7 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
                     let heartbeat = matches!(request, JobRequest::Heartbeat { .. });
                     let gate = gate.clone();
                     Box::pin(async move {
-                        if heartbeat && !before_entry {
+                        if heartbeat && !observe_cancel_first {
                             gate.acquire().await.unwrap().forget();
                         }
                         Ok(())
@@ -1150,7 +1156,9 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
                                 JobRequest::Cancel(Selector::Ids(vec![job]))
                             };
                             assert!(matches!(
-                                store.jobs(&scope, &config, Utc::now(), request).await?,
+                                store
+                                    .jobs(&scope, &config, Arc::new(Utc::now), request)
+                                    .await?,
                                 JobResponse::Changed(1)
                             ));
                         }
@@ -1165,7 +1173,10 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
             .runner_with_backend(backend, 1, move |ctx, bytes| {
                 let tx = tx.clone();
                 async move {
-                    assert_eq!(ctx.cancel.is_cancelled(), before_entry);
+                    if observe_cancel_first {
+                        ctx.cancel.cancelled().await;
+                    }
+                    assert_eq!(ctx.cancel.is_cancelled(), observe_cancel_first);
                     tx.send(bytes.clone()).unwrap();
                     ctx.cancel.cancelled().await;
                     Ok(bytes)
@@ -1178,7 +1189,7 @@ async fn runner_cancel_or_purge_after_claim_uses_handoff_payload_and_heartbeat()
                 .expect("claim payload did not reach the handler"),
             Some(payload.clone())
         );
-        if !before_entry {
+        if !observe_cancel_first {
             // The mutation committed before entry, but only the heartbeat signals it.
             assert_eq!(s.get(&id).await.state, JobState::Running);
             heartbeat_gate.add_permits(1);
@@ -1442,7 +1453,7 @@ impl Suite {
     }
     async fn op(&self, request: JobRequest) -> Result<JobResponse, JobError> {
         self.backend
-            .jobs(&self.scope, &self.config, self.now, request)
+            .jobs(&self.scope, &self.config, fixed_clock(self.now), request)
             .await
     }
     async fn enqueue(&self, specs: Vec<JobSpec>) -> Vec<Enqueued> {
@@ -1764,7 +1775,9 @@ async fn jobs_case_11_foreign_scope_refused_before_access() {
             JobRequest::Get(id.clone()),
         ] {
             assert!(matches!(
-                s.backend.jobs(&scope, &s.config, s.now, req).await,
+                s.backend
+                    .jobs(&scope, &s.config, fixed_clock(s.now), req)
+                    .await,
                 Err(JobError::Scope)
             ));
         }
@@ -1773,7 +1786,12 @@ async fn jobs_case_11_foreign_scope_refused_before_access() {
         spoof.scope = scope.clone();
         assert!(matches!(
             s.backend
-                .jobs(&scope, &s.config, s.now, JobRequest::Get(spoof))
+                .jobs(
+                    &scope,
+                    &s.config,
+                    fixed_clock(s.now),
+                    JobRequest::Get(spoof)
+                )
                 .await,
             Err(JobError::NotFound)
         ));
@@ -2804,4 +2822,114 @@ async fn jobs_completion_page_byte_bound_is_exact() {
     assert_eq!(s.get(&second).await.delivery_generation, 1);
     s.ack(page[0].token.clone(), Disposition::Accepted).await;
     assert_eq!(s.deliveries(1, 100_000).await[0].completion.id, second);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regression_runner_sqlite_lock_leaves_other_database_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Suite::new();
+    a.backend =
+        Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(dir.path().join("a.sqlite")).unwrap());
+    a.now = Utc::now();
+    a.config.claim_lease_seconds = 1;
+    let mut spec = a.spec("independent");
+    spec.limits.max_attempts = 1;
+    let id = a.insert(spec).await;
+    let mut b = Suite::new();
+    let path_b = dir.path().join("b.sqlite");
+    b.backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(&path_b).unwrap());
+    let runner_b = b.runner(1, |_, bytes| async { Ok(bytes) }).await;
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
+    let runner_a = a
+        .runner(1, move |_, bytes| {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+                Ok(bytes)
+            }
+        })
+        .await;
+    entry.await.unwrap();
+    let initial = a.get(&id).await.lease_until.unwrap();
+    let (locked, lock_ready) = std::sync::mpsc::channel();
+    let lock = std::thread::spawn(move || {
+        let mut conn = rusqlite::Connection::open(path_b).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        tx.commit().unwrap();
+    });
+    lock_ready.recv().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let renewed = a.get(&id).await.lease_until.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let row = a.get(&id).await;
+    let stopped_a = runner_a.shutdown().await;
+    runner_b.shutdown().await.unwrap();
+    lock.join().unwrap();
+    assert!(
+        renewed > initial,
+        "database B stalled database A's heartbeat"
+    );
+    assert_eq!(
+        row.state,
+        JobState::Succeeded,
+        "database B stalled database A's completion"
+    );
+    assert!(row.finished_at.unwrap() < initial + Duration::seconds(1));
+    stopped_a.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regression_sqlite_completion_lock_wait_cannot_revive_expired_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expiry.sqlite");
+    let mut s = Suite::new();
+    s.backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap());
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    let id = s.insert(s.spec("expired-completion")).await;
+    let claim = s.claim().await;
+    let (locked, lock_ready) = std::sync::mpsc::channel();
+    let release = std::thread::spawn(move || {
+        let mut conn = rusqlite::Connection::open(path).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        tx.commit().unwrap();
+    });
+    lock_ready.recv().unwrap();
+    let started = Utc::now();
+    assert!(started < claim.lease_until.unwrap());
+    let result = s
+        .backend
+        .jobs(
+            &s.scope,
+            &s.config,
+            Arc::new(Utc::now),
+            JobRequest::Complete {
+                job: id.clone(),
+                generation: claim.generation,
+                state: JobState::Succeeded,
+                origin: ResultOrigin::Handler,
+                output: Some(b"late".to_vec()),
+                receipt: None,
+                diagnostic: None,
+            },
+        )
+        .await;
+    release.join().unwrap();
+    assert!(Utc::now() > claim.lease_until.unwrap());
+    assert!(
+        matches!(result, Err(JobError::StaleClaim)),
+        "late completion accepted: {result:?}"
+    );
+    let row = s.get(&id).await;
+    assert_eq!(row.state, JobState::Running);
+    assert!(row.output.is_none());
 }

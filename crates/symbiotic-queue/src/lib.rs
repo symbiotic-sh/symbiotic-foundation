@@ -174,12 +174,14 @@ impl QueueError {
 pub trait QueueBackend: Send + Sync {
     /// Execute an atomic generic-job operation using the trusted host's clock
     /// and versioned configuration. Authority verification belongs to the host
-    /// inside the acceptance transaction. Backends without a job store fail visibly.
+    /// inside the acceptance transaction. Sample the clock once after acquiring
+    /// the write transaction; use that time for every fence and deadline.
+    /// Backends without a job store fail visibly.
     async fn jobs(
         &self,
         _scope: &jobs::JobScope,
         _config: &jobs::JobConfig,
-        _now: DateTime<Utc>,
+        _clock: jobs::JobClock,
         _request: jobs::JobRequest,
     ) -> Result<jobs::JobResponse, jobs::JobError> {
         Err(jobs::JobError::Unavailable)

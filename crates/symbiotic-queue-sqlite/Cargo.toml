@@ -17,6 +17,7 @@ hex.workspace = true
 rusqlite.workspace = true
 symbiotic-core = { path = "../symbiotic-core" }
 symbiotic-queue = { path = "../symbiotic-queue" }
+tokio.workspace = true
 
 [dev-dependencies]
 symbiotic-queue = { path = "../symbiotic-queue", features = ["conformance"] }

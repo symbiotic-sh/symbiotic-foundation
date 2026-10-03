@@ -1024,7 +1024,7 @@ mod job_store_tests {
                 .jobs(
                     &scope,
                     &JobConfig::default(),
-                    chrono::Utc::now(),
+                    Arc::new(chrono::Utc::now),
                     JobRequest::PendingUsage,
                 )
                 .await

@@ -138,7 +138,7 @@ struct Shared {
 impl Shared {
     async fn op(&self, request: JobRequest) -> Result<JobResponse, JobError> {
         self.backend
-            .jobs(&self.scope, &self.jobs, Utc::now(), request)
+            .jobs(&self.scope, &self.jobs, Arc::new(Utc::now), request)
             .await
     }
 
