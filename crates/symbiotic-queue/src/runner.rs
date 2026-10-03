@@ -23,6 +23,8 @@ pub struct RunnerConfig {
     pub worker_count: usize,
     /// Store polling period for new work and external cancellation (100 ms; PROVISIONAL).
     pub poll_interval_ms: u64,
+    /// Independent bounded maintenance period (60 seconds; PROVISIONAL).
+    pub maintenance_interval_ms: u64,
 }
 
 impl Default for RunnerConfig {
@@ -31,6 +33,7 @@ impl Default for RunnerConfig {
             version: 1,
             worker_count: 4,
             poll_interval_ms: 100,
+            maintenance_interval_ms: 60_000,
         }
     }
 }
@@ -167,14 +170,18 @@ impl Shared {
                 _ = renew.tick() => self.op(JobRequest::Heartbeat { job: claim.id.clone(), generation: claim.generation }).await.map(|response| {
                     if matches!(response, JobResponse::Done) { Ok(()) } else { Err(JobError::InvalidRequest) }
                 }).and_then(|r| r),
-                _ = poll.tick() => self.signal_cancel(&claim, &cancel).await,
+                _ = poll.tick(), if errors.is_empty() => self.signal_cancel(&claim, &cancel).await,
             };
             if let Err(error) = check {
-                // Lost storage/ownership is visible. Ask work to stop and await
-                // its own finish; the store fences any resulting completion.
+                // Ask work to stop, retaining every failure. Once cancellation
+                // is signalled, polling adds nothing; scheduled heartbeats must
+                // still protect draining work until the store fences the claim.
+                let fenced = matches!(error, JobError::StaleClaim);
                 errors.push(RunnerError::Store(error));
                 cancel.send_replace(true);
-                break task.join_next().await;
+                if fenced {
+                    break task.join_next().await;
+                }
             }
         };
         let (state, output, diagnostic) = match outcome {
@@ -230,23 +237,30 @@ impl Shared {
         Ok(())
     }
 
-    async fn worker(
+    async fn maintain(
         self: Arc<Self>,
         mut stop: watch::Receiver<bool>,
-        maintenance: bool,
+        interval: Duration,
     ) -> Result<(), RunnerError> {
+        let mut timer = tokio::time::interval(interval);
         loop {
             if *stop.borrow() {
                 return Ok(());
             }
-            if maintenance
-                && !matches!(
-                    self.op(JobRequest::Maintain).await?,
-                    JobResponse::Changed(_)
-                )
-            {
-                return Err(JobError::InvalidRequest.into());
+            tokio::select! {
+                biased;
+                _ = stop.changed() => continue,
+                _ = timer.tick() => {
+                    if !matches!(self.op(JobRequest::Maintain).await?, JobResponse::Changed(_)) {
+                        return Err(JobError::InvalidRequest.into());
+                    }
+                }
             }
+        }
+    }
+
+    async fn worker(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> Result<(), RunnerError> {
+        loop {
             if *stop.borrow() {
                 return Ok(());
             }
@@ -292,6 +306,7 @@ impl JobRunner {
         if config.version != 1
             || config.worker_count == 0
             || config.poll_interval_ms == 0
+            || config.maintenance_interval_ms == 0
             || kind.is_empty()
         {
             return Err(JobError::InvalidRequest.into());
@@ -315,8 +330,12 @@ impl JobRunner {
         let stopped = stop.clone();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
-            for n in 0..config.worker_count {
-                tasks.spawn(workers.clone().worker(rx.clone(), n == 0));
+            tasks.spawn(workers.clone().maintain(
+                rx.clone(),
+                Duration::from_millis(config.maintenance_interval_ms),
+            ));
+            for _ in 0..config.worker_count {
+                tasks.spawn(workers.clone().worker(rx.clone()));
             }
             let mut errors = Vec::new();
             while let Some(result) = tasks.join_next().await {

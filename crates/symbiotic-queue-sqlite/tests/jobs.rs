@@ -129,15 +129,33 @@ impl Suite {
         F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
     {
-        JobRunner::start(
+        self.runner_with_config(
             backend,
-            self.scope.clone(),
-            self.config.clone(),
             RunnerConfig {
                 worker_count: workers,
                 poll_interval_ms: 10,
                 ..RunnerConfig::default()
             },
+            handler,
+        )
+        .await
+    }
+
+    async fn runner_with_config<F, Fut>(
+        &self,
+        backend: Arc<dyn QueueBackend>,
+        config: RunnerConfig,
+        handler: F,
+    ) -> JobRunner
+    where
+        F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
+    {
+        JobRunner::start(
+            backend,
+            self.scope.clone(),
+            self.config.clone(),
+            config,
             "handler".into(),
             Arc::new(Handler(handler)),
         )
@@ -276,12 +294,14 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
     assert_eq!(s.get(&first).await.state, JobState::Succeeded);
     assert_eq!(s.get(&second).await.state, JobState::Succeeded);
 
-    // Stop while maintenance is suspended, before the worker can claim again.
+    // Shutdown drains an in-flight maintenance pass and stops idle workers.
+    let mut idle = Suite::new();
+    idle.now = Utc::now();
     let entered = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Semaphore::new(0));
     let claims = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(InterceptJobs {
-        backend: s.backend.clone(),
+        backend: idle.backend.clone(),
         before: {
             let (entered, resume, claims) = (entered.clone(), resume.clone(), claims.clone());
             move |request: &JobRequest| {
@@ -300,7 +320,7 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
             }
         },
     });
-    let runner = s
+    let runner = idle
         .runner_with_backend(backend, 1, |_, bytes| async { Ok(bytes) })
         .await;
     entered.notified().await;
@@ -311,11 +331,153 @@ async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
         result = &mut shutdown => panic!("shutdown finished before maintenance: {result:?}"),
         _ = tokio::task::yield_now() => {},
     }
+    let stopped_claims = claims.load(Ordering::SeqCst);
     resume.add_permits(1);
     shutdown.await.unwrap();
-    assert_eq!(claims.load(Ordering::SeqCst), 0);
-    assert_eq!(s.get(pending).await.state, JobState::Pending);
-    assert_eq!(s.get(pending).await.generation, 0);
+    assert_eq!(claims.load(Ordering::SeqCst), stopped_claims);
+}
+
+#[tokio::test]
+async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
+    for heartbeat in [false, true] {
+        let mut s = Suite::new();
+        s.now = Utc::now();
+        s.config.claim_lease_seconds = 1;
+        let id = s.insert(s.spec("draining-lease")).await;
+        let started = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(InterceptJobs {
+            backend: s.backend.clone(),
+            before: {
+                let (started, failed, renewals) =
+                    (started.clone(), failed.clone(), renewals.clone());
+                move |request: &JobRequest| {
+                    let monitoring = if heartbeat {
+                        matches!(request, JobRequest::Heartbeat { .. })
+                    } else {
+                        matches!(request, JobRequest::Get(_))
+                    };
+                    if matches!(request, JobRequest::Heartbeat { .. })
+                        && failed.load(Ordering::SeqCst)
+                    {
+                        renewals.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let error = monitoring
+                        && started.load(Ordering::SeqCst)
+                        && !failed.swap(true, Ordering::SeqCst);
+                    Box::pin(async move {
+                        if error {
+                            Err(JobError::Storage)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                        as futures::future::BoxFuture<'static, Result<(), JobError>>
+                }
+            },
+        });
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let runner = s
+            .runner_with_backend(backend, 1, {
+                let (cancelled, finish) = (cancelled.clone(), finish.clone());
+                move |ctx, bytes| {
+                    let (started, cancelled, finish) =
+                        (started.clone(), cancelled.clone(), finish.clone());
+                    async move {
+                        started.store(true, Ordering::SeqCst);
+                        ctx.cancel.cancelled().await;
+                        cancelled.notify_one();
+                        finish.acquire().await.unwrap().forget();
+                        Ok(bytes)
+                    }
+                }
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        s.now = Utc::now();
+        assert!(
+            matches!(
+                s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
+                JobResponse::Job(None)
+            ),
+            "draining handler lost its lease"
+        );
+        assert!(renewals.load(Ordering::SeqCst) >= 2);
+        finish.add_permits(1);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), runner.wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, RunnerError::Workers(workers)
+            if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+                if matches!(errors.as_slice(), [RunnerError::Store(JobError::Storage)]))));
+        let row = s.get(&id).await;
+        assert_eq!(row.state, JobState::Succeeded);
+        assert_eq!(row.generation, 1);
+        assert_eq!(row.output, Some(s.spec("draining-lease").payload));
+    }
+}
+
+#[tokio::test]
+async fn runner_maintenance_passes_continue_while_handler_runs() {
+    assert_eq!(RunnerConfig::default().maintenance_interval_ms, 60_000);
+    let mut s = Suite::new();
+    s.now = Utc::now() - Duration::seconds(2);
+    s.config.retention_seconds = 1;
+    s.config.maintenance_batch = 1;
+    let mut expired = Vec::new();
+    for key in ["expired-one", "expired-two", "expired-three"] {
+        expired.push(s.ready(key).await);
+    }
+    s.now = Utc::now();
+    let id = s.insert(s.spec("long-handler")).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let runner = s
+        .runner_with_config(
+            s.backend.clone(),
+            RunnerConfig {
+                worker_count: 1,
+                poll_interval_ms: 10,
+                maintenance_interval_ms: 40,
+                ..RunnerConfig::default()
+            },
+            {
+                let (started, finish) = (started.clone(), finish.clone());
+                move |_, bytes| {
+                    let (started, finish) = (started.clone(), finish.clone());
+                    async move {
+                        started.notify_one();
+                        finish.acquire().await.unwrap().forget();
+                        Ok(bytes)
+                    }
+                }
+            },
+        )
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        for expired_id in expired {
+            while !s.get(&expired_id).await.result_expired {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let row = s.get(&expired_id).await;
+            assert!(row.payload.is_none() && row.output.is_none());
+        }
+    })
+    .await
+    .expect("handler delayed bounded maintenance passes");
+    assert_eq!(s.get(&id).await.state, JobState::Running);
+    finish.add_permits(1);
+    runner.shutdown().await.unwrap();
+    assert_eq!(s.get(&id).await.state, JobState::Succeeded);
 }
 
 #[derive(Clone, Copy)]
