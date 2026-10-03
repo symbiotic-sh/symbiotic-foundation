@@ -936,13 +936,6 @@ fn open_persistent_queue(
     // symlinks.
     private_fs::ensure_private_dir(dir).map_err(|err| io_error(dir, err))?;
     let responses = dir.join(RESPONSES_DIR);
-    match std::fs::symlink_metadata(&responses) {
-        Ok(_) => {
-            private_fs::ensure_owned_tree(&responses).map_err(|err| io_error(&responses, err))?
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(io_error(&responses, err)),
-    }
     let path = dir.join(QUEUE_DATABASE);
     private_fs::ensure_private_file(&path).map_err(|err| io_error(&path, err))?;
     // SQLite gives its journal files the database's mode; adopt any that
@@ -959,13 +952,23 @@ fn open_persistent_queue(
         queue.clone(),
         config.retention,
         ResponseRetention {
-            cache: DirResponseCache::new(responses),
+            cache: DirResponseCache::new(responses.clone()),
             max_age: config.response_max_age,
             max_bytes: config.response_max_bytes,
         },
         spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention),
     );
-    sweep.maintain()?;
+    // Recovery expiry must run even when the cache path refuses this open.
+    // Keep the existing path diagnostic and permission tightening at startup.
+    let maintained = sweep.maintain();
+    match std::fs::symlink_metadata(&responses) {
+        Ok(_) => {
+            private_fs::ensure_owned_tree(&responses).map_err(|err| io_error(&responses, err))?
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error(&responses, err)),
+    }
+    maintained?;
     let maintenance = Maintenance::start(sweep, config.maintenance_interval)?;
     Ok((queue, maintenance))
 }

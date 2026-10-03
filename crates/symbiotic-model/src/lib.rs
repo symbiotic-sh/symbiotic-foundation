@@ -876,7 +876,6 @@ fn elapsed_ms(since: std::time::Instant) -> u64 {
 #[cfg(feature = "queue")]
 struct QueuedCall<Req> {
     _maintenance: Option<Arc<dyn Send + Sync>>,
-    completion: Arc<queue_runtime::CallCompletion>,
     queue: Arc<dyn QueueBackend>,
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
@@ -1457,22 +1456,26 @@ where
         )?,
         None => attempt_binding.clone(),
     };
-    let idempotency_key = format!(
-        "{}:{provider_identity}:{request_hash}:{}",
-        queue_id.0,
-        hash_json(&invocation)?
-    );
-    let attempt_context = runtime.attempt_context.clone().unwrap_or_default();
-    let completion = match runtime
-        .in_flight
-        .join(&idempotency_key, attempt_context.clone())?
-    {
-        queue_runtime::CallJoin::Leader(completion) => completion,
-        queue_runtime::CallJoin::Joined(joined) => return joined.wait(&attempt_context).await,
+    // Only explicit invocations and cache-enabled implicit calls coordinate
+    // through a queue key. Each accepted handoff owns its dispatch.
+    let cache = if runtime.invocation.is_none() && runtime.accepted_spend.is_none() {
+        runtime.cache()
+    } else {
+        None
     };
+    let idempotency_key =
+        if runtime.accepted_spend.is_none() && (runtime.invocation.is_some() || cache.is_some()) {
+            Some(format!(
+                "{}:{provider_identity}:{request_hash}:{}",
+                queue_id.0,
+                hash_json(&invocation)?
+            ))
+        } else {
+            None
+        };
+    let attempt_context = runtime.attempt_context.clone().unwrap_or_default();
     let call_state = Arc::new(QueuedCall {
         _maintenance: runtime.maintenance.clone(),
-        completion,
         queue: runtime.queue.clone(),
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
@@ -1498,49 +1501,13 @@ where
         kind: kind.to_string(),
         binding_identity: runtime.binding_identity.clone(),
         cache_scope: Some(provider_identity),
-        cache: if runtime.invocation.is_none() {
-            runtime.cache()
-        } else {
-            None
-        },
+        cache,
         trace_sink: runtime.trace_sink.clone(),
         request,
         request_hash,
         request_value,
-        idempotency_key: Some(idempotency_key),
+        idempotency_key,
     });
-    // A joined caller keeps the execution progressing even if its original
-    // caller drops. With no callers left, only the already owned attempt finishes.
-    let _waiting = call_state.completion.subscribe();
-    let runtime = runtime.clone();
-    let execution = tokio::spawn(async move {
-        let result = drive_queued(&runtime, call_state.clone(), provider, call).await;
-        call_state.completion.complete(&result);
-        result
-    });
-    match execution.await {
-        Ok(result) => result,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(_) => Err(ModelError::Queue(DiagnosticCode::QueueFailure)),
-    }
-}
-
-/// Drive the leader's queue/retry path; local joiners await its completion.
-#[cfg(feature = "queue")]
-async fn drive_queued<P, Req, Res, F, Fut>(
-    runtime: &QueueRuntime,
-    call_state: Arc<QueuedCall<Req>>,
-    provider: P,
-    call: F,
-) -> Result<Res, ModelError>
-where
-    P: ModelProvider + Clone + Send + Sync + 'static,
-    Req: Clone + Serialize + Send + Sync + 'static,
-    Req: BudgetedModelRequest,
-    Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
-    F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
-{
     let this = call_state.as_ref();
     let queue = &this.queue;
     let config = &this.config;
@@ -1559,9 +1526,6 @@ where
     }
     if let Some(output) = this.recovered::<Res>().await? {
         return Ok(output);
-    }
-    if !this.completion.has_waiters() {
-        return Err(ModelError::Queue(DiagnosticCode::QueueFailure));
     }
     let queued_at = std::time::Instant::now();
     // Cooldown + rate-bucket wait accumulated across loop iterations, so the
@@ -1630,9 +1594,6 @@ where
     // its throttle time across them, for its receipts.
     let mut waiting_attempt: Option<(std::time::Instant, Duration)> = None;
     loop {
-        if !this.completion.has_waiters() {
-            return Err(ModelError::Queue(DiagnosticCode::QueueFailure));
-        }
         if let Some(output) = this.recovered::<Res>().await? {
             return Ok(output);
         }
@@ -1801,7 +1762,8 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 if let Some(cached) = call_state.cached::<Res>(Some(&current)).await? {
                     return Ok(Followed::Answer(cached));
                 }
-                Err(ModelError::Queue(DiagnosticCode::InvocationCompleted))
+                *enqueue = self.renew_budget(&current.item_id).await?;
+                Ok(Followed::Moved)
             }
             // Still waiting: the top of the caller's loop checks the cache.
             QueueStatus::Pending | QueueStatus::Running | QueueStatus::Failed => {
@@ -4966,7 +4928,7 @@ mod tests {
 
     #[cfg(feature = "queue")]
     #[tokio::test]
-    async fn queued_chat_provider_waiter_shares_logical_retry_envelope() {
+    async fn queued_chat_provider_cache_off_calls_have_separate_logical_retry_envelopes() {
         let queue = Arc::new(SqliteQueue::in_memory().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
@@ -4979,6 +4941,7 @@ mod tests {
                 logical_retry_attempts: 2,
                 retry_attempts: 1,
                 retry_jitter_seconds: 0,
+                retry_base_delay_ms: 10,
                 request_timeout_seconds: Some(10),
                 requests_per_minute: None,
                 input_units_per_minute: None,
@@ -4994,53 +4957,10 @@ mod tests {
         }));
         let results = tokio::time::timeout(Duration::from_secs(5), run)
             .await
-            .expect("duplicate waiter should observe the dead item instead of spinning");
+            .expect("independent callers should finish their retry envelopes");
 
         assert!(results.iter().all(Result::is_err));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[cfg(feature = "queue")]
-    #[tokio::test]
-    async fn queued_chat_provider_joiner_retains_retry_budget_after_leader_drops() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = QueuedChatProvider::new(
-            SlowUnavailableChat::new(calls.clone()),
-            queue,
-            "worker",
-            ModelQueueConfig {
-                logical_retry_attempts: 2,
-                retry_attempts: 1,
-                retry_jitter_seconds: 0,
-                retry_base_delay_ms: 10,
-                ..ModelQueueConfig::default()
-            },
-        )
-        .with_spend_ledger(test_spend::ledger(), None);
-        let leader = tokio::spawn({
-            let provider = provider.clone();
-            async move { provider.chat(chat_request("same request")).await }
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while calls.load(Ordering::SeqCst) == 0 {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::task::yield_now().await;
-        }
-        let joined = provider.chat(chat_request("same request"));
-        tokio::pin!(joined);
-        tokio::select! {
-            result = &mut joined => panic!("joiner finished before the held attempt: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-        }
-        leader.abort();
-        assert!(leader.await.unwrap_err().is_cancelled());
-        let error = tokio::time::timeout(Duration::from_secs(5), joined)
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.code(), DiagnosticCode::AttemptBudgetExhausted);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[cfg(feature = "queue")]

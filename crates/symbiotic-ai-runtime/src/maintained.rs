@@ -43,11 +43,11 @@ impl Sweep {
         }
     }
 
-    /// Validate the cache tree before any deletion, then drain expired recovery,
-    /// retire old queue state and prune cached responses.
+    /// Drain expired recovery independently of cache validation, then retire
+    /// old queue state and prune cached responses.
     pub(crate) fn maintain(&self) -> Result<(), ModelError> {
-        self.responses.cache.validate_tree()?;
         self.recovery.expire_recovery()?;
+        self.responses.cache.validate_tree()?;
         let cutoff = chrono::Utc::now() - self.retention;
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
@@ -346,7 +346,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn refused_maintenance_preserves_expired_recovery() {
+    fn refused_cache_maintenance_still_expires_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.sqlite");
         let queue = SqliteQueue::open(&path).unwrap();
@@ -370,12 +370,16 @@ mod tests {
             )
             .unwrap();
         let cache_root = dir.path().join("responses");
-        std::os::unix::fs::symlink(dir.path().join("bystander"), &cache_root).unwrap();
+        let bystander = dir.path().join("bystander");
+        std::fs::create_dir(&bystander).unwrap();
+        let precious = bystander.join("precious");
+        std::fs::write(&precious, "untouched").unwrap();
+        std::os::unix::fs::symlink(&bystander, &cache_root).unwrap();
         let maintained = Sweep::new(
             queue,
             Duration::from_secs(60),
             ResponseRetention {
-                cache: DirResponseCache::new(cache_root),
+                cache: DirResponseCache::new(cache_root.clone()),
                 max_age: None,
                 max_bytes: None,
             },
@@ -391,12 +395,14 @@ mod tests {
             rusqlite::Connection::open(path)
                 .unwrap()
                 .query_row(
-                    "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+                    "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL",
                     [],
                     |r| r.get::<_, usize>(0)
                 )
                 .unwrap(),
-            1
+            0
         );
+        assert_eq!(std::fs::read_link(cache_root).unwrap(), bystander);
+        assert_eq!(std::fs::read_to_string(precious).unwrap(), "untouched");
     }
 }

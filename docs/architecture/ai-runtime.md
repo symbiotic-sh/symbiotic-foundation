@@ -219,9 +219,10 @@ Periodic sweeps run on a dedicated background thread. Maintenance failures are
 logged at WARN and exposed through `Runtime::last_maintenance_error`, which retains
 the most recent failure since open even if later sweeps succeed. Open-time
 maintenance errors refuse the open.
-A sweep or purge checks the whole cache tree before it deletes anything, including
-retained recovery answers. A purge refused for a filesystem path (symlink or
-path outside the cache root) removes nothing.
+Recovery expiry runs independently of cache-path validation; unsafe cache paths
+keep their visible errors for cache operations. A purge checks the whole cache tree
+before it deletes anything, including retained recovery answers. A purge refused
+for a filesystem path (symlink or path outside the cache root) removes nothing.
 If the root or any component in it is a symlink or belongs to another user,
 it refuses and removes nothing, so it can never reach outside the cache.
 
@@ -249,13 +250,14 @@ Dropping the caller's future (a job timeout, `tokio::time::timeout` around
 - keeps its model slot until then, so an abandoned call still counts against
   `max_in_flight`.
 
-Every in-process caller joining an in-flight item receives its exact completion
-and receipt in memory, including reconciliation refusals, independently of the
-response cache. Missing usage preserves the leader's answer and Unknown charge
-for every joiner. Joiners never dispatch a succeeded item again.
-A repeat of the same explicit invocation recovers its retained ledger answer. A
-later implicit call reuses a matching cached response when caching is enabled and
-dispatches again when caching is off.
+Implicit calls share results only through the response cache: cache-off calls never
+join another caller's running item or result, and cache hits resolve before provider
+execution is registered. Accepted-handoff calls never join another call and each
+consumes its own handoff through `acquire_handoff`, with identity mismatch and reuse
+refused; explicit invocations deduplicate by their invocation identity.
+A cache-off call still passes the accounting guards: while an identical call has an
+Unknown reservation, the next identical call is refused until that reservation
+settles, rather than dispatched.
 
 The attempt renews its lease every third of `lease_seconds`, from its claim
 until the item is completed or failed. That covers the provider call and

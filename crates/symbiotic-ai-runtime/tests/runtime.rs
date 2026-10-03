@@ -411,7 +411,7 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
     let binding = || {
         binding(down.clone())
             .with_policy(policy())
-            .with_response_cache(ResponseCacheMode::Off)
+            .with_response_cache(ResponseCacheMode::Default)
     };
 
     let runtime = persistent(dir.path());
@@ -423,7 +423,7 @@ async fn attempt_budgets_survive_a_restart_only_when_persistent() {
         .unwrap_err();
     assert_eq!(down.calls.load(Ordering::SeqCst), 1);
 
-    // The exhausted budget is on disk: a restarted host does not pay again.
+    // Cache-enabled calls retain queue coordination across a restart.
     let reopened = persistent(dir.path());
     let err = reopened
         .chat(binding())
@@ -580,7 +580,7 @@ async fn an_exhausted_error_keeps_its_class_after_a_restart() {
                 retry_provider_errors: true,
                 ..policy()
             })
-            .with_response_cache(ResponseCacheMode::Off)
+            .with_response_cache(ResponseCacheMode::Default)
     };
     let first = persistent(dir.path())
         .chat(binding())
@@ -793,7 +793,35 @@ async fn a_symlinked_cache_dir_is_refused() {
     let dir = private_tempdir();
     let state = dir.path().join("state");
     persistent(&state);
+    let path = state.join(symbiotic_ai_runtime::QUEUE_DATABASE);
+    let ledger = symbiotic_ai_runtime::spend::SqliteSpendLedger::open(&path)
+        .unwrap()
+        .with_retention(Duration::ZERO);
+    let reservation = symbiotic_ai_runtime::SpendReservation {
+        reference: symbiotic_ai_runtime::SpendReceiptRef::new("expired-at-open").unwrap(),
+        account: "account".into(),
+        invocation: "explicit".into(),
+        binding: "input".into(),
+        request_limit: None,
+    };
+    use symbiotic_ai_runtime::{SpendLedger, SpendState};
+    ledger.reserve_explicit(&reservation, 1).unwrap();
+    ledger
+        .finish(
+            &reservation.reference,
+            SpendState::Unknown,
+            None,
+            Some(json!({"private":"answer"})),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let payloads = || {
+        conn.query_row("SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL", [], |row| row.get::<_, usize>(0)).unwrap()
+    };
+    assert_eq!(payloads(), 1);
     let elsewhere = private_tempdir();
+    let precious = elsewhere.path().join("precious");
+    std::fs::write(&precious, "untouched").unwrap();
     let responses = state.join(symbiotic_ai_runtime::RESPONSES_DIR);
     let _ = std::fs::remove_dir_all(&responses);
     std::os::unix::fs::symlink(elsewhere.path(), &responses).unwrap();
@@ -804,6 +832,13 @@ async fn a_symlinked_cache_dir_is_refused() {
     .err()
     .expect("a symlinked response cache is refused");
     assert!(matches!(err, ModelError::Queue(_)));
+    assert_eq!(
+        payloads(),
+        0,
+        "unsafe cache must not block open-time expiry"
+    );
+    assert_eq!(std::fs::read_link(responses).unwrap(), elsewhere.path());
+    assert_eq!(std::fs::read_to_string(precious).unwrap(), "untouched");
 }
 
 #[cfg(unix)]
@@ -1870,7 +1905,7 @@ async fn restored_stopped_and_exhausted_dead_items_cannot_surface_stored_text() 
         let bind = || {
             binding(broken.clone())
                 .with_policy(policy())
-                .with_response_cache(ResponseCacheMode::Off)
+                .with_response_cache(ResponseCacheMode::Default)
         };
         let runtime = persistent(dir.path());
         let provider = runtime.chat(bind()).unwrap();
@@ -3048,94 +3083,200 @@ async fn refused_purge_preserves_retained_answers_and_cache_files() {
     }
 }
 
-// Poll B while A is held inside the provider, then release A. This guarantees
-// the second call joins a running item instead of arriving after completion.
-async fn joined_call_without_cache(measured: bool, abandon_leader: bool) {
+// A is held in the provider before B starts, so overlap is deterministic.
+async fn identical_implicit_calls(cache_on: bool, abandon_a: bool) {
     let dir = private_tempdir();
-    let runtime = Runtime::open(RuntimeConfig {
-        state_dir: Some(dir.path().to_path_buf()),
-        ..RuntimeConfig::default()
-    })
-    .unwrap();
+    let runtime = persistent(dir.path());
     let gate = Arc::new(tokio::sync::Barrier::new(2));
     let mut raw = Loopback::new(unique_identity());
-    raw.measured = measured;
+    raw.measured = true;
     raw.start_gate = Some(gate.clone());
     let calls = raw.calls.clone();
     let configured = binding(raw)
-        .with_policy(policy())
-        .with_response_cache(ResponseCacheMode::Off);
+        .with_policy(ModelQueueConfig {
+            max_in_flight: 1,
+            ..policy()
+        })
+        .with_response_cache(if cache_on {
+            ResponseCacheMode::Default
+        } else {
+            ResponseCacheMode::Off
+        });
     let a = runtime.chat(configured.clone()).unwrap();
     let b = runtime.chat(configured).unwrap();
-    let leader = tokio::spawn(async move { a.chat(request("joined")).await });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while calls.load(Ordering::SeqCst) == 0 {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::task::yield_now().await;
-    }
-    let joined = b.chat(request("joined"));
-    tokio::pin!(joined);
-    // Drive B until it waits for A; A cannot finish while the barrier is held.
+    let a = tokio::spawn(async move { a.chat(request("identical")).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let b = b.chat(request("identical"));
+    tokio::pin!(b);
     tokio::select! {
-        result = &mut joined => panic!("joiner finished before leader: {result:?}"),
+        result = &mut b => panic!("B finished before A: {result:?}"),
         _ = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
-    let leader = if abandon_leader {
-        leader.abort();
-        assert!(leader.await.unwrap_err().is_cancelled());
+    let a = if abandon_a {
+        a.abort();
+        assert!(a.await.unwrap_err().is_cancelled());
         None
     } else {
-        Some(leader)
+        Some(a)
     };
     gate.wait().await;
-    let joined = tokio::time::timeout(Duration::from_secs(1), joined)
+    if !cache_on {
+        tokio::select! {
+            result = &mut b => panic!("B must dispatch its own attempt: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(1), gate.wait()) => {
+                result.expect("cache-off B must reach the provider after A releases its slot");
+            }
+        }
+    }
+    let b = tokio::time::timeout(Duration::from_secs(1), b)
         .await
         .unwrap()
         .unwrap();
-    if let Some(leader) = leader {
-        assert_eq!(
-            serde_json::to_value(leader.await.unwrap().unwrap()).unwrap(),
-            serde_json::to_value(&joined).unwrap()
-        );
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let reference: symbiotic_ai_runtime::SpendReceiptRef =
-        serde_json::from_value(joined.trace.metadata["spend_receipt"].clone()).unwrap();
-    let receipt = runtime.spend_receipt(&reference).unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), if cache_on { 1 } else { 2 });
     assert_eq!(
-        receipt.state,
-        if measured {
-            symbiotic_ai_runtime::SpendState::Settled
-        } else {
-            symbiotic_ai_runtime::SpendState::Unknown
+        b.trace.cache.response_cache == symbiotic_trace::CacheStatus::Hit,
+        cache_on
+    );
+    if let Some(a) = a {
+        let a = a.await.unwrap().unwrap();
+        assert_eq!(a.text, b.text);
+        assert_eq!(a.trace.queue_item_id == b.trace.queue_item_id, cache_on);
+        if !cache_on {
+            assert_ne!(
+                a.trace.metadata["spend_receipt"],
+                b.trace.metadata["spend_receipt"]
+            );
         }
-    );
-    assert!(
-        receipt.recovery.is_none(),
-        "implicit joiners need no recovery payload"
-    );
-    if !measured {
-        for _ in 0..2 {
+    }
+}
+
+#[tokio::test]
+async fn proc1_cache_off_identical_running_calls_dispatch_independently() {
+    identical_implicit_calls(false, false).await;
+}
+
+#[tokio::test]
+async fn proc1_cache_off_b_dispatches_after_a_is_abandoned() {
+    identical_implicit_calls(false, true).await;
+}
+
+#[tokio::test]
+async fn proc1_cache_on_identical_calls_share_only_the_cached_response() {
+    identical_implicit_calls(true, false).await;
+}
+
+#[tokio::test]
+async fn proc1_distinct_accepted_handoffs_consume_their_own_reservations() {
+    use symbiotic_ai_runtime::{
+        AcceptedSpendHandoff, SpendLedger, SpendReceiptRef, SpendReservation, SpendState,
+        spend::SqliteSpendLedger,
+    };
+    for explicit in [false, true] {
+        let dir = private_tempdir();
+        let runtime = persistent(dir.path());
+        let path = dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let mut raw = Loopback::new(unique_identity());
+        raw.measured = true;
+        raw.start_gate = Some(gate.clone());
+        let calls = raw.calls.clone();
+        let mut configured = binding(raw).with_policy(policy());
+        if explicit {
+            configured = configured.with_invocation("same-runtime-invocation");
+        }
+        let identity = configured.identity.as_ref().unwrap();
+        let account = symbiotic_ai_runtime::account_scope(identity, None).unwrap();
+        let input = request("handoff");
+        let request_hash = symbiotic_ai_runtime::model::configuration_revision(&input)
+            .unwrap()
+            .0;
+        let input_identity = symbiotic_ai_runtime::model::handoff_input_identity(
+            "chat",
+            Some(identity),
+            &request_hash,
+        )
+        .unwrap();
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let handoffs: Vec<_> = (0..2)
+            .map(|n| AcceptedSpendHandoff {
+                reservation: SpendReservation {
+                    reference: SpendReceiptRef::new(format!("accepted-{n}")).unwrap(),
+                    account: account.clone(),
+                    invocation: format!("handoff-{n}"),
+                    binding: "accepted-binding".into(),
+                    request_limit: Some(2),
+                },
+                input_identity: input_identity.clone(),
+            })
+            .collect();
+        let tx = conn.transaction().unwrap();
+        for handoff in &handoffs {
+            assert!(SqliteSpendLedger::reserve_handoff_in(&tx, handoff).unwrap());
+        }
+        tx.commit().unwrap();
+        let providers: Vec<_> = handoffs
+            .iter()
+            .map(|handoff| {
+                let mut configured = configured.clone();
+                configured.accepted_spend = Some(handoff.clone());
+                runtime.chat(configured).unwrap()
+            })
+            .collect();
+        let a = tokio::spawn({
+            let a = providers[0].clone();
+            let input = input.clone();
+            async move { a.chat(input).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let b = providers[1].chat(input.clone());
+        tokio::pin!(b);
+        tokio::select! {
+            result = &mut b => panic!("B finished before release: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(1), async {
+                while calls.load(Ordering::SeqCst) != 2 { tokio::task::yield_now().await; }
+            }) => result.expect("each handoff must dispatch independently"),
+        }
+        gate.wait().await;
+        let outputs = [a.await.unwrap().unwrap(), b.await.unwrap()];
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        for ((handoff, provider), output) in handoffs.iter().zip(&providers).zip(&outputs) {
             assert_eq!(
-                b.chat(request("joined")).await.unwrap_err().code(),
+                serde_json::from_value::<SpendReceiptRef>(
+                    output.trace.metadata["spend_receipt"].clone()
+                )
+                .unwrap(),
+                handoff.reservation.reference
+            );
+            assert_eq!(
+                ledger
+                    .receipt(&handoff.reservation.reference)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                SpendState::Unknown
+            );
+            assert_eq!(
+                provider.chat(input.clone()).await.unwrap_err().code(),
                 symbiotic_core::DiagnosticCode::SpendReconciliationRequired
             );
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (used, owners): (u64, u64) = conn.query_row(
+            "SELECT (SELECT used FROM spend_accounts WHERE account=?1), count(DISTINCT dispatch_owner) FROM spend_receipts WHERE dispatch_owner IS NOT NULL",
+            [&account], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((used, owners), (2, 2));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
-}
-
-#[tokio::test]
-async fn fdn_joined_measured_call_returns_its_own_answer_without_cache() {
-    joined_call_without_cache(true, false).await;
-}
-
-#[tokio::test]
-async fn fdn_joined_missing_usage_returns_the_leaders_unknown_outcome_without_cache() {
-    joined_call_without_cache(false, false).await;
-}
-
-#[tokio::test]
-async fn fdn_joined_answer_survives_leader_abandonment_without_cache() {
-    joined_call_without_cache(true, true).await;
 }

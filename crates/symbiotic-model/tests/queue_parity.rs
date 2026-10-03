@@ -860,6 +860,7 @@ async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
             .map(|_| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))
             .collect(),
     );
+    let cache = tempfile::tempdir().unwrap();
     let provider = queued(
         raw.clone(),
         backend.clone(),
@@ -867,6 +868,7 @@ async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
             logical_retry_attempts: 1,
             retry_attempts: 1,
             budget_renewal_seconds: Some(1),
+            response_cache_dir: Some(cache.path().to_path_buf()),
             ..config()
         },
     );

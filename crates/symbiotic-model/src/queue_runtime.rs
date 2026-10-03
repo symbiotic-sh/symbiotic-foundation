@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use symbiotic_core::{QueueId, QueueItemId};
 use symbiotic_queue::QueueBackend;
 use symbiotic_trace::{CacheTrace, TraceSink, UsageTrace};
@@ -32,7 +32,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Clone, Default)]
 pub struct ModelAdmission {
     gates: Arc<Mutex<AdmissionGates>>,
-    pub(crate) in_flight: InFlightCalls,
 }
 
 /// Per `queue_id`: the fixed cap and its semaphore.
@@ -83,147 +82,6 @@ impl ModelAdmission {
             ));
         }
         Ok(gate.clone())
-    }
-}
-
-/// A rendezvous for currently executing calls, never a response cache.
-/// Entries are weak and removed when the caller and its owned attempt finish.
-#[derive(Clone, Default)]
-pub(crate) struct InFlightCalls(Arc<ActiveCalls>);
-
-type ActiveCalls = Mutex<HashMap<String, Weak<CallCompletion>>>;
-
-/// Either own the queued execution or await the one already in progress.
-pub(crate) enum CallJoin {
-    Leader(Arc<CallCompletion>),
-    Joined(JoinedCall),
-}
-
-/// Publisher held by the execution, with the leader's exact receipt context.
-pub(crate) struct CallCompletion {
-    key: String,
-    calls: Weak<ActiveCalls>,
-    result: tokio::sync::watch::Sender<Option<CompletedCall>>,
-    context: crate::ExecutionAttemptContext,
-}
-
-#[derive(Clone)]
-struct CompletedCall {
-    output: Result<Arc<dyn std::any::Any + Send + Sync>, ModelError>,
-    reference: Result<Option<crate::SpendReceiptRef>, ModelError>,
-}
-
-/// A caller's subscription; it retains the outcome without retaining a publisher.
-pub(crate) struct JoinedCall(tokio::sync::watch::Receiver<Option<CompletedCall>>);
-
-impl InFlightCalls {
-    /// Register before any cache/ledger lookup or enqueue: completion cannot
-    /// race a joiner's registration. The exact queue idempotency key scopes it.
-    pub(crate) fn join(
-        &self,
-        key: &str,
-        context: crate::ExecutionAttemptContext,
-    ) -> Result<CallJoin, ModelError> {
-        let mut calls = self
-            .0
-            .lock()
-            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
-        if let Some(active) = calls.get(key).and_then(Weak::upgrade) {
-            let joined = JoinedCall(active.result.subscribe());
-            drop(calls);
-            return Ok(CallJoin::Joined(joined));
-        }
-        let (result, _) = tokio::sync::watch::channel(None);
-        let completion = Arc::new(CallCompletion {
-            key: key.to_string(),
-            calls: Arc::downgrade(&self.0),
-            result,
-            context,
-        });
-        calls.insert(key.to_string(), Arc::downgrade(&completion));
-        Ok(CallJoin::Leader(completion))
-    }
-}
-
-impl CallCompletion {
-    /// Keep a caller registered until it receives the completion or drops.
-    pub(crate) fn subscribe(&self) -> JoinedCall {
-        JoinedCall(self.result.subscribe())
-    }
-
-    /// Whether anyone still wants another attempt of this execution.
-    pub(crate) fn has_waiters(&self) -> bool {
-        self.result.receiver_count() > 0
-    }
-
-    /// Publish the terminal outcome once; every receiver gets the same value.
-    pub(crate) fn complete<Res: Clone + Send + Sync + 'static>(
-        &self,
-        result: &Result<Res, ModelError>,
-    ) {
-        let output = result
-            .as_ref()
-            .map(|response| Arc::new(response.clone()) as Arc<dyn std::any::Any + Send + Sync>)
-            .map_err(|error| *error);
-        let completed = CompletedCall {
-            output,
-            reference: self.context.reference(),
-        };
-        self.result.send_if_modified(|stored| {
-            if stored.is_some() {
-                return false;
-            }
-            *stored = Some(completed);
-            true
-        });
-    }
-}
-
-impl JoinedCall {
-    /// Receive the completion and capture its canonical receipt for this caller.
-    pub(crate) async fn wait<Res: Clone + Send + Sync + 'static>(
-        mut self,
-        context: &crate::ExecutionAttemptContext,
-    ) -> Result<Res, ModelError> {
-        loop {
-            let completed = self.0.borrow().clone();
-            if let Some(completed) = completed {
-                if let Some(reference) = completed.reference? {
-                    context.capture(&reference)?;
-                }
-                return completed
-                    .output?
-                    .downcast_ref::<Res>()
-                    .cloned()
-                    .ok_or(ModelError::Queue(
-                        symbiotic_core::DiagnosticCode::QueueFailure,
-                    ));
-            }
-            self.0
-                .changed()
-                .await
-                .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
-        }
-    }
-}
-
-impl Drop for CallCompletion {
-    fn drop(&mut self) {
-        if let Some(calls) = self.calls.upgrade() {
-            match calls.lock() {
-                Ok(mut calls) => {
-                    if calls
-                        .get(&self.key)
-                        .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
-                    {
-                        calls.remove(&self.key);
-                    }
-                }
-                Err(_) => tracing::warn!("AI runtime in-flight completion lock poisoned"),
-            }
-        }
-        // Dropping the sender wakes every joiner with a visible QueueFailure
-        // if the caller was cancelled before an owned attempt could finish.
     }
 }
 
@@ -643,7 +501,6 @@ impl ResponseCache for DirResponseCache {
 pub(crate) struct QueueRuntime {
     pub(crate) queue: Arc<dyn QueueBackend>,
     pub(crate) maintenance: Option<Arc<dyn Send + Sync>>,
-    pub(crate) in_flight: InFlightCalls,
     pub(crate) trace_sink: Option<Arc<dyn TraceSink>>,
     pub(crate) receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     pub(crate) admission: Option<ModelAdmission>,
@@ -669,7 +526,6 @@ impl QueueRuntime {
         Self {
             queue,
             maintenance: None,
-            in_flight: InFlightCalls::default(),
             trace_sink: None,
             receipt_sink: None,
             admission: None,
@@ -751,7 +607,6 @@ macro_rules! queue_runtime_builders {
         }
         /// Share in-process admission with providers of the same runtime/account.
         pub fn with_admission(mut self, admission: $crate::ModelAdmission) -> Self {
-            self.runtime.in_flight = admission.in_flight.clone();
             self.runtime.admission = Some(admission);
             self
         }
@@ -779,74 +634,6 @@ pub(crate) use queue_runtime_builders;
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn in_flight_completion_delivers_one_outcome_and_receipt_to_every_joiner() {
-        let calls = InFlightCalls::default();
-        let context = crate::ExecutionAttemptContext::default();
-        let CallJoin::Leader(leader) = calls.join("item", context.clone()).unwrap() else {
-            panic!("leader")
-        };
-        let mut joined = Vec::new();
-        for _ in 0..3 {
-            let CallJoin::Joined(waiter) = calls
-                .join("item", crate::ExecutionAttemptContext::default())
-                .unwrap()
-            else {
-                panic!("joiner")
-            };
-            joined.push(waiter);
-        }
-        let reference = crate::SpendReceiptRef::new("runtime:item:1").unwrap();
-        context.capture(&reference).unwrap();
-        let error = ModelError::Queue(symbiotic_core::DiagnosticCode::SpendReconciliationRequired);
-        leader.complete::<String>(&Err(error));
-        // Completion is immutable, even if a later path tries to publish.
-        leader.complete(&Ok("different outcome".to_string()));
-        drop(leader);
-        assert!(calls.0.lock().unwrap().is_empty());
-        for waiter in joined {
-            let context = crate::ExecutionAttemptContext::default();
-            assert_eq!(
-                waiter.wait::<String>(&context).await.unwrap_err().code(),
-                error.code()
-            );
-            assert_eq!(context.reference().unwrap(), Some(reference.clone()));
-        }
-        assert!(matches!(
-            calls
-                .join("item", crate::ExecutionAttemptContext::default())
-                .unwrap(),
-            CallJoin::Leader(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn in_flight_abandonment_before_dispatch_refuses_every_joiner() {
-        let calls = InFlightCalls::default();
-        let CallJoin::Leader(leader) = calls
-            .join("item", crate::ExecutionAttemptContext::default())
-            .unwrap()
-        else {
-            panic!("leader")
-        };
-        let CallJoin::Joined(waiter) = calls
-            .join("item", crate::ExecutionAttemptContext::default())
-            .unwrap()
-        else {
-            panic!("joiner")
-        };
-        drop(leader);
-        assert_eq!(
-            waiter
-                .wait::<String>(&crate::ExecutionAttemptContext::default())
-                .await
-                .unwrap_err()
-                .code(),
-            symbiotic_core::DiagnosticCode::QueueFailure
-        );
-        assert!(calls.0.lock().unwrap().is_empty());
-    }
-
     #[tokio::test]
     async fn failed_admission_state_refuses_visibly() {
         let admission = super::ModelAdmission::new();
