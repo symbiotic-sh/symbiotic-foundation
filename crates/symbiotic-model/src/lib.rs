@@ -1368,11 +1368,14 @@ impl<Req> QueuedCall<Req> {
         response
     }
 
-    /// Trace a failed call. A failed trace write is logged; the call still
-    /// fails with its own error.
-    async fn trace_failure(&self, queue_item_id: Option<QueueItemId>, err: &ModelError) {
+    /// Trace a failed call and return any trace write failure to the caller.
+    async fn trace_failure(
+        &self,
+        queue_item_id: Option<QueueItemId>,
+        err: &ModelError,
+    ) -> Result<(), ModelError> {
         let Some(trace_sink) = &self.trace_sink else {
-            return;
+            return Ok(());
         };
         let written = trace_sink
             .record_model_invocation(ModelInvocationTrace {
@@ -1393,13 +1396,7 @@ impl<Req> QueuedCall<Req> {
                 timestamp: Utc::now(),
             })
             .await;
-        if let Err(trace_err) = written {
-            warn_side_effect(
-                &self.queue_id,
-                "failure_trace_write_failed",
-                trace_err.code(),
-            );
-        }
+        written.map_err(|err| ModelError::Queue(err.code()))
     }
 }
 
@@ -2096,7 +2093,7 @@ where
                 return Ok(AttemptEnd::Retry(Some(Box::new(next))));
             }
             this.trace_failure(Some(dead_item.item_id.clone()), &err)
-                .await;
+                .await?;
             Err(exhausted_request_error(
                 &this.queue_id,
                 &dead_item,
@@ -2106,7 +2103,7 @@ where
         }
         Settled::Failed { err, failed } => {
             failed.map_err(queue_error)?;
-            this.trace_failure(Some(item.item_id), &err).await;
+            this.trace_failure(Some(item.item_id), &err).await?;
             Err(err)
         }
     }
@@ -2412,8 +2409,10 @@ where
                     },
                 )
                 .await;
-            this.trace_failure(None, &error).await;
-            Err(error)
+            match this.trace_failure(None, &error).await {
+                Ok(()) => Err(error),
+                Err(trace_error) => Err(trace_error),
+            }
         }
     };
     if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {

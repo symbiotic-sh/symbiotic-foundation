@@ -78,8 +78,12 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
             delivery_generation: row.get(23)?,
             group: None,
             owners: Vec::new(),
-            kind: String::new(),
-            execution: Execution::Handler,
+            kind: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            execution: if row.get::<_, Option<String>>(6)?.is_some() {
+                Execution::Model
+            } else {
+                Execution::Handler
+            },
             payload: None,
             max_attempts: 0,
             generation: 0,
@@ -226,16 +230,13 @@ pub fn paid_copies_for_request(
                 })
                 .collect::<Result<Vec<_>, JobError>>()?
         }
-        JobRequest::PurgeOwner(owner) => rows
-            .inspect(
-                scope,
-                JobQuery::Owner(owner.clone()),
-                now,
-                config.max_live_jobs,
-            )?
-            .into_iter()
-            .map(|r| r.id)
-            .collect(),
+        JobRequest::PurgeOwner(owner) => {
+            let live = rows.live_count(scope)?;
+            rows.inspect(scope, JobQuery::Owner(owner.clone()), now, live)?
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        }
         JobRequest::Maintain => rows
             .inspect(scope, JobQuery::Expired, now, config.maintenance_batch)?
             .into_iter()
@@ -384,9 +385,9 @@ impl SqlRows<'_> {
     fn save(&mut self, row: JobRecord) -> Result<(), JobError> {
         if row.state.acked() {
             // One persistence owner narrows every confirmed write, including
-            // future callers of save, without retaining operational defaults.
-            self.conn.execute("INSERT INTO jobs (scope,id,key,digest,state,final_state,receipt,delivery_generation) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key,digest=excluded.digest,state=excluded.state,final_state=excluded.final_state,receipt=excluded.receipt,delivery_generation=excluded.delivery_generation,job_group=NULL,owners=NULL,kind=NULL,execution=NULL,payload=NULL,max_attempts=NULL,generation=NULL,lease_until=NULL,cancel_requested=NULL,purged=NULL,output=NULL,origin=NULL,recovery_until=NULL,result_expired=NULL,created_at=NULL,finished_at=NULL,delivery_until=NULL,diagnostic=NULL,output_bytes=NULL",
-                params![json(&row.id.scope)?, row.id.id, row.key, row.digest, json(&row.state)?, optional_json(&row.final_state)?, row.receipt, i64::try_from(row.delivery_generation).map_err(storage)?]).map_err(storage)?;
+            // future callers of save. Model kind retains the frozen binding for sticky erasure.
+            self.conn.execute("INSERT INTO jobs (scope,id,key,digest,state,final_state,receipt,delivery_generation,kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key,digest=excluded.digest,state=excluded.state,final_state=excluded.final_state,receipt=excluded.receipt,delivery_generation=excluded.delivery_generation,job_group=NULL,owners=NULL,kind=excluded.kind,execution=NULL,payload=NULL,max_attempts=NULL,generation=NULL,lease_until=NULL,cancel_requested=NULL,purged=NULL,output=NULL,origin=NULL,recovery_until=NULL,result_expired=NULL,created_at=NULL,finished_at=NULL,delivery_until=NULL,diagnostic=NULL,output_bytes=NULL",
+                params![json(&row.id.scope)?, row.id.id, row.key, row.digest, json(&row.state)?, optional_json(&row.final_state)?, row.receipt, i64::try_from(row.delivery_generation).map_err(storage)?, (row.execution == Execution::Model).then_some(&row.kind)]).map_err(storage)?;
             self.conn
                 .execute(
                     "DELETE FROM job_owners WHERE scope=?1 AND job_id=?2",
@@ -1479,13 +1480,18 @@ mod tests {
 
     #[test]
     fn jobs_confirmation_retains_only_authorized_tombstone_fields() {
-        for disposition in [Disposition::Accepted, Disposition::Discarded] {
+        for (execution, disposition) in [
+            (Execution::Model, Disposition::Accepted),
+            (Execution::Model, Disposition::Discarded),
+            (Execution::Handler, Disposition::Accepted),
+            (Execution::Handler, Disposition::Discarded),
+        ] {
             let queue = SqliteQueue::in_memory().unwrap();
             let scope = scope();
             let config = JobConfig::default();
             let now = Utc::now();
             let mut spec = spec("tombstone");
-            spec.execution = Execution::Model;
+            spec.execution = execution;
             queue
                 .job_operation(
                     &scope,
@@ -1538,8 +1544,10 @@ mod tests {
                             "final_state",
                             "receipt",
                             "delivery_generation",
+                            "kind",
                         ]
                         .contains(column)
+                            || *column == "kind" && execution == Execution::Handler
                     })
                     .map(|column| format!("{column} IS NULL"))
                     .collect::<Vec<_>>()
@@ -1575,9 +1583,15 @@ mod tests {
             assert_eq!(tombstone.final_state, Some(JobState::Failed));
             assert_eq!(tombstone.receipt, row.receipt);
             assert_eq!(tombstone.delivery_generation, 2);
+            assert_eq!(tombstone.execution, execution);
             assert!(
                 tombstone.group.is_none()
-                    && tombstone.kind.is_empty()
+                    && tombstone.kind
+                        == if execution == Execution::Model {
+                            spec.kind.clone()
+                        } else {
+                            String::new()
+                        }
                     && tombstone.owners.is_empty()
             );
             assert!(

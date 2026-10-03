@@ -1027,7 +1027,7 @@ on_both_backends!(
     settlement_failure_is_visible_retains_unknown_and_refuses_redispatch,
     a_failed_cooldown_write_refuses_retry_and_records_the_failure,
     a_failed_cooldown_write_stops_logical_chain_continuation,
-    a_failed_trace_write_keeps_the_providers_error,
+    a_failed_trace_write_reaches_caller_and_receipt_keeps_provider_error,
     a_failed_completion_still_returns_the_paid_answer,
     an_unusable_cache_directory_still_returns_the_paid_answer_and_its_usage,
     a_retryable_errors_backoff_spends_no_rate_budget,
@@ -1936,20 +1936,34 @@ fn succeeded_receipts(receipts: &InMemoryReceiptSink) -> Vec<symbiotic_model::Qu
         .collect()
 }
 
-async fn a_failed_trace_write_keeps_the_providers_error(backend: &str, queue: Arc<CountsRenewals>) {
+async fn a_failed_trace_write_reaches_caller_and_receipt_keeps_provider_error(
+    backend: &str,
+    queue: Arc<CountsRenewals>,
+) {
     let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
         symbiotic_core::DiagnosticCode::ProviderFailure,
     )]);
-    let provider = queued(raw.clone(), queue, leased()).with_trace_sink(Arc::new(BrokenTrace));
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue, leased())
+        .with_trace_sink(Arc::new(BrokenTrace))
+        .with_receipt_sink(receipts.clone());
 
     let err = provider.chat(request("rejected")).await.unwrap_err();
     assert!(
         matches!(
             err,
-            ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+            ModelError::Queue(symbiotic_core::DiagnosticCode::StorageFailure)
         ),
-        "{backend}: the provider's error, not the trace store's: {err}"
+        "{backend}: trace write failure must reach the caller: {err}"
     );
+    assert!(
+        receipts
+            .receipts()
+            .iter()
+            .any(|receipt| receipt.status == ReceiptStatus::Failed
+                && receipt.error == Some(symbiotic_core::DiagnosticCode::ProviderFailure))
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
 }
 
 async fn a_failed_completion_still_returns_the_paid_answer(

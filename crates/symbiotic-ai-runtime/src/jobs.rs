@@ -112,7 +112,9 @@ fn paid_resolution(
     max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
     let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
-    let erased = spend::recovery_erased(tx, Some(invocation)).map_err(|_| JobError::Storage)?;
+    let (erased, _) =
+        spend::job_recovery_policy(tx, Some(invocation), &receipt.reservation.invocation)
+            .map_err(|_| JobError::Storage)?;
     if erased || bytes > max_bytes {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
@@ -143,6 +145,33 @@ fn paid_resolution(
         receipt: receipt.reservation.reference.as_str().into(),
         recovery_until: Some(deadline.unwrap_or(now)),
     })
+}
+
+// One terminal receipt resolution serves both expired claims and pending jobs
+// whose direct invocation committed before the job claimed its first attempt.
+fn receipt_resolution(
+    tx: &Transaction<'_>,
+    receipt: &crate::SpendReceipt,
+    invocation: &str,
+    now: chrono::DateTime<Utc>,
+    max_bytes: usize,
+) -> Result<JobResolution, JobError> {
+    if receipt.output.is_some() {
+        paid_resolution(tx, receipt, invocation, now, max_bytes)
+    } else if receipt.state == SpendState::Released {
+        Ok(JobResolution::KnownZeroCharge {
+            receipt: receipt.reservation.reference.as_str().into(),
+        })
+    } else if receipt.state == SpendState::Settled {
+        Ok(JobResolution::Failed {
+            receipt: receipt.reservation.reference.as_str().into(),
+            diagnostic: DiagnosticCode::InvocationCompleted,
+        })
+    } else {
+        Ok(JobResolution::Uncertain {
+            receipt: receipt.reservation.reference.as_str().into(),
+        })
+    }
 }
 
 // This canonical registration survives confirmation and erasure: neither removes
@@ -395,13 +424,7 @@ impl ModelJobs {
                 for row in rows {
                     let reference = crate::SpendReceiptRef::new(row.receipt.as_deref().ok_or(JobError::Storage)?).map_err(|_| JobError::Storage)?;
                     let receipt = spend::receipt_in(tx, &reference).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
-                    let resolution = if receipt.output.is_some() {
-                        paid_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?
-                    } else if receipt.state == SpendState::Released {
-                        JobResolution::KnownZeroCharge { receipt: receipt.reservation.reference.as_str().into() }
-                    } else if receipt.state == SpendState::Settled {
-                        JobResolution::Failed { receipt: receipt.reservation.reference.as_str().into(), diagnostic: DiagnosticCode::InvocationCompleted }
-                    } else { JobResolution::Uncertain { receipt: receipt.reservation.reference.as_str().into() } };
+                    let resolution = receipt_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?;
                     jobs.op(tx, now, JobRequest::Resolve { job: row.id.clone(), generation: row.generation, resolution })?;
                     if row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
                         tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [receipt.reservation.reference.as_str()]).map_err(|_| JobError::Storage)?;
@@ -464,14 +487,14 @@ impl ClaimOwner {
             return Err(JobError::KeyConflict);
         }
         if let Some(receipt) = &previous
-            && receipt.output.is_some()
+            && (receipt.output.is_some() || receipt.state == SpendState::Settled)
         {
             self.resolve(
                 tx,
                 &current.id,
                 current.generation,
                 now,
-                paid_resolution(
+                receipt_resolution(
                     tx,
                     receipt,
                     &self.jobs.invocation_key(&current.key)?,
