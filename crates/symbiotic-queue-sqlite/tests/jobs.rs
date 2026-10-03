@@ -8,6 +8,291 @@ macro_rules! data {
     ($($t:tt)*) => { serde_json::to_vec(&serde_json::json!($($t)*)).unwrap() };
 }
 use std::sync::Arc;
+use symbiotic_queue::runner::*;
+
+struct Handler<F>(F);
+#[async_trait::async_trait]
+impl<F, Fut> JobHandler for Handler<F>
+where
+    F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
+{
+    async fn run(&self, ctx: &JobContext, payload: &[u8]) -> Result<Vec<u8>, JobFailure> {
+        (self.0)(ctx.clone(), payload.to_vec()).await
+    }
+}
+
+impl Suite {
+    async fn runner<F, Fut>(&self, workers: usize, handler: F) -> JobRunner
+    where
+        F: Fn(JobContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<u8>, JobFailure>> + Send,
+    {
+        JobRunner::start(
+            self.backend.clone(),
+            self.scope.clone(),
+            self.config.clone(),
+            RunnerConfig {
+                worker_count: workers,
+                poll_interval_ms: 10,
+                ..RunnerConfig::default()
+            },
+            "handler".into(),
+            Arc::new(Handler(handler)),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn final_row(&self, id: &JobId) -> JobRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let row = self.get(id).await;
+                if !row.state.unfinished() {
+                    return row;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+/// Case 15, v1: reopen recovers an unpaid claim; checkpoints moved by §13.
+#[tokio::test]
+async fn runner_case_15_product_handler_recovers_without_spend_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jobs.sqlite");
+    let mut s = Suite::new();
+    s.backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap());
+    s.now = Utc::now() - Duration::seconds(31);
+    let id = s.insert(s.spec("recover")).await;
+    let old = s.claim().await;
+    drop(s.backend);
+    s.backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap());
+    s.now = Utc::now();
+    let runner = s
+        .runner(1, move |ctx, payload| async move {
+            assert_eq!(ctx.attempt, 2);
+            assert_eq!(ctx.key, "recover");
+            Ok(payload)
+        })
+        .await;
+    let recovered = s.final_row(&id).await;
+    assert_eq!(recovered.state, JobState::Succeeded);
+    assert_eq!(recovered.generation, old.generation + 1);
+    assert_eq!(recovered.origin, Some(ResultOrigin::Handler));
+    assert!(recovered.receipt.is_none());
+    assert!(matches!(
+        s.op(JobRequest::Complete {
+            job: id,
+            generation: old.generation,
+            state: JobState::Succeeded,
+            origin: ResultOrigin::Handler,
+            output: Some(b"stale".to_vec()),
+            receipt: None,
+            diagnostic: None,
+        })
+        .await,
+        Err(JobError::StaleClaim)
+    ));
+    assert_eq!(recovered.output, Some(s.spec("recover").payload));
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_worker_loop_preserves_opaque_bytes_and_handler_failures_are_final() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let bytes = vec![0, 255, b'\n'];
+    let mut spec = s.spec("binary");
+    spec.payload = bytes.clone();
+    let id = s.insert(spec).await;
+    let failed = s.insert(s.spec("failure")).await;
+    let runner = s
+        .runner(1, |ctx, bytes| async move {
+            if ctx.key == "failure" {
+                Err(JobFailure {
+                    code: symbiotic_core::DiagnosticCode::QueueFailure,
+                })
+            } else {
+                Ok(bytes)
+            }
+        })
+        .await;
+    assert_eq!(s.final_row(&id).await.output, Some(bytes));
+    let row = s.final_row(&failed).await;
+    assert_eq!(row.state, JobState::Failed);
+    assert_eq!(row.generation, 1);
+    assert_eq!(
+        row.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_worker_count_bounds_claims_and_shutdown_drains_handlers() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let ids = [
+        s.insert(s.spec("one")).await,
+        s.insert(s.spec("two")).await,
+        s.insert(s.spec("three")).await,
+    ];
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = permits.clone();
+    let runner = s
+        .runner(2, move |ctx, bytes| {
+            let (gate, tx) = (gate.clone(), tx.clone());
+            async move {
+                tx.send(ctx.id).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(bytes)
+            }
+        })
+        .await;
+    let first = rx.recv().await.unwrap();
+    let second = rx.recv().await.unwrap();
+    assert_ne!(first, second);
+    let pending = ids
+        .iter()
+        .find(|id| **id != first && **id != second)
+        .unwrap();
+    assert_eq!(s.get(pending).await.state, JobState::Pending);
+    let shutdown = runner.shutdown();
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        result = &mut shutdown => panic!("shutdown finished before handlers: {result:?}"),
+        _ = tokio::task::yield_now() => {},
+    }
+    permits.add_permits(2);
+    shutdown.await.unwrap();
+    assert_eq!(s.get(pending).await.generation, 0);
+    assert_eq!(s.get(&first).await.state, JobState::Succeeded);
+    assert_eq!(s.get(&second).await.state, JobState::Succeeded);
+}
+
+#[tokio::test]
+async fn runner_renews_lease_while_handler_runs() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    s.config.claim_lease_seconds = 1;
+    let id = s.insert(s.spec("renew")).await;
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = permits.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runner = s
+        .runner(1, move |_, bytes| {
+            let (gate, tx) = (gate.clone(), tx.clone());
+            async move {
+                tx.send(()).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(bytes)
+            }
+        })
+        .await;
+    rx.recv().await.unwrap();
+    let initial = s.get(&id).await.lease_until.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    s.now = Utc::now();
+    assert!(s.get(&id).await.lease_until.unwrap() > initial);
+    assert!(matches!(
+        s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
+        JobResponse::Job(None)
+    ));
+    permits.add_permits(1);
+    assert_eq!(s.final_row(&id).await.generation, 1);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_cancel_stops_pending_at_once_and_running_handler_decides() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let running = s.insert(s.spec("running")).await;
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = permits.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runner = s
+        .runner(1, move |ctx, _| {
+            let (gate, tx) = (gate.clone(), tx.clone());
+            async move {
+                tx.send(false).unwrap();
+                ctx.cancel.cancelled().await;
+                assert!(ctx.cancel.is_cancelled());
+                ctx.cancel.cancelled().await;
+                tx.send(true).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(b"already sent finished".to_vec())
+            }
+        })
+        .await;
+    assert!(!rx.recv().await.unwrap());
+    let pending = s.insert(s.spec("pending")).await;
+    assert_eq!(
+        s.changed(JobRequest::Cancel(Selector::Group("group".into())))
+            .await,
+        2
+    );
+    let row = s.get(&pending).await;
+    assert_eq!(row.state, JobState::Cancelled);
+    assert!(row.payload.is_none());
+    assert_eq!(row.generation, 0);
+    assert!(rx.recv().await.unwrap());
+    assert_eq!(s.get(&running).await.state, JobState::Running);
+    permits.add_permits(1);
+    let row = s.final_row(&running).await;
+    assert_eq!(row.state, JobState::Cancelled);
+    assert_eq!(row.output, Some(b"already sent finished".to_vec()));
+    assert_eq!(row.generation, 1);
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_external_purge_signals_token_and_keeps_no_output() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let id = s.insert(s.spec("purge")).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runner = s
+        .runner(1, move |ctx, bytes| {
+            let tx = tx.clone();
+            async move {
+                tx.send(()).unwrap();
+                ctx.cancel.cancelled().await;
+                Ok(bytes)
+            }
+        })
+        .await;
+    rx.recv().await.unwrap();
+    s.changed(JobRequest::PurgeOwner("owner-a".into())).await;
+    let row = s.final_row(&id).await;
+    assert_eq!(row.state, JobState::Purged);
+    assert!(row.output.is_none() && row.payload.is_none());
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_handler_panic_is_final_and_visible() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let id = s.insert(s.spec("panic")).await;
+    let runner = s
+        .runner(1, |_, _| async { panic!("synthetic handler panic") })
+        .await;
+    assert!(matches!(runner.wait().await, Err(RunnerError::Workers(_))));
+    let row = s.get(&id).await;
+    assert_eq!(row.state, JobState::Failed);
+    assert_eq!(
+        row.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    assert_eq!(row.generation, 1);
+}
 
 struct Suite {
     backend: Arc<symbiotic_queue_sqlite::SqliteQueue>,

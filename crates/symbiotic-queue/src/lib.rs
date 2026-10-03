@@ -21,6 +21,7 @@ use thiserror::Error;
 pub mod conformance;
 pub mod jobs;
 mod memory;
+pub mod runner;
 
 pub use memory::{DEFAULT_RETAINED_TERMINAL_ITEMS, MemoryQueue};
 
