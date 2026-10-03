@@ -310,6 +310,7 @@ mod tests {
                     SpendState::Unknown,
                     None,
                     Some(serde_json::json!({"answer":"private"})),
+                    None,
                 )
                 .unwrap();
         }
@@ -366,6 +367,7 @@ mod tests {
                 SpendState::Unknown,
                 None,
                 Some(serde_json::json!({"answer":"private"})),
+                None,
             )
             .unwrap();
         let cache_root = dir.path().join("responses");

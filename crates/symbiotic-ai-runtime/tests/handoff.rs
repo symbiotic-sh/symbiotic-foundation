@@ -134,6 +134,7 @@ fn ordinary_or_released_reservations_do_not_authorize_an_accepted_handoff() {
             SpendState::Released,
             None,
             None,
+            None,
         )
         .unwrap();
     assert!(
@@ -170,6 +171,7 @@ fn handoff_reservation_rejects_changed_binding_after_release_and_changed_reattac
         .finish(
             &first.reservation.reference,
             SpendState::Released,
+            None,
             None,
             None,
         )

@@ -812,6 +812,7 @@ async fn a_symlinked_cache_dir_is_refused() {
             SpendState::Unknown,
             None,
             Some(json!({"private":"answer"})),
+            None,
         )
         .unwrap();
     let conn = rusqlite::Connection::open(path).unwrap();
@@ -2178,7 +2179,7 @@ impl symbiotic_ai_runtime::QueueReceiptSink for ReconcileAndReserveOnFailure {
             let reference = receipt.spend_receipt.unwrap();
             let old = ledger.receipt(&reference).unwrap().unwrap();
             ledger
-                .finish(&reference, SpendState::Released, None, None)
+                .finish(&reference, SpendState::Released, None, None, None)
                 .unwrap();
             let mut newer = old.reservation;
             newer.reference = newer_reference;

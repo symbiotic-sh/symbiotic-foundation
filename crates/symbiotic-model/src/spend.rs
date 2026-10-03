@@ -187,12 +187,14 @@ pub trait SpendLedger: Send + Sync {
         account: &str,
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError>;
+    /// Settle accounting and recovery; supply the original key for explicit invocations.
     fn finish(
         &self,
         reference: &SpendReceiptRef,
         state: SpendState,
         usage: Option<UsageTrace>,
         output: Option<Value>,
+        invocation: Option<&str>,
     ) -> Result<(), ModelError>;
 }
 
@@ -247,6 +249,7 @@ impl SpendLedger for UnavailableSpendLedger {
         _: SpendState,
         _: Option<UsageTrace>,
         _: Option<Value>,
+        _: Option<&str>,
     ) -> Result<(), ModelError> {
         Err(storage())
     }

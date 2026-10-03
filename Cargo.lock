@@ -1418,6 +1418,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "rusqlite",
+ "serde",
  "serde_json",
  "symbiotic-core",
  "symbiotic-model",

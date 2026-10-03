@@ -77,7 +77,8 @@ impl SpendLedger for Fixture {
         s: SpendState,
         u: Option<UsageTrace>,
         o: Option<serde_json::Value>,
+        invocation: Option<&str>,
     ) -> Result<(), ModelError> {
-        self.ledger.finish(r, s, u, o)
+        self.ledger.finish(r, s, u, o, invocation)
     }
 }

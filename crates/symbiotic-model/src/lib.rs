@@ -56,7 +56,7 @@ pub mod private_fs;
 mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
-    CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission,
+    CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission, ModelJob,
     QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
@@ -789,6 +789,23 @@ impl CallReceipts {
         error: Option<DiagnosticCode>,
         timing: AttemptTiming,
     ) {
+        self.record_attempt(
+            status,
+            item.map(|i| (&i.item_id, i.attempt)),
+            trace,
+            error,
+            timing,
+        )
+        .await;
+    }
+    async fn record_attempt(
+        &self,
+        status: ReceiptStatus,
+        item: Option<(&QueueItemId, u32)>,
+        trace: Option<&ModelInvocationTrace>,
+        error: Option<DiagnosticCode>,
+        timing: AttemptTiming,
+    ) {
         let Some(sink) = &self.sink else {
             return;
         };
@@ -800,14 +817,14 @@ impl CallReceipts {
                     tracing::warn!(code = error.code().code(), "receipt context unavailable");
                     None
                 })
-                .filter(|_| item.is_some_and(|i| i.attempt > 0)),
+                .filter(|_| item.is_some_and(|i| i.1 > 0)),
             binding: self.binding.clone(),
             queue_id: self.queue_id.clone(),
             kind: self.kind.clone(),
-            item_id: item.map(|item| item.item_id.clone()),
+            item_id: item.map(|item| item.0.clone()),
             request_hash: self.request_hash.clone(),
             status,
-            attempt: item.map_or(0, |item| item.attempt),
+            attempt: item.map_or(0, |item| item.1),
             request_units: 1,
             input_units: self.input_units,
             usage: trace.map(|trace| trace.usage.clone()),
@@ -880,7 +897,7 @@ struct QueuedCall<Req> {
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     invocation: String,
-    explicit_invocation: bool,
+    invocation_key: Option<String>,
     attempt_binding: String,
     attempt_context: ExecutionAttemptContext,
     worker_id: String,
@@ -907,7 +924,7 @@ impl<Req> QueuedCall<Req> {
     async fn recovered<Res: Serialize + for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<Res>, ModelError> {
-        if !self.explicit_invocation || self.accepted_spend.is_some() {
+        if self.invocation_key.is_none() || self.accepted_spend.is_some() {
             return Ok(None);
         }
         let spend = self.spend.clone();
@@ -961,7 +978,7 @@ impl<Req> QueuedCall<Req> {
     }
 
     async fn retry_state(&self, item: Option<&QueueItem>) -> Result<LogicalRetryState, ModelError> {
-        if self.explicit_invocation {
+        if self.invocation_key.is_some() {
             let spend = self.spend.clone();
             let account = self.queue_id.0.clone();
             let invocation = self.invocation.clone();
@@ -994,7 +1011,7 @@ impl<Req> QueuedCall<Req> {
             &self.capability,
             &self.request_hash,
             &self.descriptor,
-            (!self.explicit_invocation).then_some(state),
+            (self.invocation_key.is_none()).then_some(state),
         )
     }
 
@@ -1020,7 +1037,7 @@ impl<Req> QueuedCall<Req> {
                     &self.capability,
                     &self.request_hash,
                     &self.descriptor,
-                    (!self.explicit_invocation).then(|| LogicalRetryState {
+                    (self.invocation_key.is_none()).then(|| LogicalRetryState {
                         attempts_used: 0,
                         max_attempts: logical_max_attempts(&self.config),
                     }),
@@ -1036,7 +1053,7 @@ impl<Req> QueuedCall<Req> {
     }
 
     async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
-        if self.explicit_invocation {
+        if self.invocation_key.is_some() {
             return Err(ModelError::BudgetExhausted(
                 DiagnosticCode::AttemptBudgetExhausted,
             ));
@@ -1164,7 +1181,7 @@ impl<Req> QueuedCall<Req> {
         let state = self.retry_state(Some(item)).await?;
         let attempts_used = state.attempts_used;
         if attempts_used >= state.max_attempts {
-            return if !self.explicit_invocation && budget_renewed(item, &self.config)? {
+            return if self.invocation_key.is_none() && budget_renewed(item, &self.config)? {
                 self.renew_budget(&item.item_id).await.map(Some)
             } else {
                 Ok(None)
@@ -1210,7 +1227,7 @@ impl<Req> QueuedCall<Req> {
             &self.config,
             err,
             self.retry_state(Some(dead)).await?,
-            self.explicit_invocation,
+            self.invocation_key.is_some(),
         )
         .await
     }
@@ -1265,6 +1282,16 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     where
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
+        self.record_success_diagnostic(response).await.0
+    }
+    async fn record_success_diagnostic<Res>(
+        self: &Arc<Self>,
+        response: Res,
+    ) -> (Res, Option<DiagnosticCode>)
+    where
+        Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
+    {
+        let mut diagnostic = None;
         let mut response = response;
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
@@ -1282,6 +1309,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             // The blocking task has dropped its handle by the time it is joined.
             response = Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone());
             if let Err(err) = stored {
+                diagnostic = Some(err.code());
                 note_side_effect(
                     &mut response,
                     &self.queue_id,
@@ -1295,6 +1323,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 .record_model_invocation(response.trace().clone())
                 .await
         {
+            diagnostic = Some(err.code());
             note_side_effect(
                 &mut response,
                 &self.queue_id,
@@ -1302,7 +1331,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 err.code(),
             );
         }
-        response
+        (response, diagnostic)
     }
 }
 
@@ -1425,7 +1454,7 @@ async fn run_queued<P, Req, Res, F, Fut>(
 ) -> Result<Res, ModelError>
 where
     P: ModelProvider + Clone + Send + Sync + 'static,
-    Req: Clone + Serialize + Send + Sync + 'static,
+    Req: Clone + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
     Req: BudgetedModelRequest,
     Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
     F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
@@ -1490,7 +1519,7 @@ where
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         invocation,
-        explicit_invocation: runtime.invocation.is_some(),
+        invocation_key: runtime.invocation.clone(),
         attempt_binding,
         attempt_context: attempt_context.clone(),
         worker_id: runtime.worker_id.clone(),
@@ -1528,6 +1557,9 @@ where
             DirResponseCache::new(dir).store(&call.cache_entry(), &call.request_value)
         })
         .await?;
+    }
+    if let Some(job) = &runtime.job {
+        return run_job(runtime, job.clone(), call_state, provider, call).await;
     }
     // Ordinary cache hits retain their cache provenance and need no dispatch
     // store. Explicit invocation replay must validate its exact binding first.
@@ -1573,7 +1605,7 @@ where
                 }
             }
             QueueStatus::Dead
-                if !this.explicit_invocation && budget_renewed(&enqueue.item, config)? =>
+                if this.invocation_key.is_none() && budget_renewed(&enqueue.item, config)? =>
             {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
@@ -1749,7 +1781,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                     Err(dead_item_retry_error(&current))
                 }
             }
-            QueueStatus::Dead if !self.explicit_invocation && budget_renewed(&current, config)? => {
+            QueueStatus::Dead
+                if self.invocation_key.is_none() && budget_renewed(&current, config)? =>
+            {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
             }
@@ -1943,7 +1977,7 @@ where
                         binding: state.attempt_binding.clone(),
                         request_limit: state.config.provider_request_limit,
                     };
-                    if state.explicit_invocation {
+                    if state.invocation_key.is_some() {
                         state
                             .spend
                             .reserve_explicit(&reservation, logical_max_attempts(&state.config))
@@ -2096,6 +2130,333 @@ enum Settled<Res> {
     },
 }
 
+/// Shared transport boundary for direct calls and jobs already holding their slot.
+#[cfg(feature = "queue")]
+async fn dispatch_model<P: ModelProvider, T: Serialize + for<'de> Deserialize<'de>>(
+    queue: &QueueId,
+    config: &ModelQueueConfig,
+    provider: &P,
+    call: impl std::future::Future<Output = Result<T, ModelError>>,
+) -> Result<T, ModelError> {
+    secrets::composed_result(
+        provider,
+        within_timeout(queue, config.request_timeout_seconds, call).await,
+    )
+}
+
+#[cfg(feature = "queue")]
+async fn run_job<P, Req, Res, F, Fut>(
+    runtime: &QueueRuntime,
+    job: Arc<dyn ModelJob>,
+    mut this: Arc<QueuedCall<Req>>,
+    provider: P,
+    call: F,
+) -> Result<Res, ModelError>
+where
+    P: ModelProvider + Clone + Send + Sync + 'static,
+    Req: Clone
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Send
+        + Sync
+        + 'static
+        + BudgetedModelRequest,
+    Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
+    F: FnOnce(P, Req) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
+{
+    let reservation = SpendReservation {
+        reference: SpendReceiptRef::new(format!("job:{}", QueueItemId::new().0))?,
+        account: this.queue_id.0.clone(),
+        invocation: this.invocation.clone(),
+        binding: this.attempt_binding.clone(),
+        request_limit: this.config.provider_request_limit,
+    };
+    let owner = job.clone();
+    let recover = reservation.clone();
+    if run_blocking(move || owner.recover(&recover)).await? {
+        return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+    }
+    // Rate waits happen before claim/reservation. The one admission owner is
+    // shared with direct calls; the permit remains held through settlement.
+    let permit = runtime.admission.as_ref().ok_or_else(spend::storage)?;
+    let (_slot, rate) = {
+        let admission = async {
+            loop {
+                let slot = permit
+                    .acquire(&this.queue_id, this.config.max_in_flight)
+                    .await?;
+                wait_for_model_cooldown(this.queue.as_ref(), &this.queue_id).await?;
+                match check_model_budget(
+                    &runtime.rate_state,
+                    &this.queue_id,
+                    &this.config,
+                    &this.request,
+                )
+                .await?
+                {
+                    RateCheck::Cleared(rate) => break Ok::<_, ModelError>((slot, rate)),
+                    RateCheck::Wait(wait) => {
+                        drop(slot);
+                        tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                    }
+                }
+            }
+        };
+        tokio::pin!(admission);
+        let mut eligibility = tokio::time::interval(RATE_WAIT_SLICE);
+        loop {
+            tokio::select! {
+                biased;
+                _ = eligibility.tick() => {
+                    let owner = job.clone();
+                    if !run_blocking(move || owner.eligible()).await? { return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted)); }
+                }
+                result = &mut admission => break result?,
+            }
+        }
+    };
+    let reference = reservation.reference.clone();
+    let owner = job.clone();
+    let limit = logical_max_attempts(&this.config);
+    let payload = run_blocking(move || owner.claim(&reservation, limit)).await?;
+    let Some(payload) = payload else {
+        return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+    };
+    // All preparation failures share the durable no-dispatch release path.
+    // No provider future exists until this block succeeds.
+    let attempt = job.attempt()?;
+    let item_id = QueueItemId(reference.as_str().into());
+    let mut monitoring = Vec::new();
+    let prepared = holding_job_lease(&job, true, &mut monitoring, async {
+        let request: Req = serde_json::from_slice(&payload)
+            .map_err(|_| ModelError::InvalidRequest(DiagnosticCode::InvalidConfiguration))?;
+        if hash_json(&request)? != this.request_hash {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        Arc::get_mut(&mut this).ok_or_else(spend::storage)?.request = request;
+        this.attempt_context.capture(&reference)?;
+        this.receipts
+            .record_attempt(
+                ReceiptStatus::Queued,
+                Some((&item_id, 0)),
+                None,
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
+        this.receipts
+            .record_attempt(
+                ReceiptStatus::Running,
+                Some((&item_id, attempt)),
+                None,
+                None,
+                AttemptTiming::NONE,
+            )
+            .await;
+        let owner = job.clone();
+        if run_blocking(move || owner.heartbeat()).await? {
+            return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+        }
+        if let Some(rate) = rate {
+            rate.charge()?;
+        }
+        Ok::<_, ModelError>(())
+    })
+    .await;
+    if let Err(error) = prepared {
+        let owner = job.clone();
+        run_blocking(move || owner.release()).await?;
+        return Err(error);
+    }
+    let provider_started = Instant::now();
+    let dispatch = this.clone();
+    let transport_provider = provider.clone();
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(async move {
+        dispatch_model(
+            &dispatch.queue_id,
+            &dispatch.config,
+            &transport_provider,
+            call(transport_provider.clone(), dispatch.request.clone()),
+        )
+        .await
+    });
+    let transport = async {
+        let (result, panicked) = match task.join_next().await {
+            Some(Ok(result)) => (result, false),
+            _ => (Err(ModelError::Queue(DiagnosticCode::QueueFailure)), true),
+        };
+        let mut side_error = None;
+        if let Err(error) = &result
+            && !panicked
+            && !matches!(error, ModelError::Timeout(_))
+            && provider.failure_charge(error) == FailureCharge::KnownZero
+            && is_retryable(error, &this.config)
+        {
+            let owner = job.clone();
+            let limit = logical_max_attempts(&this.config);
+            let retry_allowed = match run_blocking(move || owner.can_retry(limit)).await {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    side_error = Some(error);
+                    false
+                }
+            };
+            if retry_allowed {
+                let delay = retry_delay_ms(
+                    job.attempt()?,
+                    &this.config,
+                    &QueueItemId(reference.as_str().into()),
+                    &this.request_hash,
+                    error,
+                )?;
+                if is_transient(error) {
+                    side_error =
+                        note_model_cooldown(this.queue.as_ref(), &this.queue_id, error, delay)
+                            .await
+                            .err();
+                }
+                if side_error.is_none() {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+        Ok::<_, ModelError>((result, side_error, panicked))
+    };
+    let (mut result, side_error, panicked) =
+        holding_job_lease(&job, false, &mut monitoring, transport).await?;
+    let known_zero = result.as_ref().err().is_some_and(|error| {
+        !panicked
+            && !matches!(error, ModelError::Timeout(_))
+            && provider.failure_charge(error) == FailureCharge::KnownZero
+    });
+    let retry = result.as_ref().err().is_some_and(|error| {
+        known_zero && side_error.is_none() && is_retryable(error, &this.config)
+    });
+    if let Ok(response) = &mut result {
+        let mut trace = response.trace().clone();
+        trace.request_hash = this.request_hash.clone();
+        if !trace.metadata.is_object() {
+            trace.metadata = serde_json::json!({"value": trace.metadata});
+        }
+        trace.metadata["spend_receipt"] = serde_json::json!(reference);
+        trace.metadata["binding"] = serde_json::json!(this.binding_identity);
+        response.set_trace(trace);
+    }
+    let (state, usage, output, failure) = match &result {
+        Ok(response) => {
+            let usage = response.trace().usage.clone();
+            let measured = has_measured_usage(&usage);
+            (
+                if measured {
+                    SpendState::Settled
+                } else {
+                    SpendState::Unknown
+                },
+                measured.then_some(usage),
+                Some(serde_json::to_value(response).map_err(|_| spend::storage())?),
+                None,
+            )
+        }
+        Err(error) => (
+            if known_zero {
+                SpendState::Released
+            } else {
+                SpendState::Unknown
+            },
+            None,
+            None,
+            Some(error.code()),
+        ),
+    };
+    let owner = job.clone();
+    run_blocking(move || owner.finish(state, usage, output, failure, retry)).await?;
+    let outcome = match result {
+        Ok(response) => {
+            let (response, diagnostic) = this.record_success_diagnostic(response).await;
+            this.receipts
+                .record_attempt(
+                    ReceiptStatus::Succeeded,
+                    Some((&item_id, attempt)),
+                    Some(response.trace()),
+                    None,
+                    AttemptTiming {
+                        queue_wait_ms: None,
+                        throttle_wait_ms: None,
+                        provider_ms: Some(provider_started.elapsed().as_millis() as u64),
+                    },
+                )
+                .await;
+            if let Some(code) = diagnostic {
+                Err(ModelError::Queue(code))
+            } else {
+                Ok(response)
+            }
+        }
+        Err(error) => {
+            this.receipts
+                .record_attempt(
+                    ReceiptStatus::Failed,
+                    Some((&item_id, attempt)),
+                    None,
+                    Some(error.code()),
+                    AttemptTiming {
+                        queue_wait_ms: None,
+                        throttle_wait_ms: None,
+                        provider_ms: Some(provider_started.elapsed().as_millis() as u64),
+                    },
+                )
+                .await;
+            this.trace_failure(None, &error).await;
+            Err(error)
+        }
+    };
+    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
+        return Err(error);
+    }
+    outcome
+}
+
+// One renewal owner covers both receipt preparation and dispatched transport.
+// Before dispatch, cancellation or renewal failure releases the reservation;
+// after dispatch, accounting must finish before a renewal error reaches the caller.
+#[cfg(feature = "queue")]
+async fn holding_job_lease<T>(
+    job: &Arc<dyn ModelJob>,
+    before_dispatch: bool,
+    monitoring: &mut Vec<ModelError>,
+    work: impl std::future::Future<Output = Result<T, ModelError>>,
+) -> Result<T, ModelError> {
+    tokio::pin!(work);
+    let mut timer = tokio::time::interval(job.heartbeat_interval());
+    timer.tick().await;
+    let mut fenced = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = timer.tick(), if !fenced => {
+                let owner = job.clone();
+                match run_blocking(move || owner.heartbeat()).await {
+                    Ok(true) if before_dispatch => return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted)),
+                    Ok(_) => {},
+                    Err(error) if before_dispatch => return Err(error),
+                    Err(error) => {
+                        fenced = error.code() == DiagnosticCode::QueueFailure;
+                        if !monitoring.iter().any(|cause| cause.code() == error.code()) {
+                            tracing::warn!(code = %error.code(), "model job heartbeat failed");
+                            monitoring.push(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The leased part of an attempt: the running receipt, the provider call,
 /// and recording its outcome up to completing or failing the item. Every
 /// path ends with `complete` or `fail_with`, whatever the writes before it
@@ -2160,13 +2521,13 @@ where
         return Settled::Failed { err, failed };
     }
     let provider_started = std::time::Instant::now();
-    let result = within_timeout(
+    let result = dispatch_model(
         &this.queue_id,
-        config.request_timeout_seconds,
+        config,
+        &provider,
         call(provider.clone(), this.request.clone()),
     )
     .await;
-    let result = secrets::composed_result(&provider, result);
     let provider_ms = elapsed_ms(provider_started);
     let failed_timing = || AttemptTiming {
         queue_wait_ms: None,
@@ -2181,7 +2542,7 @@ where
     let released = if known_zero && this.accepted_spend.is_none() {
         let spend = this.spend.clone();
         let reference = reference.clone();
-        run_blocking(move || spend.finish(&reference, SpendState::Released, None, None)).await
+        run_blocking(move || spend.finish(&reference, SpendState::Released, None, None, None)).await
     } else {
         Ok(())
     };
@@ -2229,18 +2590,17 @@ where
                 let response_to_save = response.clone();
                 let spend = this.spend.clone();
                 let reference = reference.clone();
+                let invocation_key = this.invocation_key.clone();
                 let saved = run_blocking(move || {
                     let output =
                         serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?;
+                    let usage = has_measured_usage(&usage).then_some(usage);
                     spend.finish(
                         &reference,
                         state,
-                        if has_measured_usage(&usage) {
-                            Some(usage)
-                        } else {
-                            None
-                        },
+                        usage,
                         Some(output),
+                        invocation_key.as_deref(),
                     )
                 })
                 .await;

@@ -58,6 +58,7 @@ use symbiotic_trace::TraceSink;
 mod execution;
 mod maintained;
 pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
+pub mod jobs;
 pub mod spend;
 #[cfg(test)]
 mod spend_tests;
@@ -151,6 +152,12 @@ pub enum ResponseCacheMode {
 }
 
 /// A raw provider (the transport) plus how the runtime should run it.
+///
+/// ```compile_fail
+/// use symbiotic_ai_runtime::{ModelBinding, model::StaticChatProvider};
+/// let mut binding = ModelBinding::new(StaticChatProvider::new("answer"));
+/// binding.job_owner = None;
+/// ```
 #[derive(Clone)]
 pub struct ModelBinding<P> {
     /// Raw transport whose effective configuration is checked at binding.
@@ -164,6 +171,9 @@ pub struct ModelBinding<P> {
     /// Foundation-internal capture of the exact attempt selected for this call.
     #[doc(hidden)]
     pub attempt_context: Option<model::ExecutionAttemptContext>,
+    /// Foundation-owned durable job execution seam.
+    #[doc(hidden)]
+    pub(crate) job_owner: Option<Arc<dyn model::ModelJob>>,
     /// Required tenant, provider, revision and concrete account.
     pub identity: Option<BindingIdentity>,
     /// Explicit quota pool. `None` isolates by tenant and concrete account.
@@ -189,6 +199,7 @@ impl<P> ModelBinding<P> {
             accepted_spend: None,
             invocation: None,
             attempt_context: None,
+            job_owner: None,
             identity: None,
             account_sharing_key: None,
             policy: None,
@@ -276,6 +287,7 @@ struct Inner {
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
     spend: Arc<dyn SpendLedger>,
+    job_ledger: Option<Arc<spend::SqliteSpendLedger>>,
     registry: Option<Arc<model::ModelRegistry>>,
     limits: Mutex<HashMap<String, SharedLimits>>,
     state_dir: Option<PathBuf>,
@@ -325,20 +337,32 @@ impl Runtime {
                 None,
             ),
         };
-        let spend: Arc<dyn SpendLedger> = match &config.state_dir {
-            Some(dir) => Arc::new(
-                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))?
-                    .with_retention(config.retention),
-            ),
+        let job_ledger = config
+            .state_dir
+            .as_ref()
+            .map(|dir| {
+                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))
+                    .map(|ledger| Arc::new(ledger.with_retention(config.retention)))
+            })
+            .transpose()?;
+        let spend: Arc<dyn SpendLedger> = match &job_ledger {
+            Some(ledger) => ledger.clone(),
             None => Arc::new(model::UnavailableSpendLedger),
         };
-        Ok(Self::from_state(config, queue, spend, maintenance))
+        Ok(Self::from_state(
+            config,
+            queue,
+            spend,
+            job_ledger,
+            maintenance,
+        ))
     }
 
     fn from_state(
         config: RuntimeConfig,
         queue: Arc<dyn QueueBackend>,
         spend: Arc<dyn SpendLedger>,
+        job_ledger: Option<Arc<spend::SqliteSpendLedger>>,
         maintenance: Option<Arc<Maintenance>>,
     ) -> Self {
         let worker_id = config
@@ -350,6 +374,7 @@ impl Runtime {
             inner: Arc::new(Inner {
                 maintenance,
                 spend,
+                job_ledger,
                 queue,
                 admission: ModelAdmission::new(),
                 rate_state: model::ModelRateState::default(),
@@ -389,7 +414,7 @@ impl Runtime {
         state: SpendState,
         usage: Option<symbiotic_trace::UsageTrace>,
     ) -> Result<(), ModelError> {
-        self.inner.spend.finish(reference, state, usage, None)
+        self.inner.spend.finish(reference, state, usage, None, None)
     }
 
     /// An in-memory runtime for configuration inspection; dispatch is refused.
@@ -610,6 +635,11 @@ impl Runtime {
                 .with_admission(self.inner.admission.clone())
                 .with_rate_state(self.inner.rate_state.clone())
                 .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
+        let provider = if let Some(job) = binding.job_owner {
+            provider.with_job_owner(job)
+        } else {
+            provider
+        };
         Ok(Arc::new(bound.sinks.apply_chat(provider)))
     }
 
@@ -632,6 +662,11 @@ impl Runtime {
         .with_admission(self.inner.admission.clone())
         .with_rate_state(self.inner.rate_state.clone())
         .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
+        let provider = if let Some(job) = binding.job_owner {
+            provider.with_job_owner(job)
+        } else {
+            provider
+        };
         Ok(Arc::new(bound.sinks.apply_embedding(provider)))
     }
 
@@ -647,6 +682,11 @@ impl Runtime {
                 .with_admission(self.inner.admission.clone())
                 .with_rate_state(self.inner.rate_state.clone())
                 .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
+        let provider = if let Some(job) = binding.job_owner {
+            provider.with_job_owner(job)
+        } else {
+            provider
+        };
         Ok(Arc::new(bound.sinks.apply_rerank(provider)))
     }
 
@@ -669,6 +709,11 @@ impl Runtime {
         .with_admission(self.inner.admission.clone())
         .with_rate_state(self.inner.rate_state.clone())
         .with_spend_ledger(self.inner.spend.clone(), binding.accepted_spend.clone());
+        let provider = if let Some(job) = binding.job_owner {
+            provider.with_job_owner(job)
+        } else {
+            provider
+        };
         Ok(Arc::new(bound.sinks.apply_classifier(provider)))
     }
 

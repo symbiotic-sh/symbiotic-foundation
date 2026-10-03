@@ -363,17 +363,38 @@ impl JobRunner {
         ) {
             return Err(JobError::InvalidRequest.into());
         }
-        let (stop, rx) = watch::channel(false);
         let workers = shared.clone();
+        Ok(Self::start_owned(
+            config.worker_count,
+            move |rx| shared.clone().worker(rx),
+            move |rx| {
+                let shared = workers.clone();
+                async move {
+                    shared
+                        .maintain(rx, Duration::from_millis(config.maintenance_interval_ms))
+                        .await
+                }
+            },
+        ))
+    }
+
+    /// Compose the same worker supervision and draining lifecycle with a
+    /// Foundation execution owner (model admission and ledger transactions).
+    #[doc(hidden)]
+    pub fn start_owned<W, M, WF, MF>(count: usize, worker: W, maintenance: M) -> Self
+    where
+        W: Fn(watch::Receiver<bool>) -> WF + Send + 'static,
+        M: FnOnce(watch::Receiver<bool>) -> MF + Send + 'static,
+        WF: std::future::Future<Output = Result<(), RunnerError>> + Send + 'static,
+        MF: std::future::Future<Output = Result<(), RunnerError>> + Send + 'static,
+    {
+        let (stop, rx) = watch::channel(false);
         let stopped = stop.clone();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
-            tasks.spawn(workers.clone().maintain(
-                rx.clone(),
-                Duration::from_millis(config.maintenance_interval_ms),
-            ));
-            for _ in 0..config.worker_count {
-                tasks.spawn(workers.clone().worker(rx.clone()));
+            tasks.spawn(maintenance(rx.clone()));
+            for _ in 0..count {
+                tasks.spawn(worker(rx.clone()));
             }
             let mut errors = Vec::new();
             while let Some(result) = tasks.join_next().await {
@@ -392,10 +413,10 @@ impl JobRunner {
                 Err(RunnerError::Workers(errors))
             }
         });
-        Ok(Self {
+        Self {
             stop,
             task: Some(task),
-        })
+        }
     }
 
     /// Stop claiming and await running handlers and all worker errors.
