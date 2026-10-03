@@ -74,6 +74,58 @@ fn process_fixture() {
         return;
     };
     let dir = PathBuf::from(std::env::var_os("SUPERVISE_TEST_DIR").unwrap());
+    if role == "closed-stdin-parent" {
+        // Close all standard streams so both pipe ends need relocation.
+        // SAFETY: this isolated fixture owns its standard descriptors.
+        unsafe {
+            for fd in 0..3 {
+                libc::close(fd);
+            }
+        }
+        let child_dir = dir.clone();
+        let child = Supervisor::start(
+            move || {
+                let mut command = fixture("busy", &child_dir);
+                command.stdin(Stdio::null()).stderr(Stdio::null());
+                command
+            },
+            policy(),
+        )
+        .unwrap();
+        until(|| dir.join("busy.ready").exists());
+        child.stop().unwrap();
+        std::process::exit(0);
+    }
+    if role == "shutdown-error-parent" {
+        let child_dir = dir.clone();
+        let child = Supervisor::start(move || fixture("busy", &child_dir), policy()).unwrap();
+        let pid = started(&child);
+        until(|| dir.join("busy.ready").exists());
+        assert!(
+            matches!(child.stop(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EPERM))
+        );
+        assert!(!alive(pid), "shutdown failure must still kill and reap");
+        std::process::exit(0);
+    }
+    if role == "broken-stderr" {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [-1; 2];
+        // SAFETY: this fixture owns both pipe descriptors; disconnect the reader
+        // and replace stderr with the writer (closing stderr alone is insufficient).
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let reader = OwnedFd::from_raw_fd(fds[0]);
+            let writer = OwnedFd::from_raw_fd(fds[1]);
+            assert_eq!(libc::dup2(fds[1], libc::STDERR_FILENO), libc::STDERR_FILENO);
+            drop(reader);
+            drop(writer);
+        }
+        watch_parent(|| Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap();
+        fs::write(dir.join("broken-stderr.ready"), "ready").unwrap();
+        loop {
+            std::hint::spin_loop();
+        }
+    }
     #[cfg(target_os = "linux")]
     if role == "linux-parent" {
         let child_dir = dir.clone();
@@ -197,10 +249,8 @@ fn restarts_after_reaping_and_reports_crash_limit_with_backoff() {
     let path = dir.path().to_owned();
     let supervisor = Supervisor::start(move || fixture("crash", &path), policy()).unwrap();
     let begin = Instant::now();
-    let mut pids = Vec::new();
     for _ in 0..3 {
         let pid = started(&supervisor);
-        pids.push(pid);
         assert!(
             matches!(supervisor.next_event().unwrap(), Event::Exited(status) if status.code() == Some(7))
         );
@@ -215,7 +265,6 @@ fn restarts_after_reaping_and_reports_crash_limit_with_backoff() {
             ..
         })
     ));
-    assert_eq!(pids.len(), 3);
     supervisor.stop().unwrap();
 }
 
@@ -312,4 +361,139 @@ fn linux_parent_death_signal_kills_an_unwatched_busy_child() {
     parent.0.kill().unwrap();
     parent.0.wait().unwrap();
     until(|| !alive(child));
+}
+
+#[test]
+fn closed_standard_streams_do_not_replace_the_parent_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = Reap(fixture("closed-stdin-parent", dir.path()).spawn().unwrap());
+    until(|| parent.0.try_wait().unwrap().is_some());
+    assert!(parent.0.wait().unwrap().success());
+}
+
+#[test]
+fn cleanup_failure_exits_even_with_a_broken_stderr_pipe() {
+    use std::os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::process::CommandExt,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut fds = [-1; 2];
+    // SAFETY: pipe initializes two uniquely owned descriptors.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let mut command = fixture("broken-stderr", dir.path());
+    command.env("SYMBIOTIC_PARENT_FD", fds[0].to_string());
+    // SAFETY: pre_exec closes only the test's inherited writer.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::close(fds[1]) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(reader);
+    until(|| dir.path().join("broken-stderr.ready").exists());
+    drop(writer);
+    until(|| child.0.try_wait().unwrap().is_some());
+    assert_eq!(child.0.wait().unwrap().code(), Some(1));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shutdown_error_returns_after_emergency_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = fixture("shutdown-error-parent", dir.path());
+    #[cfg(target_os = "macos")]
+    {
+        let library = dir.path().join("refuse-term.dylib");
+        let compiler = std::env::var("CC").expect("configured compiler cache");
+        let mut compiler = compiler.split_whitespace();
+        let output = Command::new(compiler.next().unwrap())
+            .args(compiler)
+            .args(["-O2", "-dynamiclib"])
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/refuse_term.c"))
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        command.env("DYLD_INSERT_LIBRARIES", library);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: pre_exec uses only prctl and preallocated seccomp data.
+        unsafe {
+            command.pre_exec(|| {
+                let filter = [
+                    libc::sock_filter {
+                        code: 0x20,
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    }, // syscall
+                    libc::sock_filter {
+                        code: 0x15,
+                        jt: 0,
+                        jf: 3,
+                        k: libc::SYS_kill as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x20,
+                        jt: 0,
+                        jf: 0,
+                        k: 24,
+                    }, // signal argument
+                    libc::sock_filter {
+                        code: 0x15,
+                        jt: 0,
+                        jf: 1,
+                        k: libc::SIGTERM as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ALLOW,
+                    },
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr() as *mut _,
+                };
+                if libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                    || libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                        &program,
+                    ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut parent = Reap(command.spawn().unwrap());
+    until(|| parent.0.try_wait().unwrap().is_some());
+    assert!(parent.0.wait().unwrap().success());
 }

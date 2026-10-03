@@ -1,7 +1,7 @@
 use crate::{Error, Policy};
 use std::{
     collections::HashSet,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::process::CommandExt,
@@ -14,6 +14,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
+    // Diagnostics must not interrupt emergency cleanup or process termination.
+    let _ = writeln!(io::stderr().lock(), "{message}");
+}
 
 const PARENT_FD: &str = "SYMBIOTIC_PARENT_FD";
 static WATCHING: AtomicBool = AtomicBool::new(false);
@@ -61,7 +66,7 @@ impl Drop for Writer {
                     drop(fd);
                 }
             }
-            Err(_) => eprintln!("parent pipe registry unavailable"),
+            Err(_) => diagnostic(format_args!("parent pipe registry unavailable")),
         }
     }
 }
@@ -116,10 +121,10 @@ impl Drop for ManagedChild {
         if !self.reaped {
             // Emergency cleanup on an error path. Explicit shutdown reports errors.
             if let Err(error) = self.child.kill() {
-                eprintln!("child kill failed: {error}");
+                diagnostic(format_args!("child kill failed: {error}"));
             }
             if let Err(error) = self.child.wait() {
-                eprintln!("child reap failed: {error}");
+                diagnostic(format_args!("child reap failed: {error}"));
             }
         }
     }
@@ -145,6 +150,8 @@ fn spawn_here(mut command: Command) -> Result<ManagedChild, Error> {
             return Err(io::Error::last_os_error().into());
         }
     }
+    let reader = dedicated_pipe_fd(reader)?;
+    let writer = dedicated_pipe_fd(writer)?;
     let mut inherited_writers: Vec<_> = writers.iter().copied().collect();
     inherited_writers.push(writer.as_raw_fd());
     let read_fd = reader.as_raw_fd();
@@ -176,6 +183,20 @@ fn spawn_here(mut command: Command) -> Result<ManagedChild, Error> {
         _writer: Writer(Some(writer)),
         reaped: false,
     })
+}
+
+fn dedicated_pipe_fd(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    // SAFETY: duplicate the live descriptor above the standard streams, retaining
+    // close-on-exec. Dropping the original releases its standard-stream slot.
+    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor with unique ownership.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 #[cfg(target_os = "linux")]
@@ -245,7 +266,7 @@ pub fn watch_parent(
                 }
             };
             if let Err(error) = cleanup() {
-                eprintln!("parent-death cleanup failed: {error}");
+                diagnostic(format_args!("parent-death cleanup failed: {error}"));
                 std::process::exit(1);
             }
             std::process::exit(code);

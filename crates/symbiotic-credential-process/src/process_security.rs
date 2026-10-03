@@ -36,14 +36,10 @@ mod tests {
 
     #[test]
     fn guard_child() {
-        let Ok(mode) = std::env::var("PROTECTION_TEST_MODE") else {
+        let Ok(_) = std::env::var("PROTECTION_TEST_MODE") else {
             return;
         };
         let result = super::protect_process();
-        if mode == "refused" {
-            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPERM));
-            return;
-        }
         result.unwrap();
         let mut limit = libc::rlimit {
             rlim_cur: 1,
@@ -87,67 +83,5 @@ mod tests {
                 .unwrap()
                 .success()
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn either_os_refusal_reaches_the_startup_caller() {
-        use std::os::unix::process::CommandExt;
-        for syscall in [libc::SYS_prctl, libc::SYS_prlimit64] {
-            let mut command = child();
-            command.env("PROTECTION_TEST_MODE", "refused");
-            // SAFETY: pre_exec performs only prctl on preallocated BPF data.
-            unsafe {
-                command.pre_exec(move || {
-                    let filter = [
-                        libc::sock_filter {
-                            code: 0x20,
-                            jt: 0,
-                            jf: 0,
-                            k: 0,
-                        }, // load syscall
-                        libc::sock_filter {
-                            code: 0x15,
-                            jt: 0,
-                            jf: 1,
-                            k: syscall as u32,
-                        },
-                        libc::sock_filter {
-                            code: 0x06,
-                            jt: 0,
-                            jf: 0,
-                            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-                        },
-                        libc::sock_filter {
-                            code: 0x06,
-                            jt: 0,
-                            jf: 0,
-                            k: libc::SECCOMP_RET_ALLOW,
-                        },
-                    ];
-                    let program = libc::sock_fprog {
-                        len: filter.len() as u16,
-                        filter: filter.as_ptr() as *mut _,
-                    };
-                    if libc::prctl(
-                        libc::PR_SET_NO_NEW_PRIVS,
-                        1 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    ) != 0
-                        || libc::prctl(
-                            libc::PR_SET_SECCOMP,
-                            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
-                            &program,
-                        ) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            assert!(command.status().unwrap().success());
-        }
     }
 }

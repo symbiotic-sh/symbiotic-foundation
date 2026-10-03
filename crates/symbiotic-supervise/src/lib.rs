@@ -96,9 +96,8 @@ impl Supervisor {
             .spawn(move || {
                 let result = lifecycle(&mut command, &policy, &stopped, &events_tx);
                 if let Err(error) = result {
-                    // Report the original failure and remain stoppable until the owner drops.
+                    // Report the original failure after lifecycle cleanup.
                     events_tx.send(Err(error)).map_err(|_| Error::Unavailable)?;
-                    let _ = stopped.recv();
                 }
                 Ok(())
             })?;
@@ -137,7 +136,7 @@ impl Drop for Supervisor {
     fn drop(&mut self) {
         // Drop cannot return failures; explicit stop is the observable shutdown API.
         if let Err(error) = self.finish() {
-            eprintln!("{error}");
+            unix::diagnostic(format_args!("{error}"));
         }
     }
 }
