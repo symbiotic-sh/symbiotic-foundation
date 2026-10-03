@@ -19,6 +19,7 @@ symbiotic-ai-runtime = { path = "../symbiotic-ai-runtime" }
 symbiotic-egress = { path = "../symbiotic-egress" }
 symbiotic-trace = { path = "../symbiotic-trace" }
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }
+tracing.workspace = true
 uuid.workspace = true
 zeroize = "1"
 
@@ -29,4 +30,3 @@ security-framework = "3.7"
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
-tracing.workspace = true

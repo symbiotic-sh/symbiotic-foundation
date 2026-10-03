@@ -1043,7 +1043,10 @@ async fn immutable_invocation_inputs_and_destination_cannot_change_on_retry() {
 }
 
 #[derive(Clone, Default)]
-struct CapturedLogs(Arc<std::sync::Mutex<String>>);
+struct CapturedLogs(
+    Arc<std::sync::Mutex<String>>,
+    Option<Arc<dyn Fn() + Send + Sync>>,
+);
 impl tracing::field::Visit for CapturedLogs {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         use std::fmt::Write;
@@ -1064,6 +1067,12 @@ impl tracing::Subscriber for CapturedLogs {
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
         event.record(&mut self.clone());
+        if event.metadata().fields().field("ahead_seconds").is_some()
+            && let Some(on_warning) = &self.1
+        {
+            assert_eq!(*event.metadata().level(), tracing::Level::WARN);
+            on_warning();
+        }
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
@@ -1110,17 +1119,123 @@ async fn ambient_proxies_cannot_receive_credentials_or_private_inputs() {
 
 #[tokio::test]
 async fn signed_attempt_time_ahead_beyond_tolerance_warns_and_accepts() {
-    executable_dispatch(None, None, Some((3600, 5, true))).await;
+    signed_attempt_time_warning(3600, 5, true).await;
 }
 
 #[tokio::test]
 async fn signed_attempt_time_within_tolerance_accepts_without_warning() {
-    executable_dispatch(None, None, Some((5, 5, false))).await;
+    signed_attempt_time_warning(5, 5, false).await;
 }
 
 #[tokio::test]
 async fn signed_attempt_time_uses_configured_warning_tolerance() {
-    executable_dispatch(None, None, Some((3600, 7200, false))).await;
+    signed_attempt_time_warning(3600, 7200, false).await;
+}
+
+async fn signed_attempt_time_warning(
+    ahead_seconds: u64,
+    tolerance_seconds: u64,
+    should_warn: bool,
+) {
+    use std::io::Write;
+    use tracing::instrument::WithSubscriber;
+
+    let mut fixture = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
+    fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
+    let process = fixture.process().await;
+    let failed_writes = Arc::new(AtomicUsize::new(0));
+    let failures = failed_writes.clone();
+    let reentrant_process = process.clone();
+    let (sink, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let logs = CapturedLogs(
+        Arc::default(),
+        Some(Arc::new(move || {
+            // A subscriber can reenter the process. Delivery must hold no registry lock.
+            let process = reentrant_process.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(process.purge_expired_results());
+            });
+            assert_eq!(
+                receive.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Ok(())
+            );
+            // Logging IO errors stay in the subscriber, never in admission or dispatch.
+            let error = (&sink).write_all(b"clock warning\n").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            failures.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let (mut admission, payload) = fixture.attempt("clock-warning", 1, 1);
+    admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
+    admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
+    admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    async {
+        let granted = permit(&process, &admission).await;
+        let replayed = permit(&process, &admission).await;
+        assert!(replayed.token == granted.token);
+        assert_eq!(replayed.attempt_digest, granted.attempt_digest);
+        let result = dispatched(
+            exchange(&process, inject(admission, payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+        assert!(result.receipt_persisted);
+    }
+    .with_subscriber(logs.clone())
+    .await;
+    let captured = logs.0.lock().unwrap();
+    // Fresh issuance, replayed issuance, and accepted dispatch all report.
+    assert_eq!(
+        captured
+            .matches("event=\"signed_attempt_time_ahead\"")
+            .count(),
+        if should_warn { 3 } else { 0 }
+    );
+    if should_warn {
+        assert_eq!(captured.matches("recorded_at=").count(), 3);
+        assert_eq!(captured.matches("foundation_now=").count(), 3);
+        assert_eq!(captured.matches("ahead_seconds=").count(), 3);
+        assert_eq!(
+            captured
+                .matches(&format!("tolerance_seconds={tolerance_seconds}\n"))
+                .count(),
+            3
+        );
+        let lines = captured.lines().collect::<Vec<_>>();
+        let (warnings, remainder) = lines.as_chunks::<5>();
+        assert!(remainder.is_empty());
+        for warning in warnings {
+            let value = |name: &str| {
+                warning
+                    .iter()
+                    .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            assert_eq!(
+                value("ahead_seconds"),
+                value("recorded_at") - value("foundation_now")
+            );
+            assert!(value("ahead_seconds") > tolerance_seconds);
+        }
+    }
+    assert_eq!(
+        failed_writes.load(Ordering::SeqCst),
+        if should_warn { 3 } else { 0 }
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn signed_attempt_time_closed_log_sink_preserves_permit_and_dispatch() {
+    executable_dispatch(None, None, Some((3600, 5))).await;
 }
 
 #[tokio::test]
@@ -1138,7 +1253,7 @@ async fn signed_attempt_time_warning_tolerance_defaults_to_five_seconds() {
 async fn executable_dispatch(
     proxy: Option<&str>,
     numeric_cost: Option<&'static str>,
-    clock_case: Option<(u64, u64, bool)>,
+    clock_case: Option<(u64, u64)>,
 ) {
     struct Child(std::process::Child);
     impl Drop for Child {
@@ -1174,7 +1289,7 @@ async fn executable_dispatch(
         numeric_cost.unwrap_or(r#""0.00001234567890123456789""#),
     )
     .await;
-    if let Some((_, tolerance_seconds, _)) = clock_case {
+    if let Some((_, tolerance_seconds)) = clock_case {
         fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
     }
     let config_path = fixture.dir.path().join("config.json");
@@ -1216,13 +1331,17 @@ async fn executable_dispatch(
             .spawn()
             .unwrap(),
     );
+    if clock_case.is_some() {
+        // Closing the reader makes stderr writes fail with BrokenPipe.
+        drop(child.0.stderr.take());
+    }
     let client = socket::UnixEgressClient {
         path: fixture.config.socket_path.clone(),
         max_frame_bytes: fixture.config.max_frame_bytes,
         timeout: Duration::from_secs(3),
     };
     let (mut admission, payload) = fixture.attempt("executable", 1, 1);
-    if let Some((ahead_seconds, _, _)) = clock_case {
+    if let Some((ahead_seconds, _)) = clock_case {
         admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
         admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
         admission = AdmissionKey::new(KEY.to_vec())
@@ -1310,33 +1429,6 @@ async fn executable_dispatch(
     );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
-    if let Some((_, tolerance_seconds, should_warn)) = clock_case {
-        use std::io::Read;
-        let mut stderr = String::new();
-        child
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        let warnings: Vec<serde_json::Value> = stderr
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        // Fresh issuance, replayed issuance, and accepted dispatch all report.
-        assert_eq!(warnings.len(), if should_warn { 3 } else { 0 });
-        for warning in warnings {
-            assert_eq!(warning["level"], "warn");
-            assert_eq!(warning["event"], "signed_attempt_time_ahead");
-            assert_eq!(warning["tolerance_seconds"], tolerance_seconds);
-            let recorded_at = warning["recorded_at"].as_u64().unwrap();
-            let foundation_now = warning["foundation_now"].as_u64().unwrap();
-            assert_eq!(warning["ahead_seconds"], recorded_at - foundation_now);
-            assert!(recorded_at - foundation_now > tolerance_seconds);
-            assert_eq!(warning.as_object().unwrap().len(), 6);
-        }
-    }
     drop(child);
     std::fs::remove_file(&fixture.config.socket_path).unwrap();
     let mut child = Child(command.spawn().unwrap());

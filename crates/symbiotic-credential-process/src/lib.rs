@@ -235,13 +235,14 @@ impl CredentialProcess {
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
                 let foundation_now = registry::now()?;
-                if let Some(grant) = self
+                // Release the registry mutex before invoking a tracing subscriber.
+                let existing = self
                     .inner
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .existing(&signed.attempt)?
-                {
+                    .existing(&signed.attempt)?;
+                if let Some(grant) = existing {
                     self.warn_if_attempt_time_ahead(signed.attempt.recorded_at, foundation_now);
                     return Ok(Reply::Permit(grant));
                 }
@@ -340,10 +341,12 @@ impl CredentialProcess {
         let ahead_seconds = recorded_at.saturating_sub(foundation_now);
         let tolerance_seconds = self.inner.config.clock_rollback_warning_tolerance_seconds;
         if ahead_seconds > tolerance_seconds {
-            // Structured stderr also reaches standalone deployments without a
-            // tracing subscriber. Only clock values enter this diagnostic.
-            eprintln!(
-                r#"{{"level":"warn","event":"signed_attempt_time_ahead","recorded_at":{recorded_at},"foundation_now":{foundation_now},"ahead_seconds":{ahead_seconds},"tolerance_seconds":{tolerance_seconds}}}"#
+            tracing::warn!(
+                event = "signed_attempt_time_ahead",
+                recorded_at,
+                foundation_now,
+                ahead_seconds,
+                tolerance_seconds,
             );
         }
     }
