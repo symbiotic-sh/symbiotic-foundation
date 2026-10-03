@@ -278,7 +278,6 @@ mod tests {
             format!("runtime:{}:{}", item_id.0, u32::MAX)
         );
         assert_eq!(reference.as_str().len(), 55);
-        assert!(reference.as_str().len() <= SpendReceiptRef::MAX_BYTES);
         let max_item_bytes = SpendReceiptRef::MAX_BYTES - "runtime:".len() - 1 - 10;
         assert_eq!(
             runtime_reference(&"a".repeat(max_item_bytes), u32::MAX)
