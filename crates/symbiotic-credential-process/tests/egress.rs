@@ -129,6 +129,7 @@ impl Fixture {
             max_frame_bytes: 262144,
             max_connections: 8,
             io_timeout_seconds: 2,
+            clock_rollback_warning_tolerance_seconds: 5,
             routes: vec![RouteConfig {
                 tenant: "tenant".into(),
                 account: "account".into(),
@@ -1042,7 +1043,10 @@ async fn immutable_invocation_inputs_and_destination_cannot_change_on_retry() {
 }
 
 #[derive(Clone, Default)]
-struct CapturedLogs(Arc<std::sync::Mutex<String>>);
+struct CapturedLogs(
+    Arc<std::sync::Mutex<String>>,
+    Option<Arc<dyn Fn() + Send + Sync>>,
+);
 impl tracing::field::Visit for CapturedLogs {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         use std::fmt::Write;
@@ -1063,6 +1067,12 @@ impl tracing::Subscriber for CapturedLogs {
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
         event.record(&mut self.clone());
+        if event.metadata().fields().field("ahead_seconds").is_some()
+            && let Some(on_warning) = &self.1
+        {
+            assert_eq!(*event.metadata().level(), tracing::Level::WARN);
+            on_warning();
+        }
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
@@ -1090,24 +1100,169 @@ async fn provider_credential_errors_never_reach_runtime_logs() {
 
 #[tokio::test]
 async fn executable_recovery_lost_permit_and_completion_replies() {
-    executable_dispatch(None, None).await;
+    executable_dispatch(None, None, None).await;
 }
 
 #[tokio::test]
 async fn executable_preserves_numeric_provider_cost_after_restart() {
     // Run this package alone (also a separate CI step): workspace tests unify
     // serde_json dev features that the production executable does not inherit.
-    executable_dispatch(None, Some("0.1234567890123456789")).await;
+    executable_dispatch(None, Some("0.1234567890123456789"), None).await;
 }
 
 #[tokio::test]
 async fn ambient_proxies_cannot_receive_credentials_or_private_inputs() {
     let proxy = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
-    executable_dispatch(Some(&proxy.config.routes[0].destination), None).await;
+    executable_dispatch(Some(&proxy.config.routes[0].destination), None, None).await;
     assert_eq!(proxy.calls.load(Ordering::SeqCst), 0);
 }
 
-async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static str>) {
+#[tokio::test]
+async fn signed_attempt_time_ahead_beyond_tolerance_warns_and_accepts() {
+    signed_attempt_time_warning(3600, 5, true).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_within_tolerance_accepts_without_warning() {
+    signed_attempt_time_warning(5, 5, false).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_uses_configured_warning_tolerance() {
+    signed_attempt_time_warning(3600, 7200, false).await;
+}
+
+async fn signed_attempt_time_warning(
+    ahead_seconds: u64,
+    tolerance_seconds: u64,
+    should_warn: bool,
+) {
+    use tracing::instrument::WithSubscriber;
+
+    let mut fixture = Fixture::new(200, "process answer".into(), Duration::ZERO).await;
+    fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
+    let process = fixture.process().await;
+    let reentrant_process = process.clone();
+    let logs = CapturedLogs(
+        Arc::default(),
+        Some(Arc::new(move || {
+            // A subscriber can reenter the process. Delivery must hold no registry lock.
+            let process = reentrant_process.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(process.purge_expired_results());
+            });
+            assert_eq!(
+                receive.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Ok(())
+            );
+        })),
+    );
+    let (mut admission, payload) = fixture.attempt("clock-warning", 1, 1);
+    admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
+    admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
+    admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(admission.attempt)
+        .unwrap();
+    async {
+        let granted = permit(&process, &admission).await;
+        let replayed = permit(&process, &admission).await;
+        assert!(replayed.token == granted.token);
+        assert_eq!(replayed.attempt_digest, granted.attempt_digest);
+        let result = dispatched(
+            exchange(&process, inject(admission, payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+        assert!(result.receipt_persisted);
+    }
+    .with_subscriber(logs.clone())
+    .await;
+    let captured = logs.0.lock().unwrap();
+    // Fresh issuance, replayed issuance, and accepted dispatch all report.
+    assert_eq!(
+        captured
+            .matches("event=\"signed_attempt_time_ahead\"")
+            .count(),
+        if should_warn { 3 } else { 0 }
+    );
+    if should_warn {
+        assert_eq!(captured.matches("recorded_at=").count(), 3);
+        assert_eq!(captured.matches("foundation_now=").count(), 3);
+        assert_eq!(captured.matches("ahead_seconds=").count(), 3);
+        assert_eq!(
+            captured
+                .matches(&format!("tolerance_seconds={tolerance_seconds}\n"))
+                .count(),
+            3
+        );
+        let lines = captured.lines().collect::<Vec<_>>();
+        let (warnings, remainder) = lines.as_chunks::<5>();
+        assert!(remainder.is_empty());
+        for warning in warnings {
+            let value = |name: &str| {
+                warning
+                    .iter()
+                    .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            assert_eq!(
+                value("ahead_seconds"),
+                value("recorded_at") - value("foundation_now")
+            );
+            assert!(value("ahead_seconds") > tolerance_seconds);
+        }
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn signed_attempt_time_open_log_sink_reports_executable_warnings() {
+    let logs = executable_dispatch(None, None, Some((3600, 5, false))).await;
+    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr.
+    assert_eq!(logs.matches("WARN").count(), 3);
+    assert_eq!(
+        logs.matches("event=\"signed_attempt_time_ahead\"").count(),
+        3
+    );
+    for field in [
+        "recorded_at=",
+        "foundation_now=",
+        "ahead_seconds=",
+        "tolerance_seconds=5",
+    ] {
+        assert_eq!(logs.matches(field).count(), 3);
+    }
+    assert!(!logs.contains(SECRET));
+    assert!(!logs.contains(&general_purpose::STANDARD.encode(SECRET)));
+}
+
+#[tokio::test]
+async fn signed_attempt_time_closed_log_sink_preserves_permit_and_dispatch() {
+    executable_dispatch(None, None, Some((3600, 5, true))).await;
+}
+
+#[tokio::test]
+async fn signed_attempt_time_warning_tolerance_defaults_to_five_seconds() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let mut value = serde_json::to_value(&fixture.config).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("clock_rollback_warning_tolerance_seconds");
+    let config: ProcessConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(config.clock_rollback_warning_tolerance_seconds, 5);
+}
+
+async fn executable_dispatch(
+    proxy: Option<&str>,
+    numeric_cost: Option<&'static str>,
+    clock_case: Option<(u64, u64, bool)>,
+) -> String {
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) {
@@ -1135,13 +1290,16 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
         .await
         .unwrap()
     }
-    let fixture = Fixture::with_cost(
+    let mut fixture = Fixture::with_cost(
         200,
         "process answer".into(),
         Duration::ZERO,
         numeric_cost.unwrap_or(r#""0.00001234567890123456789""#),
     )
     .await;
+    if let Some((_, tolerance_seconds, _)) = clock_case {
+        fixture.config.clock_rollback_warning_tolerance_seconds = tolerance_seconds;
+    }
     let config_path = fixture.dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1181,12 +1339,24 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
             .spawn()
             .unwrap(),
     );
+    if matches!(clock_case, Some((_, _, true))) {
+        // Closing the reader makes stderr writes fail with BrokenPipe.
+        drop(child.0.stderr.take());
+    }
     let client = socket::UnixEgressClient {
         path: fixture.config.socket_path.clone(),
         max_frame_bytes: fixture.config.max_frame_bytes,
         timeout: Duration::from_secs(3),
     };
-    let (admission, payload) = fixture.attempt("executable", 1, 1);
+    let (mut admission, payload) = fixture.attempt("executable", 1, 1);
+    if let Some((ahead_seconds, _, _)) = clock_case {
+        admission.attempt.recorded_at = unix_seconds() + ahead_seconds;
+        admission.attempt.expires_at = admission.attempt.recorded_at + 3600;
+        admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(admission.attempt)
+            .unwrap();
+    }
     let signed_id = AdmissionKey::new(KEY.to_vec())
         .unwrap()
         .sign_attempt_id(admission.attempt.attempt_id())
@@ -1265,6 +1435,13 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
     assert!(
         matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
     );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut logs = String::new();
+    if let Some(mut stderr) = child.0.stderr.take() {
+        use std::io::Read;
+        stderr.read_to_string(&mut logs).unwrap();
+    }
     drop(child);
     std::fs::remove_file(&fixture.config.socket_path).unwrap();
     let mut child = Child(command.spawn().unwrap());
@@ -1277,6 +1454,7 @@ async fn executable_dispatch(proxy: Option<&str>, numeric_cost: Option<&'static 
         serde_json::to_value(recovered).unwrap()
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    logs
 }
 
 #[tokio::test]

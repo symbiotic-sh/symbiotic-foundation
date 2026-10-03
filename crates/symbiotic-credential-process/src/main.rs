@@ -17,6 +17,14 @@ async fn run() -> Result<(), symbiotic_egress::EgressError> {
         CredentialProcess, ProcessConfig, secrets::SecretSource, server,
     };
     use symbiotic_egress::EgressError;
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        // The default IO-error fallback uses eprintln!, which panics on closed stderr.
+        .log_internal_errors(false)
+        .try_init()
+        .map_err(|_| EgressError::StateUnavailable)?;
     process_security::disable_core_dumps().map_err(|_| EgressError::StateUnavailable)?;
     let mut args = std::env::args_os().skip(1);
     let path = args.next().ok_or(EgressError::InvalidRequest)?;

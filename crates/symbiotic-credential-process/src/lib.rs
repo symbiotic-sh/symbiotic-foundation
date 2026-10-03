@@ -121,8 +121,16 @@ pub struct ProcessConfig {
     pub max_connections: usize,
     /// Time allowed for reading/writing a socket frame.
     pub io_timeout_seconds: u64,
+    /// Reporting-only tolerance for signed attempt time ahead of this clock.
+    /// In seconds; defaults to five. Does not change admission or authority checks.
+    #[serde(default = "default_clock_rollback_warning_tolerance_seconds")]
+    pub clock_rollback_warning_tolerance_seconds: u64,
     /// Approved routes; no caller-supplied destinations or secret paths.
     pub routes: Vec<RouteConfig>,
+}
+
+fn default_clock_rollback_warning_tolerance_seconds() -> u64 {
+    5
 }
 
 // Fixed receipt/status/permit envelope allowance, excluding escaped identity
@@ -226,13 +234,16 @@ impl CredentialProcess {
         match operation {
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
-                if let Some(grant) = self
+                let foundation_now = registry::now()?;
+                // Release the registry mutex before invoking a tracing subscriber.
+                let existing = self
                     .inner
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .existing(&signed.attempt)?
-                {
+                    .existing(&signed.attempt)?;
+                if let Some(grant) = existing {
+                    self.warn_if_attempt_time_ahead(signed.attempt.recorded_at, foundation_now);
                     return Ok(Reply::Permit(grant));
                 }
                 let max_attempts = self.validate_attempt(&signed.attempt)?.max_attempts;
@@ -242,6 +253,7 @@ impl CredentialProcess {
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
                     .issue(&signed.attempt, max_attempts)?;
+                self.warn_if_attempt_time_ahead(signed.attempt.recorded_at, foundation_now);
                 Ok(Reply::Permit(permit))
             }
             Operation::AttemptStatus(signed) => {
@@ -286,6 +298,7 @@ impl CredentialProcess {
                     return Err(EgressError::Version);
                 }
                 self.inner.key.verify_attempt(&request.admission)?;
+                let foundation_now = registry::now()?;
                 let route = self.validate_attempt(&request.admission.attempt)?.clone();
                 validate_payload(&route, &request.payload)?;
                 if request.payload.digest()? != request.admission.attempt.input_digest {
@@ -313,10 +326,28 @@ impl CredentialProcess {
                 let task = tokio::spawn(async move {
                     process.dispatch(route, payload, receipt, handoff).await
                 });
+                self.warn_if_attempt_time_ahead(
+                    request.admission.attempt.recorded_at,
+                    foundation_now,
+                );
                 task.await
                     .map_err(|_| EgressError::Transport)
                     .map(Reply::Dispatched)
             }
+        }
+    }
+
+    fn warn_if_attempt_time_ahead(&self, recorded_at: u64, foundation_now: u64) {
+        let ahead_seconds = recorded_at.saturating_sub(foundation_now);
+        let tolerance_seconds = self.inner.config.clock_rollback_warning_tolerance_seconds;
+        if ahead_seconds > tolerance_seconds {
+            tracing::warn!(
+                event = "signed_attempt_time_ahead",
+                recorded_at,
+                foundation_now,
+                ahead_seconds,
+                tolerance_seconds,
+            );
         }
     }
 
