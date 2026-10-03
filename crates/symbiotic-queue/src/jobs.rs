@@ -2,15 +2,14 @@
 //!
 //! IDs and all operations are scoped to a tenant, restore incarnation and queue.
 //! Enqueue/claim order is `(created_at, id)`; final deliveries use `(finished_at,
-//! id)`, ahead of admission notices. Diagnostic cursors use ascending IDs.
+//! id)`. Diagnostic cursors use ascending IDs.
 //! Backends own atomicity: an error must roll back every write in an operation.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use symbiotic_core::{BindingIdentity, DiagnosticCode, QueueItemId};
+use std::collections::BTreeSet;
+use symbiotic_core::{DiagnosticCode, QueueItemId};
 use thiserror::Error;
 
 /// Authorization namespace supplied by the trusted host, never by an unverified client.
@@ -35,29 +34,6 @@ pub struct JobId {
     pub id: String,
 }
 
-/// Scheduling class; untagged jobs are background.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum Priority {
-    /// Latency-sensitive work.
-    Interactive,
-    /// Bulk work, FIFO within the class.
-    #[default]
-    Background,
-}
-
-/// Per-app claim policy. Running work is never preempted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum PriorityPolicy {
-    /// FIFO regardless of class.
-    Fifo,
-    /// Interactive work first.
-    StrictClasses,
-    /// Reserve this many concurrent slots for waiting background work.
-    BackgroundShare { minimum_slots: usize },
-}
-
 /// Versioned store policy, supplied by the owning app.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,11 +48,11 @@ pub struct JobConfig {
     pub max_leased_completions: usize,
     /// Maximum serialized delivery page (1 MiB).
     pub max_page_bytes: usize,
-    /// Maximum encoded cache/handler result (16 MiB; PROVISIONAL).
+    /// Maximum raw handler result (16 MiB; PROVISIONAL).
     pub max_result_bytes: usize,
     /// Hard unfinished-job count bound (1024).
     pub max_pending_items: usize,
-    /// Hard unfinished input-byte bound, including metadata/checkpoints (16 MiB).
+    /// Hard unfinished input-byte bound, including metadata (16 MiB).
     pub max_pending_bytes: usize,
     /// Delivery lease length (30 seconds).
     pub delivery_lease_seconds: u64,
@@ -84,15 +60,11 @@ pub struct JobConfig {
     pub claim_lease_seconds: u64,
     /// Final-result retention without an explicit deadline (7 days).
     pub retention_seconds: u64,
-    /// Maximum checkpoint (64 KiB).
-    pub max_checkpoint_bytes: usize,
     /// Maximum expired results deleted in one maintenance pass (64).
     pub maintenance_batch: usize,
-    /// Encoded recovery-copy/result bytes erased per pass (16 MiB; PROVISIONAL).
+    /// Raw recovery-copy/result bytes erased per pass (16 MiB; PROVISIONAL).
     /// A nonempty pass always erases at least one job, even if it exceeds the budget.
     pub maintenance_bytes_per_pass: usize,
-    /// Per-app scheduling policy (one background slot by default).
-    pub priority: PriorityPolicy,
 }
 
 impl Default for JobConfig {
@@ -109,30 +81,13 @@ impl Default for JobConfig {
             delivery_lease_seconds: 30,
             claim_lease_seconds: 30,
             retention_seconds: 7 * 24 * 60 * 60,
-            max_checkpoint_bytes: 64 * 1024,
             maintenance_batch: 64,
             maintenance_bytes_per_pass: 16 * 1024 * 1024,
-            priority: PriorityPolicy::BackgroundShare { minimum_slots: 1 },
         }
     }
 }
 
-/// One admission, verified by the authority owner before entering the store.
-/// Signature verification/current-grant checks belong to PR 4, inside acceptance.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedAdmission {
-    /// Monotonically increasing admission ordinal, independent of paid attempts.
-    pub ordinal: u32,
-    /// Frozen execution binding.
-    pub binding: BindingIdentity,
-    /// Authority deadline, independent of result retention.
-    pub authority_until: DateTime<Utc>,
-    /// Signed envelope bytes (no provider credentials).
-    pub signed: Vec<u8>,
-}
-
-/// Attempt ceiling frozen on first enqueue; successors cannot renew it.
+/// Attempt ceiling frozen on first enqueue; duplicate keys cannot renew it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobLimits {
@@ -164,15 +119,10 @@ pub struct JobSpec {
     pub kind: String,
     /// Execution/recovery owner.
     pub execution: Execution,
-    /// Per-app scheduling class; absent wire classes default to background.
-    #[serde(default)]
-    pub priority: Priority,
     /// Full waiting copy.
-    pub payload: Value,
+    pub payload: Vec<u8>,
     /// Frozen execution limits.
     pub limits: JobLimits,
-    /// Optional first signed admission.
-    pub admission: Option<SignedAdmission>,
     /// Limits final-result availability only.
     pub recovery_until: Option<DateTime<Utc>>,
 }
@@ -183,8 +133,6 @@ pub struct JobSpec {
 pub enum JobState {
     /// Waiting for a claim.
     Pending,
-    /// Authority expired; unfinished.
-    AwaitingAdmission,
     /// Leased to a worker.
     Running,
     /// Charge may exist; cannot be claimed blindly.
@@ -208,10 +156,7 @@ pub enum JobState {
 impl JobState {
     /// Whether execution/reconciliation still needs the waiting copy.
     pub fn unfinished(self) -> bool {
-        matches!(
-            self,
-            Self::Pending | Self::AwaitingAdmission | Self::Running | Self::Uncertain
-        )
+        matches!(self, Self::Pending | Self::Running | Self::Uncertain)
     }
     /// Whether a confirmation already won.
     pub fn acked(self) -> bool {
@@ -225,8 +170,6 @@ impl JobState {
 pub enum ResultOrigin {
     /// Ledger owns the saved answer and receipt.
     Paid,
-    /// Independent recovery copy of a response-cache hit.
-    Cache,
     /// Product-handler output; no receipt required.
     Handler,
 }
@@ -249,40 +192,26 @@ pub struct JobRecord {
     pub kind: String,
     /// Execution/recovery owner.
     pub execution: Execution,
-    /// Scheduling class.
-    pub priority: Priority,
     /// Current lifecycle.
     pub state: JobState,
     /// Final state retained after confirmation.
     pub final_state: Option<JobState>,
     /// Waiting copy; never removed solely because an unfinished job is old.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_present_value"
-    )]
-    pub payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<u8>>,
     /// Frozen ceiling.
     pub max_attempts: u32,
-    /// Latest admission (successors replace expired envelopes).
-    pub admission: Option<SignedAdmission>,
     /// Monotonic claim fence.
     pub generation: u64,
     /// Current claim deadline.
     pub lease_until: Option<DateTime<Utc>>,
-    /// Handler checkpoint, deleted with payload.
-    pub checkpoint: Option<Vec<u8>>,
     /// Cancellation intent for running work.
     pub cancel_requested: bool,
     /// Sticky erasure fence checked before every result commit.
     pub purged: bool,
-    /// Cache/handler recovery copy; never contains paid output.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_present_value"
-    )]
-    pub output: Option<Value>,
+    /// Handler recovery copy; never contains paid output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<u8>>,
     /// Rebuildable encoded result length for content-free delivery preflight.
     #[serde(skip)]
     pub output_bytes: usize,
@@ -306,14 +235,6 @@ pub struct JobRecord {
     pub diagnostic: Option<DiagnosticCode>,
 }
 
-// Missing means erased/unavailable; a present JSON null is valid generic data.
-// One decoder owns this distinction for both waiting copies and saved answers.
-fn deserialize_present_value<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(deserializer).map(Some)
-}
-
 impl JobRecord {
     /// Delivery metadata without cloning waiting copies or saved answers.
     #[doc(hidden)]
@@ -326,15 +247,12 @@ impl JobRecord {
             owners: self.owners.clone(),
             kind: self.kind.clone(),
             execution: self.execution,
-            priority: self.priority,
             state: self.state,
             final_state: self.final_state,
             payload: None,
             max_attempts: self.max_attempts,
-            admission: None,
             generation: self.generation,
             lease_until: self.lease_until,
-            checkpoint: None,
             cancel_requested: self.cancel_requested,
             purged: self.purged,
             output: None,
@@ -352,7 +270,6 @@ impl JobRecord {
     }
 
     /// One-based execution claim ordinal, derived from the fence rather than copied.
-    /// Admission refresh consumes no claim generation or attempt allowance.
     pub fn attempt(&self) -> u64 {
         self.generation
     }
@@ -360,7 +277,7 @@ impl JobRecord {
     // Waiting work and expired unpaid claims can stop without ledger reconciliation.
     // Cancel and erasure use the same rule so neither strands an expired handler.
     fn can_stop_without_accounting(&self, now: DateTime<Utc>) -> bool {
-        matches!(self.state, JobState::Pending | JobState::AwaitingAdmission)
+        self.state == JobState::Pending
             || self.state == JobState::Running
                 && self.execution == Execution::Handler
                 && self.lease_until.is_some_and(|until| until <= now)
@@ -408,20 +325,20 @@ pub struct DeliveryToken {
     pub generation: u64,
 }
 
-/// Final completion or admission notice; notices have no confirmable token.
+/// Final completion with a confirmable token.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Delivery {
-    /// Snapshot of the job (payload/admission/checkpoint are not disclosed).
+    /// Snapshot of the job (payload is not disclosed).
     pub completion: JobRecord,
-    /// Only final results receive a token.
-    pub token: Option<DeliveryToken>,
+    /// Issued confirmation fence.
+    pub token: DeliveryToken,
 }
 
 /// Bounded completion page with visible delivery backpressure.
 #[derive(Clone, Debug)]
 pub struct CompletionPage {
-    /// Final deliveries and admission notices within the requested page.
+    /// Final deliveries within the requested page.
     pub items: Vec<Delivery>,
     /// The per-scope lease cap prevented further final delivery.
     pub lease_cap_reached: bool,
@@ -437,27 +354,13 @@ pub enum AckResult {
     AlreadyAcked(Disposition),
 }
 
-/// Counts rebuilt from canonical job rows; no usage is copied here.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GroupSummary {
-    /// Counts are unavailable while bounded rebuilding is in progress.
-    pub rebuilding: bool,
-    /// Last incorporated ID in a resumable rebuild; stored with the summary.
-    pub rebuild_after: Option<String>,
-    /// Number of jobs in each lifecycle/disposition.
-    pub counts: BTreeMap<JobState, usize>,
-    /// Creation time of the oldest Pending job.
-    pub oldest_pending: Option<DateTime<Utc>>,
-}
-
 /// Bounded operational diagnostic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobDiagnostic {
     /// Affected identity.
     pub id: JobId,
-    /// Failed, Uncertain or AwaitingAdmission.
+    /// Failed or Uncertain.
     pub state: JobState,
     /// Static cause, if available.
     pub code: Option<DiagnosticCode>,
@@ -487,7 +390,7 @@ pub enum Selector {
 pub struct PendingUsage {
     /// Unfinished job count (including Running and Uncertain).
     pub items: usize,
-    /// Retained unfinished input bytes, including metadata/checkpoints.
+    /// Retained unfinished input bytes, including metadata.
     pub bytes: usize,
 }
 
@@ -516,44 +419,29 @@ pub enum JobResolution {
 pub enum JobRequest {
     /// All-or-none enqueue; joined keys consume no additional capacity.
     Enqueue(Vec<JobSpec>),
-    /// Replace an expired admission under the same invocation and frozen ceiling.
-    Admit {
-        job: JobId,
-        admission: SignedAdmission,
-    },
     /// Claim one job within handler kinds, given currently available account slots.
     Claim {
         kinds: Vec<String>,
         slots_available: usize,
-        background_in_flight: usize,
     },
     /// Inspect a bounded claim page before obtaining the existing account slot.
     Candidates {
         kinds: Vec<String>,
-        background_in_flight: usize,
         limit: usize,
         max_bytes: usize,
     },
     /// Claim the inspected job inside the account owner's acceptance transaction.
     /// The trusted caller holds its account/handler slot; the store is not a limiter.
     ClaimJob(JobId),
-    /// Current-grant rejection before handoff; consumes no execution attempt.
-    AwaitAdmission(JobId),
     /// Extend a live claim without changing its generation.
     Heartbeat { job: JobId, generation: u64 },
-    /// Save bounded progress under a live generation.
-    Checkpoint {
-        job: JobId,
-        generation: u64,
-        bytes: Vec<u8>,
-    },
     /// Set a final result or Uncertain under a live generation.
     Complete {
         job: JobId,
         generation: u64,
         state: JobState,
         origin: ResultOrigin,
-        output: Option<Value>,
+        output: Option<Vec<u8>>,
         receipt: Option<String>,
         diagnostic: Option<DiagnosticCode>,
     },
@@ -563,7 +451,7 @@ pub enum JobRequest {
         generation: u64,
         resolution: JobResolution,
     },
-    /// Final results first, then unconfirmable admission notices; serialized byte bound.
+    /// Final results in delivery order; serialized byte bound.
     Completions { limit: usize, max_bytes: usize },
     /// Atomic batch confirm; paid-output discard participates via the transaction seam.
     Ack(Vec<(DeliveryToken, Disposition)>),
@@ -571,10 +459,6 @@ pub enum JobRequest {
     Cancel(Selector),
     /// Sticky owner erasure, including concurrent/late completion writes.
     PurgeOwner(String),
-    /// Read a summary row.
-    Status(String),
-    /// Rebuild one summary from canonical rows.
-    RebuildSummary(String),
     /// Page static diagnostics.
     Diagnostics {
         group: String,
@@ -598,14 +482,12 @@ pub enum JobResponse {
     Job(Option<Box<JobRecord>>),
     /// Bounded candidate snapshots for the runner/account owner.
     Candidates(Vec<JobRecord>),
-    /// Final results and admission notices.
+    /// Final results.
     Deliveries(CompletionPage),
     /// Confirmation dispositions.
     Acks(Vec<AckResult>),
     /// Cancellation/purge/maintenance changed this many rows.
     Changed(usize),
-    /// Group status.
-    Summary(GroupSummary),
     /// Paged static diagnostics.
     Diagnostics(DiagnosticPage),
     /// Pending utilization.
@@ -632,19 +514,19 @@ pub enum JobError {
     /// An eligible completion cannot fit individually in the requested page.
     #[error("completion exceeds page byte bound: {job:?} ({bytes} bytes)")]
     CompletionTooLarge { job: JobId, bytes: usize },
-    /// A cache/handler result exceeds the configured encoded-byte limit.
+    /// A handler result exceeds the configured raw-byte limit.
     #[error("result exceeds byte bound: {job:?} ({bytes} bytes)")]
     ResultTooLarge { job: JobId, bytes: usize },
     /// An inspected job cannot fit individually in the requested candidate page.
     #[error("claim candidate exceeds page byte bound: {job:?} ({bytes} bytes)")]
     CandidateTooLarge { job: JobId, bytes: usize },
-    /// Invalid configuration, state transition, admission or page bound.
+    /// Invalid configuration, state transition or page bound.
     #[error("invalid job request")]
     InvalidRequest,
     /// Expired or superseded claim.
     #[error("stale job claim")]
     StaleClaim,
-    /// An unfinished admission notice cannot be acknowledged.
+    /// An unfinished job cannot be acknowledged.
     #[error("cannot confirm an unfinished job")]
     NotFinal,
     /// The caller-selected backend does not provide a job store.
@@ -659,26 +541,20 @@ pub enum JobError {
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub enum JobQuery {
-    /// Scoped group scan (for atomic group cancel/rebuild).
+    /// Unfinished scoped group scan for atomic group cancellation.
     Group {
         group: String,
         after: Option<String>,
-        unfinished: bool,
     },
     /// Indexed owner membership, chunked in ascending ID order.
     Owner {
         owner: String,
         after: Option<String>,
     },
-    /// Waiting claims in a specific class, FIFO.
-    Pending {
-        kinds: Vec<String>,
-        priority: Option<Priority>,
-    },
+    /// Waiting claims within handler kinds, FIFO.
+    Pending { kinds: Vec<String> },
     /// Unleased final deliveries, oldest first.
     Final,
-    /// Admission notices, FIFO after final results.
-    Notices,
     /// Final recovery copies past deadline.
     Expired,
     /// Static diagnostic states, ascending ID.
@@ -729,76 +605,19 @@ pub trait JobRows {
     /// Read delivery fields without waiting copies or saved answers.
     fn delivery_metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError>;
     /// Load a saved answer only after delivery byte admission.
-    fn output(&mut self, id: &JobId) -> Result<Option<Value>, JobError>;
-    /// Count encoded recovery copies and results without cloning or decoding them.
+    fn output(&mut self, id: &JobId) -> Result<Option<Vec<u8>>, JobError>;
+    /// Count raw recovery copies and results without cloning or decoding them.
     fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError>;
     /// Lease a preflighted delivery, optionally erasing expired recovery copies.
     fn deliver(&mut self, row: &JobRecord, expired: bool) -> Result<(), JobError>;
     /// Erase recovery copies without materializing them.
     fn expire(&mut self, id: &JobId) -> Result<(), JobError>;
-    /// Write canonical row and update its group summary atomically.
+    /// Write the canonical row and its rebuildable indexes atomically.
     fn save(&mut self, row: JobRecord) -> Result<(), JobError>;
     /// Count unfinished rows and bytes.
     fn usage(&mut self, scope: &JobScope) -> Result<PendingUsage, JobError>;
     /// Count live completion leases using their deadline index.
     fn leased(&mut self, scope: &JobScope, now: DateTime<Utc>) -> Result<usize, JobError>;
-    /// Load the stored summary, including any partial rebuild progress.
-    fn load_summary(&mut self, scope: &JobScope, group: &str) -> Result<GroupSummary, JobError>;
-    /// Atomically save the rebuildable summary alongside canonical row writes.
-    fn save_summary(
-        &mut self,
-        scope: &JobScope,
-        group: &str,
-        summary: &GroupSummary,
-    ) -> Result<(), JobError>;
-    /// Oldest pending timestamp, restricted to the incorporated prefix during rebuilding.
-    fn oldest_pending(
-        &mut self,
-        scope: &JobScope,
-        group: &str,
-        summary: &GroupSummary,
-    ) -> Result<Option<DateTime<Utc>>, JobError>;
-    /// Read or advance one bounded summary rebuild using the shared cursor owner.
-    fn summary(
-        &mut self,
-        scope: &JobScope,
-        group: &str,
-        rebuild: Option<usize>,
-    ) -> Result<GroupSummary, JobError>
-    where
-        Self: Sized,
-    {
-        let mut summary = self.load_summary(scope, group)?;
-        if let Some(batch) = rebuild {
-            if !summary.rebuilding {
-                summary = GroupSummary {
-                    rebuilding: true,
-                    ..GroupSummary::default()
-                };
-            }
-            let selected = self.inspect(
-                scope,
-                JobQuery::Group {
-                    group: group.into(),
-                    after: summary.rebuild_after.clone(),
-                    unfinished: false,
-                },
-                Utc::now(),
-                batch,
-            )?;
-            for row in &selected {
-                *summary.counts.entry(row.state).or_default() += 1;
-                summary.rebuild_after = Some(row.id.id.clone());
-            }
-            if selected.len() < batch {
-                summary.rebuilding = false;
-                summary.rebuild_after = None;
-            }
-            summary.oldest_pending = self.oldest_pending(scope, group, &summary)?;
-            self.save_summary(scope, group, &summary)?;
-        }
-        Ok(summary)
-    }
 }
 
 // Cancellation and reclaim share the sticky erasure precedence.
@@ -818,16 +637,6 @@ pub fn millisecond_time(time: DateTime<Utc>) -> Result<DateTime<Utc>, JobError> 
         return Err(JobError::InvalidRequest);
     }
     DateTime::from_timestamp_millis(time.timestamp_millis()).ok_or(JobError::InvalidRequest)
-}
-
-/// Hide incomplete counts from callers while preserving the stored rebuild cursor.
-#[doc(hidden)]
-pub fn summary_status(mut summary: GroupSummary) -> GroupSummary {
-    if summary.rebuilding {
-        summary.counts.clear();
-        summary.oldest_pending = None;
-    }
-    summary
 }
 
 fn deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, JobError> {
@@ -864,8 +673,6 @@ fn live(row: &JobRecord, generation: u64, now: DateTime<Utc>) -> Result<(), JobE
 
 fn delete_copies(row: &mut JobRecord) {
     row.payload = None;
-    row.checkpoint = None;
-    row.admission = None;
     row.output = None;
     row.output_bytes = 0;
 }
@@ -879,8 +686,6 @@ fn finish(
     row.state = state;
     row.finished_at = Some(now);
     row.lease_until = None;
-    row.checkpoint = None;
-    row.admission = None;
     if row.recovery_until.is_none() {
         row.recovery_until = Some(deadline(now, config.retention_seconds)?);
     }
@@ -956,25 +761,23 @@ pub fn job_input_bytes(row: &JobRecord) -> Result<usize, JobError> {
     if !row.state.unfinished() {
         return Ok(0);
     }
-    serde_json::to_vec(&(
+    encoded_bytes(&(
         &row.id.scope,
         &row.key,
         &row.group,
         &row.owners,
         &row.kind,
         row.execution,
-        row.priority,
-        &row.payload,
-        &row.admission,
-        &row.checkpoint,
         row.max_attempts,
     ))
-    .map(|bytes| bytes.len())
-    .map_err(|_| JobError::Storage)
+    .and_then(|metadata| {
+        metadata
+            .checked_add(row.payload.as_ref().map_or(0, Vec::len))
+            .ok_or(JobError::Storage)
+    })
 }
 
-// Every retained-input write uses this owner, so successors/checkpoints cannot
-// bypass enqueue's hard bound. Utilization is derived, never stored separately.
+// Every retained-input write shares the hard bound; utilization is derived.
 fn save_job(
     rows: &mut impl JobRows,
     config: &JobConfig,
@@ -988,9 +791,6 @@ fn save_job(
         &mut row.delivery_until,
     ] {
         *time = time.map(millisecond_time).transpose()?;
-    }
-    if let Some(admission) = &mut row.admission {
-        admission.authority_until = millisecond_time(admission.authority_until)?;
     }
     let new_bytes = job_input_bytes(&row)?;
     let old = rows.get(&row.id)?;
@@ -1016,54 +816,6 @@ fn save_job(
     rows.save(row)
 }
 
-// The account slot owner supplies its current background concurrency. This
-// derives claim order without adding another limiter or a stored scheduler copy.
-fn candidates(
-    rows: &mut impl JobRows,
-    scope: &JobScope,
-    config: &JobConfig,
-    now: DateTime<Utc>,
-    kinds: Vec<String>,
-    background_in_flight: usize,
-    limit: usize,
-) -> Result<Vec<JobRecord>, JobError> {
-    if kinds.is_empty() {
-        return Err(JobError::InvalidRequest);
-    }
-    let priority = match config.priority {
-        PriorityPolicy::Fifo => None,
-        PriorityPolicy::StrictClasses => Some(Priority::Interactive),
-        PriorityPolicy::BackgroundShare { minimum_slots } => {
-            Some(if background_in_flight < minimum_slots {
-                Priority::Background
-            } else {
-                Priority::Interactive
-            })
-        }
-    };
-    let mut selected = rows.select(
-        scope,
-        JobQuery::Pending {
-            kinds: kinds.clone(),
-            priority,
-        },
-        now,
-        limit,
-    )?;
-    if selected.is_empty() && priority.is_some() {
-        selected = rows.select(
-            scope,
-            JobQuery::Pending {
-                kinds,
-                priority: None,
-            },
-            now,
-            limit,
-        )?;
-    }
-    Ok(selected)
-}
-
 fn claim_job(
     rows: &mut impl JobRows,
     config: &JobConfig,
@@ -1077,15 +829,6 @@ fn claim_job(
         let state = stopped_state(&row);
         finish(&mut row, state, now, config)?;
         delete_copies(&mut row);
-        save_job(rows, config, row)?;
-        return Ok(None);
-    }
-    if row
-        .admission
-        .as_ref()
-        .is_some_and(|a| a.authority_until <= now)
-    {
-        row.state = JobState::AwaitingAdmission;
         save_job(rows, config, row)?;
         return Ok(None);
     }
@@ -1105,7 +848,7 @@ fn claim_job(
 }
 
 /// Apply one operation with the same lifecycle/bounds/fences for every backend.
-/// Errors require rollback, including delivery leases and summary writes.
+/// Errors require rollback, including delivery leases.
 #[doc(hidden)]
 pub fn apply_job_request(
     rows: &mut impl JobRows,
@@ -1146,11 +889,7 @@ pub fn apply_job_request(
                     return Err(JobError::InvalidRequest);
                 }
                 spec.recovery_until.map(millisecond_time).transpose()?;
-                if let Some(a) = &spec.admission {
-                    validate_admission(scope, a)?;
-                }
-                let payload = serde_json::to_vec(&spec.payload).map_err(|_| JobError::Storage)?;
-                let digest = hex::encode(Sha256::digest(&payload));
+                let digest = hex::encode(Sha256::digest(&spec.payload));
                 if let Some(row) = rows.by_key(scope, &spec.key)? {
                     if row.digest != digest {
                         return Err(JobError::KeyConflict);
@@ -1166,15 +905,6 @@ pub fn apply_job_request(
                     scope: scope.clone(),
                     id: QueueItemId::new().0,
                 };
-                let state = if spec
-                    .admission
-                    .as_ref()
-                    .is_some_and(|a| a.authority_until <= now)
-                {
-                    JobState::AwaitingAdmission
-                } else {
-                    JobState::Pending
-                };
                 save_job(
                     rows,
                     config,
@@ -1186,15 +916,12 @@ pub fn apply_job_request(
                         owners: spec.owners,
                         kind: spec.kind,
                         execution: spec.execution,
-                        priority: spec.priority,
-                        state,
+                        state: JobState::Pending,
                         final_state: None,
                         payload: Some(spec.payload),
                         max_attempts: spec.limits.max_attempts,
-                        admission: spec.admission,
                         generation: 0,
                         lease_until: None,
-                        checkpoint: None,
                         cancel_requested: false,
                         purged: false,
                         output: None,
@@ -1214,27 +941,9 @@ pub fn apply_job_request(
             }
             Ok(JobResponse::Enqueued(outcomes))
         }
-        JobRequest::Admit { job, admission } => {
-            scoped(scope, &job)?;
-            validate_admission(scope, &admission)?;
-            let mut row = get(rows, scope, &job)?;
-            if row.state != JobState::AwaitingAdmission || admission.authority_until <= now {
-                return Err(JobError::InvalidRequest);
-            }
-            if let Some(previous) = &row.admission
-                && (previous.binding != admission.binding || admission.ordinal <= previous.ordinal)
-            {
-                return Err(JobError::InvalidRequest);
-            }
-            row.admission = Some(admission);
-            row.state = JobState::Pending;
-            save_job(rows, config, row)?;
-            Ok(JobResponse::Done)
-        }
         JobRequest::Claim {
             kinds,
             slots_available,
-            background_in_flight,
         } => {
             if kinds.is_empty() {
                 return Err(JobError::InvalidRequest);
@@ -1242,15 +951,8 @@ pub fn apply_job_request(
             if slots_available == 0 {
                 return Ok(JobResponse::Job(None));
             }
-            let candidates = candidates(
-                rows,
-                scope,
-                config,
-                now,
-                kinds,
-                background_in_flight,
-                config.max_page,
-            )?;
+            let candidates =
+                rows.select(scope, JobQuery::Pending { kinds }, now, config.max_page)?;
             for row in candidates {
                 if let Some(row) = claim_job(rows, config, now, row)? {
                     return Ok(JobResponse::Job(Some(Box::new(row))));
@@ -1260,16 +962,17 @@ pub fn apply_job_request(
         }
         JobRequest::Candidates {
             kinds,
-            background_in_flight,
             limit,
             max_bytes,
         } => {
             page(config, limit)?;
+            if kinds.is_empty() {
+                return Err(JobError::InvalidRequest);
+            }
             if max_bytes < 2 || max_bytes > config.max_page_bytes {
                 return Err(JobError::InvalidRequest);
             }
-            let selected =
-                candidates(rows, scope, config, now, kinds, background_in_flight, limit)?;
+            let selected = rows.select(scope, JobQuery::Pending { kinds }, now, limit)?;
             let mut page = Vec::new();
             let mut bytes: usize = 2;
             for row in selected {
@@ -1294,36 +997,10 @@ pub fn apply_job_request(
                 claim_job(rows, config, now, row)?.map(Box::new),
             ))
         }
-        JobRequest::AwaitAdmission(job) => {
-            let mut row = get(rows, scope, &job)?;
-            if row.state != JobState::Pending || row.admission.is_none() {
-                return Err(JobError::InvalidRequest);
-            }
-            row.state = JobState::AwaitingAdmission;
-            save_job(rows, config, row)?;
-            Ok(JobResponse::Done)
-        }
         JobRequest::Heartbeat { job, generation } => {
             let mut row = get(rows, scope, &job)?;
             live(&row, generation, now)?;
             row.lease_until = Some(deadline(now, config.claim_lease_seconds)?);
-            save_job(rows, config, row)?;
-            Ok(JobResponse::Done)
-        }
-        JobRequest::Checkpoint {
-            job,
-            generation,
-            bytes,
-        } => {
-            let mut row = get(rows, scope, &job)?;
-            live(&row, generation, now)?;
-            if bytes.len() > config.max_checkpoint_bytes
-                || row.purged
-                || row.execution != Execution::Handler
-            {
-                return Err(JobError::InvalidRequest);
-            }
-            row.checkpoint = Some(bytes);
             save_job(rows, config, row)?;
             Ok(JobResponse::Done)
         }
@@ -1338,7 +1015,7 @@ pub fn apply_job_request(
         } => {
             let mut row = get(rows, scope, &job)?;
             if let Some(output) = &output {
-                let bytes = encoded_bytes(output)?;
+                let bytes = output.len();
                 if bytes > config.max_result_bytes {
                     return Err(JobError::ResultTooLarge {
                         job: row.id.clone(),
@@ -1346,20 +1023,7 @@ pub fn apply_job_request(
                     });
                 }
             }
-            if origin == ResultOrigin::Cache {
-                if row.state == JobState::Purged && generation == 0 && row.generation == 0 {
-                    return Ok(JobResponse::Done);
-                }
-                if row.state != JobState::Pending
-                    || state != JobState::Succeeded
-                    || generation != 0
-                    || row.generation != 0
-                {
-                    return Err(JobError::InvalidRequest);
-                }
-            } else {
-                live(&row, generation, now)?;
-            }
+            live(&row, generation, now)?;
             if origin == ResultOrigin::Paid && row.execution != Execution::Model
                 || origin == ResultOrigin::Handler && row.execution != Execution::Handler
                 || state == JobState::Uncertain && row.execution != Execution::Model
@@ -1502,40 +1166,27 @@ pub fn apply_job_request(
             let leased = rows.leased(scope, now)?;
             let available = config.max_leased_completions.saturating_sub(leased);
             let final_limit = limit.min(available);
-            let mut candidates = if final_limit == 0 {
+            let candidates = if final_limit == 0 {
                 Vec::new()
             } else {
                 rows.inspect(scope, JobQuery::Final, now, final_limit)?
             };
-            if candidates.len() < limit {
-                candidates.extend(rows.inspect(
-                    scope,
-                    JobQuery::Notices,
-                    now,
-                    limit - candidates.len(),
-                )?);
-            }
             let mut admitted = Vec::new();
             let mut bytes: usize = 2; // JSON array brackets, plus commas between deliveries.
             for info in candidates {
                 let mut row = rows.delivery_metadata(&info.id)?;
-                let final_result = !row.state.unfinished();
-                if final_result && row.recovery_until.is_some_and(|until| until <= now) {
+                if row.recovery_until.is_some_and(|until| until <= now) {
                     row.result_expired = true;
                     delete_copies(&mut row);
                 }
-                let token = if final_result {
-                    row.delivery_generation = row
-                        .delivery_generation
-                        .checked_add(1)
-                        .ok_or(JobError::InvalidRequest)?;
-                    row.delivery_until = Some(deadline(now, config.delivery_lease_seconds)?);
-                    Some(DeliveryToken {
-                        job: row.id.clone(),
-                        generation: row.delivery_generation,
-                    })
-                } else {
-                    None
+                row.delivery_generation = row
+                    .delivery_generation
+                    .checked_add(1)
+                    .ok_or(JobError::InvalidRequest)?;
+                row.delivery_until = Some(deadline(now, config.delivery_lease_seconds)?);
+                let token = DeliveryToken {
+                    job: row.id.clone(),
+                    generation: row.delivery_generation,
                 };
                 let delivery = Delivery {
                     completion: row.clone(),
@@ -1571,13 +1222,11 @@ pub fn apply_job_request(
                         return Err(JobError::Storage);
                     }
                 }
-                if delivery.token.is_some() {
-                    rows.deliver(&row, row.result_expired)?;
-                }
+                rows.deliver(&row, row.result_expired)?;
                 deliveries.push(delivery);
             }
             let lease_cap_reached = leased
-                .checked_add(deliveries.iter().filter(|d| d.token.is_some()).count())
+                .checked_add(deliveries.len())
                 .ok_or(JobError::Storage)?
                 >= config.max_leased_completions;
             Ok(JobResponse::Deliveries(CompletionPage {
@@ -1668,7 +1317,6 @@ pub fn apply_job_request(
                         JobQuery::Group {
                             group: group.clone(),
                             after: after.clone(),
-                            unfinished: true,
                         },
                         now,
                         config.maintenance_batch,
@@ -1733,12 +1381,6 @@ pub fn apply_job_request(
             }
             Ok(JobResponse::Changed(count))
         }
-        JobRequest::Status(group) => Ok(JobResponse::Summary(summary_status(
-            rows.summary(scope, &group, None)?,
-        ))),
-        JobRequest::RebuildSummary(group) => Ok(JobResponse::Summary(summary_status(
-            rows.summary(scope, &group, Some(config.maintenance_batch))?,
-        ))),
         JobRequest::Diagnostics {
             group,
             after,
@@ -1782,44 +1424,4 @@ pub fn apply_job_request(
         JobRequest::Get(id) => Ok(JobResponse::Job(Some(Box::new(get(rows, scope, &id)?)))),
         JobRequest::PendingUsage => Ok(JobResponse::Usage(rows.usage(scope)?)),
     }
-}
-
-fn validate_admission(scope: &JobScope, admission: &SignedAdmission) -> Result<(), JobError> {
-    millisecond_time(admission.authority_until)?;
-    if admission.binding.tenant.0 != scope.tenant {
-        return Err(JobError::Scope);
-    }
-    if admission.ordinal == 0 || !admission.binding.is_valid() || admission.signed.is_empty() {
-        return Err(JobError::InvalidRequest);
-    }
-    Ok(())
-}
-
-/// Adjust a rebuildable summary after one canonical row transition.
-#[doc(hidden)]
-pub fn summary_transition(
-    summary: &mut GroupSummary,
-    old: Option<&JobRecord>,
-    new: &JobRecord,
-) -> Result<(), JobError> {
-    if summary.rebuilding
-        && summary
-            .rebuild_after
-            .as_ref()
-            .is_none_or(|id| new.id.id > *id)
-    {
-        return Ok(());
-    }
-    if let Some(old) = old {
-        let count = summary
-            .counts
-            .get_mut(&old.state)
-            .ok_or(JobError::Storage)?;
-        *count = count.checked_sub(1).ok_or(JobError::Storage)?;
-        if *count == 0 {
-            summary.counts.remove(&old.state);
-        }
-    }
-    *summary.counts.entry(new.state).or_default() += 1;
-    Ok(())
 }

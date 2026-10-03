@@ -765,9 +765,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum JobIndex {
     State(JobState),
-    Group(String),
     UnfinishedGroup(String),
-    PendingGroup(String),
     Owner(String),
     Diagnostics(String),
     Final,
@@ -782,26 +780,21 @@ struct JobMemoryState {
     rows: BTreeMap<RowKey, JobRecord>,
     keys: BTreeMap<RowKey, String>,
     indexes: BTreeMap<(JobScope, JobIndex), BTreeSet<OrderKey>>,
-    summaries: BTreeMap<RowKey, GroupSummary>,
 }
 
 fn row_indexes(row: &JobRecord) -> Vec<(JobIndex, OrderKey)> {
     let id = &row.id.id;
     let created = (row.created_at.timestamp_millis(), id.clone());
     let identity = (0, id.clone());
-    let mut entries = vec![(JobIndex::State(row.state), created.clone())];
+    let mut entries = Vec::new();
+    if row.state.unfinished() {
+        entries.push((JobIndex::State(row.state), created));
+    }
     if let Some(group) = &row.group {
-        entries.push((JobIndex::Group(group.clone()), identity.clone()));
         if row.state.unfinished() {
             entries.push((JobIndex::UnfinishedGroup(group.clone()), identity.clone()));
         }
-        if row.state == JobState::Pending {
-            entries.push((JobIndex::PendingGroup(group.clone()), created));
-        }
-        if matches!(
-            row.state,
-            JobState::Failed | JobState::Uncertain | JobState::AwaitingAdmission
-        ) {
+        if matches!(row.state, JobState::Failed | JobState::Uncertain) {
             entries.push((JobIndex::Diagnostics(group.clone()), identity.clone()));
         }
     }
@@ -863,28 +856,11 @@ impl JobMemoryState {
             .into_iter()
             .flat_map(|set| set.iter())
     }
-    fn oldest_pending(
-        &self,
-        scope: &JobScope,
-        group: &str,
-        summary: &GroupSummary,
-    ) -> Option<DateTime<Utc>> {
-        self.entries(scope, JobIndex::PendingGroup(group.into()))
-            .find(|(_, id)| {
-                !summary.rebuilding
-                    || summary
-                        .rebuild_after
-                        .as_ref()
-                        .is_some_and(|cursor| id <= cursor)
-            })
-            .and_then(|(time, _)| DateTime::from_timestamp_millis(*time))
-    }
 }
 
 struct JobMemoryTransaction<'a> {
     state: &'a mut JobMemoryState,
     rows_before: BTreeMap<RowKey, Option<JobRecord>>,
-    summaries_before: BTreeMap<RowKey, Option<GroupSummary>>,
     committed: bool,
     #[cfg(test)]
     examined: usize,
@@ -899,19 +875,10 @@ impl<'a> JobMemoryTransaction<'a> {
         project: fn(&JobRecord) -> Result<T, JobError>,
     ) -> Result<Vec<T>, JobError> {
         let index = match &query {
-            JobQuery::Group {
-                group, unfinished, ..
-            } => {
-                if *unfinished {
-                    JobIndex::UnfinishedGroup(group.clone())
-                } else {
-                    JobIndex::Group(group.clone())
-                }
-            }
+            JobQuery::Group { group, .. } => JobIndex::UnfinishedGroup(group.clone()),
             JobQuery::Owner { owner, .. } => JobIndex::Owner(owner.clone()),
             JobQuery::Pending { .. } => JobIndex::State(JobState::Pending),
             JobQuery::Final => JobIndex::Final,
-            JobQuery::Notices => JobIndex::State(JobState::AwaitingAdmission),
             JobQuery::Expired => JobIndex::Expired,
             JobQuery::Diagnostics { group, .. } => JobIndex::Diagnostics(group.clone()),
         };
@@ -968,11 +935,7 @@ impl<'a> JobMemoryTransaction<'a> {
                 .get(&(scope.clone(), id.clone()))
                 .ok_or(JobError::Storage)?;
             let eligible = match &query {
-                JobQuery::Pending { kinds, priority } => {
-                    row.claimable(now)
-                        && kinds.contains(&row.kind)
-                        && priority.is_none_or(|p| p == row.priority)
-                }
+                JobQuery::Pending { kinds } => row.claimable(now) && kinds.contains(&row.kind),
                 JobQuery::Final => row.delivery_until.is_none_or(|until| until <= now),
                 _ => true,
             };
@@ -986,16 +949,10 @@ impl<'a> JobMemoryTransaction<'a> {
         Self {
             state,
             rows_before: BTreeMap::new(),
-            summaries_before: BTreeMap::new(),
             committed: false,
             #[cfg(test)]
             examined: 0,
         }
-    }
-    fn remember_summary(&mut self, key: &RowKey) {
-        self.summaries_before
-            .entry(key.clone())
-            .or_insert_with(|| self.state.summaries.get(key).cloned());
     }
 }
 impl Drop for JobMemoryTransaction<'_> {
@@ -1003,13 +960,6 @@ impl Drop for JobMemoryTransaction<'_> {
         if !self.committed {
             for (key, old) in std::mem::take(&mut self.rows_before) {
                 self.state.replace(key, old);
-            }
-            for (key, old) in std::mem::take(&mut self.summaries_before) {
-                if let Some(old) = old {
-                    self.state.summaries.insert(key, old);
-                } else {
-                    self.state.summaries.remove(&key);
-                }
             }
         }
     }
@@ -1062,7 +1012,7 @@ impl JobRows for JobMemoryTransaction<'_> {
             .map(JobRecord::delivery_metadata)
             .ok_or(JobError::NotFound)
     }
-    fn output(&mut self, id: &JobId) -> Result<Option<serde_json::Value>, JobError> {
+    fn output(&mut self, id: &JobId) -> Result<Option<Vec<u8>>, JobError> {
         self.state
             .rows
             .get(&(id.scope.clone(), id.id.clone()))
@@ -1075,29 +1025,13 @@ impl JobRows for JobMemoryTransaction<'_> {
             .rows
             .get(&(id.scope.clone(), id.id.clone()))
             .ok_or(JobError::NotFound)?;
-        [
-            row.payload
-                .as_ref()
-                .map(encoded_bytes)
-                .transpose()?
-                .unwrap_or(0),
-            row.checkpoint
-                .as_ref()
-                .map(encoded_bytes)
-                .transpose()?
-                .unwrap_or(0),
-            row.admission
-                .as_ref()
-                .map(encoded_bytes)
-                .transpose()?
-                .unwrap_or(0),
-            row.output_bytes,
-        ]
-        .into_iter()
-        .try_fold(0usize, |total, bytes| {
-            total.checked_add(bytes).ok_or(JobError::Storage)
-        })
+        row.payload
+            .as_ref()
+            .map_or(0, Vec::len)
+            .checked_add(row.output.as_ref().map_or(0, Vec::len))
+            .ok_or(JobError::Storage)
     }
+
     fn deliver(&mut self, row: &JobRecord, expired: bool) -> Result<(), JobError> {
         if expired {
             self.expire(&row.id)?;
@@ -1129,24 +1063,11 @@ impl JobRows for JobMemoryTransaction<'_> {
             .entry(key.clone())
             .or_insert_with(|| old.clone());
         self.state.replace(key, Some(row.clone()));
-        if let Some(group) = &row.group {
-            let key = (row.id.scope.clone(), group.clone());
-            self.remember_summary(&key);
-            let mut summary = self.state.summaries.get(&key).cloned().unwrap_or_default();
-            summary_transition(&mut summary, old.as_ref(), &row)?;
-            summary.oldest_pending = self.state.oldest_pending(&row.id.scope, group, &summary);
-            self.state.summaries.insert(key, summary);
-        }
         Ok(())
     }
     fn usage(&mut self, scope: &JobScope) -> Result<PendingUsage, JobError> {
         let mut usage = PendingUsage::default();
-        for state in [
-            JobState::Pending,
-            JobState::AwaitingAdmission,
-            JobState::Running,
-            JobState::Uncertain,
-        ] {
+        for state in [JobState::Pending, JobState::Running, JobState::Uncertain] {
             for (_, id) in self.state.entries(scope, JobIndex::State(state)) {
                 let row = self
                     .state
@@ -1173,39 +1094,11 @@ impl JobRows for JobMemoryTransaction<'_> {
                 .count()
             }))
     }
-    fn load_summary(&mut self, scope: &JobScope, group: &str) -> Result<GroupSummary, JobError> {
-        Ok(self
-            .state
-            .summaries
-            .get(&(scope.clone(), group.into()))
-            .cloned()
-            .unwrap_or_default())
-    }
-    fn save_summary(
-        &mut self,
-        scope: &JobScope,
-        group: &str,
-        summary: &GroupSummary,
-    ) -> Result<(), JobError> {
-        let key = (scope.clone(), group.into());
-        self.remember_summary(&key);
-        self.state.summaries.insert(key, summary.clone());
-        Ok(())
-    }
-    fn oldest_pending(
-        &mut self,
-        scope: &JobScope,
-        group: &str,
-        summary: &GroupSummary,
-    ) -> Result<Option<DateTime<Utc>>, JobError> {
-        Ok(self.state.oldest_pending(scope, group, summary))
-    }
 }
 
 #[cfg(test)]
 mod job_index_tests {
     use super::*;
-    use serde_json::json;
 
     fn fixture(retained: usize) -> (JobMemoryState, JobScope, DateTime<Utc>, JobRecord) {
         let mut state = JobMemoryState::default();
@@ -1227,10 +1120,8 @@ mod job_index_tests {
                 owners: vec!["other".into()],
                 kind: "handler".into(),
                 execution: Execution::Handler,
-                priority: Priority::Background,
-                payload: json!("input"),
+                payload: b"input".to_vec(),
                 limits: JobLimits { max_attempts: 3 },
-                admission: None,
                 recovery_until: None,
             }]),
         )
@@ -1319,7 +1210,6 @@ mod job_index_tests {
                     JobQuery::Group {
                         group: "group".into(),
                         after: None,
-                        unfinished: true
                     },
                     now,
                     1
@@ -1342,7 +1232,6 @@ mod job_index_tests {
     fn jobs_memory_rollback_journals_only_touched_entries_and_restores_indexes() {
         let (mut state, scope, now, mut row) = fixture(10_000);
         let original = row.clone();
-        let summary = state.summaries.clone();
         let indexes = state.indexes.clone();
         {
             let mut tx = JobMemoryTransaction::new(&mut state);
@@ -1351,11 +1240,9 @@ mod job_index_tests {
             tx.save(row.clone()).unwrap();
             tx.save(row).unwrap();
             assert_eq!(tx.rows_before.len(), 1);
-            assert_eq!(tx.summaries_before.len(), 1);
             // Abort after repeated writes to the same row.
         }
         assert_eq!(state.indexes, indexes);
-        assert_eq!(state.summaries, summary);
         let mut tx = JobMemoryTransaction::new(&mut state);
         assert_eq!(
             tx.by_key(&scope, "eligible").unwrap().unwrap().state,
