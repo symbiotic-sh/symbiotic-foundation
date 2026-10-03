@@ -1115,6 +1115,7 @@ async fn review_4_direct_settlement_respects_purge_even_after_confirmation() {
     assert!(call.await.unwrap().is_ok());
     assert_eq!(copies(dir.path()), 0);
     assert_eq!(row(&j, &id).await.final_state, Some(JobState::Purged));
+    assert!(row(&j, &id).await.receipt.is_some());
     assert_eq!(
         sql(dir.path())
             .query_row(
