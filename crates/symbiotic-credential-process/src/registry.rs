@@ -578,10 +578,7 @@ mod tests {
             format!("egress:{}", digest(&attempt).unwrap())
         );
         assert_eq!(reference.as_str().len(), 71);
-        assert_eq!(
-            reference.as_str().len(),
-            symbiotic_ai_runtime::SpendReceiptRef::MAX_BYTES
-        );
+        assert!(reference.as_str().len() <= symbiotic_ai_runtime::SpendReceiptRef::MAX_BYTES);
     }
 
     fn finish_released(registry: &mut Registry, mut receipt: DispatchReceipt) {

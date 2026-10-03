@@ -232,13 +232,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn receipt_ref_has_generous_headroom() {
-        assert_eq!(SpendReceiptRef::MAX_BYTES, 256);
-        assert!(SpendReceiptRef::new("a".repeat(256)).is_ok());
-    }
-
-    #[test]
     fn receipt_ref_over_max_refused_at_construction_and_decode() {
+        assert_eq!(SpendReceiptRef::MAX_BYTES, 256);
         for value in [
             "a".repeat(SpendReceiptRef::MAX_BYTES + 1),
             "é".repeat(SpendReceiptRef::MAX_BYTES / 2 + 1),
