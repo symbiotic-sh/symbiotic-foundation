@@ -198,9 +198,11 @@ index in batches of at most 64 answers. Discard, expiry and erasure preserve
 completion markers, receipts, usage and account spend. Replaying a completed invocation returns its retained answer,
 then the typed `InvocationCompleted` diagnostic with its receipt once the answer is gone.
 
-**Current retention settings.** At open, and after every 10,000 finished calls, a persistent
-runtime retires state older than `RuntimeConfig::retention` (seven days by
-default):
+**Current retention settings.** At open, and on a runtime-owned background timer,
+a persistent runtime retires state older than `RuntimeConfig::retention` (seven
+days by default). `RuntimeConfig::maintenance_interval` defaults to 60 seconds
+and must be nonzero; sweeps continue while idle. Dropping the last runtime handle
+stops and joins the timer worker. Each sweep:
 
 - calls orphaned by a crash are marked dead;
 - finished calls' queue records are deleted, along with queue events;
@@ -212,9 +214,10 @@ An expired response also misses on read, before any sweep removes it.
 These are sweep-based soft cache limits, not hard byte admission bounds. Pending
 count/bytes and per-batch/idle work remain unbounded by these settings; see
 [boundary.md](boundary.md#bounds-as-labelled-settings).
-Periodic sweeps run on the blocking pool. Sweep errors reach the queue operation
-that triggered maintenance; a successful paid answer preserves that error in its
-`queue_complete_failed` diagnostic. Open-time maintenance errors refuse the open.
+Periodic sweeps run on a dedicated background thread. Maintenance failures are
+logged at WARN and exposed through `Runtime::last_maintenance_error`, which retains
+the most recent failure since open even if later sweeps succeed. Open-time
+maintenance errors refuse the open.
 A sweep or purge checks the whole cache tree before it deletes anything, including
 retained recovery answers. A refused purge removes nothing.
 If the root or any component in it is a symlink or belongs to another user,
@@ -226,7 +229,9 @@ source or tenant is erased, the host purges its responses. Each entry is
 matched by what its response's trace records: the request's `source` and
 `role_binding`, model, and typed binding identity (`CachedResponse::binding`).
 Tenant erasure matches `binding.tenant`, independently of free-text source labels. The purge reads every entry once, so it suits erasure, not a
-hot path.
+hot path. Until the Foundation job queue implements its purge flag and settlement
+without an answer (queue PR 3), the host drains in-flight calls for the affected
+input before declaring erasure complete.
 
 ## Calls in flight
 
@@ -242,8 +247,10 @@ Dropping the caller's future (a job timeout, `tokio::time::timeout` around
 - keeps its model slot until then, so an abandoned call still counts against
   `max_in_flight`.
 
-An identical caller waiting on the item, or a later identical request, gets
-the result through deduplication, the cache or ledger recovery.
+An identical caller waiting on the item can share its result through deduplication.
+A repeat of the same explicit invocation recovers its retained ledger answer. A
+later implicit call reuses a matching cached response when caching is enabled and
+dispatches again when caching is off.
 
 The attempt renews its lease every third of `lease_seconds`, from its claim
 until the item is completed or failed. That covers the provider call and

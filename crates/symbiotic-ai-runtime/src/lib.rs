@@ -29,8 +29,9 @@
 //!
 //! Once a provider call starts, it belongs to the runtime. A caller that
 //! stops waiting (a dropped future, a timeout around the call) does not
-//! cancel it: the call finishes, records its outcome, fills the cache and
-//! releases its queue item, and identical requests get its result.
+//! cancel it: the call finishes, records its outcome, stores any applicable cache
+//! entry and releases its queue item. Explicit invocation repeats recover their
+//! retained answer; implicit calls reuse a matching cached response or dispatch again.
 //!
 //! Every provider bound to one configured account shares one
 //! concurrency cap, one pair of rate buckets and one cooldown, whichever role
@@ -64,7 +65,7 @@ pub use model::{
     AcceptedSpendHandoff, SpendLedger, SpendReceipt, SpendReceiptRef, SpendReservation, SpendState,
 };
 
-use maintained::{MaintainedQueue, ResponseRetention};
+use maintained::{Maintenance, ResponseRetention, Sweep};
 
 /// The provider contracts and HTTP providers, for implementing or
 /// constructing the raw transports a [`ModelBinding`] wraps. Its `Queued*`
@@ -107,6 +108,9 @@ pub struct RuntimeConfig {
     /// receipts and frozen attempt budgets remain. Cached responses follow
     /// `response_max_age` and `response_max_bytes`.
     pub retention: Duration,
+    /// Time between background retention sweeps, including while idle.
+    /// Defaults to 60 seconds; zero is refused at open.
+    pub maintenance_interval: Duration,
     /// Cached responses older than this miss, and the retention sweep
     /// removes them. 30 days by default; `None` keeps them indefinitely.
     pub response_max_age: Option<Duration>,
@@ -124,6 +128,7 @@ impl Default for RuntimeConfig {
             trace_sink: None,
             receipt_sink: None,
             retention: model::DEFAULT_RETENTION,
+            maintenance_interval: Duration::from_secs(60),
             response_max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
             response_max_bytes: Some(1 << 30),
         }
@@ -137,7 +142,8 @@ pub enum ResponseCacheMode {
     /// binding identity and effective transport; no cache when it is in memory.
     #[default]
     Default,
-    /// No response cache: every call reaches the provider.
+    /// No response cache: implicit calls dispatch again. Explicit invocations
+    /// still recover their own retained answers.
     Off,
     /// A host cache. Its hits must carry the runtime's matching result scope.
     /// See [`ResponseCache`].
@@ -265,6 +271,7 @@ impl SharedLimits {
 }
 
 struct Inner {
+    maintenance: Option<Maintenance>,
     queue: Arc<dyn QueueBackend>,
     admission: ModelAdmission,
     rate_state: model::ModelRateState,
@@ -301,9 +308,17 @@ impl Runtime {
     /// needed, opens (or creates) its queue database and retires state older
     /// than the retention window.
     pub fn open(config: RuntimeConfig) -> Result<Self, ModelError> {
-        let queue: Arc<dyn QueueBackend> = match &config.state_dir {
-            Some(dir) => Arc::new(open_persistent_queue(dir, &config)?),
-            None => Arc::new(MemoryQueue::new()),
+        if config.maintenance_interval.is_zero() {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        let (queue, maintenance): (Arc<dyn QueueBackend>, _) = match &config.state_dir {
+            Some(dir) => {
+                let (queue, maintenance) = open_persistent_queue(dir, &config)?;
+                (Arc::new(queue), Some(maintenance))
+            }
+            None => (Arc::new(MemoryQueue::new()), None),
         };
         let spend: Arc<dyn SpendLedger> = match &config.state_dir {
             Some(dir) => Arc::new(
@@ -312,13 +327,14 @@ impl Runtime {
             ),
             None => Arc::new(model::UnavailableSpendLedger),
         };
-        Ok(Self::from_state(config, queue, spend))
+        Ok(Self::from_state(config, queue, spend, maintenance))
     }
 
     fn from_state(
         config: RuntimeConfig,
         queue: Arc<dyn QueueBackend>,
         spend: Arc<dyn SpendLedger>,
+        maintenance: Option<Maintenance>,
     ) -> Self {
         let worker_id = config
             .worker_id
@@ -327,6 +343,7 @@ impl Runtime {
         let worker_id = format!("{worker_id}:{}", QueueItemId::new().0);
         Self {
             inner: Arc::new(Inner {
+                maintenance,
                 spend,
                 queue,
                 admission: ModelAdmission::new(),
@@ -340,6 +357,16 @@ impl Runtime {
                 receipt_sink: config.receipt_sink,
             }),
         }
+    }
+
+    /// Most recent background maintenance failure since this runtime opened.
+    /// Successful later sweeps do not erase it. Only static diagnostics are exposed.
+    /// Dropping the last runtime handle stops and joins the maintenance worker.
+    pub fn last_maintenance_error(&self) -> Option<ModelError> {
+        self.inner
+            .maintenance
+            .as_ref()
+            .and_then(Maintenance::last_error)
     }
 
     /// Canonical receipt lookup. Consumer commit refusal never alters this receipt.
@@ -366,6 +393,7 @@ impl Runtime {
             RuntimeConfig::default(),
             Arc::new(MemoryQueue::new()),
             Arc::new(model::UnavailableSpendLedger),
+            None,
         )
     }
 
@@ -896,7 +924,7 @@ impl Sinks {
 fn open_persistent_queue(
     dir: &Path,
     config: &RuntimeConfig,
-) -> Result<MaintainedQueue, ModelError> {
+) -> Result<(SqliteQueue, Maintenance), ModelError> {
     // The state directory is the host's: it must already be private, or be
     // created so. Inside it, everything is the runtime's own: owner-only,
     // with wider permissions from earlier versions tightened, and no
@@ -922,8 +950,8 @@ fn open_persistent_queue(
     }
     let queue = SqliteQueue::open(&path)
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
-    let queue = MaintainedQueue::new(
-        queue,
+    let sweep = Sweep::new(
+        queue.clone(),
         config.retention,
         ResponseRetention {
             cache: DirResponseCache::new(responses),
@@ -932,8 +960,9 @@ fn open_persistent_queue(
         },
         spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention),
     );
-    queue.maintain()?;
-    Ok(queue)
+    sweep.maintain()?;
+    let maintenance = Maintenance::start(sweep, config.maintenance_interval)?;
+    Ok((queue, maintenance))
 }
 
 fn io_error(_path: &Path, _err: std::io::Error) -> ModelError {

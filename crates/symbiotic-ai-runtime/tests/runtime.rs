@@ -2473,6 +2473,172 @@ async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
 }
 
 #[tokio::test]
+async fn fdn_idle_runtime_deletes_expired_recovery_without_reopening() {
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().to_path_buf()),
+        retention: Duration::from_millis(50),
+        maintenance_interval: Duration::from_millis(10),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let raw = Loopback::new(unique_identity());
+    runtime
+        .execute_chat(
+            binding(raw.clone()).with_policy(policy()),
+            "idle-expiry",
+            request("private"),
+        )
+        .await
+        .unwrap();
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    let payload_count = || {
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(payload_count(), 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while payload_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(payload_count(), 0);
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn fdn_idle_maintenance_failure_remains_visible_after_success() {
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().to_path_buf()),
+        retention: Duration::from_secs(60),
+        maintenance_interval: Duration::from_millis(10),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    runtime
+        .execute_chat(
+            binding(Loopback::new(unique_identity())).with_policy(policy()),
+            "failure",
+            request("private"),
+        )
+        .await
+        .unwrap();
+    assert!(runtime.last_maintenance_error().is_none());
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_expiry BEFORE UPDATE OF recovery ON spend_receipts WHEN NEW.recovery IS NULL BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;
+        UPDATE spend_receipts SET recovery_expires_at='2000-01-01T00:00:00+00:00';").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while runtime.last_maintenance_error().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.last_maintenance_error().unwrap().code(),
+        symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+    );
+    let payload_count = || {
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(payload_count(), 1);
+    conn.execute_batch("DROP TRIGGER refuse_expiry;").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while payload_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(payload_count(), 0);
+    assert_eq!(
+        runtime.last_maintenance_error().unwrap().code(),
+        symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+    );
+}
+
+#[tokio::test]
+async fn fdn_maintenance_lives_until_last_runtime_handle_not_provider_drop() {
+    let dir = private_tempdir();
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(dir.path().to_path_buf()),
+        retention: Duration::from_secs(60),
+        maintenance_interval: Duration::from_millis(10),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let retained = runtime.clone();
+    let provider = runtime
+        .chat(
+            binding(Loopback::new(unique_identity()))
+                .with_policy(policy())
+                .with_invocation("lifetime"),
+        )
+        .unwrap();
+    provider.chat(request("private")).await.unwrap();
+    drop(runtime);
+    let conn =
+        rusqlite::Connection::open(dir.path().join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+    conn.execute(
+        "UPDATE spend_receipts SET recovery_expires_at='2000-01-01T00:00:00+00:00'",
+        [],
+    )
+    .unwrap();
+    let payload_count = || {
+        conn.query_row(
+            "SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .unwrap()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while payload_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(payload_count(), 0);
+    drop(retained);
+    // The bound provider still owns the queue, but not the maintenance timer.
+    conn.execute(
+        "UPDATE spend_receipts SET recovery='{}', recovery_expires_at='2000-01-01T00:00:00+00:00'",
+        [],
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(payload_count(), 1);
+    drop(provider);
+}
+
+#[test]
+fn fdn_zero_maintenance_interval_is_refused() {
+    assert!(matches!(
+        Runtime::open(RuntimeConfig {
+            maintenance_interval: Duration::ZERO,
+            ..RuntimeConfig::default()
+        }),
+        Err(ModelError::InvalidRequest(
+            symbiotic_core::DiagnosticCode::InvalidConfiguration
+        ))
+    ));
+    assert_eq!(
+        RuntimeConfig::default().maintenance_interval,
+        Duration::from_secs(60)
+    );
+    assert!(Runtime::in_memory().last_maintenance_error().is_none());
+}
+
+#[tokio::test]
 async fn fdn_saved_answer_expires_at_retention_without_reopening() {
     let dir = private_tempdir();
     let runtime = Runtime::open(RuntimeConfig {
