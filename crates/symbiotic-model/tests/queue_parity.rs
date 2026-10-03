@@ -3033,3 +3033,216 @@ async fn lease_loss_at_transport_boundary_preserves_unused_provider_attempts(
         assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}");
     }
 }
+
+/// Advertise a custom backend identity at enqueue or only after claiming.
+struct ReferenceIds {
+    inner: MemoryQueue,
+    reference_id: QueueItemId,
+    original_id: Mutex<Option<QueueItemId>>,
+    refusal: Mutex<Option<Failure>>,
+    advertise_at_enqueue: bool,
+    fail_settlement: bool,
+}
+
+impl ReferenceIds {
+    fn new(id: String, advertise_at_enqueue: bool, fail_settlement: bool) -> Self {
+        Self {
+            inner: MemoryQueue::new(),
+            reference_id: QueueItemId(id),
+            original_id: Mutex::new(None),
+            refusal: Mutex::new(None),
+            advertise_at_enqueue,
+            fail_settlement,
+        }
+    }
+
+    fn stored_id(&self, item_id: &QueueItemId) -> QueueItemId {
+        if *item_id == self.reference_id {
+            self.original_id.lock().unwrap().clone().unwrap()
+        } else {
+            item_id.clone()
+        }
+    }
+}
+
+#[async_trait]
+impl QueueBackend for ReferenceIds {
+    async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
+        let mut outcome = self.inner.enqueue(request).await?;
+        *self.original_id.lock().unwrap() = Some(outcome.item.item_id.clone());
+        if self.advertise_at_enqueue {
+            outcome.item.item_id = self.reference_id.clone();
+        }
+        Ok(outcome)
+    }
+    async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
+        self.inner.claim(request).await
+    }
+    async fn claim_item(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_in_flight: Option<usize>,
+    ) -> Result<Option<QueueItem>, QueueError> {
+        let mut item = self
+            .inner
+            .claim_item(
+                &self.stored_id(item_id),
+                worker_id,
+                lease_seconds,
+                max_in_flight,
+            )
+            .await?;
+        if let Some(item) = &mut item {
+            item.item_id = self.reference_id.clone();
+        }
+        Ok(item)
+    }
+
+    async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
+        self.inner.get_item(&self.stored_id(item_id)).await
+    }
+    async fn heartbeat(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<(), QueueError> {
+        self.inner
+            .heartbeat(&self.stored_id(item_id), worker_id, lease_seconds)
+            .await
+    }
+    async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
+        self.inner
+            .complete(&self.stored_id(item_id), worker_id)
+            .await
+    }
+    async fn fail(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        error: symbiotic_core::DiagnosticCode,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<FailOutcome, QueueError> {
+        self.inner
+            .fail(
+                &self.stored_id(item_id),
+                worker_id,
+                error,
+                retry_after_seconds,
+            )
+            .await
+    }
+    async fn fail_with(
+        &self,
+        item_id: &QueueItemId,
+        worker_id: &str,
+        failure: Failure,
+    ) -> Result<FailOutcome, QueueError> {
+        *self.refusal.lock().unwrap() = Some(failure.clone());
+        if self.fail_settlement {
+            return Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::StorageFailure,
+            ));
+        }
+        self.inner
+            .fail_with(&self.stored_id(item_id), worker_id, failure)
+            .await
+    }
+    async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
+        self.inner.reclaim_expired_leases(queue_id).await
+    }
+}
+
+#[tokio::test]
+async fn receipt_ref_item_ids_are_bounded_at_enqueue_for_every_attempt() {
+    // Reserve the runtime prefix, separator and all ten u32 attempt digits.
+    let max_item_bytes = 256 - "runtime:".len() - 1 - u32::MAX.to_string().len();
+    for id in [
+        "a".repeat(max_item_bytes + 1),
+        "é".repeat(max_item_bytes / 2 + 1),
+    ] {
+        let backend = Arc::new(ReferenceIds::new(id, true, false));
+        let raw = Loopback::new(unique_identity());
+        let error = queued(raw.clone(), backend.clone(), config())
+            .chat(request("overlong enqueue identity"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::SpendReceiptRefTooLong)
+            ),
+            "{error:?}"
+        );
+        let original = backend.original_id.lock().unwrap().clone().unwrap();
+        let item = backend.inner.get_item(&original).await.unwrap().unwrap();
+        assert_eq!(item.status, QueueStatus::Pending);
+        assert_eq!(item.attempt, 0, "refuse before claiming");
+        assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+    }
+    let backend = Arc::new(ReferenceIds::new("a".repeat(max_item_bytes), true, false));
+    let raw = Loopback::new(unique_identity());
+    queued(raw.clone(), backend, config())
+        .chat(request("largest permitted identity"))
+        .await
+        .unwrap();
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn receipt_ref_failure_after_claim_releases_lease_and_records_refusal() {
+    let backend = Arc::new(ReferenceIds::new("a".repeat(256), false, false));
+    let raw = Loopback::new(unique_identity());
+    let spend = ObservedSpend::new(Duration::ZERO);
+    let error = queued(raw.clone(), backend.clone(), config())
+        .with_spend_ledger(spend.clone(), None)
+        .chat(request("overlong claimed identity"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::SpendReceiptRefTooLong)
+        ),
+        "{error:?}"
+    );
+    let original = backend.original_id.lock().unwrap().clone().unwrap();
+    let item = backend.inner.get_item(&original).await.unwrap().unwrap();
+    assert_eq!(item.status, QueueStatus::Stopped);
+    assert_eq!(
+        item.last_error,
+        Some(symbiotic_core::DiagnosticCode::SpendReceiptRefTooLong)
+    );
+    assert_eq!(
+        item.last_error_class,
+        Some(symbiotic_core::FailureClass::InvalidRequest)
+    );
+    assert!(item.lease_owner.is_none());
+    assert!(item.lease_until.is_none());
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+    assert!(spend.reservations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn receipt_ref_failure_after_claim_propagates_settlement_error() {
+    let backend = Arc::new(ReferenceIds::new("a".repeat(256), false, true));
+    let raw = Loopback::new(unique_identity());
+    let error = queued(raw.clone(), backend.clone(), config())
+        .chat(request("refused settlement"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        backend.refusal.lock().unwrap().as_ref().unwrap().error,
+        symbiotic_core::DiagnosticCode::SpendReceiptRefTooLong
+    );
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+}

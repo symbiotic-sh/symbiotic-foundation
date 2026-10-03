@@ -12,9 +12,10 @@ pub struct SpendReceiptRef(String);
 
 impl SpendReceiptRef {
     /// Maximum stored reference size in UTF-8 bytes.
-    // egress: + 64 SHA-256 hex bytes = 71; runtime: + 36-byte UUID item ID
-    // + : + 10 decimal digits (u32::MAX attempt) = 55. Custom IDs are checked too.
-    pub const MAX_BYTES: usize = 71;
+    // 256 gives generous headroom over emitted egress references (71 bytes)
+    // and UUID runtime references (55 bytes at u32::MAX). Model enqueue checks
+    // custom item IDs against the longest runtime reference before claiming.
+    pub const MAX_BYTES: usize = 256;
 
     /// Construct a reference, refusing values longer than [`Self::MAX_BYTES`].
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -231,8 +232,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receipt_ref_has_generous_headroom() {
+        assert_eq!(SpendReceiptRef::MAX_BYTES, 256);
+        assert!(SpendReceiptRef::new("a".repeat(256)).is_ok());
+    }
+
+    #[test]
     fn receipt_ref_over_max_refused_at_construction_and_decode() {
-        for value in ["a".repeat(SpendReceiptRef::MAX_BYTES + 1), "é".repeat(36)] {
+        for value in [
+            "a".repeat(SpendReceiptRef::MAX_BYTES + 1),
+            "é".repeat(SpendReceiptRef::MAX_BYTES / 2 + 1),
+        ] {
             assert!(matches!(
                 SpendReceiptRef::new(value.clone()),
                 Err(ModelError::InvalidRequest(
@@ -249,7 +259,7 @@ mod tests {
         }
         for value in [
             "a".repeat(SpendReceiptRef::MAX_BYTES),
-            format!("{}a", "é".repeat(35)),
+            "é".repeat(SpendReceiptRef::MAX_BYTES / 2),
         ] {
             let reference = SpendReceiptRef::new(value.clone()).unwrap();
             assert_eq!(reference.as_str(), value);

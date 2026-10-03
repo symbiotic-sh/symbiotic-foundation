@@ -166,10 +166,14 @@ so the state directory and everything in it are owner-only:
 
 The ledger durably reserves one provider request before dispatch and retains Unknown
 charge after crash, timeout or missing usage; success settles measured usage.
-`SpendReceiptRef::MAX_BYTES` is 71 UTF-8 bytes. Construction and deserialization
-refuse longer references. This covers `egress:` plus a 64-byte SHA-256 hex digest
-and `runtime:` plus a 36-byte UUID item ID, `:`, and a ten-digit `u32` attempt.
-Custom queue IDs must also fit the reference bound before provider spending.
+`SpendReceiptRef::MAX_BYTES` is 256 UTF-8 bytes, giving generous headroom over
+emitted `egress:` references (71 bytes) and UUID `runtime:` references (55 bytes
+at `u32::MAX`). Construction and deserialization refuse longer references.
+Every model enqueue result must have an item ID that fits `runtime:{item_id}:{attempt}`
+for every `u32` attempt: at most 237 UTF-8 bytes. Oversized IDs are refused with
+`SpendReceiptRefTooLong` before claiming; reference-construction failures after
+claiming abort before dispatch, recording the refusal and releasing the lease.
+Queue settlement errors propagate to the caller.
 `QueueReceipt::spend_receipt` carries a typed `SpendReceiptRef`, looked up through
 `Runtime::spend_receipt` even after queue retention. Same-attempt output recovery is
 independent of cache purge/expiry; callers identify new invocations through request

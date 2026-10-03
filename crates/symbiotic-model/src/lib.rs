@@ -971,6 +971,7 @@ impl<Req> QueuedCall<Req> {
             })
             .await
             .map_err(queue_error)
+            .and_then(validate_runtime_enqueue)
     }
 
     async fn renew_budget(&self, current: &QueueItemId) -> Result<EnqueueOutcome, ModelError> {
@@ -1129,8 +1130,9 @@ impl<Req> QueuedCall<Req> {
                 &item.item_id,
             )
             .await
-            .map(Some)
             .map_err(queue_error)
+            .and_then(validate_runtime_enqueue)
+            .map(Some)
     }
 
     /// The next item of the request's retry chain after `dead`, or `None`
@@ -1805,10 +1807,20 @@ where
         Err(symbiotic_queue::QueueError::NotFound(_)) => return Ok(AttemptEnd::Missing),
         Err(err) => return Err(queue_error(err)),
     };
-    this.attempt_context.clear()?;
-    let reference = match &this.accepted_spend {
-        Some(handoff) => handoff.reservation.reference.clone(),
-        None => spend::runtime_reference(&item.item_id.0, item.attempt)?,
+    let reference = this
+        .attempt_context
+        .clear()
+        .and_then(|()| match &this.accepted_spend {
+            Some(handoff) => Ok(handoff.reservation.reference.clone()),
+            None => spend::runtime_reference(&item.item_id.0, item.attempt),
+        });
+    let reference = match reference {
+        Ok(reference) => reference,
+        Err(err) => {
+            let (err, failed) = this.abort_before_dispatch(&item, None, err).await;
+            failed.map_err(queue_error)?;
+            return Err(err);
+        }
     };
     let ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled = holding_lease(
@@ -2670,7 +2682,8 @@ async fn reenqueue_dead_item(
             &item.item_id,
         )
         .await
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+        .and_then(validate_runtime_enqueue)?;
     Ok(Some(outcome))
 }
 
@@ -2714,6 +2727,14 @@ async fn reenqueue_with_fresh_budget(
         )
         .await
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+        .and_then(validate_runtime_enqueue)
+}
+
+// All model enqueue paths refuse IDs that cannot represent every u32 attempt.
+#[cfg(feature = "queue")]
+fn validate_runtime_enqueue(outcome: EnqueueOutcome) -> Result<EnqueueOutcome, ModelError> {
+    spend::runtime_reference(&outcome.item.item_id.0, u32::MAX)?;
+    Ok(outcome)
 }
 
 #[cfg(feature = "queue")]
