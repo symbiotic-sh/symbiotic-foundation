@@ -687,3 +687,105 @@ async fn configured_retrieval_uses_shared_receipts_and_redacts_before_persistenc
         }
     }
 }
+
+#[tokio::test]
+async fn configured_anthropic_uses_credentials_queue_receipt_and_ledger() {
+    let (endpoint, server) = fixture(
+        200,
+        json!({
+            "content":[{"type":"text","text":"OK"}], "stop_reason":"end_turn",
+            "usage":{"input_tokens":7,"output_tokens":3}
+        })
+        .to_string(),
+        None,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let mut config: Value =
+        serde_json::from_slice(include_bytes!("../../../examples/model-registry.json")).unwrap();
+    config["models"][0]["adapter"] = json!("anthropic_chat");
+    config["accounts"] = json!([{"id":"policy","policy":ModelQueueConfig {
+        logical_retry_attempts:1, retry_attempts:1, request_timeout_seconds:Some(2), ..ModelQueueConfig::default()
+    }}]);
+    config["bindings"] = json!([{
+        "identity":{"tenant":"tenant","provider":"provider","revision":"1","account":"account"},
+        "model":"example-chat-alias","endpoint":endpoint,"secret_ref":"synthetic",
+        "account_policy":"policy","account_sharing_key":null,
+        "limits":{"max_request_bytes":65536,"max_response_bytes":65536,"max_output_tokens":128},
+        "settings":{"thinking":"enabled"}
+    }]);
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let runtime = Runtime::open(RuntimeConfig {
+        state_dir: Some(state.path().join("state")),
+        registry: Some(Arc::new(
+            model::ModelRegistry::from_json(&serde_json::to_vec(&config).unwrap()).unwrap(),
+        )),
+        receipt_sink: Some(receipts.clone()),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let wrong =
+        model::OpenAiCompatibleChatProvider::new("example", "example-model", &endpoint, KEY)
+            .with_request_limit(65536)
+            .with_response_limit(65536)
+            .with_output_limit(128)
+            .with_thinking(Some(model::ThinkingMode::Enabled));
+    let wrong_binding = runtime
+        .registry_binding(
+            &TenantId("tenant".into()),
+            &ProviderPrincipalId("provider".into()),
+            wrong,
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.chat(wrong_binding),
+        Err(ModelError::InvalidRequest(_))
+    ));
+    let configured = runtime
+        .configured_provider(
+            &TenantId("tenant".into()),
+            &ProviderPrincipalId("provider".into()),
+            &Credentials(KEY),
+        )
+        .await
+        .unwrap();
+    let ConfiguredProvider::Chat(provider) = configured else {
+        panic!("chat expected")
+    };
+    let descriptor = provider.descriptor();
+    assert_eq!(descriptor.metadata["wire"], "anthropic-messages");
+    let response = provider
+        .chat(ChatRequest {
+            messages: vec![model::ChatMessage {
+                role: "user".into(),
+                content: "synthetic prompt".into(),
+            }],
+            max_output_tokens: Some(32),
+            temperature: None,
+            response_format: None,
+            role_binding: None,
+            source: None,
+            metadata: Value::Null,
+        })
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(response.text, "OK");
+    assert_eq!(response.trace.usage.input_tokens, Some(7));
+    assert!(response.trace.queue_item_id.is_some());
+    let recorded = receipts.receipts();
+    assert_eq!(
+        recorded.iter().map(|r| r.status).collect::<Vec<_>>(),
+        vec![
+            symbiotic_ai_runtime::ReceiptStatus::Queued,
+            symbiotic_ai_runtime::ReceiptStatus::Running,
+            symbiotic_ai_runtime::ReceiptStatus::Succeeded,
+        ]
+    );
+    assert_eq!(recorded[2].usage.as_ref().unwrap().input_tokens, Some(7));
+    let spend = runtime
+        .spend_receipt(recorded[2].spend_receipt.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(spend.usage.unwrap().input_tokens, Some(7));
+    assert_no_secret_files(state.path());
+}

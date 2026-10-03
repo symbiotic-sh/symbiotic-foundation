@@ -6,7 +6,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use symbiotic_ai_runtime::{
-    model::{CredentialBoundary, GeminiEmbeddingProvider, OpenAiCompatibleChatProvider},
+    model::{
+        AnthropicChatProvider, CredentialBoundary, GeminiEmbeddingProvider,
+        OpenAiCompatibleChatProvider,
+    },
     *,
 };
 use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, ProviderPayload};
@@ -137,6 +140,10 @@ pub(crate) fn route_settings(
         RouteProvider::OpenAiChat { operator } => {
             (model::ModelAdapter::OpenAiChat, operator.as_str())
         }
+        RouteProvider::AnthropicChat { operator, thinking } => {
+            settings.thinking = *thinking;
+            (model::ModelAdapter::AnthropicChat, operator.as_str())
+        }
         RouteProvider::GeminiEmbedding { dimensions } => {
             settings.dimensions = Some(*dimensions);
             (model::ModelAdapter::GeminiEmbedding, "gemini")
@@ -238,7 +245,7 @@ pub(crate) fn configured_registry(
             limits: model::ProviderLimits {
                 max_request_bytes: route.max_input_bytes,
                 max_response_bytes: route.max_response_bytes,
-                max_output_tokens: if adapter == model::ModelAdapter::OpenAiChat {
+                max_output_tokens: if adapter.capability() == model::ModelCapability::Chat {
                     Some(route.max_output_tokens)
                 } else {
                     None
@@ -296,6 +303,20 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
                 )
                 .map(|_| ())
         }
+        RouteProvider::AnthropicChat { operator, thinking } => runtime
+            .chat(
+                route_binding(
+                    runtime,
+                    route,
+                    AnthropicChatProvider::new(operator, &route.model, &route.destination, "")
+                        .with_request_limit(route.max_input_bytes)
+                        .with_response_limit(route.max_response_bytes)
+                        .with_output_limit(route.max_output_tokens)
+                        .with_thinking(*thinking),
+                )?
+                .with_response_cache(ResponseCacheMode::Off),
+            )
+            .map(|_| ()),
         RouteProvider::OpenAiChat { operator } => runtime
             .chat(
                 route_binding(
@@ -412,19 +433,41 @@ pub(crate) async fn execute(
 ) -> Result<(ProviderOutput, UsageTrace, Vec<DispatchDiagnostic>), ExecuteError> {
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
-        (RouteProvider::OpenAiChat { operator }, ProviderPayload::Chat(request)) => {
+        (
+            RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. },
+            ProviderPayload::Chat(request),
+        ) => {
+            let inner: Arc<dyn ChatProvider> = match &route.provider {
+                RouteProvider::AnthropicChat { thinking, .. } => Arc::new(
+                    AnthropicChatProvider::new(
+                        operator,
+                        &route.model,
+                        &route.destination,
+                        secret.value(),
+                    )
+                    .with_timeout(route.timeout_seconds)
+                    .map_err(|_| EgressError::InvalidRequest)?
+                    .with_request_limit(route.max_input_bytes)
+                    .with_response_limit(route.max_response_bytes)
+                    .with_output_limit(route.max_output_tokens)
+                    .with_thinking(*thinking),
+                ),
+                _ => Arc::new(
+                    OpenAiCompatibleChatProvider::new(
+                        operator,
+                        &route.model,
+                        &route.destination,
+                        secret.value(),
+                    )
+                    .with_timeout(route.timeout_seconds)
+                    .map_err(|_| EgressError::InvalidRequest)?
+                    .with_request_limit(route.max_input_bytes)
+                    .with_response_limit(route.max_response_bytes)
+                    .with_output_limit(route.max_output_tokens),
+                ),
+            };
             let provider = Dispatched {
-                inner: OpenAiCompatibleChatProvider::new(
-                    operator,
-                    &route.model,
-                    &route.destination,
-                    secret.value(),
-                )
-                .with_timeout(route.timeout_seconds)
-                .map_err(|_| EgressError::InvalidRequest)?
-                .with_request_limit(route.max_input_bytes)
-                .with_response_limit(route.max_response_bytes)
-                .with_output_limit(route.max_output_tokens),
+                inner,
                 started: started.clone(),
             };
             let provider = runtime
