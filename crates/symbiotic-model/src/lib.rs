@@ -1014,7 +1014,17 @@ impl<Req> QueuedCall<Req> {
             .enqueue(EnqueueRequest {
                 queue_id: self.queue_id.clone(),
                 kind: self.kind.clone(),
-                payload: self.payload(self.retry_state(None).await?),
+                // A fresh item starts with zero attempts; explicit invocations keep their
+                // retry state in the ledger, so their payload carries none and needs no read.
+                payload: model_queue_payload(
+                    &self.capability,
+                    &self.request_hash,
+                    &self.descriptor,
+                    (!self.explicit_invocation).then(|| LogicalRetryState {
+                        attempts_used: 0,
+                        max_attempts: logical_max_attempts(&self.config),
+                    }),
+                ),
                 idempotency_key: self.idempotency_key.clone(),
                 run_after: None,
                 max_attempts: Some(item_max_attempts(&self.config)),
