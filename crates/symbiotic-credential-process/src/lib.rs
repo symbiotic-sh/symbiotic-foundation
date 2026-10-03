@@ -6,6 +6,9 @@ mod process_security;
 #[cfg(unix)]
 pub use process_security::protect_process;
 
+mod in_process;
+pub use in_process::InProcessEgressClient;
+
 mod provider;
 mod registry;
 pub mod secrets;
