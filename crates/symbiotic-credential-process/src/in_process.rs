@@ -27,15 +27,14 @@ impl EgressClient for InProcessEgressClient {
     async fn exchange(&self, request: Request) -> Result<Response, EgressError> {
         let limit = self.process.config().max_frame_bytes;
         let bytes = encode_frame(&request, limit)?;
-        let request: Request = match serde_json::from_slice(&bytes) {
-            Ok(request) => request,
-            Err(_) => {
-                return Ok(Response {
-                    version: PROTOCOL_VERSION,
-                    result: Err(EgressError::InvalidRequest),
-                });
-            }
-        };
+        // Check wire decodability (including nesting limits), but validate the
+        // original typed request: JSON turns nonfinite temperatures into null.
+        if serde_json::from_slice::<Request>(&bytes).is_err() {
+            return Ok(Response {
+                version: PROTOCOL_VERSION,
+                result: Err(EgressError::InvalidRequest),
+            });
+        }
         let process = self.process.clone();
         tokio::spawn(async move {
             let response = process.handle(request).await;

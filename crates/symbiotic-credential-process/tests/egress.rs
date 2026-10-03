@@ -3278,6 +3278,69 @@ async fn anthropic_invalid_temperatures_are_refused_before_consumption() {
     }
 }
 
+#[tokio::test]
+async fn in_process_nonfinite_temperatures_cannot_alias_an_admitted_request() {
+    let mut fixture = Fixture::with_http_response(
+        200,
+        serde_json::json!({
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 1}
+        })
+        .to_string(),
+        Duration::ZERO,
+        "0",
+        true,
+        false,
+    )
+    .await;
+    fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+        operator: "anthropic".into(),
+        thinking: None,
+    };
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process.clone());
+    let (admission, payload) = fixture.attempt("nonfinite-temperature", 1, 1);
+    let granted = permit(&process, &admission).await;
+    for temperature in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+        let mut invalid_payload = payload.clone();
+        let ProviderPayload::Chat(chat) = &mut invalid_payload else {
+            panic!("chat expected")
+        };
+        chat.temperature = Some(temperature);
+        // JSON maps nonfinite floats to null, so the digest alone cannot
+        // distinguish these invalid inputs from the admitted absent temperature.
+        assert_eq!(invalid_payload.digest().unwrap(), payload.digest().unwrap());
+        assert!(matches!(
+            exchange_client(
+                &client,
+                inject(admission.clone(), invalid_payload, granted.clone()),
+            )
+            .await,
+            Err(EgressError::InvalidRequest)
+        ));
+        assert!(matches!(
+            status(&process, &admission).await,
+            AttemptStatus::Permitted
+        ));
+        assert!(matches!(
+            exchange(&process, Operation::Receipt(signed_id(&admission))).await,
+            Ok(Reply::Receipt(None))
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger_totals(&fixture), (0, 0));
+    }
+    let result = dispatched(
+        exchange_client(&client, inject(admission, payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert!(matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "answer"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
 async fn anthropic_invalid_conversation_is_refused(
     prefill: bool,
     temperature: Option<f32>,
