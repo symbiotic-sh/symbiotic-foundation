@@ -1262,6 +1262,15 @@ pub mod jobs {
     pub async fn jobs_case_20_claim_generation_fencing(backend: Arc<dyn QueueBackend>) {
         let mut s = Suite::new(backend);
         let id = s.insert(s.spec("fencing")).await;
+        let mut other = s.spec("other-running");
+        other.kind = "other".into();
+        let other_running = s.insert(other).await;
+        s.op(JobRequest::ClaimJob(other_running.clone()))
+            .await
+            .unwrap();
+        let mut other = s.spec("other-pending");
+        other.kind = "other".into();
+        let other_pending = s.insert(other).await;
         let first = s.claim().await;
         s.op(JobRequest::Checkpoint {
             job: id.clone(),
@@ -1271,8 +1280,30 @@ pub mod jobs {
         .await
         .unwrap();
         s.advance(31);
+        let excluded = [s.get(&other_running).await, s.get(&other_pending).await];
+        match s
+            .op(JobRequest::Candidates {
+                kinds: vec!["handler".into()],
+                limit: 4,
+                max_bytes: 100_000,
+                background_in_flight: 0,
+            })
+            .await
+            .unwrap()
+        {
+            JobResponse::Candidates(rows) => {
+                assert_eq!(rows.iter().map(|r| &r.id).collect::<Vec<_>>(), vec![&id])
+            }
+            other => panic!("{other:?}"),
+        }
         let second = s.claim().await;
         assert_eq!(second.id, id);
+        for before in excluded {
+            assert_eq!(
+                serde_json::to_value(s.get(&before.id).await).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
         assert!(second.generation > first.generation);
         assert_eq!(second.checkpoint, Some(b"session".to_vec()));
         for req in [
@@ -1697,6 +1728,12 @@ pub mod jobs {
     pub async fn jobs_invalid_bounds_and_leases_leave_store_usable(backend: Arc<dyn QueueBackend>) {
         let mut s = Suite::new(backend);
         let id = s.insert(s.spec("invalid")).await;
+        s.config.maintenance_bytes_per_pass = 0;
+        assert!(matches!(
+            s.op(JobRequest::Maintain).await,
+            Err(JobError::InvalidRequest)
+        ));
+        s.config.maintenance_bytes_per_pass = JobConfig::default().maintenance_bytes_per_pass;
         s.config.claim_lease_seconds = u64::MAX;
         assert!(matches!(
             s.op(JobRequest::Claim {
@@ -2033,10 +2070,182 @@ pub mod jobs {
         unrelated.owners = vec!["other".into()];
         let unrelated = s.insert(unrelated).await;
         assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 7);
+        let mut erased = Vec::new();
         for id in ids {
-            assert_eq!(s.get(&id).await.state, JobState::Purged);
+            let row = s.get(&id).await;
+            assert_eq!(row.state, JobState::Purged);
+            assert!(row.owners.is_empty());
+            erased.push(row);
+        }
+        s.advance(1);
+        let new = s.insert(s.spec("new-owner-job")).await;
+        assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 1);
+        assert_eq!(s.get(&new).await.state, JobState::Purged);
+        for before in erased {
+            assert_eq!(
+                serde_json::to_value(s.get(&before.id).await).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
         }
         assert_eq!(s.get(&unrelated).await.state, JobState::Pending);
+    }
+
+    /// An oversized expired job is erased alone and cannot stall later maintenance.
+    pub async fn jobs_maintenance_oversized_job_makes_progress(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.retention_seconds = 1;
+        s.config.maintenance_bytes_per_pass = 16;
+        assert_eq!(
+            JobConfig::default().maintenance_bytes_per_pass,
+            16 * 1024 * 1024
+        );
+        let mut ids = Vec::new();
+        for output in [json!(null), json!("x".repeat(32)), json!(null)] {
+            let mut spec = s.spec(&format!("maintenance-{}", ids.len()));
+            spec.payload = Value::Null;
+            let id = s.insert(spec).await;
+            let claim = s.claim().await;
+            s.complete(&claim, output).await;
+            ids.push(id);
+            s.advance(1);
+        }
+        // The first small job cannot share a pass with the oversized second job.
+        for (pass, id) in ids.iter().enumerate() {
+            assert_eq!(s.changed(JobRequest::Maintain).await, 1);
+            let row = s.get(id).await;
+            assert!(row.result_expired && row.payload.is_none() && row.output.is_none());
+            assert_eq!(row.output_bytes, 0);
+            for waiting in &ids[pass + 1..] {
+                assert!(!s.get(waiting).await.result_expired);
+            }
+        }
+        assert_eq!(s.changed(JobRequest::Maintain).await, 0);
+    }
+
+    /// The budget counts encoded UTF-8 input and result bytes and splits a small-job backlog.
+    pub async fn jobs_maintenance_small_jobs_share_byte_budget(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.retention_seconds = 1;
+        // Each retained payload encodes to 4 bytes and each result to 6 bytes.
+        s.config.maintenance_bytes_per_pass = 20;
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let mut spec = s.spec(&format!("maintenance-small-{i}"));
+            spec.payload = json!("é");
+            let id = s.insert(spec).await;
+            let claim = s.claim().await;
+            s.complete(&claim, json!("🦀")).await;
+            ids.push(id);
+            s.advance(1);
+        }
+        let mut erased = 0;
+        for expected in [2, 2, 1, 0] {
+            assert_eq!(s.changed(JobRequest::Maintain).await, expected);
+            erased += expected;
+            for (i, id) in ids.iter().enumerate() {
+                let row = s.get(id).await;
+                assert_eq!(row.result_expired, i < erased);
+                assert_eq!(row.payload.is_none(), i < erased);
+                assert_eq!(row.output.is_none(), i < erased);
+            }
+        }
+    }
+
+    /// Result limits use encoded UTF-8 bytes and reject before changing the claim.
+    pub async fn jobs_result_byte_limit_is_atomic(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.max_result_bytes = 4;
+        let id = s.insert(s.spec("result-bound")).await;
+        let claim = s.claim().await;
+        let before = s.get(&id).await;
+        assert!(matches!(s.op(JobRequest::Complete {
+            job: id.clone(), generation: claim.generation, state: JobState::Succeeded,
+            origin: ResultOrigin::Handler, output: Some(json!("🦀")), receipt: None, diagnostic: None,
+        }).await, Err(JobError::ResultTooLarge { job, bytes: 6 }) if job == id));
+        assert_eq!(
+            serde_json::to_value(s.get(&id).await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        s.complete(&claim, json!("é")).await;
+        assert_eq!(s.get(&id).await.output, Some(json!("é")));
+        assert_eq!(
+            s.deliveries(1, 100_000).await[0].completion.output,
+            Some(json!("é"))
+        );
+        let cache = s.insert(s.spec("cache-result-bound")).await;
+        assert!(matches!(s.op(JobRequest::Complete {
+            job: cache.clone(), generation: 0, state: JobState::Succeeded,
+            origin: ResultOrigin::Cache, output: Some(json!("🦀")), receipt: None, diagnostic: None,
+        }).await, Err(JobError::ResultTooLarge { job, bytes: 6 }) if job == cache));
+        assert_eq!(s.get(&cache).await.state, JobState::Pending);
+        s.op(JobRequest::Complete {
+            job: cache.clone(),
+            generation: 0,
+            state: JobState::Succeeded,
+            origin: ResultOrigin::Cache,
+            output: Some(json!(null)),
+            receipt: None,
+            diagnostic: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.get(&cache).await.output_bytes, 4);
+    }
+
+    /// Erased paid uncertainty stays reconcilable until terminal ledger evidence.
+    pub async fn jobs_purged_complete_uncertain_then_resolve(backend: Arc<dyn QueueBackend>) {
+        let s = Suite::new(backend);
+        for resolution in [
+            JobResolution::KnownZeroCharge {
+                receipt: "receipt".into(),
+            },
+            JobResolution::PaidResult {
+                receipt: "receipt".into(),
+                recovery_until: None,
+            },
+            JobResolution::Failed {
+                receipt: "receipt".into(),
+                diagnostic: symbiotic_core::DiagnosticCode::AttemptBudgetExhausted,
+            },
+        ] {
+            let mut spec = s.spec(&format!("uncertain-{resolution:?}"));
+            spec.execution = Execution::Model;
+            let id = s.insert(spec).await;
+            let claim = s.claim().await;
+            assert_eq!(claim.id, id);
+            assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 1);
+            s.op(JobRequest::Complete {
+                job: id.clone(),
+                generation: claim.generation,
+                state: JobState::Uncertain,
+                origin: ResultOrigin::Paid,
+                output: None,
+                receipt: Some("receipt".into()),
+                diagnostic: Some(symbiotic_core::DiagnosticCode::SpendReconciliationRequired),
+            })
+            .await
+            .unwrap();
+            let row = s.get(&id).await;
+            assert_eq!(row.state, JobState::Uncertain);
+            assert!(
+                row.purged
+                    && row.payload.is_none()
+                    && row.output.is_none()
+                    && row.checkpoint.is_none()
+                    && row.admission.is_none()
+            );
+            assert!(row.finished_at.is_none());
+            s.op(JobRequest::Resolve {
+                job: id.clone(),
+                generation: claim.generation,
+                resolution,
+            })
+            .await
+            .unwrap();
+            let row = s.get(&id).await;
+            assert_eq!(row.state, JobState::Purged);
+            assert!(row.purged && row.payload.is_none() && row.output.is_none());
+        }
     }
 
     /// Rebuilding is bounded and hides partial counts, including transitions between passes.
@@ -2206,6 +2415,10 @@ macro_rules! job_backend_conformance {
             jobs_purged_expired_claim_cancel_is_purged,
             jobs_cancel_deduplicates_and_chunks_unfinished_group,
             jobs_owner_purge_chunks_membership,
+            jobs_purged_complete_uncertain_then_resolve,
+            jobs_result_byte_limit_is_atomic,
+            jobs_maintenance_oversized_job_makes_progress,
+            jobs_maintenance_small_jobs_share_byte_budget,
             jobs_summary_rebuild_resumes_with_transitions,
             jobs_completion_lease_cap_is_visible,
             jobs_timestamp_order_and_range

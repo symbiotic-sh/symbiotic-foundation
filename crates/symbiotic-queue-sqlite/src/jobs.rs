@@ -5,7 +5,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use symbiotic_queue::jobs::*;
 
-const COLUMNS: &str = "scope, id, key, digest, job_group, owners, kind, execution, priority, state, final_state, payload, max_attempts, admission, generation, lease_until, checkpoint, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic";
+type SqlProjection<'a, T> = (&'a str, fn(&Row<'_>) -> rusqlite::Result<T>, fn(&T) -> &str);
+
+const COLUMNS: &str = "scope, id, key, digest, job_group, owners, kind, execution, priority, state, final_state, payload, max_attempts, admission, generation, lease_until, checkpoint, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes";
 
 fn storage(_: impl std::fmt::Display) -> JobError {
     JobError::Storage
@@ -88,6 +90,7 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         delivery_generation: row.get(26)?,
         delivery_until: read_optional_time(row, 27)?,
         diagnostic: read_optional_json(row, 28)?,
+        output_bytes: row.get(29)?,
     })
 }
 
@@ -124,6 +127,7 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
         delivery_generation INTEGER NOT NULL,
         delivery_until INTEGER,
         diagnostic TEXT,
+        output_bytes INTEGER NOT NULL,
         PRIMARY KEY(scope, id), UNIQUE(scope, key)
     );
     CREATE INDEX jobs_claim ON jobs(scope, created_at, id)
@@ -218,113 +222,88 @@ impl JobRows for SqlRows<'_> {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<JobRecord>, JobError> {
-        let bound = i64::try_from(limit).map_err(|_| JobError::InvalidRequest)?;
-        if let JobQuery::Diagnostics { group, after } = &query {
-            // Each state class gets an ordered LIMIT before merging at most 2 * page.
-            // Failed/Uncertain history stays in jobs_diagnostics; notices are separate.
-            let mut selected = Vec::new();
-            for (index, predicate) in [
-                (
-                    "jobs_diagnostics",
-                    "state IN ('\"Failed\"','\"Uncertain\"')",
-                ),
-                ("jobs_notice_diagnostics", "state='\"AwaitingAdmission\"'"),
-            ] {
-                let sql = format!(
-                    "SELECT {COLUMNS} FROM jobs INDEXED BY {index} WHERE scope=?1 AND job_group=?2 AND {predicate} AND id>?3 ORDER BY id LIMIT ?4"
-                );
-                selected.extend(self.read(
-                    &sql,
-                    vec![
-                        json(scope)?.into(),
-                        group.clone().into(),
-                        after.clone().unwrap_or_default().into(),
-                        bound.into(),
-                    ],
-                )?);
-            }
-            selected.sort_by(|a, b| a.id.id.cmp(&b.id.id));
-            selected.truncate(limit);
-            return Ok(selected);
-        }
-        if let JobQuery::Owner { owner, after } = query {
-            let columns = COLUMNS
-                .split(", ")
-                .map(|c| format!("jobs.{c}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT {columns} FROM job_owners JOIN jobs ON jobs.scope=job_owners.scope AND jobs.id=job_owners.job_id WHERE job_owners.scope=?1 AND job_owners.owner=?2 AND job_owners.job_id>?3 ORDER BY job_owners.job_id LIMIT ?4"
-            );
-            return self.read(
-                &sql,
-                vec![
-                    json(scope)?.into(),
-                    owner.into(),
-                    after.unwrap_or_default().into(),
-                    bound.into(),
-                ],
-            );
-        }
-        let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
-        let (filter, order, index) = match query {
-            JobQuery::Group {
-                group,
-                after,
-                unfinished,
-            } => {
-                args.push(group.into());
-                args.push(after.unwrap_or_default().into());
-                (
-                    format!(
-                        "job_group=?2 AND id>?3{}",
-                        if unfinished {
-                            " AND state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"')"
-                        } else {
-                            ""
-                        }
-                    ),
-                    "id",
-                    if unfinished {
-                        "jobs_unfinished_group"
-                    } else {
-                        "jobs_group"
-                    },
-                )
-            }
-            JobQuery::Pending { kinds, priority } => {
-                args.push(json(&kinds)?.into());
-                args.push(stamp(now).into());
-                let mut filter = "state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND (state='\"Pending\"' OR (state='\"Running\"' AND execution='\"Handler\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2))".to_string();
-                if let Some(priority) = priority {
-                    args.push(json(&priority)?.into());
-                    filter.push_str(" AND priority=?4");
-                }
-                (filter, "created_at, id", "jobs_claim")
-            }
-            JobQuery::Final => {
-                args.push(stamp(now).into());
-                ("state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"') AND (delivery_until IS NULL OR delivery_until<=?2)".to_string(), "finished_at, id", "jobs_delivery")
-            }
-            JobQuery::Notices => (
-                "state='\"AwaitingAdmission\"'".to_string(),
-                "created_at, id",
-                "jobs_notices",
+        self.select_with(
+            scope,
+            query,
+            now,
+            limit,
+            (COLUMNS, read_record, |r| &r.id.id),
+        )
+    }
+    fn inspect(
+        &mut self,
+        scope: &JobScope,
+        query: JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<JobInfo>, JobError> {
+        self.select_with(
+            scope,
+            query,
+            now,
+            limit,
+            (
+                "scope, id, state, diagnostic, output_bytes",
+                |r| {
+                    Ok(JobInfo {
+                        id: JobId {
+                            scope: read_json(r, 0)?,
+                            id: r.get(1)?,
+                        },
+                        state: read_json(r, 2)?,
+                        diagnostic: read_optional_json(r, 3)?,
+                        output_bytes: r.get(4)?,
+                    })
+                },
+                |r| &r.id.id,
             ),
-            JobQuery::Expired => {
-                args.push(stamp(now).into());
-                ("state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"') AND result_expired=0 AND recovery_until<=?2".to_string(), "recovery_until, id", "jobs_expiry")
-            }
-            JobQuery::Diagnostics { .. } | JobQuery::Owner { .. } => {
-                return Err(JobError::InvalidRequest);
-            }
-        };
-        args.push(bound.into());
-        let sql = format!(
-            "SELECT {COLUMNS} FROM jobs INDEXED BY {index} WHERE scope=?1 AND {filter} ORDER BY {order} LIMIT ?{}",
-            args.len()
-        );
-        self.read(&sql, args)
+        )
+    }
+    fn delivery_metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError> {
+        let columns = COLUMNS
+            .split(", ")
+            .map(|c| match c {
+                "payload" | "checkpoint" | "admission" | "output" => "NULL",
+                _ => c,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn
+            .query_row(
+                &format!("SELECT {columns} FROM jobs WHERE scope=?1 AND id=?2"),
+                params![json(&id.scope)?, id.id],
+                read_record,
+            )
+            .map_err(storage)
+    }
+    fn output(&mut self, id: &JobId) -> Result<Option<serde_json::Value>, JobError> {
+        self.conn
+            .query_row(
+                "SELECT output FROM jobs WHERE scope=?1 AND id=?2",
+                params![json(&id.scope)?, id.id],
+                |r| read_optional_json(r, 0),
+            )
+            .map_err(storage)
+    }
+    fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError> {
+        self.conn
+            .query_row(
+                "SELECT coalesce(length(CAST(payload AS BLOB)),0) + coalesce(length(CAST(checkpoint AS BLOB)),0) + coalesce(length(CAST(admission AS BLOB)),0) + coalesce(length(CAST(output AS BLOB)),0) FROM jobs WHERE scope=?1 AND id=?2",
+                params![json(&id.scope)?, id.id],
+                |r| r.get(0),
+            )
+            .map_err(storage)
+    }
+    fn deliver(&mut self, row: &JobRecord, expired: bool) -> Result<(), JobError> {
+        if expired {
+            self.expire(&row.id)?;
+        }
+        self.conn.execute("UPDATE jobs SET delivery_generation=?3, delivery_until=?4 WHERE scope=?1 AND id=?2", params![json(&row.id.scope)?, row.id.id, i64::try_from(row.delivery_generation).map_err(storage)?, row.delivery_until.map(stamp)]).map_err(storage)?;
+        Ok(())
+    }
+    fn expire(&mut self, id: &JobId) -> Result<(), JobError> {
+        self.conn.execute("UPDATE jobs SET result_expired=1, payload=NULL, checkpoint=NULL, admission=NULL, output=NULL, output_bytes=0 WHERE scope=?1 AND id=?2", params![json(&id.scope)?, id.id]).map_err(storage)?;
+        Ok(())
     }
     fn save(&mut self, row: JobRecord) -> Result<(), JobError> {
         // Validate before touching SQL, also when used directly by backend tests.
@@ -341,7 +320,7 @@ impl JobRows for SqlRows<'_> {
             millisecond_time(time)?;
         }
         let old = self.get(&row.id)?;
-        self.conn.execute("INSERT INTO jobs (scope, id, key, digest, job_group, owners, kind, execution, priority, state, final_state, payload, max_attempts, admission, generation, lease_until, checkpoint, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key, digest=excluded.digest, job_group=excluded.job_group, owners=excluded.owners, kind=excluded.kind, execution=excluded.execution, priority=excluded.priority, state=excluded.state, final_state=excluded.final_state, payload=excluded.payload, max_attempts=excluded.max_attempts, admission=excluded.admission, generation=excluded.generation, lease_until=excluded.lease_until, checkpoint=excluded.checkpoint, cancel_requested=excluded.cancel_requested, purged=excluded.purged, output=excluded.output, origin=excluded.origin, receipt=excluded.receipt, recovery_until=excluded.recovery_until, result_expired=excluded.result_expired, created_at=excluded.created_at, finished_at=excluded.finished_at, delivery_generation=excluded.delivery_generation, delivery_until=excluded.delivery_until, diagnostic=excluded.diagnostic",
+        self.conn.execute("INSERT INTO jobs (scope, id, key, digest, job_group, owners, kind, execution, priority, state, final_state, payload, max_attempts, admission, generation, lease_until, checkpoint, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key, digest=excluded.digest, job_group=excluded.job_group, owners=excluded.owners, kind=excluded.kind, execution=excluded.execution, priority=excluded.priority, state=excluded.state, final_state=excluded.final_state, payload=excluded.payload, max_attempts=excluded.max_attempts, admission=excluded.admission, generation=excluded.generation, lease_until=excluded.lease_until, checkpoint=excluded.checkpoint, cancel_requested=excluded.cancel_requested, purged=excluded.purged, output=excluded.output, origin=excluded.origin, receipt=excluded.receipt, recovery_until=excluded.recovery_until, result_expired=excluded.result_expired, created_at=excluded.created_at, finished_at=excluded.finished_at, delivery_generation=excluded.delivery_generation, delivery_until=excluded.delivery_until, diagnostic=excluded.diagnostic, output_bytes=excluded.output_bytes",
             params![
                 json(&row.id.scope)?,
                 &row.id.id,
@@ -372,6 +351,7 @@ impl JobRows for SqlRows<'_> {
                 i64::try_from(row.delivery_generation).map_err(storage)?,
                 row.delivery_until.map(stamp),
                 optional_json(&row.diagnostic)?,
+                i64::try_from(row.output.as_ref().map(encoded_bytes).transpose()?.unwrap_or(0)).map_err(storage)?,
             ]).map_err(storage)?;
         if old.as_ref().is_none_or(|old| old.owners != row.owners) {
             self.conn
@@ -436,14 +416,134 @@ impl JobRows for SqlRows<'_> {
     }
 }
 impl SqlRows<'_> {
-    fn read(
+    fn select_with<T>(
+        &mut self,
+        scope: &JobScope,
+        query: JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+        projection: SqlProjection<'_, T>,
+    ) -> Result<Vec<T>, JobError> {
+        let (columns, decode, identity) = projection;
+        let bound = i64::try_from(limit).map_err(|_| JobError::InvalidRequest)?;
+        if let JobQuery::Diagnostics { group, after } = &query {
+            // Each state class gets an ordered LIMIT before merging at most 2 * page.
+            // Failed/Uncertain history stays in jobs_diagnostics; notices are separate.
+            let mut selected = Vec::new();
+            for (index, predicate) in [
+                (
+                    "jobs_diagnostics",
+                    "state IN ('\"Failed\"','\"Uncertain\"')",
+                ),
+                ("jobs_notice_diagnostics", "state='\"AwaitingAdmission\"'"),
+            ] {
+                let sql = format!(
+                    "SELECT {columns} FROM jobs INDEXED BY {index} WHERE scope=?1 AND job_group=?2 AND {predicate} AND id>?3 ORDER BY id LIMIT ?4"
+                );
+                selected.extend(self.read(
+                    &sql,
+                    vec![
+                        json(scope)?.into(),
+                        group.clone().into(),
+                        after.clone().unwrap_or_default().into(),
+                        bound.into(),
+                    ],
+                    decode,
+                )?);
+            }
+            selected.sort_by(|a, b| identity(a).cmp(identity(b)));
+            selected.truncate(limit);
+            return Ok(selected);
+        }
+        if let JobQuery::Owner { owner, after } = query {
+            let columns = columns
+                .split(", ")
+                .map(|c| format!("jobs.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {columns} FROM job_owners JOIN jobs ON jobs.scope=job_owners.scope AND jobs.id=job_owners.job_id WHERE job_owners.scope=?1 AND job_owners.owner=?2 AND job_owners.job_id>?3 ORDER BY job_owners.job_id LIMIT ?4"
+            );
+            return self.read(
+                &sql,
+                vec![
+                    json(scope)?.into(),
+                    owner.into(),
+                    after.unwrap_or_default().into(),
+                    bound.into(),
+                ],
+                decode,
+            );
+        }
+        let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
+        let (filter, order, index) = match query {
+            JobQuery::Group {
+                group,
+                after,
+                unfinished,
+            } => {
+                args.push(group.into());
+                args.push(after.unwrap_or_default().into());
+                (
+                    format!(
+                        "job_group=?2 AND id>?3{}",
+                        if unfinished {
+                            " AND state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"')"
+                        } else {
+                            ""
+                        }
+                    ),
+                    "id",
+                    if unfinished {
+                        "jobs_unfinished_group"
+                    } else {
+                        "jobs_group"
+                    },
+                )
+            }
+            JobQuery::Pending { kinds, priority } => {
+                args.push(json(&kinds)?.into());
+                args.push(stamp(now).into());
+                let mut filter = "state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND (state='\"Pending\"' OR (state='\"Running\"' AND execution='\"Handler\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2))".to_string();
+                if let Some(priority) = priority {
+                    args.push(json(&priority)?.into());
+                    filter.push_str(" AND priority=?4");
+                }
+                (filter, "created_at, id", "jobs_claim")
+            }
+            JobQuery::Final => {
+                args.push(stamp(now).into());
+                ("state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"') AND (delivery_until IS NULL OR delivery_until<=?2)".to_string(), "finished_at, id", "jobs_delivery")
+            }
+            JobQuery::Notices => (
+                "state='\"AwaitingAdmission\"'".to_string(),
+                "created_at, id",
+                "jobs_notices",
+            ),
+            JobQuery::Expired => {
+                args.push(stamp(now).into());
+                ("state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"') AND result_expired=0 AND recovery_until<=?2".to_string(), "recovery_until, id", "jobs_expiry")
+            }
+            JobQuery::Diagnostics { .. } | JobQuery::Owner { .. } => {
+                return Err(JobError::InvalidRequest);
+            }
+        };
+        args.push(bound.into());
+        let sql = format!(
+            "SELECT {columns} FROM jobs INDEXED BY {index} WHERE scope=?1 AND {filter} ORDER BY {order} LIMIT ?{}",
+            args.len()
+        );
+        self.read(&sql, args, decode)
+    }
+    fn read<T>(
         &self,
         sql: &str,
         args: Vec<rusqlite::types::Value>,
-    ) -> Result<Vec<JobRecord>, JobError> {
+        decode: fn(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, JobError> {
         let mut stmt = self.conn.prepare(sql).map_err(storage)?;
         let records = stmt
-            .query_map(rusqlite::params_from_iter(&args), read_record)
+            .query_map(rusqlite::params_from_iter(&args), decode)
             .map_err(storage)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
@@ -1070,6 +1170,91 @@ mod tests {
         eprintln!(
             "delivery/diagnostic/owner/group VM steps at 10 vs 10,000 retained rows: {measurements:?}"
         );
+    }
+
+    #[test]
+    fn jobs_projections_preflight_and_erase_without_loading_content() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        SqliteQueue::initialize_connection(&mut conn).unwrap();
+        let mut tx = conn.transaction().unwrap();
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let config = JobConfig::default();
+        jobs_in_transaction(
+            &mut tx,
+            &scope(),
+            &config,
+            now,
+            JobRequest::Enqueue(vec![spec("projection")]),
+        )
+        .unwrap();
+        let mut store = SqlRows::new(&tx);
+        let mut row = store.by_key(&scope(), "projection").unwrap().unwrap();
+        row.state = JobState::Failed;
+        row.finished_at = Some(now);
+        row.recovery_until = Some(now + chrono::Duration::seconds(1));
+        row.output = Some(serde_json::json!("x".repeat(1000)));
+        store.save(row.clone()).unwrap();
+        // Invalid content is a read probe: any materialization produces Storage.
+        tx.execute("UPDATE jobs SET output='invalid-json', payload='invalid-json', admission='invalid-json', checkpoint='invalid-json'", []).unwrap();
+        assert!(
+            matches!(jobs_in_transaction(&mut tx, &scope(), &config, now, JobRequest::Completions { limit: 1, max_bytes: 100 }), Err(JobError::CompletionTooLarge { job, .. }) if job == row.id)
+        );
+        assert_eq!(
+            tx.query_row("SELECT delivery_generation FROM jobs", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        match jobs_in_transaction(
+            &mut tx,
+            &scope(),
+            &config,
+            now,
+            JobRequest::Diagnostics {
+                group: "group".into(),
+                after: None,
+                limit: 1,
+            },
+        )
+        .unwrap()
+        {
+            JobResponse::Diagnostics(page) => assert_eq!(page.items[0].id, row.id),
+            other => panic!("{other:?}"),
+        }
+        match jobs_in_transaction(
+            &mut tx,
+            &scope(),
+            &config,
+            now,
+            JobRequest::RebuildSummary("group".into()),
+        )
+        .unwrap()
+        {
+            JobResponse::Summary(summary) => {
+                assert_eq!(summary.counts.get(&JobState::Failed), Some(&1))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            jobs_in_transaction(
+                &mut tx,
+                &scope(),
+                &config,
+                now + chrono::Duration::seconds(2),
+                JobRequest::Maintain
+            )
+            .unwrap(),
+            JobResponse::Changed(1)
+        ));
+        let stored = SqlRows::new(&tx).get(&row.id).unwrap().unwrap();
+        assert!(
+            stored.result_expired
+                && stored.output.is_none()
+                && stored.payload.is_none()
+                && stored.admission.is_none()
+                && stored.checkpoint.is_none()
+        );
+        assert_eq!(stored.output_bytes, 0);
     }
 
     #[test]

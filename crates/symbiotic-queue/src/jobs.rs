@@ -72,6 +72,8 @@ pub struct JobConfig {
     pub max_leased_completions: usize,
     /// Maximum serialized delivery page (1 MiB).
     pub max_page_bytes: usize,
+    /// Maximum encoded cache/handler result (16 MiB; PROVISIONAL).
+    pub max_result_bytes: usize,
     /// Hard unfinished-job count bound (1024).
     pub max_pending_items: usize,
     /// Hard unfinished input-byte bound, including metadata/checkpoints (16 MiB).
@@ -86,6 +88,9 @@ pub struct JobConfig {
     pub max_checkpoint_bytes: usize,
     /// Maximum expired results deleted in one maintenance pass (64).
     pub maintenance_batch: usize,
+    /// Encoded recovery-copy/result bytes erased per pass (16 MiB; PROVISIONAL).
+    /// A nonempty pass always erases at least one job, even if it exceeds the budget.
+    pub maintenance_bytes_per_pass: usize,
     /// Per-app scheduling policy (one background slot by default).
     pub priority: PriorityPolicy,
 }
@@ -98,6 +103,7 @@ impl Default for JobConfig {
             max_page: 64,
             max_leased_completions: 4 * 64,
             max_page_bytes: 1024 * 1024,
+            max_result_bytes: 16 * 1024 * 1024,
             max_pending_items: 1024,
             max_pending_bytes: 16 * 1024 * 1024,
             delivery_lease_seconds: 30,
@@ -105,6 +111,7 @@ impl Default for JobConfig {
             retention_seconds: 7 * 24 * 60 * 60,
             max_checkpoint_bytes: 64 * 1024,
             maintenance_batch: 64,
+            maintenance_bytes_per_pass: 16 * 1024 * 1024,
             priority: PriorityPolicy::BackgroundShare { minimum_slots: 1 },
         }
     }
@@ -276,6 +283,9 @@ pub struct JobRecord {
         deserialize_with = "deserialize_present_value"
     )]
     pub output: Option<Value>,
+    /// Rebuildable encoded result length for content-free delivery preflight.
+    #[serde(skip)]
+    pub output_bytes: usize,
     /// Result provenance.
     pub origin: Option<ResultOrigin>,
     /// Optional accounting reference, with no copied usage.
@@ -305,6 +315,42 @@ fn deserialize_present_value<'de, D: serde::Deserializer<'de>>(
 }
 
 impl JobRecord {
+    /// Delivery metadata without cloning waiting copies or saved answers.
+    #[doc(hidden)]
+    pub fn delivery_metadata(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            digest: self.digest.clone(),
+            group: self.group.clone(),
+            owners: self.owners.clone(),
+            kind: self.kind.clone(),
+            execution: self.execution,
+            priority: self.priority,
+            state: self.state,
+            final_state: self.final_state,
+            payload: None,
+            max_attempts: self.max_attempts,
+            admission: None,
+            generation: self.generation,
+            lease_until: self.lease_until,
+            checkpoint: None,
+            cancel_requested: self.cancel_requested,
+            purged: self.purged,
+            output: None,
+            output_bytes: self.output_bytes,
+            origin: self.origin,
+            receipt: self.receipt.clone(),
+            recovery_until: self.recovery_until,
+            result_expired: self.result_expired,
+            created_at: self.created_at,
+            finished_at: self.finished_at,
+            delivery_generation: self.delivery_generation,
+            delivery_until: self.delivery_until,
+            diagnostic: self.diagnostic,
+        }
+    }
+
     /// One-based execution claim ordinal, derived from the fence rather than copied.
     /// Admission refresh consumes no claim generation or attempt allowance.
     pub fn attempt(&self) -> u64 {
@@ -586,6 +632,9 @@ pub enum JobError {
     /// An eligible completion cannot fit individually in the requested page.
     #[error("completion exceeds page byte bound: {job:?} ({bytes} bytes)")]
     CompletionTooLarge { job: JobId, bytes: usize },
+    /// A cache/handler result exceeds the configured encoded-byte limit.
+    #[error("result exceeds byte bound: {job:?} ({bytes} bytes)")]
+    ResultTooLarge { job: JobId, bytes: usize },
     /// An inspected job cannot fit individually in the requested candidate page.
     #[error("claim candidate exceeds page byte bound: {job:?} ({bytes} bytes)")]
     CandidateTooLarge { job: JobId, bytes: usize },
@@ -639,6 +688,20 @@ pub enum JobQuery {
     },
 }
 
+/// Content-free operational projection from canonical rows.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct JobInfo {
+    /// Scoped identity.
+    pub id: JobId,
+    /// Lifecycle.
+    pub state: JobState,
+    /// Static diagnostic.
+    pub diagnostic: Option<DiagnosticCode>,
+    /// Encoded saved-answer length.
+    pub output_bytes: usize,
+}
+
 /// Storage primitives for the single shared transition mechanism.
 /// Implementations must be inside a rollback-capable transaction.
 #[doc(hidden)]
@@ -655,6 +718,24 @@ pub trait JobRows {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<JobRecord>, JobError>;
+    /// Select identities, states and lengths without reading recovery content.
+    fn inspect(
+        &mut self,
+        scope: &JobScope,
+        query: JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<JobInfo>, JobError>;
+    /// Read delivery fields without waiting copies or saved answers.
+    fn delivery_metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError>;
+    /// Load a saved answer only after delivery byte admission.
+    fn output(&mut self, id: &JobId) -> Result<Option<Value>, JobError>;
+    /// Count encoded recovery copies and results without cloning or decoding them.
+    fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError>;
+    /// Lease a preflighted delivery, optionally erasing expired recovery copies.
+    fn deliver(&mut self, row: &JobRecord, expired: bool) -> Result<(), JobError>;
+    /// Erase recovery copies without materializing them.
+    fn expire(&mut self, id: &JobId) -> Result<(), JobError>;
     /// Write canonical row and update its group summary atomically.
     fn save(&mut self, row: JobRecord) -> Result<(), JobError>;
     /// Count unfinished rows and bytes.
@@ -695,7 +776,7 @@ pub trait JobRows {
                     ..GroupSummary::default()
                 };
             }
-            let selected = self.select(
+            let selected = self.inspect(
                 scope,
                 JobQuery::Group {
                     group: group.into(),
@@ -786,6 +867,7 @@ fn delete_copies(row: &mut JobRecord) {
     row.checkpoint = None;
     row.admission = None;
     row.output = None;
+    row.output_bytes = 0;
 }
 
 fn finish(
@@ -817,6 +899,27 @@ fn page(config: &JobConfig, limit: usize) -> Result<(), JobError> {
     }
 }
 
+/// Count canonical JSON bytes without allocating an encoded copy.
+#[doc(hidden)]
+pub fn encoded_bytes(value: &impl Serialize) -> Result<usize, JobError> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("encoded length overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| JobError::Storage)?;
+    Ok(counter.0)
+}
+
 // One byte-bound owner for all JSON-array pages: reject an individually oversized
 // row, and defer a row that only exceeds the remaining aggregate page budget.
 fn page_bytes(
@@ -826,9 +929,16 @@ fn page_bytes(
     comma: bool,
     oversized: impl FnOnce(usize) -> JobError,
 ) -> Result<Option<usize>, JobError> {
-    let size = serde_json::to_vec(item)
-        .map_err(|_| JobError::Storage)?
-        .len();
+    admit_page_bytes(encoded_bytes(item)?, used, max_bytes, comma, oversized)
+}
+
+fn admit_page_bytes(
+    size: usize,
+    used: usize,
+    max_bytes: usize,
+    comma: bool,
+    oversized: impl FnOnce(usize) -> JobError,
+) -> Result<Option<usize>, JobError> {
     let individual = size.checked_add(2).ok_or(JobError::InvalidRequest)?;
     if individual > max_bytes {
         return Err(oversized(individual));
@@ -1010,7 +1120,9 @@ pub fn apply_job_request(
         || config.max_page == 0
         || config.max_leased_completions == 0
         || config.max_page_bytes < 2
+        || config.max_result_bytes == 0
         || config.maintenance_batch == 0
+        || config.maintenance_bytes_per_pass == 0
         || config.claim_lease_seconds == 0
         || config.delivery_lease_seconds == 0
         || [&scope.tenant, &scope.incarnation, &scope.queue]
@@ -1086,6 +1198,7 @@ pub fn apply_job_request(
                         cancel_requested: false,
                         purged: false,
                         output: None,
+                        output_bytes: 0,
                         origin: None,
                         receipt: None,
                         recovery_until: spec.recovery_until,
@@ -1224,6 +1337,15 @@ pub fn apply_job_request(
             diagnostic,
         } => {
             let mut row = get(rows, scope, &job)?;
+            if let Some(output) = &output {
+                let bytes = encoded_bytes(output)?;
+                if bytes > config.max_result_bytes {
+                    return Err(JobError::ResultTooLarge {
+                        job: row.id.clone(),
+                        bytes,
+                    });
+                }
+            }
             if origin == ResultOrigin::Cache {
                 if row.state == JobState::Purged && generation == 0 && row.generation == 0 {
                     return Ok(JobResponse::Done);
@@ -1265,12 +1387,15 @@ pub fn apply_job_request(
             row.origin = Some(origin);
             row.receipt = receipt;
             row.diagnostic = diagnostic;
-            if row.purged {
-                finish(&mut row, JobState::Purged, now, config)?;
-                delete_copies(&mut row);
-            } else if state == JobState::Uncertain {
+            if state == JobState::Uncertain {
                 row.state = state;
                 row.lease_until = None;
+                if row.purged {
+                    delete_copies(&mut row);
+                }
+            } else if row.purged {
+                finish(&mut row, JobState::Purged, now, config)?;
+                delete_copies(&mut row);
             } else {
                 row.output = output;
                 let state = if row.cancel_requested {
@@ -1380,19 +1505,20 @@ pub fn apply_job_request(
             let mut candidates = if final_limit == 0 {
                 Vec::new()
             } else {
-                rows.select(scope, JobQuery::Final, now, final_limit)?
+                rows.inspect(scope, JobQuery::Final, now, final_limit)?
             };
             if candidates.len() < limit {
-                candidates.extend(rows.select(
+                candidates.extend(rows.inspect(
                     scope,
                     JobQuery::Notices,
                     now,
                     limit - candidates.len(),
                 )?);
             }
-            let mut deliveries = Vec::new();
+            let mut admitted = Vec::new();
             let mut bytes: usize = 2; // JSON array brackets, plus commas between deliveries.
-            for mut row in candidates {
+            for info in candidates {
+                let mut row = rows.delivery_metadata(&info.id)?;
                 let final_result = !row.state.unfinished();
                 if final_result && row.recovery_until.is_some_and(|until| until <= now) {
                     row.result_expired = true;
@@ -1411,27 +1537,42 @@ pub fn apply_job_request(
                 } else {
                     None
                 };
-                let mut completion = row.clone();
-                completion.payload = None;
-                completion.checkpoint = None;
-                completion.admission = None;
-                let delivery = Delivery { completion, token };
-                let Some(required) = page_bytes(
-                    &delivery,
-                    bytes,
-                    max_bytes,
-                    !deliveries.is_empty(),
-                    |bytes| JobError::CompletionTooLarge {
-                        job: row.id.clone(),
-                        bytes,
-                    },
-                )?
+                let delivery = Delivery {
+                    completion: row.clone(),
+                    token,
+                };
+                let has_output = info.output_bytes > 0 && !row.result_expired;
+                let size = encoded_bytes(&delivery)?
+                    .checked_add(if has_output {
+                        // A present output adds `,"output":` plus its encoded value.
+                        info.output_bytes.checked_add(10).ok_or(JobError::Storage)?
+                    } else {
+                        0
+                    })
+                    .ok_or(JobError::Storage)?;
+                let Some(required) =
+                    admit_page_bytes(size, bytes, max_bytes, !admitted.is_empty(), |bytes| {
+                        JobError::CompletionTooLarge {
+                            job: row.id.clone(),
+                            bytes,
+                        }
+                    })?
                 else {
                     break;
                 };
                 bytes = required;
-                if final_result {
-                    save_job(rows, config, row)?;
+                admitted.push((row, delivery, has_output));
+            }
+            let mut deliveries = Vec::with_capacity(admitted.len());
+            for (row, mut delivery, has_output) in admitted {
+                if has_output {
+                    delivery.completion.output = rows.output(&row.id)?;
+                    if delivery.completion.output.is_none() {
+                        return Err(JobError::Storage);
+                    }
+                }
+                if delivery.token.is_some() {
+                    rows.deliver(&row, row.result_expired)?;
                 }
                 deliveries.push(delivery);
             }
@@ -1577,6 +1718,7 @@ pub fn apply_job_request(
                 count += selected.len();
                 for mut row in selected {
                     row.purged = true;
+                    row.owners.clear();
                     row.cancel_requested = true;
                     delete_copies(&mut row);
                     if row.can_stop_without_accounting(now)
@@ -1604,7 +1746,7 @@ pub fn apply_job_request(
         } => {
             page(config, limit)?;
             let selected =
-                rows.select(scope, JobQuery::Diagnostics { group, after }, now, limit)?;
+                rows.inspect(scope, JobQuery::Diagnostics { group, after }, now, limit)?;
             let after = selected.last().map(|r| r.id.id.clone());
             let items = selected
                 .into_iter()
@@ -1617,12 +1759,23 @@ pub fn apply_job_request(
             Ok(JobResponse::Diagnostics(DiagnosticPage { items, after }))
         }
         JobRequest::Maintain => {
-            let selected = rows.select(scope, JobQuery::Expired, now, config.maintenance_batch)?;
-            let count = selected.len();
-            for mut row in selected {
-                row.result_expired = true;
-                delete_copies(&mut row);
-                save_job(rows, config, row)?;
+            let selected = rows.inspect(scope, JobQuery::Expired, now, config.maintenance_batch)?;
+            let mut count = 0;
+            let mut bytes: usize = 0;
+            for row in selected {
+                let required = bytes
+                    .checked_add(rows.recovery_bytes(&row.id)?)
+                    .ok_or(JobError::Storage)?;
+                // Always admit the first job, including one larger than the budget.
+                if count > 0 && required > config.maintenance_bytes_per_pass {
+                    break;
+                }
+                rows.expire(&row.id)?;
+                count += 1;
+                bytes = required;
+                if bytes >= config.maintenance_bytes_per_pass {
+                    break;
+                }
             }
             Ok(JobResponse::Changed(count))
         }

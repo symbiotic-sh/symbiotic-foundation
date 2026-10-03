@@ -830,10 +830,11 @@ fn row_indexes(row: &JobRecord) -> Vec<(JobIndex, OrderKey)> {
 
 impl JobMemoryState {
     // One owner maintains all rebuildable indexes on writes and rollback.
-    fn replace(&mut self, key: RowKey, new: Option<JobRecord>) {
-        if let Some(old) = self.rows.remove(&key) {
+    fn replace(&mut self, key: RowKey, new: Option<JobRecord>) -> Option<JobRecord> {
+        let old = self.rows.remove(&key);
+        if let Some(old) = &old {
             self.keys.remove(&(old.id.scope.clone(), old.key.clone()));
-            for (index, order) in row_indexes(&old) {
+            for (index, order) in row_indexes(old) {
                 let index_key = (old.id.scope.clone(), index);
                 if let Some(entries) = self.indexes.get_mut(&index_key) {
                     entries.remove(&order);
@@ -854,6 +855,7 @@ impl JobMemoryState {
             }
             self.rows.insert(key, row);
         }
+        old
     }
     fn entries(&self, scope: &JobScope, index: JobIndex) -> impl Iterator<Item = &OrderKey> {
         self.indexes
@@ -888,61 +890,14 @@ struct JobMemoryTransaction<'a> {
     examined: usize,
 }
 impl<'a> JobMemoryTransaction<'a> {
-    fn new(state: &'a mut JobMemoryState) -> Self {
-        Self {
-            state,
-            rows_before: BTreeMap::new(),
-            summaries_before: BTreeMap::new(),
-            committed: false,
-            #[cfg(test)]
-            examined: 0,
-        }
-    }
-    fn remember_summary(&mut self, key: &RowKey) {
-        self.summaries_before
-            .entry(key.clone())
-            .or_insert_with(|| self.state.summaries.get(key).cloned());
-    }
-}
-impl Drop for JobMemoryTransaction<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            for (key, old) in std::mem::take(&mut self.rows_before) {
-                self.state.replace(key, old);
-            }
-            for (key, old) in std::mem::take(&mut self.summaries_before) {
-                if let Some(old) = old {
-                    self.state.summaries.insert(key, old);
-                } else {
-                    self.state.summaries.remove(&key);
-                }
-            }
-        }
-    }
-}
-impl JobRows for JobMemoryTransaction<'_> {
-    fn get(&mut self, id: &JobId) -> Result<Option<JobRecord>, JobError> {
-        Ok(self
-            .state
-            .rows
-            .get(&(id.scope.clone(), id.id.clone()))
-            .cloned())
-    }
-    fn by_key(&mut self, scope: &JobScope, key: &str) -> Result<Option<JobRecord>, JobError> {
-        Ok(self
-            .state
-            .keys
-            .get(&(scope.clone(), key.into()))
-            .and_then(|id| self.state.rows.get(&(scope.clone(), id.clone())))
-            .cloned())
-    }
-    fn select(
+    fn select_with<T>(
         &mut self,
         scope: &JobScope,
         query: JobQuery,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<JobRecord>, JobError> {
+        project: fn(&JobRecord) -> Result<T, JobError>,
+    ) -> Result<Vec<T>, JobError> {
         let index = match &query {
             JobQuery::Group {
                 group, unfinished, ..
@@ -1022,12 +977,152 @@ impl JobRows for JobMemoryTransaction<'_> {
                 _ => true,
             };
             if eligible {
-                selected.push(row.clone());
+                selected.push(project(row)?);
             }
         }
         Ok(selected)
     }
-    fn save(&mut self, row: JobRecord) -> Result<(), JobError> {
+    fn new(state: &'a mut JobMemoryState) -> Self {
+        Self {
+            state,
+            rows_before: BTreeMap::new(),
+            summaries_before: BTreeMap::new(),
+            committed: false,
+            #[cfg(test)]
+            examined: 0,
+        }
+    }
+    fn remember_summary(&mut self, key: &RowKey) {
+        self.summaries_before
+            .entry(key.clone())
+            .or_insert_with(|| self.state.summaries.get(key).cloned());
+    }
+}
+impl Drop for JobMemoryTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            for (key, old) in std::mem::take(&mut self.rows_before) {
+                self.state.replace(key, old);
+            }
+            for (key, old) in std::mem::take(&mut self.summaries_before) {
+                if let Some(old) = old {
+                    self.state.summaries.insert(key, old);
+                } else {
+                    self.state.summaries.remove(&key);
+                }
+            }
+        }
+    }
+}
+impl JobRows for JobMemoryTransaction<'_> {
+    fn get(&mut self, id: &JobId) -> Result<Option<JobRecord>, JobError> {
+        Ok(self
+            .state
+            .rows
+            .get(&(id.scope.clone(), id.id.clone()))
+            .cloned())
+    }
+    fn by_key(&mut self, scope: &JobScope, key: &str) -> Result<Option<JobRecord>, JobError> {
+        Ok(self
+            .state
+            .keys
+            .get(&(scope.clone(), key.into()))
+            .and_then(|id| self.state.rows.get(&(scope.clone(), id.clone())))
+            .cloned())
+    }
+    fn select(
+        &mut self,
+        scope: &JobScope,
+        query: JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, JobError> {
+        self.select_with(scope, query, now, limit, |r| Ok(r.clone()))
+    }
+    fn inspect(
+        &mut self,
+        scope: &JobScope,
+        query: JobQuery,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<JobInfo>, JobError> {
+        self.select_with(scope, query, now, limit, |r| {
+            Ok(JobInfo {
+                id: r.id.clone(),
+                state: r.state,
+                diagnostic: r.diagnostic,
+                output_bytes: r.output_bytes,
+            })
+        })
+    }
+    fn delivery_metadata(&mut self, id: &JobId) -> Result<JobRecord, JobError> {
+        self.state
+            .rows
+            .get(&(id.scope.clone(), id.id.clone()))
+            .map(JobRecord::delivery_metadata)
+            .ok_or(JobError::NotFound)
+    }
+    fn output(&mut self, id: &JobId) -> Result<Option<serde_json::Value>, JobError> {
+        self.state
+            .rows
+            .get(&(id.scope.clone(), id.id.clone()))
+            .map(|r| r.output.clone())
+            .ok_or(JobError::NotFound)
+    }
+    fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError> {
+        let row = self
+            .state
+            .rows
+            .get(&(id.scope.clone(), id.id.clone()))
+            .ok_or(JobError::NotFound)?;
+        [
+            row.payload
+                .as_ref()
+                .map(encoded_bytes)
+                .transpose()?
+                .unwrap_or(0),
+            row.checkpoint
+                .as_ref()
+                .map(encoded_bytes)
+                .transpose()?
+                .unwrap_or(0),
+            row.admission
+                .as_ref()
+                .map(encoded_bytes)
+                .transpose()?
+                .unwrap_or(0),
+            row.output_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| {
+            total.checked_add(bytes).ok_or(JobError::Storage)
+        })
+    }
+    fn deliver(&mut self, row: &JobRecord, expired: bool) -> Result<(), JobError> {
+        if expired {
+            self.expire(&row.id)?;
+        }
+        let mut stored = self.get(&row.id)?.ok_or(JobError::NotFound)?;
+        stored.delivery_generation = row.delivery_generation;
+        stored.delivery_until = row.delivery_until;
+        self.save(stored)
+    }
+    fn expire(&mut self, id: &JobId) -> Result<(), JobError> {
+        let key = (id.scope.clone(), id.id.clone());
+        let mut new = self.delivery_metadata(id)?;
+        new.result_expired = true;
+        new.output_bytes = 0;
+        let old = self.state.replace(key.clone(), Some(new));
+        self.rows_before.entry(key).or_insert(old);
+        Ok(())
+    }
+    fn save(&mut self, mut row: JobRecord) -> Result<(), JobError> {
+        row.output_bytes = row
+            .output
+            .as_ref()
+            .map(encoded_bytes)
+            .transpose()?
+            .unwrap_or(0);
         let key = (row.id.scope.clone(), row.id.id.clone());
         let old = self.state.rows.get(&key).cloned();
         self.rows_before
