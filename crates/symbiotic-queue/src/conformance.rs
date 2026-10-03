@@ -863,7 +863,7 @@ pub mod jobs {
                 .await
                 .unwrap()
             {
-                JobResponse::Deliveries(v) => v,
+                JobResponse::Deliveries(v) => v.items,
                 other => panic!("{other:?}"),
             }
         }
@@ -989,13 +989,17 @@ pub mod jobs {
             }
         }
         // Separate unacked finals prove each maintenance pass deletes at most one.
-        s.ready("expire-1").await;
-        s.ready("expire-2").await;
+        let mut expected = vec![s.ready("expire-1").await.id, s.ready("expire-2").await.id];
+        expected.sort();
         s.advance(2);
         assert_eq!(s.changed(JobRequest::Maintain).await, 1);
         assert_eq!(s.changed(JobRequest::Maintain).await, 1);
         assert_eq!(s.changed(JobRequest::Maintain).await, 0);
         let page = s.deliveries(2, 100_000).await;
+        assert_eq!(page.len(), 2);
+        let mut actual: Vec<_> = page.iter().map(|d| d.completion.id.id.clone()).collect();
+        actual.sort();
+        assert_eq!(actual, expected);
         assert!(
             page.iter()
                 .all(|d| d.completion.result_expired && d.completion.output.is_none())
@@ -1972,6 +1976,180 @@ pub mod jobs {
         s.insert(spec).await;
     }
 
+    /// Erasure remains the final state when cancel follows handler lease expiry.
+    pub async fn jobs_purged_expired_claim_cancel_is_purged(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        let id = s.insert(s.spec("purged-cancel")).await;
+        s.claim().await;
+        assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 1);
+        s.advance(31);
+        assert_eq!(
+            s.changed(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+                .await,
+            1
+        );
+        let row = s.get(&id).await;
+        assert_eq!(row.state, JobState::Purged);
+        assert!(row.payload.is_none() && row.output.is_none());
+    }
+
+    /// Duplicate running identities count one job and group cancel visits unfinished rows only.
+    pub async fn jobs_cancel_deduplicates_and_chunks_unfinished_group(
+        backend: Arc<dyn QueueBackend>,
+    ) {
+        let mut s = Suite::new(backend);
+        s.config.maintenance_batch = 1;
+        let final_id = s.ready("final").await;
+        let running = s.insert(s.spec("running")).await;
+        s.claim().await;
+        assert_eq!(
+            s.changed(JobRequest::Cancel(Selector::Ids(vec![
+                running.clone(),
+                running.clone()
+            ])))
+            .await,
+            1
+        );
+        let pending = s.insert(s.spec("pending")).await;
+        assert_eq!(
+            s.changed(JobRequest::Cancel(Selector::Group("group".into())))
+                .await,
+            2
+        );
+        assert_eq!(s.get(&pending).await.state, JobState::Cancelled);
+        assert_eq!(s.get(&final_id).await.state, JobState::Succeeded);
+        assert!(s.get(&running).await.cancel_requested);
+    }
+
+    /// Atomic owner erasure drains more than one bounded chunk and leaves unrelated rows intact.
+    pub async fn jobs_owner_purge_chunks_membership(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.maintenance_batch = 2;
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            ids.push(s.insert(s.spec(&format!("owner-{i}"))).await);
+        }
+        let mut unrelated = s.spec("other-owner");
+        unrelated.owners = vec!["other".into()];
+        let unrelated = s.insert(unrelated).await;
+        assert_eq!(s.changed(JobRequest::PurgeOwner("owner-a".into())).await, 7);
+        for id in ids {
+            assert_eq!(s.get(&id).await.state, JobState::Purged);
+        }
+        assert_eq!(s.get(&unrelated).await.state, JobState::Pending);
+    }
+
+    /// Rebuilding is bounded and hides partial counts, including transitions between passes.
+    pub async fn jobs_summary_rebuild_resumes_with_transitions(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.maintenance_batch = 2;
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            ids.push(s.insert(s.spec(&format!("rebuild-{i}"))).await);
+        }
+        ids.sort_by(|a, b| a.id.cmp(&b.id));
+        let first = s.summary(true).await;
+        assert!(first.rebuilding && first.counts.is_empty() && first.oldest_pending.is_none());
+        assert_eq!(s.summary(false).await, first);
+        // Both already counted and not-yet-counted rows can change during rebuilding.
+        s.changed(JobRequest::Cancel(Selector::Ids(vec![
+            ids[0].clone(),
+            ids[6].clone(),
+        ])))
+        .await;
+        s.insert(s.spec("during-rebuild")).await;
+        let mut passes = 1;
+        loop {
+            let status = s.summary(true).await;
+            passes += 1;
+            assert!(passes <= 5);
+            if !status.rebuilding {
+                assert_eq!(status.counts.get(&JobState::Pending), Some(&6));
+                assert_eq!(status.counts.get(&JobState::Cancelled), Some(&2));
+                assert_eq!(s.summary(false).await, status);
+                break;
+            }
+            assert!(status.counts.is_empty());
+        }
+    }
+
+    /// Leases enforce per-scope delivery backpressure and expire without counting old leases.
+    pub async fn jobs_completion_lease_cap_is_visible(backend: Arc<dyn QueueBackend>) {
+        let mut s = Suite::new(backend);
+        s.config.max_leased_completions = 2;
+        for i in 0..3 {
+            s.ready(&format!("cap-{i}")).await;
+        }
+        let first = match s
+            .op(JobRequest::Completions {
+                limit: 3,
+                max_bytes: 100_000,
+            })
+            .await
+            .unwrap()
+        {
+            JobResponse::Deliveries(page) => page,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first.items.len(), 2);
+        assert!(first.lease_cap_reached);
+        let capped = match s
+            .op(JobRequest::Completions {
+                limit: 1,
+                max_bytes: 100_000,
+            })
+            .await
+            .unwrap()
+        {
+            JobResponse::Deliveries(page) => page,
+            other => panic!("{other:?}"),
+        };
+        assert!(capped.items.is_empty() && capped.lease_cap_reached);
+        s.ack(first.items[0].token.clone().unwrap(), Disposition::Accepted)
+            .await;
+        assert_eq!(s.deliveries(1, 100_000).await.len(), 1);
+        s.advance(31);
+        assert_eq!(s.deliveries(2, 100_000).await.len(), 2);
+    }
+
+    /// Numeric timestamps keep chronological order across extended years and reject leap seconds atomically.
+    pub async fn jobs_timestamp_order_and_range(backend: Arc<dyn QueueBackend>) {
+        use chrono::TimeZone;
+        let mut s = Suite::new(backend);
+        s.now = Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap();
+        let early = s.ready("early-year").await;
+        s.now = Utc.with_ymd_and_hms(10000, 1, 1, 0, 0, 0).unwrap();
+        let late = s.ready("extended-year").await;
+        let page = s.deliveries(2, 100_000).await;
+        assert_eq!(
+            page.iter()
+                .map(|d| d.completion.id.clone())
+                .collect::<Vec<_>>(),
+            vec![early, late]
+        );
+        let leap = DateTime::from_timestamp(1_483_228_799, 1_500_000_000).unwrap();
+        let mut invalid = s.spec("invalid-time");
+        invalid.recovery_until = Some(leap);
+        assert!(matches!(
+            s.op(JobRequest::Enqueue(vec![
+                s.spec("rolled-back-time"),
+                invalid
+            ]))
+            .await,
+            Err(JobError::InvalidRequest)
+        ));
+        assert!(matches!(
+            s.enqueue(vec![s.spec("rolled-back-time")]).await[0],
+            Enqueued::Inserted(_)
+        ));
+        s.now = DateTime::<Utc>::MAX_UTC;
+        assert!(matches!(
+            s.op(JobRequest::Enqueue(vec![s.spec("overflow-time")]))
+                .await,
+            Err(JobError::InvalidRequest)
+        ));
+    }
+
     /// Byte-bounded completion pages defer the next row without leasing it.
     pub async fn jobs_completion_page_byte_bound_is_exact(backend: Arc<dyn QueueBackend>) {
         let mut s = Suite::new(backend);
@@ -2024,7 +2202,13 @@ macro_rules! job_backend_conformance {
             jobs_paid_reconciliation_requires_explicit_evidence,
             jobs_null_payload_and_result_round_trip,
             jobs_unknown_metadata_is_refused,
-            jobs_completion_page_byte_bound_is_exact
+            jobs_completion_page_byte_bound_is_exact,
+            jobs_purged_expired_claim_cancel_is_purged,
+            jobs_cancel_deduplicates_and_chunks_unfinished_group,
+            jobs_owner_purge_chunks_membership,
+            jobs_summary_rebuild_resumes_with_transitions,
+            jobs_completion_lease_cap_is_visible,
+            jobs_timestamp_order_and_range
         );
     };
     (@tests $make:expr; $($check:ident),+ $(,)?) => {

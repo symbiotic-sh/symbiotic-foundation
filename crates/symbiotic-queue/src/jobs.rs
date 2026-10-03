@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use symbiotic_core::{BindingIdentity, DiagnosticCode, QueueItemId};
 use thiserror::Error;
 
@@ -68,6 +68,8 @@ pub struct JobConfig {
     pub max_batch: usize,
     /// Maximum delivery/diagnostic/claim page (64).
     pub max_page: usize,
+    /// Maximum simultaneously leased unconfirmed finals (256; PROVISIONAL).
+    pub max_leased_completions: usize,
     /// Maximum serialized delivery page (1 MiB).
     pub max_page_bytes: usize,
     /// Hard unfinished-job count bound (1024).
@@ -94,6 +96,7 @@ impl Default for JobConfig {
             version: 1,
             max_batch: 64,
             max_page: 64,
+            max_leased_completions: 4 * 64,
             max_page_bytes: 1024 * 1024,
             max_pending_items: 1024,
             max_pending_bytes: 16 * 1024 * 1024,
@@ -369,6 +372,15 @@ pub struct Delivery {
     pub token: Option<DeliveryToken>,
 }
 
+/// Bounded completion page with visible delivery backpressure.
+#[derive(Clone, Debug)]
+pub struct CompletionPage {
+    /// Final deliveries and admission notices within the requested page.
+    pub items: Vec<Delivery>,
+    /// The per-scope lease cap prevented further final delivery.
+    pub lease_cap_reached: bool,
+}
+
 /// One confirmation result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -383,6 +395,10 @@ pub enum AckResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupSummary {
+    /// Counts are unavailable while bounded rebuilding is in progress.
+    pub rebuilding: bool,
+    /// Last incorporated ID in a resumable rebuild; stored with the summary.
+    pub rebuild_after: Option<String>,
     /// Number of jobs in each lifecycle/disposition.
     pub counts: BTreeMap<JobState, usize>,
     /// Creation time of the oldest Pending job.
@@ -537,7 +553,7 @@ pub enum JobResponse {
     /// Bounded candidate snapshots for the runner/account owner.
     Candidates(Vec<JobRecord>),
     /// Final results and admission notices.
-    Deliveries(Vec<Delivery>),
+    Deliveries(CompletionPage),
     /// Confirmation dispositions.
     Acks(Vec<AckResult>),
     /// Cancellation/purge/maintenance changed this many rows.
@@ -595,9 +611,16 @@ pub enum JobError {
 #[derive(Clone, Debug)]
 pub enum JobQuery {
     /// Scoped group scan (for atomic group cancel/rebuild).
-    Group(String),
-    /// Scoped owner matches (for atomic erasure).
-    Owner(String),
+    Group {
+        group: String,
+        after: Option<String>,
+        unfinished: bool,
+    },
+    /// Indexed owner membership, chunked in ascending ID order.
+    Owner {
+        owner: String,
+        after: Option<String>,
+    },
     /// Waiting claims in a specific class, FIFO.
     Pending {
         kinds: Vec<String>,
@@ -636,13 +659,94 @@ pub trait JobRows {
     fn save(&mut self, row: JobRecord) -> Result<(), JobError>;
     /// Count unfinished rows and bytes.
     fn usage(&mut self, scope: &JobScope) -> Result<PendingUsage, JobError>;
-    /// Read or rebuild the group summary.
+    /// Count live completion leases using their deadline index.
+    fn leased(&mut self, scope: &JobScope, now: DateTime<Utc>) -> Result<usize, JobError>;
+    /// Load the stored summary, including any partial rebuild progress.
+    fn load_summary(&mut self, scope: &JobScope, group: &str) -> Result<GroupSummary, JobError>;
+    /// Atomically save the rebuildable summary alongside canonical row writes.
+    fn save_summary(
+        &mut self,
+        scope: &JobScope,
+        group: &str,
+        summary: &GroupSummary,
+    ) -> Result<(), JobError>;
+    /// Oldest pending timestamp, restricted to the incorporated prefix during rebuilding.
+    fn oldest_pending(
+        &mut self,
+        scope: &JobScope,
+        group: &str,
+        summary: &GroupSummary,
+    ) -> Result<Option<DateTime<Utc>>, JobError>;
+    /// Read or advance one bounded summary rebuild using the shared cursor owner.
     fn summary(
         &mut self,
         scope: &JobScope,
         group: &str,
-        rebuild: bool,
-    ) -> Result<GroupSummary, JobError>;
+        rebuild: Option<usize>,
+    ) -> Result<GroupSummary, JobError>
+    where
+        Self: Sized,
+    {
+        let mut summary = self.load_summary(scope, group)?;
+        if let Some(batch) = rebuild {
+            if !summary.rebuilding {
+                summary = GroupSummary {
+                    rebuilding: true,
+                    ..GroupSummary::default()
+                };
+            }
+            let selected = self.select(
+                scope,
+                JobQuery::Group {
+                    group: group.into(),
+                    after: summary.rebuild_after.clone(),
+                    unfinished: false,
+                },
+                Utc::now(),
+                batch,
+            )?;
+            for row in &selected {
+                *summary.counts.entry(row.state).or_default() += 1;
+                summary.rebuild_after = Some(row.id.id.clone());
+            }
+            if selected.len() < batch {
+                summary.rebuilding = false;
+                summary.rebuild_after = None;
+            }
+            summary.oldest_pending = self.oldest_pending(scope, group, &summary)?;
+            self.save_summary(scope, group, &summary)?;
+        }
+        Ok(summary)
+    }
+}
+
+// Cancellation and reclaim share the sticky erasure precedence.
+fn stopped_state(row: &JobRecord) -> JobState {
+    if row.purged {
+        JobState::Purged
+    } else {
+        JobState::Cancelled
+    }
+}
+
+/// Ordered store timestamps use Unix milliseconds within chrono's supported range.
+/// Ordinary submillisecond clock precision is quantized; leap seconds are refused.
+#[doc(hidden)]
+pub fn millisecond_time(time: DateTime<Utc>) -> Result<DateTime<Utc>, JobError> {
+    if time.timestamp_subsec_nanos() >= 1_000_000_000 {
+        return Err(JobError::InvalidRequest);
+    }
+    DateTime::from_timestamp_millis(time.timestamp_millis()).ok_or(JobError::InvalidRequest)
+}
+
+/// Hide incomplete counts from callers while preserving the stored rebuild cursor.
+#[doc(hidden)]
+pub fn summary_status(mut summary: GroupSummary) -> GroupSummary {
+    if summary.rebuilding {
+        summary.counts.clear();
+        summary.oldest_pending = None;
+    }
+    summary
 }
 
 fn deadline(now: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>, JobError> {
@@ -761,7 +865,23 @@ pub fn job_input_bytes(row: &JobRecord) -> Result<usize, JobError> {
 
 // Every retained-input write uses this owner, so successors/checkpoints cannot
 // bypass enqueue's hard bound. Utilization is derived, never stored separately.
-fn save_job(rows: &mut impl JobRows, config: &JobConfig, row: JobRecord) -> Result<(), JobError> {
+fn save_job(
+    rows: &mut impl JobRows,
+    config: &JobConfig,
+    mut row: JobRecord,
+) -> Result<(), JobError> {
+    row.created_at = millisecond_time(row.created_at)?;
+    for time in [
+        &mut row.lease_until,
+        &mut row.recovery_until,
+        &mut row.finished_at,
+        &mut row.delivery_until,
+    ] {
+        *time = time.map(millisecond_time).transpose()?;
+    }
+    if let Some(admission) = &mut row.admission {
+        admission.authority_until = millisecond_time(admission.authority_until)?;
+    }
     let new_bytes = job_input_bytes(&row)?;
     let old = rows.get(&row.id)?;
     let old_items = usize::from(old.as_ref().is_some_and(|r| r.state.unfinished()));
@@ -844,11 +964,7 @@ fn claim_job(
         return Ok(None);
     }
     if row.cancel_requested && row.can_stop_without_accounting(now) {
-        let state = if row.purged {
-            JobState::Purged
-        } else {
-            JobState::Cancelled
-        };
+        let state = stopped_state(&row);
         finish(&mut row, state, now, config)?;
         delete_copies(&mut row);
         save_job(rows, config, row)?;
@@ -888,9 +1004,11 @@ pub fn apply_job_request(
     now: DateTime<Utc>,
     request: JobRequest,
 ) -> Result<JobResponse, JobError> {
+    let now = millisecond_time(now)?;
     if config.version != 1
         || config.max_batch == 0
         || config.max_page == 0
+        || config.max_leased_completions == 0
         || config.max_page_bytes < 2
         || config.maintenance_batch == 0
         || config.claim_lease_seconds == 0
@@ -915,6 +1033,7 @@ pub fn apply_job_request(
                 if spec.key.is_empty() || spec.kind.is_empty() || spec.limits.max_attempts == 0 {
                     return Err(JobError::InvalidRequest);
                 }
+                spec.recovery_until.map(millisecond_time).transpose()?;
                 if let Some(a) = &spec.admission {
                     validate_admission(scope, a)?;
                 }
@@ -1213,6 +1332,7 @@ pub fn apply_job_request(
                     row.receipt = Some(receipt);
                     row.diagnostic = None;
                     if let Some(until) = recovery_until {
+                        let until = millisecond_time(until)?;
                         row.recovery_until = Some(
                             row.recovery_until
                                 .map_or(until, |current| current.min(until)),
@@ -1254,7 +1374,14 @@ pub fn apply_job_request(
             if max_bytes < 2 || max_bytes > config.max_page_bytes {
                 return Err(JobError::InvalidRequest);
             }
-            let mut candidates = rows.select(scope, JobQuery::Final, now, limit)?;
+            let leased = rows.leased(scope, now)?;
+            let available = config.max_leased_completions.saturating_sub(leased);
+            let final_limit = limit.min(available);
+            let mut candidates = if final_limit == 0 {
+                Vec::new()
+            } else {
+                rows.select(scope, JobQuery::Final, now, final_limit)?
+            };
             if candidates.len() < limit {
                 candidates.extend(rows.select(
                     scope,
@@ -1308,7 +1435,14 @@ pub fn apply_job_request(
                 }
                 deliveries.push(delivery);
             }
-            Ok(JobResponse::Deliveries(deliveries))
+            let lease_cap_reached = leased
+                .checked_add(deliveries.iter().filter(|d| d.token.is_some()).count())
+                .ok_or(JobError::Storage)?
+                >= config.max_leased_completions;
+            Ok(JobResponse::Deliveries(CompletionPage {
+                items: deliveries,
+                lease_cap_reached,
+            }))
         }
         JobRequest::Ack(acks) => {
             if acks.len() > config.max_batch
@@ -1356,7 +1490,7 @@ pub fn apply_job_request(
             Ok(JobResponse::Acks(results))
         }
         JobRequest::Cancel(selector) => {
-            let selected = match selector {
+            let (mut selected, group) = match selector {
                 Selector::Ids(ids) => {
                     if ids.len() > config.max_batch {
                         return Err(JobError::InvalidRequest);
@@ -1364,52 +1498,105 @@ pub fn apply_job_request(
                     for id in &ids {
                         scoped(scope, id)?;
                     }
-                    ids.iter()
-                        .map(|id| get(rows, scope, id))
-                        .collect::<Result<Vec<_>, _>>()?
+                    let unique: BTreeSet<_> = ids.into_iter().map(|id| id.id).collect();
+                    (
+                        unique
+                            .into_iter()
+                            .map(|id| {
+                                get(
+                                    rows,
+                                    scope,
+                                    &JobId {
+                                        scope: scope.clone(),
+                                        id,
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        None,
+                    )
                 }
-                Selector::Group(group) => {
-                    rows.select(scope, JobQuery::Group(group), now, usize::MAX)?
-                }
+                Selector::Group(group) => (Vec::new(), Some(group)),
             };
+            let mut after = None;
             let mut changed = 0;
-            for mut row in selected {
-                if !row.state.unfinished() {
-                    continue;
+            loop {
+                if let Some(group) = &group {
+                    selected = rows.select(
+                        scope,
+                        JobQuery::Group {
+                            group: group.clone(),
+                            after: after.clone(),
+                            unfinished: true,
+                        },
+                        now,
+                        config.maintenance_batch,
+                    )?;
                 }
-                if row.can_stop_without_accounting(now) {
-                    finish(&mut row, JobState::Cancelled, now, config)?;
-                    delete_copies(&mut row);
-                } else {
-                    row.cancel_requested = true;
+                if selected.is_empty() {
+                    break;
                 }
-                save_job(rows, config, row)?;
-                changed += 1;
+                after = selected.last().map(|r| r.id.id.clone());
+                for mut row in selected.drain(..) {
+                    if !row.state.unfinished() {
+                        continue;
+                    }
+                    if row.can_stop_without_accounting(now) {
+                        let state = stopped_state(&row);
+                        finish(&mut row, state, now, config)?;
+                        delete_copies(&mut row);
+                    } else {
+                        row.cancel_requested = true;
+                    }
+                    save_job(rows, config, row)?;
+                    changed += 1;
+                }
+                if group.is_none() {
+                    break;
+                }
             }
             Ok(JobResponse::Changed(changed))
         }
         JobRequest::PurgeOwner(owner) => {
-            let selected = rows.select(scope, JobQuery::Owner(owner), now, usize::MAX)?;
-            let count = selected.len();
-            for mut row in selected {
-                row.purged = true;
-                row.cancel_requested = true;
-                delete_copies(&mut row);
-                if row.can_stop_without_accounting(now)
-                    || row.state != JobState::Running
-                        && row.state != JobState::Uncertain
-                        && !row.state.acked()
-                {
-                    finish(&mut row, JobState::Purged, now, config)?;
+            let mut count = 0;
+            let mut after = None;
+            loop {
+                let selected = rows.select(
+                    scope,
+                    JobQuery::Owner {
+                        owner: owner.clone(),
+                        after: after.clone(),
+                    },
+                    now,
+                    config.maintenance_batch,
+                )?;
+                if selected.is_empty() {
+                    break;
                 }
-                save_job(rows, config, row)?;
+                after = selected.last().map(|r| r.id.id.clone());
+                count += selected.len();
+                for mut row in selected {
+                    row.purged = true;
+                    row.cancel_requested = true;
+                    delete_copies(&mut row);
+                    if row.can_stop_without_accounting(now)
+                        || row.state != JobState::Running
+                            && row.state != JobState::Uncertain
+                            && !row.state.acked()
+                    {
+                        finish(&mut row, JobState::Purged, now, config)?;
+                    }
+                    save_job(rows, config, row)?;
+                }
             }
             Ok(JobResponse::Changed(count))
         }
-        JobRequest::Status(group) => Ok(JobResponse::Summary(rows.summary(scope, &group, false)?)),
-        JobRequest::RebuildSummary(group) => {
-            Ok(JobResponse::Summary(rows.summary(scope, &group, true)?))
-        }
+        JobRequest::Status(group) => Ok(JobResponse::Summary(summary_status(
+            rows.summary(scope, &group, None)?,
+        ))),
+        JobRequest::RebuildSummary(group) => Ok(JobResponse::Summary(summary_status(
+            rows.summary(scope, &group, Some(config.maintenance_batch))?,
+        ))),
         JobRequest::Diagnostics {
             group,
             after,
@@ -1445,6 +1632,7 @@ pub fn apply_job_request(
 }
 
 fn validate_admission(scope: &JobScope, admission: &SignedAdmission) -> Result<(), JobError> {
+    millisecond_time(admission.authority_until)?;
     if admission.binding.tenant.0 != scope.tenant {
         return Err(JobError::Scope);
     }
@@ -1461,6 +1649,14 @@ pub fn summary_transition(
     old: Option<&JobRecord>,
     new: &JobRecord,
 ) -> Result<(), JobError> {
+    if summary.rebuilding
+        && summary
+            .rebuild_after
+            .as_ref()
+            .is_none_or(|id| new.id.id > *id)
+    {
+        return Ok(());
+    }
     if let Some(old) = old {
         let count = summary
             .counts
