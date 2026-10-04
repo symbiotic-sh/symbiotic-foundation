@@ -1,17 +1,17 @@
 use symbiotic_egress::*;
 
 #[test]
-fn v3_refusal_has_the_documented_wire_shape() {
+fn v4_refusal_has_the_documented_wire_shape() {
     let response = Response {
         version: PROTOCOL_VERSION,
         result: Err(EgressError::PermitRefused),
     };
     assert_eq!(
         serde_json::to_string(&response).unwrap(),
-        r#"{"version":3,"result":{"Err":"permit_refused"}}"#
+        r#"{"version":4,"result":{"Err":"permit_refused"}}"#
     );
     let decoded: Response =
-        serde_json::from_str(r#"{"version":3,"result":{"Err":"permit_refused"}}"#).unwrap();
+        serde_json::from_str(r#"{"version":4,"result":{"Err":"permit_refused"}}"#).unwrap();
     assert!(matches!(decoded.result, Err(EgressError::PermitRefused)));
 }
 
@@ -26,7 +26,7 @@ fn invalidated_status_has_a_distinct_wire_state() {
 }
 
 #[test]
-fn authority_expired_refusal_has_a_typed_v3_wire_error() {
+fn authority_expired_refusal_has_a_typed_v4_wire_error() {
     let response = Response {
         version: PROTOCOL_VERSION,
         result: Err(EgressError::AuthorityExpired),
@@ -34,7 +34,7 @@ fn authority_expired_refusal_has_a_typed_v3_wire_error() {
     let json = serde_json::to_string(&response).unwrap();
     assert_eq!(
         json,
-        r#"{"version":3,"result":{"Err":"authority_expired"}}"#
+        r#"{"version":4,"result":{"Err":"authority_expired"}}"#
     );
     assert!(matches!(
         serde_json::from_str::<Response>(&json).unwrap().result,
@@ -43,7 +43,7 @@ fn authority_expired_refusal_has_a_typed_v3_wire_error() {
 }
 
 #[test]
-fn authority_deadline_is_required_signed_and_digested_in_v3() {
+fn authority_deadline_is_required_signed_and_digested_in_v4() {
     let attempt = protocol_attempt();
     let key = AdmissionKey::new(vec![42; 32]).unwrap();
     let signed = key.sign_attempt(attempt.clone()).unwrap();
@@ -112,12 +112,12 @@ async fn frame_limit_is_checked_without_waiting_for_or_allocating_the_declared_b
 }
 
 #[tokio::test]
-async fn recovery_status_method_uses_v3_and_rejects_old_replies() {
+async fn recovery_status_method_uses_v4_and_rejects_old_replies() {
     struct Double(u16);
     #[async_trait::async_trait]
     impl EgressClient for Double {
         async fn exchange(&self, request: Request) -> Result<Response, EgressError> {
-            assert_eq!(request.version, 3);
+            assert_eq!(request.version, PROTOCOL_VERSION);
             let Operation::AttemptStatus(signed) = request.operation else {
                 panic!("wrong operation");
             };
@@ -140,13 +140,13 @@ async fn recovery_status_method_uses_v3_and_rejects_old_replies() {
             attempt_ordinal: 1,
         })
         .unwrap();
-    let client: Box<dyn EgressClient> = Box::new(Double(3));
+    let client: Box<dyn EgressClient> = Box::new(Double(PROTOCOL_VERSION));
     assert!(matches!(
         client.attempt_status(signed.clone()).await.unwrap(),
         AttemptStatus::NotIssued
     ));
     assert!(matches!(
-        Double(1).attempt_status(signed).await,
+        Double(PROTOCOL_VERSION - 1).attempt_status(signed).await,
         Err(EgressError::Version)
     ));
 }
@@ -395,6 +395,8 @@ mod clients {
             max_connections: 8,
             io_timeout_seconds: 2,
             clock_rollback_warning_tolerance_seconds: 5,
+            jobs: Default::default(),
+            job_runner: Default::default(),
             routes: vec![RouteConfig {
                 tenant: "tenant".into(),
                 account: "account".into(),

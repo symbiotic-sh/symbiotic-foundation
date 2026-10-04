@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub mod jobs_client;
+pub use jobs_client::*;
+
 #[cfg(unix)]
 pub mod socket;
 
@@ -42,7 +45,7 @@ pub fn encode_frame(value: &impl Serialize, max_bytes: u32) -> Result<Vec<u8>, E
 }
 
 /// Current wire and operation version. Unknown versions fail closed.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Static, safe-to-log errors. Never carry transport/provider bodies or credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -190,7 +193,7 @@ pub enum ProviderPayload {
 }
 
 impl ProviderPayload {
-    /// Digest the exact version-3 typed JSON representation; Memory uses this helper.
+    /// Digest the exact version-4 typed JSON representation; Memory uses this helper.
     pub fn digest(&self) -> Result<String, EgressError> {
         digest(self)
     }
@@ -246,7 +249,7 @@ impl AdmissionKey {
 
     /// Attest an attempt after the Memory durability barrier (never before).
     pub fn sign_attempt(&self, attempt: DurableAttempt) -> Result<SignedAttempt, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v3/attempt\0", &attempt)?;
+        let authentication = self.sign(b"symbiotic-egress/v4/attempt\0", &attempt)?;
         Ok(SignedAttempt {
             attempt,
             authentication,
@@ -255,7 +258,7 @@ impl AdmissionKey {
 
     /// Authorize result recovery for an attempt identity.
     pub fn sign_attempt_id(&self, attempt_id: AttemptId) -> Result<SignedAttemptId, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v3/attempt-status\0", &attempt_id)?;
+        let authentication = self.sign(b"symbiotic-egress/v4/attempt-status\0", &attempt_id)?;
         Ok(SignedAttemptId {
             attempt_id,
             authentication,
@@ -265,7 +268,7 @@ impl AdmissionKey {
     /// Verify status authorization in constant time.
     pub fn verify_attempt_id(&self, signed: &SignedAttemptId) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v3/attempt-status\0",
+            b"symbiotic-egress/v4/attempt-status\0",
             &signed.attempt_id,
             &signed.authentication,
         )
@@ -276,7 +279,7 @@ impl AdmissionKey {
         &self,
         grant: GrantRevision,
     ) -> Result<SignedGrantRevision, EgressError> {
-        let authentication = self.sign(b"symbiotic-egress/v3/grant-revision\0", &grant)?;
+        let authentication = self.sign(b"symbiotic-egress/v4/grant-revision\0", &grant)?;
         Ok(SignedGrantRevision {
             grant,
             authentication,
@@ -286,7 +289,7 @@ impl AdmissionKey {
     /// Verify a durable admission attestation in constant time.
     pub fn verify_attempt(&self, signed: &SignedAttempt) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v3/attempt\0",
+            b"symbiotic-egress/v4/attempt\0",
             &signed.attempt,
             &signed.authentication,
         )
@@ -295,7 +298,7 @@ impl AdmissionKey {
     /// Verify a revision publication in constant time.
     pub fn verify_grant_revision(&self, signed: &SignedGrantRevision) -> Result<(), EgressError> {
         self.verify(
-            b"symbiotic-egress/v3/grant-revision\0",
+            b"symbiotic-egress/v4/grant-revision\0",
             &signed.grant,
             &signed.authentication,
         )
@@ -488,6 +491,18 @@ pub struct Request {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "body", rename_all = "snake_case")]
 pub enum Operation {
+    /// Atomic authenticated job enqueue.
+    EnqueueJobs(Box<SignedJobsRequest>),
+    /// Renew an unsent job's signed authority.
+    AdmitJob(Box<SignedJobsRequest>),
+    /// Bounded job delivery and admission notices.
+    Completions(Box<SignedJobsRequest>),
+    /// Fenced job confirmations.
+    AckJobs(Box<SignedJobsRequest>),
+    /// Scoped job cancellation.
+    CancelJobs(Box<SignedJobsRequest>),
+    /// Content-free scoped job status.
+    JobStatus(Box<SignedJobsRequest>),
     /// Verify durable admission and issue its single-use permit.
     IssuePermit(Box<SignedAttempt>),
     /// Recover execution state/results using an authenticated durable identity.
@@ -514,6 +529,8 @@ pub struct Response {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", content = "body", rename_all = "snake_case")]
 pub enum Reply {
+    /// Typed queue result; no ledger settlement instructions are accepted.
+    Jobs(Result<JobsReply, JobError>),
     /// Newly issued or reattached capability and current execution state.
     Permit(PermitGrant),
     /// State and bounded recovery result for an authenticated attempt identity.

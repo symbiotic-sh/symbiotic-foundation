@@ -1444,6 +1444,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "libc",
  "reqwest",
  "rusqlite",
@@ -1452,6 +1453,7 @@ dependencies = [
  "socket2",
  "symbiotic-ai-runtime",
  "symbiotic-egress",
+ "symbiotic-queue",
  "symbiotic-queue-sqlite",
  "symbiotic-supervise",
  "symbiotic-trace",
@@ -1477,6 +1479,7 @@ dependencies = [
  "symbiotic-core",
  "symbiotic-credential-process",
  "symbiotic-model",
+ "symbiotic-queue",
  "symbiotic-trace",
  "tempfile",
  "thiserror",

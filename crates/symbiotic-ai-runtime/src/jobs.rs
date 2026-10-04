@@ -24,12 +24,30 @@ fn storage(_: impl std::fmt::Debug) -> ModelError {
 
 /// Final delivery plus the ledger's sole paid recovery answer. The answer is
 /// absent after expiry, confirmation or purge; accounting remains queryable.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelDelivery {
     /// Job metadata and confirmation token.
     pub delivery: Delivery,
     /// Same-invocation answer, with no cache reuse across keys.
     pub output: Option<serde_json::Value>,
+}
+
+/// Optional trusted admission owner for model jobs crossing an authenticated boundary.
+/// Successor and claim checks run inside the same IMMEDIATE transaction as the transition.
+/// Returning false at claim waits for renewed authority without reserving spend.
+pub trait ModelJobAdmission: Send + Sync {
+    /// Validate a signed initial authority before storing a waiting copy.
+    fn enqueue(&self, spec: &JobSpec) -> Result<(), JobError>;
+    /// Validate a successor against the canonical frozen row and previous authority.
+    /// False is an exact replay: leave the current lifecycle unchanged.
+    fn admit(&self, row: &JobRecord, admission: &[u8]) -> Result<bool, JobError>;
+    /// Recheck current authority after obtaining the account slot, before claim/reservation.
+    fn claim(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, JobError>;
 }
 
 /// One trusted scoped job API on the runtime's ledger connection.
@@ -39,6 +57,7 @@ pub struct ModelJobs {
     ledger: Arc<spend::SqliteSpendLedger>,
     scope: JobScope,
     config: JobConfig,
+    admission: Option<Arc<dyn ModelJobAdmission>>,
 }
 
 impl Runtime {
@@ -50,6 +69,7 @@ impl Runtime {
             ledger: self.inner.job_ledger.clone().ok_or(JobError::Unavailable)?,
             scope,
             config,
+            admission: None,
         };
         jobs.request_sync(JobRequest::PendingUsage)?;
         Ok(jobs)
@@ -224,6 +244,11 @@ fn job_receipt_reference_in(
 }
 
 impl ModelJobs {
+    /// Attach the trusted admission owner; signed jobs never retry automatically.
+    pub fn with_admission(mut self, admission: Arc<dyn ModelJobAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     /// D1 invocation key for direct execution/recovery of this scoped job.
     /// The scope and caller key identify one invocation across job attempts.
     pub fn invocation_key(&self, key: &str) -> Result<String, JobError> {
@@ -263,11 +288,14 @@ impl ModelJobs {
         if !matches!(
             request,
             JobRequest::Enqueue(_)
+                | JobRequest::Admit { .. }
+                | JobRequest::AdmissionNotices { .. }
                 | JobRequest::Ack(_)
                 | JobRequest::Cancel(_)
                 | JobRequest::PurgeOwner(_)
                 | JobRequest::Diagnostics { .. }
                 | JobRequest::Maintain
+                | JobRequest::Status(_)
                 | JobRequest::Get(_)
                 | JobRequest::PendingUsage
         ) {
@@ -284,6 +312,11 @@ impl ModelJobs {
                 return Err(JobError::InvalidRequest);
             }
             for spec in specs {
+                if let Some(admission) = &self.admission {
+                    admission.enqueue(spec)?;
+                } else if spec.admission.is_some() {
+                    return Err(JobError::InvalidRequest);
+                }
                 if spec.execution != Execution::Model {
                     return Err(JobError::InvalidRequest);
                 }
@@ -309,6 +342,10 @@ impl ModelJobs {
             return Err(JobError::InvalidRequest);
         }
         self.transaction(|tx, now| {
+            if let JobRequest::Admit { job, admission } = &request {
+                let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(job.clone()))? else { return Err(JobError::NotFound) };
+                if !self.admission.as_ref().ok_or(JobError::InvalidRequest)?.admit(&row, admission)? { return Ok(JobResponse::Done); }
+            }
             if let JobRequest::Enqueue(specs) = &request {
                 for spec in specs {
                     let (identity, sharing, _) = input(&spec.payload)?;
@@ -606,6 +643,18 @@ impl model::ModelJob for ClaimOwner {
                 )?;
                 return Ok(None);
             }
+            if let Some(admission) = &self.jobs.admission {
+                let JobResponse::Job(Some(row)) =
+                    self.jobs
+                        .op(tx, now, JobRequest::Get(self.candidate.clone()))?
+                else {
+                    return Err(JobError::NotFound);
+                };
+                if !admission.claim(tx, &row, now)? {
+                    self.jobs.op(tx, now, JobRequest::AwaitAdmission(row.id))?;
+                    return Ok(None);
+                }
+            }
             let JobResponse::Job(row) = self.jobs.op(
                 tx,
                 now,
@@ -620,10 +669,17 @@ impl model::ModelJob for ClaimOwner {
             let Some(row) = row else {
                 return Ok(None);
             };
+            // Signed jobs require successor authority for each further claim;
+            // their frozen ceiling is independent of a route's one-send retry policy.
+            let attempt_limit = if self.jobs.admission.is_some() {
+                row.max_attempts
+            } else {
+                row.max_attempts.min(limit)
+            };
             let accepted = spend::SqliteSpendLedger::reserve_with_limit_in(
                 tx,
                 reservation,
-                Some(row.max_attempts.min(limit)),
+                Some(attempt_limit),
                 false,
             )
             .map_err(|error| JobError::Execution(error.code()))?;
@@ -843,6 +899,9 @@ impl model::ModelJob for ClaimOwner {
         Ok(eligible)
     }
     fn can_retry(&self, limit: u32) -> Result<bool, ModelError> {
+        if self.jobs.admission.is_some() {
+            return Ok(false);
+        }
         let claim = self.claim_record()?;
         if claim.generation >= u64::from(claim.max_attempts.min(limit)) {
             return Ok(false);
@@ -1014,6 +1073,7 @@ mod review_tests {
             kind: "chat".into(),
             execution: Execution::Model,
             payload: model_job_payload(&binding, &request).expect("payload"),
+            admission: None,
             limits: JobLimits { max_attempts: 1 },
             recovery_until: None,
         };
@@ -1109,6 +1169,7 @@ mod review_tests {
             execution: Execution::Model,
             payload: model_job_payload(&binding, &serde_json::json!({"data": "x".repeat(65536)}))
                 .expect("payload"),
+            admission: None,
             limits: JobLimits { max_attempts: 1 },
             recovery_until: None,
         };
@@ -1155,5 +1216,131 @@ mod review_tests {
                 < std::mem::size_of::<JobRecord>()
         );
         assert!(!model::ModelJob::heartbeat(&owner).expect("heartbeat"));
+    }
+
+    #[tokio::test]
+    async fn signed_claims_use_frozen_job_ceiling_across_successor_admissions() {
+        struct Admitted;
+        impl ModelJobAdmission for Admitted {
+            fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn admit(&self, _: &JobRecord, _: &[u8]) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn claim(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: chrono::DateTime<Utc>,
+            ) -> Result<bool, JobError> {
+                Ok(true)
+            }
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs")
+            .with_admission(Arc::new(Admitted));
+        let binding = ModelBinding::new(model::StaticChatProvider::new("response"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"));
+        let spec = JobSpec {
+            key: "key".into(),
+            group: None,
+            owners: vec![],
+            kind: "chat".into(),
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &serde_json::json!({"input": "x"}))
+                .expect("payload"),
+            admission: Some(b"first".to_vec()),
+            limits: JobLimits { max_attempts: 3 },
+            recovery_until: None,
+        };
+        let JobResponse::Enqueued(rows) = jobs
+            .request(JobRequest::Enqueue(vec![spec]))
+            .await
+            .expect("enqueue")
+        else {
+            panic!("enqueue response")
+        };
+        let Enqueued::Inserted(id) = &rows[0] else {
+            panic!("inserted")
+        };
+        let (_stop, stop) = watch::channel(false);
+        let owner = ClaimOwner {
+            jobs: jobs.clone(),
+            candidate: id.clone(),
+            claim: Mutex::new(None),
+            heartbeat: Duration::from_millis(10),
+            finished: AtomicBool::new(false),
+            stop,
+        };
+        let mut reservation = SpendReservation {
+            reference: crate::SpendReceiptRef::new("first").expect("reference"),
+            account: "account".into(),
+            invocation: "invocation".into(),
+            binding: "binding".into(),
+            request_limit: None,
+        };
+        assert!(
+            model::ModelJob::claim(&owner, &reservation, 1)
+                .expect("first claim")
+                .is_some()
+        );
+        model::ModelJob::finish(
+            &owner,
+            SpendState::Released,
+            None,
+            None,
+            Some(DiagnosticCode::AuthenticationRejected),
+            true,
+        )
+        .expect("trusted zero charge");
+        let JobResponse::Job(Some(row)) = jobs
+            .request(JobRequest::Get(id.clone()))
+            .await
+            .expect("row")
+        else {
+            panic!("row")
+        };
+        assert_eq!(row.state, JobState::AwaitingAdmission);
+        jobs.request(JobRequest::Admit {
+            job: id.clone(),
+            admission: b"successor".to_vec(),
+        })
+        .await
+        .expect("successor");
+        reservation.reference = crate::SpendReceiptRef::new("second").expect("reference");
+        assert!(
+            model::ModelJob::claim(&owner, &reservation, 1)
+                .expect("successor claim")
+                .is_some()
+        );
+        let receipt = spend::receipt_in(
+            &jobs.ledger.0.lock().expect("ledger"),
+            &reservation.reference,
+        )
+        .expect("receipt")
+        .expect("present");
+        assert_eq!(receipt.attempt_limit, Some(3));
+        assert_eq!(receipt.attempts_used, 2);
     }
 }

@@ -1529,6 +1529,7 @@ impl Suite {
             kind: "handler".into(),
             execution: Execution::Handler,
             payload: data!({ "input": key }),
+            admission: None,
             limits: JobLimits { max_attempts: 3 },
             recovery_until: None,
         }
@@ -3054,4 +3055,149 @@ async fn regression_sqlite_completion_lock_wait_cannot_revive_expired_claim() {
     let row = s.get(&id).await;
     assert_eq!(row.state, JobState::Running);
     assert!(row.output.is_none());
+}
+
+#[tokio::test]
+async fn signed_zero_charge_recovery_requires_successor_authority() {
+    let suite = Suite::new();
+    let mut spec = suite.spec("signed");
+    spec.execution = Execution::Model;
+    spec.admission = Some(b"opaque signed authority".to_vec());
+    let id = suite.insert(spec).await;
+    let JobResponse::Job(Some(claim)) = suite
+        .op(JobRequest::ClaimPaid {
+            job: id.clone(),
+            receipt: "pre-dispatch".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    suite
+        .op(JobRequest::Resolve {
+            job: id.clone(),
+            generation: claim.generation,
+            resolution: JobResolution::KnownZeroCharge {
+                receipt: "pre-dispatch".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let row = suite.get(&id).await;
+    assert_eq!(row.state, JobState::AwaitingAdmission);
+    assert_eq!(row.generation, 1);
+    assert!(row.payload.is_some());
+    assert!(matches!(
+        suite
+            .op(JobRequest::ClaimPaid {
+                job: id.clone(),
+                receipt: "blind-retry".into()
+            })
+            .await
+            .unwrap(),
+        JobResponse::Job(None)
+    ));
+    // Replaying the old admission must not make it eligible again.
+    suite
+        .op(JobRequest::Admit {
+            job: id.clone(),
+            admission: row.admission.unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(suite.get(&id).await.state, JobState::AwaitingAdmission);
+    suite
+        .op(JobRequest::Admit {
+            job: id.clone(),
+            admission: b"successor".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(suite.get(&id).await.state, JobState::Pending);
+}
+
+#[tokio::test]
+async fn admission_bytes_share_pending_bound_and_failed_updates_roll_back() {
+    let mut suite = Suite::new();
+    let mut spec = suite.spec("signed-bounds");
+    spec.execution = Execution::Model;
+    spec.admission = Some(vec![1; 64]);
+    let id = suite.insert(spec).await;
+    let JobResponse::Usage(usage) = suite.op(JobRequest::PendingUsage).await.unwrap() else {
+        panic!("usage")
+    };
+    suite.config.max_pending_bytes = usage.bytes;
+    suite
+        .op(JobRequest::AwaitAdmission(id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        suite
+            .op(JobRequest::Admit {
+                job: id.clone(),
+                admission: vec![2; 65]
+            })
+            .await
+            .unwrap_err(),
+        JobError::QueueFull
+    );
+    let row = suite.get(&id).await;
+    assert_eq!(row.state, JobState::AwaitingAdmission);
+    assert_eq!(row.admission, Some(vec![1; 64]));
+    assert!(matches!(
+        suite
+            .op(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+            .await
+            .unwrap(),
+        JobResponse::Changed(1)
+    ));
+    let row = suite.get(&id).await;
+    assert_eq!(row.state, JobState::Cancelled);
+    assert!(row.admission.is_none() && row.payload.is_none());
+}
+
+#[tokio::test]
+async fn admission_bytes_share_maintenance_budget() {
+    let mut suite = Suite::new();
+    suite.config.maintenance_bytes_per_pass = 80;
+    suite.config.retention_seconds = 1;
+    let mut ids = Vec::new();
+    for key in ["signed-maintenance-a", "signed-maintenance-b"] {
+        let mut spec = suite.spec(key);
+        spec.execution = Execution::Model;
+        spec.payload = vec![0; 4];
+        spec.admission = Some(vec![1; 64]);
+        let id = suite.insert(spec).await;
+        let JobResponse::Job(Some(claim)) = suite
+            .op(JobRequest::ClaimPaid {
+                job: id.clone(),
+                receipt: key.into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("claim")
+        };
+        suite
+            .op(JobRequest::Resolve {
+                job: id.clone(),
+                generation: claim.generation,
+                resolution: JobResolution::Failed {
+                    receipt: key.into(),
+                    diagnostic: symbiotic_core::DiagnosticCode::AuthenticationRejected,
+                },
+            })
+            .await
+            .unwrap();
+        ids.push(id);
+        suite.advance(1);
+    }
+    assert_eq!(suite.changed(JobRequest::Maintain).await, 1);
+    let first = suite.get(&ids[0]).await;
+    assert!(first.result_expired && first.admission.is_none());
+    assert!(!suite.get(&ids[1]).await.result_expired);
+    assert_eq!(suite.changed(JobRequest::Maintain).await, 1);
+    let second = suite.get(&ids[1]).await;
+    assert!(second.result_expired && second.admission.is_none());
 }

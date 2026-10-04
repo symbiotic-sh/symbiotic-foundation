@@ -17,6 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 socket2 = "0.6"
 symbiotic-ai-runtime = { path = "../symbiotic-ai-runtime" }
+chrono.workspace = true
+symbiotic-queue = { path = "../symbiotic-queue" }
 symbiotic-supervise = { path = "../symbiotic-supervise" }
 symbiotic-egress = { path = "../symbiotic-egress" }
 symbiotic-trace = { path = "../symbiotic-trace" }

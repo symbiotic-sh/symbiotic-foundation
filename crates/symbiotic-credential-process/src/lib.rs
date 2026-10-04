@@ -9,6 +9,7 @@ pub use process_security::protect_process;
 mod in_process;
 pub use in_process::InProcessEgressClient;
 
+mod jobs;
 mod provider;
 mod registry;
 pub mod secrets;
@@ -120,7 +121,7 @@ pub struct RouteConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
-    /// Must equal protocol version 3.
+    /// Must equal protocol version 4.
     pub version: u16,
     /// Owner-only runtime directory (queue plus permit replay metadata).
     pub state_dir: PathBuf,
@@ -140,6 +141,12 @@ pub struct ProcessConfig {
     /// In seconds; defaults to five. Does not change admission or authority checks.
     #[serde(default = "default_clock_rollback_warning_tolerance_seconds")]
     pub clock_rollback_warning_tolerance_seconds: u64,
+    /// Versioned job-store policy (queue defaults).
+    #[serde(default)]
+    pub jobs: symbiotic_queue::jobs::JobConfig,
+    /// Versioned job-runner policy (runner defaults).
+    #[serde(default)]
+    pub job_runner: symbiotic_queue::runner::RunnerConfig,
     /// Approved routes; no caller-supplied destinations or secret paths.
     pub routes: Vec<RouteConfig>,
 }
@@ -171,7 +178,8 @@ struct Inner {
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
     runtime: Runtime,
-    _process_lock: ProcessLock,
+    job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
+    _process_lock: Arc<ProcessLock>,
 }
 
 /// Cloneable process handle. Started dispatch work survives dropped caller futures.
@@ -238,7 +246,8 @@ impl CredentialProcess {
                 routes,
                 registry: Mutex::new(registry),
                 runtime,
-                _process_lock: process_lock,
+                job_runners: tokio::sync::Mutex::new(HashMap::new()),
+                _process_lock: Arc::new(process_lock),
             }),
         })
     }
@@ -264,6 +273,42 @@ impl CredentialProcess {
     async fn operation(&self, operation: Operation) -> Result<Reply, EgressError> {
         self.purge_expired_results()?;
         match operation {
+            Operation::EnqueueJobs(signed)
+                if matches!(signed.request.command, JobsCommand::EnqueueJobs(_)) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::AdmitJob(signed)
+                if matches!(signed.request.command, JobsCommand::AdmitJob { .. }) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::Completions(signed)
+                if matches!(signed.request.command, JobsCommand::Completions { .. }) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::AckJobs(signed)
+                if matches!(signed.request.command, JobsCommand::AckJobs(_)) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::CancelJobs(signed)
+                if matches!(signed.request.command, JobsCommand::CancelJobs(_)) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::JobStatus(signed)
+                if matches!(signed.request.command, JobsCommand::JobStatus(_)) =>
+            {
+                self.jobs_operation(*signed).await
+            }
+            Operation::EnqueueJobs(_)
+            | Operation::AdmitJob(_)
+            | Operation::Completions(_)
+            | Operation::AckJobs(_)
+            | Operation::CancelJobs(_)
+            | Operation::JobStatus(_) => Err(EgressError::InvalidRequest),
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
                 let foundation_now = registry::now()?;
@@ -422,7 +467,8 @@ impl CredentialProcess {
             || a.record_sequence > i64::MAX as u64
             || a.recorded_at >= a.expires_at
             || a.expires_at > i64::MAX as u64
-            || a.recovery_expires_at <= a.recorded_at
+            || a.recovery_expires_at == 0
+            || a.attempt_ordinal == 1 && a.recovery_expires_at <= a.recorded_at
             || a.recovery_expires_at > i64::MAX as u64
             || !is_digest(&a.input_digest)
             || !is_digest(&a.input_manifest_digest)

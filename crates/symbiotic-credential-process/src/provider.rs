@@ -96,7 +96,7 @@ impl From<EgressError> for ExecuteError {
     }
 }
 
-fn route_binding<P>(
+pub(crate) fn route_binding<P>(
     runtime: &Runtime,
     route: &RouteConfig,
     provider: P,
@@ -121,7 +121,7 @@ fn accepted_route_binding<P>(
     Ok(binding.with_response_cache(ResponseCacheMode::Off))
 }
 
-fn resolved_route<'a>(
+pub(crate) fn resolved_route<'a>(
     runtime: &'a Runtime,
     route: &RouteConfig,
 ) -> Result<model::RegistryBinding<'a>, EgressError> {
@@ -440,6 +440,72 @@ pub(crate) fn accepted_handoff(
     })
 }
 
+pub(crate) fn chat_adapter(
+    route: &RouteConfig,
+    secret: &str,
+) -> Result<Arc<dyn ChatProvider>, EgressError> {
+    let (RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. }) =
+        &route.provider
+    else {
+        return Err(EgressError::InvalidRequest);
+    };
+    let inner: Arc<dyn ChatProvider> = match &route.provider {
+        RouteProvider::AnthropicChat { thinking, .. } => Arc::new(
+            AnthropicChatProvider::new(operator, &route.model, &route.destination, secret)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens)
+                .with_thinking(*thinking),
+        ),
+        _ => Arc::new(
+            OpenAiCompatibleChatProvider::new(operator, &route.model, &route.destination, secret)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens),
+        ),
+    };
+
+    Ok(inner)
+}
+
+pub(crate) fn embedding_adapter(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    secret: &str,
+) -> Result<Arc<dyn EmbeddingProvider>, EgressError> {
+    match route.provider {
+        RouteProvider::GeminiEmbedding { dimensions } => Ok(Arc::new(
+            GeminiEmbeddingProvider::new("gemini", &route.model, secret, dimensions)
+                .with_timeout(route.timeout_seconds)
+                .map_err(|_| EgressError::InvalidRequest)?
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes),
+        )),
+        RouteProvider::CompatibleEmbedding { .. } => Ok(Arc::new(
+            model::CompatibleEmbeddingProvider::from_binding(
+                &resolved_route(runtime, route)?,
+                secret,
+            )
+            .map_err(|_| EgressError::InvalidRequest)?,
+        )),
+        _ => Err(EgressError::InvalidRequest),
+    }
+}
+pub(crate) fn rerank_adapter(
+    runtime: &Runtime,
+    route: &RouteConfig,
+    secret: &str,
+) -> Result<Arc<dyn RerankProvider>, EgressError> {
+    Ok(Arc::new(
+        model::CohereRerankProvider::from_binding(&resolved_route(runtime, route)?, secret)
+            .map_err(|_| EgressError::InvalidRequest)?,
+    ))
+}
+
 pub(crate) async fn execute(
     runtime: &Runtime,
     route: &RouteConfig,
@@ -450,38 +516,10 @@ pub(crate) async fn execute(
     let started = Arc::new(AtomicBool::new(false));
     match (&route.provider, payload) {
         (
-            RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. },
+            RouteProvider::OpenAiChat { .. } | RouteProvider::AnthropicChat { .. },
             ProviderPayload::Chat(request),
         ) => {
-            let inner: Arc<dyn ChatProvider> = match &route.provider {
-                RouteProvider::AnthropicChat { thinking, .. } => Arc::new(
-                    AnthropicChatProvider::new(
-                        operator,
-                        &route.model,
-                        &route.destination,
-                        secret.value(),
-                    )
-                    .with_timeout(route.timeout_seconds)
-                    .map_err(|_| EgressError::InvalidRequest)?
-                    .with_request_limit(route.max_input_bytes)
-                    .with_response_limit(route.max_response_bytes)
-                    .with_output_limit(route.max_output_tokens)
-                    .with_thinking(*thinking),
-                ),
-                _ => Arc::new(
-                    OpenAiCompatibleChatProvider::new(
-                        operator,
-                        &route.model,
-                        &route.destination,
-                        secret.value(),
-                    )
-                    .with_timeout(route.timeout_seconds)
-                    .map_err(|_| EgressError::InvalidRequest)?
-                    .with_request_limit(route.max_input_bytes)
-                    .with_response_limit(route.max_response_bytes)
-                    .with_output_limit(route.max_output_tokens),
-                ),
-            };
+            let inner = chat_adapter(route, secret.value())?;
             let provider = Dispatched {
                 inner,
                 started: started.clone(),
@@ -500,40 +538,12 @@ pub(crate) async fn execute(
                 response.trace,
             ))
         }
-        (RouteProvider::GeminiEmbedding { dimensions }, ProviderPayload::Embedding(request)) => {
+        (
+            RouteProvider::GeminiEmbedding { .. } | RouteProvider::CompatibleEmbedding { .. },
+            ProviderPayload::Embedding(request),
+        ) => {
             let provider = Dispatched {
-                inner: GeminiEmbeddingProvider::new(
-                    "gemini",
-                    &route.model,
-                    secret.value(),
-                    *dimensions,
-                )
-                .with_timeout(route.timeout_seconds)
-                .map_err(|_| EgressError::InvalidRequest)?
-                .with_request_limit(route.max_input_bytes)
-                .with_response_limit(route.max_response_bytes),
-                started: started.clone(),
-            };
-            let provider = runtime
-                .embedding(accepted_route_binding(runtime, route, provider, handoff)?)
-                .map_err(|_| EgressError::StateUnavailable)?;
-            let response = provider
-                .embed(request)
-                .await
-                .map_err(|error| execute_error(error, &started))?;
-            Ok(completed(
-                ProviderOutput::Embedding {
-                    vectors: response.vectors,
-                    dimensions: response.dimensions,
-                },
-                response.trace,
-            ))
-        }
-        (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(request)) => {
-            let resolved = resolved_route(runtime, route)?;
-            let provider = Dispatched {
-                inner: model::CompatibleEmbeddingProvider::from_binding(&resolved, secret.value())
-                    .map_err(|_| EgressError::InvalidRequest)?,
+                inner: embedding_adapter(runtime, route, secret.value())?,
                 started: started.clone(),
             };
             let provider = runtime
@@ -552,10 +562,8 @@ pub(crate) async fn execute(
             ))
         }
         (RouteProvider::CohereRerank { .. }, ProviderPayload::Rerank(request)) => {
-            let resolved = resolved_route(runtime, route)?;
             let provider = Dispatched {
-                inner: model::CohereRerankProvider::from_binding(&resolved, secret.value())
-                    .map_err(|_| EgressError::InvalidRequest)?,
+                inner: rerank_adapter(runtime, route, secret.value())?,
                 started: started.clone(),
             };
             let provider = runtime

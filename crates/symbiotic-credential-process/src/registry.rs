@@ -201,7 +201,10 @@ impl Registry {
         Ok(())
     }
 
-    fn check_revision(conn: &Connection, attempt: &DurableAttempt) -> Result<(), EgressError> {
+    pub(crate) fn check_revision(
+        conn: &Connection,
+        attempt: &DurableAttempt,
+    ) -> Result<(), EgressError> {
         let key = digest(&(&attempt.tenant, &attempt.incarnation))?;
         let current: Option<u64> = conn
             .query_row(
