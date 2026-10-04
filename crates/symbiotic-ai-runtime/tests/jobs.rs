@@ -1797,10 +1797,136 @@ async fn audit_54_failed_attempt_trace_error_reaches_shutdown() {
     let runner = start(&j, p.clone()).await;
     wait_state(&j, &id, JobState::Uncertain).await;
     let result = runner.shutdown().await;
-    assert!(
-        matches!(result, Err(symbiotic_queue::runner::RunnerError::Workers(ref errors)) if errors.iter().any(|e| matches!(e, symbiotic_queue::runner::RunnerError::Store(JobError::Execution(symbiotic_core::DiagnosticCode::StorageFailure))))),
-        "{result:?}"
+    fn codes(error: symbiotic_queue::runner::RunnerError) -> Vec<symbiotic_core::DiagnosticCode> {
+        match error {
+            symbiotic_queue::runner::RunnerError::Workers(errors) => {
+                errors.into_iter().flat_map(codes).collect()
+            }
+            symbiotic_queue::runner::RunnerError::Store(JobError::Execution(code)) => vec![code],
+            other => panic!("unexpected runner failure: {other:?}"),
+        }
+    }
+    assert_eq!(
+        codes(result.unwrap_err()),
+        [
+            symbiotic_core::DiagnosticCode::HttpUnavailable,
+            symbiotic_core::DiagnosticCode::StorageFailure
+        ]
     );
     assert_eq!(p.calls.load(Ordering::SeqCst), 1);
     assert_eq!(copies(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn trial_purge_erases_cancelled_receiptless_direct_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let p = Provider::new();
+    let id = enqueue(&j, spec("cancelled-direct", &p)).await;
+    let key = j.invocation_key("cancelled-direct").unwrap();
+    r.execute_chat(binding(p.clone()), &key, request())
+        .await
+        .unwrap();
+    j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+        .await
+        .unwrap();
+    let cancelled = row(&j, &id).await;
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(cancelled.payload.is_none());
+    assert!(cancelled.receipt.is_none());
+    assert_eq!(copies(dir.path()), 1);
+    j.request(JobRequest::PurgeOwner("owner-a".into()))
+        .await
+        .unwrap();
+    assert_eq!(copies(dir.path()), 0);
+    assert!(row(&j, &id).await.receipt.is_none());
+    assert!(
+        r.execute_chat(binding(p.clone()), &key, request())
+            .await
+            .is_err()
+    );
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn trial_enqueue_clamps_preexisting_answer_and_adoption_preserves_deadline() {
+    for adopt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let p = Provider::new();
+        let key = j.invocation_key("earlier-deadline").unwrap();
+        r.execute_chat(binding(p.clone()), &key, request())
+            .await
+            .unwrap();
+        let mut s = spec("earlier-deadline", &p);
+        let until = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+        s.recovery_until = Some(until);
+        let id = enqueue(&j, s).await;
+        if adopt {
+            let runner = start(&j, p.clone()).await;
+            wait_state(&j, &id, JobState::Succeeded).await;
+            runner.shutdown().await.unwrap();
+        }
+        let deadline: String = sql(dir.path())
+            .query_row("SELECT recovery_expires_at FROM spend_receipts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&deadline).unwrap() <= until);
+        tokio::time::sleep(
+            (until - chrono::Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(5),
+        )
+        .await;
+        assert!(
+            r.execute_chat(binding(p.clone()), &key, request())
+                .await
+                .is_err()
+        );
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn trial_confirmed_cancel_prohibits_later_direct_recovery() {
+    for disposition in [Disposition::Accepted, Disposition::Discarded] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let mut p = Provider::new();
+        let finish = Arc::new(Notify::new());
+        p.finish = Some(finish.clone());
+        let id = enqueue(&j, spec("confirmed-direct", &p)).await;
+        let key = j.invocation_key("confirmed-direct").unwrap();
+        let call = tokio::spawn({
+            let r = r.clone();
+            let p = p.clone();
+            let key = key.clone();
+            async move { r.execute_chat(binding(p), &key, request()).await }
+        });
+        p.started.notified().await;
+        j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+            .await
+            .unwrap();
+        let delivery = j.completions(1, 10000).await.unwrap().remove(0);
+        j.request(JobRequest::Ack(vec![(
+            delivery.delivery.token,
+            disposition,
+        )]))
+        .await
+        .unwrap();
+        finish.notify_one();
+        call.await.unwrap().unwrap();
+        assert_eq!(copies(dir.path()), 0);
+        let b = binding(p.clone());
+        let status = r
+            .invocation_status(b.identity.as_ref().unwrap(), None, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, SpendState::Settled);
+        assert!(!status.output_available);
+        assert!(r.execute_chat(b, &key, request()).await.is_err());
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
 }

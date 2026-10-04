@@ -284,7 +284,7 @@ pub struct RerankResponse {
 /// let key = "synthetic-validation-key";
 /// let error = ModelError::Auth(format!("invalid key {key}"));
 /// ```
-#[derive(Clone, Copy, Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ModelError {
     #[error("provider unavailable: {0}")]
     Unavailable(symbiotic_core::DiagnosticCode),
@@ -306,6 +306,15 @@ pub enum ModelError {
     Queue(symbiotic_core::DiagnosticCode),
     #[error("model cache failed: {0}")]
     Cache(symbiotic_core::DiagnosticCode),
+    /// Original failure with additional closed diagnostics from the same attempt.
+    #[error("{primary}; secondary diagnostics: {secondary:?}")]
+    Diagnostics {
+        /// Original provider or runtime failure, preserving its class.
+        #[source]
+        primary: Box<ModelError>,
+        /// Additional failures in append order; contains no adapter text.
+        secondary: Vec<DiagnosticCode>,
+    },
 }
 
 impl ModelError {
@@ -322,6 +331,36 @@ impl ModelError {
             Self::Queue(code) => *code,
             Self::Cache(code) => *code,
             Self::Unsupported(_) => DiagnosticCode::InvalidConfiguration,
+            Self::Diagnostics { primary, .. } => primary.code(),
+        }
+    }
+
+    /// Additional closed diagnostics accompanying the original failure.
+    pub fn diagnostics(&self) -> &[DiagnosticCode] {
+        match self {
+            Self::Diagnostics { secondary, .. } => secondary,
+            _ => &[],
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    fn with_diagnostics(self, diagnostics: impl IntoIterator<Item = DiagnosticCode>) -> Self {
+        let mut diagnostics = diagnostics.into_iter().peekable();
+        if diagnostics.peek().is_none() {
+            return self;
+        }
+        match self {
+            Self::Diagnostics {
+                primary,
+                mut secondary,
+            } => {
+                secondary.extend(diagnostics);
+                Self::Diagnostics { primary, secondary }
+            }
+            primary => Self::Diagnostics {
+                primary: Box::new(primary),
+                secondary: diagnostics.collect(),
+            },
         }
     }
 }
@@ -1396,7 +1435,7 @@ impl<Req> QueuedCall<Req> {
                 timestamp: Utc::now(),
             })
             .await;
-        written.map_err(|err| ModelError::Queue(err.code()))
+        written.map_err(|trace_error| err.clone().with_diagnostics([trace_error.code()]))
     }
 }
 
@@ -2372,7 +2411,14 @@ where
         ),
     };
     let owner = job.clone();
-    run_blocking(move || owner.finish(state, usage, output, failure, retry)).await?;
+    if let Err(error) =
+        run_blocking(move || owner.finish(state, usage, output, failure, retry)).await
+    {
+        return combine_attempt_errors(
+            result,
+            std::iter::once(error).chain(side_error).chain(monitoring),
+        );
+    }
     let outcome = match result {
         Ok(response) => {
             let (response, diagnostic) = this.record_success_diagnostic(response).await;
@@ -2415,10 +2461,27 @@ where
             }
         }
     };
-    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
-        return Err(error);
-    }
-    outcome
+    combine_attempt_errors(outcome, side_error.into_iter().chain(monitoring))
+}
+
+#[cfg(feature = "queue")]
+fn combine_attempt_errors<T>(
+    outcome: Result<T, ModelError>,
+    diagnostics: impl IntoIterator<Item = ModelError>,
+) -> Result<T, ModelError> {
+    let mut diagnostics = diagnostics.into_iter();
+    let primary = match outcome {
+        Err(error) => error,
+        Ok(value) => match diagnostics.next() {
+            Some(error) => error,
+            None => return Ok(value),
+        },
+    };
+    Err(primary.with_diagnostics(diagnostics.flat_map(|error| {
+        std::iter::once(error.code())
+            .chain(error.diagnostics().iter().copied())
+            .collect::<Vec<_>>()
+    })))
 }
 
 // One renewal owner covers both receipt preparation and dispatched transport.
@@ -2982,6 +3045,7 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 #[cfg(feature = "queue")]
 fn error_class(err: &ModelError) -> FailureClass {
     match err {
+        ModelError::Diagnostics { primary, .. } => error_class(primary),
         ModelError::Unavailable(_) => FailureClass::Unavailable,
         ModelError::Auth(_) => FailureClass::Auth,
         ModelError::RateLimited(_) => FailureClass::RateLimited,
@@ -3216,6 +3280,10 @@ fn exhausted_request_error(
     last_error: &ModelError,
 ) -> ModelError {
     match last_error {
+        ModelError::Diagnostics { primary, secondary } => {
+            exhausted_request_error(_queue_id, _item, _config, primary)
+                .with_diagnostics(secondary.iter().copied())
+        }
         ModelError::RateLimited(_) => {
             ModelError::RateLimited(DiagnosticCode::AttemptBudgetExhausted)
         }

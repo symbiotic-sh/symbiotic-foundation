@@ -809,7 +809,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 15;
+pub const QUEUE_SCHEMA_VERSION: u32 = 16;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
@@ -1280,6 +1280,31 @@ mod tests {
         assert_eq!(conn.query_row("select count(*) from sqlite_master where type = 'table' and name in ('queue_items', 'queue_cooldowns', 'spend_accounts', 'spend_receipts', 'jobs', 'job_owners', 'model_job_bindings')", [], |row| row.get::<_, u32>(0)).unwrap(), 0);
         conn.execute_batch("drop view queue_cooldowns").unwrap();
         assert!(SqliteQueue::open(&path).is_ok());
+    }
+
+    #[test]
+    fn trial_version_15_confirmed_purge_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        drop(SqliteQueue::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO jobs(scope,id,key,digest,state,final_state,kind,delivery_generation) VALUES ('scope','id','key','digest','\"Accepted\"','\"Purged\"',NULL,1)", []).unwrap();
+        conn.pragma_update(None, "user_version", 15).unwrap();
+        assert!(matches!(
+            SqliteQueue::open(&path),
+            Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::UnsupportedQueueSchema
+            ))
+        ));
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            15
+        );
+        assert!(
+            conn.query_row("SELECT kind IS NULL FROM jobs", [], |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
     }
 
     #[test]

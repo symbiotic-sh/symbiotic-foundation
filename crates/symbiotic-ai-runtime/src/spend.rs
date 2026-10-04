@@ -45,7 +45,7 @@ pub(crate) fn job_recovery_policy(
         return Ok((false, None));
     };
     let row: Option<(Option<String>, bool, Option<i64>)> = tx.query_row(
-        "SELECT b.binding, coalesce(j.purged=1 OR j.final_state='\"Purged\"',0), j.recovery_until
+        "SELECT b.binding, coalesce(j.purged=1 OR j.final_state='\"Purged\"' OR j.state IN ('\"Accepted\"','\"Discarded\"'),0), j.recovery_until
          FROM jobs j LEFT JOIN model_job_bindings b ON b.scope=j.scope AND b.kind=j.kind
          WHERE j.scope=?1 AND j.key=?2 AND j.kind IS NOT NULL
          AND (j.execution='\"Model\"' OR j.execution IS NULL)",
@@ -66,6 +66,43 @@ pub(crate) fn job_recovery_policy(
         .map(|millis| chrono::DateTime::from_timestamp_millis(millis).ok_or_else(|| storage(())))
         .transpose()?;
     Ok((erased, deadline))
+}
+
+// Enqueue and adoption narrow the sole saved answer without extending its lifetime.
+pub(crate) fn constrain_job_recovery_in(
+    tx: &rusqlite::Transaction<'_>,
+    receipt: &SpendReceipt,
+    invocation: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), ModelError> {
+    let (prohibited, job_deadline) =
+        job_recovery_policy(tx, Some(invocation), &receipt.reservation.invocation)?;
+    let deadline: Option<String> = tx
+        .query_row(
+            "SELECT recovery_expires_at FROM spend_receipts WHERE reference=?1",
+            [receipt.reservation.reference.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let deadline = deadline
+        .map(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&chrono::Utc)))
+        .transpose()
+        .map_err(storage)?;
+    let deadline = deadline.map(|until| job_deadline.map_or(until, |job| job.min(until)));
+    if prohibited || deadline.is_some_and(|until| until <= now) {
+        tx.execute(
+            "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
+            [receipt.reservation.reference.as_str()],
+        )
+        .map_err(storage)?;
+    } else if let Some(until) = deadline {
+        tx.execute(
+            "UPDATE spend_receipts SET recovery_expires_at=?2 WHERE reference=?1",
+            params![receipt.reservation.reference.as_str(), until.to_rfc3339()],
+        )
+        .map_err(storage)?;
+    }
+    Ok((prohibited, deadline))
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.

@@ -112,9 +112,8 @@ fn paid_resolution(
     max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
     let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
-    let (erased, _) =
-        spend::job_recovery_policy(tx, Some(invocation), &receipt.reservation.invocation)
-            .map_err(|_| JobError::Storage)?;
+    let (erased, deadline) = spend::constrain_job_recovery_in(tx, receipt, invocation, now)
+        .map_err(|_| JobError::Storage)?;
     if erased || bytes > max_bytes {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
@@ -130,17 +129,6 @@ fn paid_resolution(
             },
         });
     }
-    let deadline: Option<String> = tx
-        .query_row(
-            "SELECT recovery_expires_at FROM spend_receipts WHERE reference=?1",
-            [receipt.reservation.reference.as_str()],
-            |r| r.get(0),
-        )
-        .map_err(|_| JobError::Storage)?;
-    let deadline = deadline
-        .map(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|_| JobError::Storage)?;
     Ok(JobResolution::PaidResult {
         receipt: receipt.reservation.reference.as_str().into(),
         recovery_until: Some(deadline.unwrap_or(now)),
@@ -205,6 +193,33 @@ fn bind_kind(
     )
     .map_err(|_| JobError::Storage)?;
     Ok(())
+}
+
+// Resolve through the frozen registry even after cancellation removes payloads.
+// Latest receipt wins: a Pending job may still point at a Released predecessor.
+fn job_receipt_in(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &symbiotic_queue::jobs::JobScope,
+    key: &str,
+    kind: &str,
+) -> Result<Option<crate::SpendReceipt>, ModelError> {
+    let binding: String = tx
+        .query_row(
+            "SELECT binding FROM model_job_bindings WHERE scope=?1 AND kind=?2",
+            params![serde_json::to_string(scope).map_err(storage)?, kind],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let (identity, sharing): (
+        symbiotic_core::BindingIdentity,
+        Option<symbiotic_core::AccountSharingKey>,
+    ) = serde_json::from_str(&binding).map_err(storage)?;
+    let account = crate::account_scope(&identity, sharing.as_ref())?;
+    let invocation = symbiotic_model::execution_invocation_identity(
+        &identity,
+        &spend::job_invocation_key(scope, key)?,
+    )?;
+    spend::invocation_in(tx, &account, &invocation)
 }
 
 impl ModelJobs {
@@ -299,22 +314,32 @@ impl ModelJobs {
                 }
             }
             let affected = symbiotic_queue_sqlite::jobs::paid_copies_for_request(tx, &self.scope, &self.config, now, &request)?;
+            let enqueued = match &request {
+                JobRequest::Enqueue(specs) => specs.iter().map(|spec| (spec.key.clone(), spec.kind.clone())).collect(),
+                _ => Vec::new(),
+            };
             let response = self.op(tx, now, request)?;
+            for (key, kind) in enqueued {
+                if let Some(receipt) = job_receipt_in(tx, &self.scope, &key, &kind)
+                    .map_err(|_| JobError::Storage)? {
+                    spend::constrain_job_recovery_in(tx, &receipt, &self.invocation_key(&key)?, now)
+                        .map_err(|_| JobError::Storage)?;
+                }
+            }
             for row in affected {
-                let receipt = match row.receipt {
-                    reference if !(purging && row.state.unfinished()) => reference,
-                    _ if purging && row.execution == Execution::Model && row.payload.is_some() => {
-                        let (identity, sharing, _) = input(row.payload.as_deref().ok_or(JobError::InvalidRequest)?)?;
-                        let account = crate::account_scope(&identity, sharing.as_ref()).map_err(|_| JobError::Storage)?;
-                        let invocation = model::execution_invocation_identity(&identity, &self.invocation_key(&row.key)?).map_err(|_| JobError::Storage)?;
-                        spend::invocation_in(tx, &account, &invocation).map_err(|_| JobError::Storage)?.map(|r| r.reservation.reference.as_str().to_string())
-                    }
-                    _ => row.receipt,
+                let attach_receipt = purging && row.state.unfinished();
+                let receipt = if purging && row.execution == Execution::Model {
+                    job_receipt_in(tx, &self.scope, &row.key, &row.kind)
+                        .map_err(|_| JobError::Storage)?
+                        .map(|r| r.reservation.reference.as_str().to_string())
+                        .or(row.receipt)
+                } else {
+                    row.receipt
                 };
                 if let Some(receipt) = receipt
                     && let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(row.id))?
                     && (row.state.acked() || row.purged || row.result_expired) {
-                    if purging {
+                    if attach_receipt {
                         tx.execute("UPDATE jobs SET receipt=?3 WHERE scope=?1 AND id=?2", params![serde_json::to_string(&row.id.scope).map_err(|_| JobError::Storage)?, row.id.id, receipt]).map_err(|_| JobError::Storage)?;
                     }
                     tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [&receipt]).map_err(|_| JobError::Storage)?;
@@ -889,8 +914,11 @@ macro_rules! model_runner {
                                     continue;
                                 }
                                 if let Err(error) = result
-                                    && (!owner.finished.load(Ordering::SeqCst) || matches!(error, ModelError::Queue(_)) && error.code() != DiagnosticCode::InvocationCompleted) {
-                                    return Err(JobError::Execution(error.code()).into());
+                                    && (!owner.finished.load(Ordering::SeqCst) || !error.diagnostics().is_empty() || matches!(error, ModelError::Queue(_)) && error.code() != DiagnosticCode::InvocationCompleted) {
+                                    if error.diagnostics().is_empty() {
+                                        return Err(JobError::Execution(error.code()).into());
+                                    }
+                                    return Err(RunnerError::Workers(std::iter::once(error.code()).chain(error.diagnostics().iter().copied()).map(|code| JobError::Execution(code).into()).collect()));
                                 }
                             } else {
                                 tokio::select! { _ = stop.changed() => {}, _ = tokio::time::sleep(poll) => {} }

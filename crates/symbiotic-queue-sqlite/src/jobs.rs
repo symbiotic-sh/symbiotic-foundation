@@ -244,19 +244,7 @@ pub fn paid_copies_for_request(
             .collect(),
         _ => Vec::new(),
     };
-    ids.into_iter()
-        .map(|id| {
-            let row = rows.metadata(&id)?;
-            if row.execution == Execution::Model
-                && row.state.unfinished()
-                && matches!(request, JobRequest::PurgeOwner(_))
-            {
-                rows.get(&id)?.ok_or(JobError::NotFound)
-            } else {
-                Ok(row)
-            }
-        })
-        .collect()
+    ids.into_iter().map(|id| rows.metadata(&id)).collect()
 }
 
 struct SqlRows<'a> {

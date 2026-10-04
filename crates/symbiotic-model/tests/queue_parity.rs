@@ -1950,11 +1950,9 @@ async fn a_failed_trace_write_reaches_caller_and_receipt_keeps_provider_error(
 
     let err = provider.chat(request("rejected")).await.unwrap_err();
     assert!(
-        matches!(
-            err,
-            ModelError::Queue(symbiotic_core::DiagnosticCode::StorageFailure)
-        ),
-        "{backend}: trace write failure must reach the caller: {err}"
+        err.code() == symbiotic_core::DiagnosticCode::ProviderFailure
+            && err.diagnostics() == [symbiotic_core::DiagnosticCode::StorageFailure],
+        "{backend}: both failures must reach the caller: {err}"
     );
     assert!(
         receipts
@@ -3475,4 +3473,136 @@ async fn receipt_ref_failure_after_claim_propagates_settlement_error() {
         symbiotic_core::DiagnosticCode::SpendReceiptRefTooLong
     );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn trial_provider_and_trace_failures_visible_without_receipts() {
+    let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
+    let provider =
+        queued(raw, Arc::new(MemoryQueue::new()), config()).with_trace_sink(Arc::new(BrokenTrace));
+    let error = provider.chat(request("both failures")).await.unwrap_err();
+    assert!(matches!(&error, ModelError::Diagnostics { primary, .. }
+        if matches!(primary.as_ref(), ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure))));
+    assert_eq!(
+        error.diagnostics(),
+        [symbiotic_core::DiagnosticCode::StorageFailure]
+    );
+}
+
+struct TrialJob {
+    calls: Arc<AtomicUsize>,
+    payload: Vec<u8>,
+    renewals: AtomicUsize,
+    recovered: Arc<tokio::sync::Notify>,
+    finished: std::sync::atomic::AtomicBool,
+}
+impl symbiotic_model::ModelJob for TrialJob {
+    fn recover(&self, _: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
+        Ok(false)
+    }
+    fn claim(
+        &self,
+        _: &symbiotic_model::SpendReservation,
+        _: u32,
+    ) -> Result<Option<Vec<u8>>, ModelError> {
+        Ok(Some(self.payload.clone()))
+    }
+    fn heartbeat(&self) -> Result<bool, ModelError> {
+        if self.calls.load(Ordering::SeqCst) == 0 {
+            return Ok(false);
+        }
+        match self.renewals.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            )),
+            1 => {
+                self.recovered.notify_one();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+    fn finish(
+        &self,
+        state: symbiotic_model::SpendState,
+        _: Option<UsageTrace>,
+        _: Option<Value>,
+        failure: Option<symbiotic_core::DiagnosticCode>,
+        _: bool,
+    ) -> Result<(), ModelError> {
+        assert_eq!(state, symbiotic_model::SpendState::Unknown);
+        assert_eq!(
+            failure,
+            Some(symbiotic_core::DiagnosticCode::ProviderFailure)
+        );
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn release(&self) -> Result<(), ModelError> {
+        panic!("dispatched attempt must settle")
+    }
+    fn refuse(&self, _: symbiotic_core::DiagnosticCode) -> Result<(), ModelError> {
+        panic!("valid request")
+    }
+    fn eligible(&self) -> Result<bool, ModelError> {
+        Ok(true)
+    }
+    fn can_retry(&self, _: u32) -> Result<bool, ModelError> {
+        Ok(false)
+    }
+    fn attempt(&self) -> Result<u32, ModelError> {
+        Ok(1)
+    }
+    fn heartbeat_interval(&self) -> Duration {
+        Duration::from_millis(1)
+    }
+}
+
+#[tokio::test]
+async fn trial_heartbeat_provider_and_trace_failures_all_visible() {
+    let recovered = Arc::new(tokio::sync::Notify::new());
+    let mut raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
+        symbiotic_core::DiagnosticCode::ProviderFailure,
+    )]);
+    raw.uncertain_failures = true;
+    raw.completion_gate = Some(recovered.clone());
+    let input = request("three failures");
+    let job = Arc::new(TrialJob {
+        calls: raw.calls.clone(),
+        payload: serde_json::to_vec(&input).unwrap(),
+        renewals: AtomicUsize::new(0),
+        recovered,
+        finished: std::sync::atomic::AtomicBool::new(false),
+    });
+    let provider = queued(raw, Arc::new(MemoryQueue::new()), config())
+        .with_admission(ModelAdmission::new())
+        .with_binding_identity(symbiotic_core::BindingIdentity::new(
+            "tenant", "provider", "1", "account",
+        ))
+        .with_invocation("trial-heartbeat".into())
+        .with_job_owner(job.clone())
+        .with_trace_sink(Arc::new(BrokenTrace));
+    let error = tokio::time::timeout(Duration::from_secs(5), provider.chat(input))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        job.finished.load(Ordering::SeqCst),
+        "{error:?}; renewals={}",
+        job.renewals.load(Ordering::SeqCst)
+    );
+    assert!(job.renewals.load(Ordering::SeqCst) >= 2);
+    assert_eq!(
+        error.code(),
+        symbiotic_core::DiagnosticCode::ProviderFailure
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [
+            symbiotic_core::DiagnosticCode::StorageFailure,
+            symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
+        ]
+    );
 }
