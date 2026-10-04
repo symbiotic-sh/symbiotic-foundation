@@ -29,6 +29,7 @@ fn credential_process() -> std::path::PathBuf {
         .into()
 }
 
+#[cfg(target_os = "macos")]
 fn manifest_dir() -> std::path::PathBuf {
     std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo test sets CARGO_MANIFEST_DIR")
