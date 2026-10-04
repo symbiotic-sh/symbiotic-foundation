@@ -464,14 +464,24 @@ pub(crate) fn receipt_in(
     )
     .transpose()
 }
+/// Find the latest accepted receipt reference without loading receipt content.
+pub(crate) fn invocation_reference_in(
+    conn: &Connection,
+    account: &str,
+    invocation: &str,
+) -> Result<Option<SpendReceiptRef>, ModelError> {
+    let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
+    reference
+        .map(|r| SpendReceiptRef::new(r).map_err(storage))
+        .transpose()
+}
 pub(crate) fn invocation_in(
     conn: &Connection,
     account: &str,
     invocation: &str,
 ) -> Result<Option<SpendReceipt>, ModelError> {
-    let reference: Option<String> = conn.query_row("SELECT reference FROM spend_receipts WHERE account=?1 AND invocation=?2 ORDER BY rowid DESC LIMIT 1", params![account, invocation], |r| r.get(0)).optional().map_err(storage)?;
-    reference
-        .map(|r| receipt_in(conn, &SpendReceiptRef::new(r).map_err(storage)?))
+    invocation_reference_in(conn, account, invocation)?
+        .map(|reference| receipt_in(conn, &reference))
         .transpose()
         .map(Option::flatten)
 }
