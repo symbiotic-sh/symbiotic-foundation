@@ -942,6 +942,9 @@ struct CountsRenewals {
     renewals: AtomicUsize,
     fail_cooldown_writes: std::sync::atomic::AtomicBool,
     fail_completions: std::sync::atomic::AtomicBool,
+    fail_transitions: std::sync::atomic::AtomicBool,
+    fail_dead_reads: std::sync::atomic::AtomicBool,
+    fail_replacements: std::sync::atomic::AtomicBool,
     fail_heartbeats: std::sync::atomic::AtomicBool,
     fail_heartbeat_at: AtomicUsize,
     completion_state: AtomicUsize,
@@ -963,6 +966,9 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         renewals: AtomicUsize::new(0),
         fail_cooldown_writes: std::sync::atomic::AtomicBool::new(false),
         fail_completions: std::sync::atomic::AtomicBool::new(false),
+        fail_transitions: std::sync::atomic::AtomicBool::new(false),
+        fail_dead_reads: std::sync::atomic::AtomicBool::new(false),
+        fail_replacements: std::sync::atomic::AtomicBool::new(false),
         fail_heartbeats: std::sync::atomic::AtomicBool::new(false),
         fail_heartbeat_at: AtomicUsize::new(0),
         completion_state: AtomicUsize::new(0),
@@ -999,6 +1005,7 @@ macro_rules! on_both_backends {
 }
 
 on_both_backends!(
+    close_storage_failures_preserve_provider_error,
     post_claim_recovery_errors_release_capacity_without_changing_accounting,
     an_abandoned_call_completes_and_answers_the_next_identical_request,
     an_abandoned_call_that_fails_records_its_class_and_releases_its_lease,
@@ -1048,6 +1055,11 @@ impl QueueBackend for CountsRenewals {
         request: EnqueueRequest,
         current: &QueueItemId,
     ) -> Result<EnqueueOutcome, QueueError> {
+        if self.fail_replacements.load(Ordering::SeqCst) {
+            return Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::StorageFailure,
+            ));
+        }
         self.inner.enqueue_replacing(request, current).await
     }
     async fn claim(&self, request: ClaimRequest) -> Result<Vec<QueueItem>, QueueError> {
@@ -1072,6 +1084,15 @@ impl QueueBackend for CountsRenewals {
     }
     async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
         let item = self.inner.get_item(item_id).await?;
+        if self.fail_dead_reads.load(Ordering::SeqCst)
+            && item
+                .as_ref()
+                .is_some_and(|item| item.status == QueueStatus::Dead)
+        {
+            return Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::StorageFailure,
+            ));
+        }
         if item
             .as_ref()
             .is_some_and(|item| item.status == QueueStatus::Running)
@@ -1146,6 +1167,11 @@ impl QueueBackend for CountsRenewals {
         worker_id: &str,
         failure: Failure,
     ) -> Result<FailOutcome, QueueError> {
+        if self.fail_transitions.load(Ordering::SeqCst) {
+            return Err(QueueError::Storage(
+                symbiotic_core::DiagnosticCode::StorageFailure,
+            ));
+        }
         self.inner.fail_with(item_id, worker_id, failure).await
     }
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
@@ -1724,12 +1750,28 @@ async fn failed_cooldown_is_terminal(
     })
     .await
     .unwrap_or_else(|_| panic!("{backend}: callers finish"));
-    for result in [first, waiter] {
-        assert!(
-            matches!(result, Err(ModelError::Queue(_))),
-            "{backend}: {result:?}"
-        );
-    }
+    let errors = [first.unwrap_err(), waiter.unwrap_err()];
+    let error = errors
+        .iter()
+        .find(|error| matches!(error, ModelError::Diagnostics { .. }))
+        .expect("dispatching caller retains the provider failure");
+    assert_eq!(
+        error.code(),
+        symbiotic_core::DiagnosticCode::HttpUnavailable,
+        "{backend}: {error:?}"
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [symbiotic_core::DiagnosticCode::QueueFailure]
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| matches!(error, ModelError::Queue(_)))
+            .count(),
+        1,
+        "{backend}: the joined waiter sees the durable refusal: {errors:?}"
+    );
     let item = queue
         .get_item(&queued_item(&receipts))
         .await
@@ -2324,6 +2366,7 @@ struct ObservedSpend {
     fail_reservations: std::sync::atomic::AtomicBool,
     panic_reservation: std::sync::atomic::AtomicBool,
     fail_settlement: std::sync::atomic::AtomicBool,
+    fail_releases: std::sync::atomic::AtomicBool,
     fail_invocations: std::sync::atomic::AtomicBool,
 }
 
@@ -2336,6 +2379,7 @@ impl ObservedSpend {
             fail_reservations: std::sync::atomic::AtomicBool::new(false),
             panic_reservation: std::sync::atomic::AtomicBool::new(false),
             fail_settlement: std::sync::atomic::AtomicBool::new(false),
+            fail_releases: std::sync::atomic::AtomicBool::new(false),
             fail_invocations: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -2443,7 +2487,10 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         output: Option<Value>,
         invocation: Option<&str>,
     ) -> Result<(), ModelError> {
-        if self.fail_settlement.load(Ordering::SeqCst) && output.is_some() {
+        if (self.fail_settlement.load(Ordering::SeqCst) && output.is_some())
+            || (self.fail_releases.load(Ordering::SeqCst)
+                && state == symbiotic_model::SpendState::Released)
+        {
             return Err(ModelError::Queue(
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
@@ -3001,12 +3048,24 @@ async fn uncertain_charge_cooldown_failure_is_visible_and_terminal(
         .chat(request("uncertain cooldown"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
-        ),
-        "{backend}: limiter storage failure reaches caller: {err:?}"
+    assert_eq!(
+        err.code(),
+        symbiotic_core::DiagnosticCode::HttpUnavailable,
+        "{backend}: {err:?}"
+    );
+    assert_eq!(
+        err.diagnostics(),
+        [symbiotic_core::DiagnosticCode::QueueFailure]
+    );
+    let failed: Vec<_> = receipts
+        .receipts()
+        .into_iter()
+        .filter(|r| r.status == ReceiptStatus::Failed)
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].error,
+        Some(symbiotic_core::DiagnosticCode::HttpUnavailable)
     );
     let item = queue
         .get_item(&queued_item(&receipts))
@@ -3605,4 +3664,136 @@ async fn trial_heartbeat_provider_and_trace_failures_all_visible() {
             symbiotic_core::DiagnosticCode::SpendLedgerUnavailable
         ]
     );
+}
+
+async fn close_storage_failures_preserve_provider_error(backend: &str, queue: Arc<CountsRenewals>) {
+    use symbiotic_core::DiagnosticCode;
+    use symbiotic_model::{SpendLedger, SpendState};
+    for fault in [
+        "dead-read",
+        "continuation",
+        "transition",
+        "cooldown",
+        "release",
+        "cooldown-and-transition",
+        "release-and-transition",
+    ] {
+        for retryable in [false, true] {
+            let continuing = matches!(fault, "dead-read" | "continuation");
+            if continuing && !retryable {
+                continue;
+            }
+            queue
+                .fail_dead_reads
+                .store(fault == "dead-read", Ordering::SeqCst);
+            queue
+                .fail_replacements
+                .store(fault == "continuation", Ordering::SeqCst);
+            queue
+                .fail_transitions
+                .store(fault.contains("transition"), Ordering::SeqCst);
+            queue
+                .fail_cooldown_writes
+                .store(fault.contains("cooldown"), Ordering::SeqCst);
+            let spend = ObservedSpend::new(Duration::ZERO);
+            spend
+                .fail_releases
+                .store(fault.contains("release"), Ordering::SeqCst);
+            let primary = if retryable || fault.contains("cooldown") {
+                ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
+            } else {
+                ModelError::Provider(DiagnosticCode::ProviderFailure)
+            };
+            let mut raw = Loopback::new(unique_identity()).failing_first(vec![primary.clone()]);
+            raw.uncertain_failures = !retryable && fault.contains("cooldown");
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let provider = queued_with_cache(
+                raw.clone(),
+                queue.clone(),
+                ModelQueueConfig {
+                    retry_attempts: if continuing { 1 } else { 3 },
+                    ..config()
+                },
+            )
+            .with_spend_ledger(spend.clone(), None)
+            .with_receipt_sink(receipts.clone());
+            let error = provider
+                .chat(request("storage after provider failure"))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                primary.code(),
+                "{backend}: {fault}, retryable={retryable}: {error:?}"
+            );
+            let ModelError::Diagnostics {
+                primary: preserved, ..
+            } = &error
+            else {
+                panic!("provider error lost diagnostics: {error:?}");
+            };
+            assert_eq!(
+                std::mem::discriminant(preserved.as_ref()),
+                std::mem::discriminant(&primary)
+            );
+            queue.fail_dead_reads.store(false, Ordering::SeqCst);
+            queue.fail_replacements.store(false, Ordering::SeqCst);
+            let expected = if fault.contains("release") {
+                DiagnosticCode::SpendLedgerUnavailable
+            } else {
+                DiagnosticCode::QueueFailure
+            };
+            let count = if fault.contains("-and-") { 2 } else { 1 };
+            assert_eq!(
+                error.diagnostics(),
+                &[expected, DiagnosticCode::QueueFailure][..count],
+                "{backend}: {fault}"
+            );
+            let failed: Vec<_> = receipts
+                .receipts()
+                .into_iter()
+                .filter(|r| r.status == ReceiptStatus::Failed)
+                .collect();
+            assert_eq!(failed.len(), 1, "{backend}: {fault}");
+            assert_eq!(failed[0].error, Some(primary.code()));
+            let receipt = spend.receipt(&spend.last_reference()).unwrap().unwrap();
+            assert_eq!(
+                receipt.state,
+                if fault.contains("release") || raw.uncertain_failures {
+                    SpendState::Unknown
+                } else {
+                    SpendState::Released
+                },
+                "{backend}: {fault}"
+            );
+            let item = queue
+                .get_item(&queued_item(&receipts))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.status,
+                if fault.contains("transition") {
+                    QueueStatus::Running
+                } else if continuing {
+                    QueueStatus::Dead
+                } else {
+                    QueueStatus::Stopped
+                },
+                "{backend}: {fault}"
+            );
+            if !fault.contains("transition") && !continuing {
+                queue.fail_cooldown_writes.store(false, Ordering::SeqCst);
+                spend.fail_releases.store(false, Ordering::SeqCst);
+                spend.release_last();
+                assert!(
+                    provider
+                        .chat(request("storage after provider failure"))
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}: {fault}");
+        }
+    }
 }

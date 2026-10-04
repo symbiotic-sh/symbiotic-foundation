@@ -1256,21 +1256,29 @@ impl<Req> QueuedCall<Req> {
         dead: &QueueItem,
         err: &ModelError,
     ) -> Result<Option<EnqueueOutcome>, ModelError> {
-        reenqueue_dead_item(
-            self.queue.as_ref(),
-            &self.queue_id,
-            &self.descriptor,
-            self.capability,
-            &self.kind,
-            &self.request_hash,
-            &self.idempotency_key,
-            dead,
-            &self.config,
-            err,
-            self.retry_state(Some(dead)).await?,
-            self.invocation_key.is_some(),
-        )
-        .await
+        let outcome = async {
+            reenqueue_dead_item(
+                self.queue.as_ref(),
+                &self.queue_id,
+                &self.descriptor,
+                self.capability,
+                &self.kind,
+                &self.request_hash,
+                &self.idempotency_key,
+                dead,
+                &self.config,
+                err,
+                self.retry_state(Some(dead)).await?,
+                self.invocation_key.is_some(),
+            )
+            .await
+        }
+        .await;
+        outcome.map_err(|failure| {
+            err.clone().with_diagnostics(
+                std::iter::once(failure.code()).chain(failure.diagnostics().iter().copied()),
+            )
+        })
     }
 }
 
@@ -2120,13 +2128,16 @@ where
             Ok(AttemptEnd::Succeeded(response))
         }
         Settled::Retryable { err, failed } => {
-            if failed.map_err(queue_error)? == FailOutcome::RetryScheduled {
+            if failed
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?
+                == FailOutcome::RetryScheduled
+            {
                 return Ok(AttemptEnd::Retry(None));
             }
             let dead_item = queue
                 .get_item(&item.item_id)
                 .await
-                .map_err(queue_error)?
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?
                 .unwrap_or(item);
             if let Some(next) = this.continue_chain(&dead_item, &err).await? {
                 return Ok(AttemptEnd::Retry(Some(Box::new(next))));
@@ -2141,7 +2152,8 @@ where
             ))
         }
         Settled::Failed { err, failed } => {
-            failed.map_err(queue_error)?;
+            failed
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?;
             this.trace_failure(Some(item.item_id), &err).await?;
             Err(err)
         }
@@ -2599,6 +2611,17 @@ where
         provider_ms: Some(provider_ms),
     };
 
+    if let Err(err) = &result {
+        this.receipts
+            .record(
+                ReceiptStatus::Failed,
+                Some(item),
+                None,
+                Some(err.code()),
+                failed_timing(),
+            )
+            .await;
+    }
     let known_zero = result.as_ref().err().is_some_and(|err| {
         !matches!(err, ModelError::Timeout(_))
             && provider.failure_charge(err) == FailureCharge::KnownZero
@@ -2622,6 +2645,10 @@ where
                 },
             )
             .await;
+        let err = match result {
+            Err(provider_err) => provider_err.with_diagnostics([err.code()]),
+            Ok(_) => err,
+        };
         return Settled::Failed { err, failed };
     }
     match result {
@@ -2692,15 +2719,6 @@ where
             }
         }
         Err(err) if known_zero && is_retryable(&err, config) => {
-            this.receipts
-                .record(
-                    ReceiptStatus::Failed,
-                    Some(item),
-                    None,
-                    Some(err.code()),
-                    failed_timing(),
-                )
-                .await;
             let delay_ms = match retry_delay_ms(
                 item.attempt,
                 config,
@@ -2741,7 +2759,7 @@ where
                     )
                     .await;
                 return Settled::Failed {
-                    err: cooldown_err,
+                    err: err.with_diagnostics([cooldown_err.code()]),
                     failed,
                 };
             }
@@ -2778,19 +2796,10 @@ where
                     )
                     .await;
                 return Settled::Failed {
-                    err: failure,
+                    err: err.with_diagnostics([failure.code()]),
                     failed,
                 };
             }
-            this.receipts
-                .record(
-                    ReceiptStatus::Failed,
-                    Some(item),
-                    None,
-                    Some(err.code()),
-                    failed_timing(),
-                )
-                .await;
             let failed = queue
                 .fail_with(
                     &item.item_id,

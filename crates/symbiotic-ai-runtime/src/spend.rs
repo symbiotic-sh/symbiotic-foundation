@@ -71,19 +71,18 @@ pub(crate) fn job_recovery_policy(
 // Enqueue and adoption narrow the sole saved answer without extending its lifetime.
 pub(crate) fn constrain_job_recovery_in(
     tx: &rusqlite::Transaction<'_>,
-    receipt: &SpendReceipt,
+    reference: &SpendReceiptRef,
     invocation: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), ModelError> {
-    let (prohibited, job_deadline) =
-        job_recovery_policy(tx, Some(invocation), &receipt.reservation.invocation)?;
-    let deadline: Option<String> = tx
+    let (bound_invocation, deadline): (String, Option<String>) = tx
         .query_row(
-            "SELECT recovery_expires_at FROM spend_receipts WHERE reference=?1",
-            [receipt.reservation.reference.as_str()],
-            |row| row.get(0),
+            "SELECT invocation, recovery_expires_at FROM spend_receipts WHERE reference=?1",
+            [reference.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(storage)?;
+    let (prohibited, job_deadline) = job_recovery_policy(tx, Some(invocation), &bound_invocation)?;
     let deadline = deadline
         .map(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&chrono::Utc)))
         .transpose()
@@ -92,13 +91,13 @@ pub(crate) fn constrain_job_recovery_in(
     if prohibited || deadline.is_some_and(|until| until <= now) {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
-            [receipt.reservation.reference.as_str()],
+            [reference.as_str()],
         )
         .map_err(storage)?;
     } else if let Some(until) = deadline {
         tx.execute(
             "UPDATE spend_receipts SET recovery_expires_at=?2 WHERE reference=?1",
-            params![receipt.reservation.reference.as_str(), until.to_rfc3339()],
+            params![reference.as_str(), until.to_rfc3339()],
         )
         .map_err(storage)?;
     }

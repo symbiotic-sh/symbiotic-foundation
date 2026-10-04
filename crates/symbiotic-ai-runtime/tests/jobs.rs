@@ -1930,3 +1930,91 @@ async fn trial_confirmed_cancel_prohibits_later_direct_recovery() {
         assert_eq!(p.calls.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn close_confirmation_erases_receiptless_paid_answer() {
+    for disposition in [Disposition::Accepted, Disposition::Discarded] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let p = Provider::new();
+        let id = enqueue(&j, spec("receiptless-confirmation", &p)).await;
+        let key = j.invocation_key("receiptless-confirmation").unwrap();
+        r.execute_chat(binding(p.clone()), &key, request())
+            .await
+            .unwrap();
+        j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+            .await
+            .unwrap();
+        let cancelled = row(&j, &id).await;
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert!(cancelled.receipt.is_none());
+        assert_eq!(copies(dir.path()), 1);
+        let delivery = j.completions(1, 10000).await.unwrap().remove(0);
+        j.request(JobRequest::Ack(vec![(
+            delivery.delivery.token,
+            disposition,
+        )]))
+        .await
+        .unwrap();
+        let retained: (bool, bool) = sql(dir.path())
+            .query_row(
+                "SELECT recovery IS NOT NULL, recovery_expires_at IS NOT NULL FROM spend_receipts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (false, false));
+        assert!(row(&j, &id).await.owners.is_empty());
+        assert!(
+            r.execute_chat(binding(p.clone()), &key, request())
+                .await
+                .is_err()
+        );
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn close_enqueue_narrows_deadline_without_decoding_saved_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = runtime(dir.path());
+    let j = jobs(&r, JobConfig::default());
+    let p = Provider::new();
+    let key = j.invocation_key("metadata-only").unwrap();
+    r.execute_chat(binding(p.clone()), &key, request())
+        .await
+        .unwrap();
+    let mut s = spec("metadata-only", &p);
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    s.recovery_until = Some(until);
+    // Invalid content detects any attempted answer deserialization. The
+    // metadata update must neither read nor rewrite that content.
+    sql(dir.path())
+        .execute("UPDATE spend_receipts SET recovery='invalid JSON'", [])
+        .unwrap();
+    enqueue(&j, s.clone()).await;
+    for replay in [false, true] {
+        if replay {
+            sql(dir.path())
+                .execute(
+                    "UPDATE spend_receipts SET recovery_expires_at=?1",
+                    [(until + chrono::Duration::hours(1)).to_rfc3339()],
+                )
+                .unwrap();
+            j.request(JobRequest::Enqueue(vec![s.clone()]))
+                .await
+                .unwrap();
+        }
+        let (content, deadline): (String, String) = sql(dir.path())
+            .query_row(
+                "SELECT recovery, recovery_expires_at FROM spend_receipts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "invalid JSON");
+        assert!(chrono::DateTime::parse_from_rfc3339(&deadline).unwrap() <= until);
+    }
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+}

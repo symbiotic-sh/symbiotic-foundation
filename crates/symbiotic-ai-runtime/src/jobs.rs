@@ -112,8 +112,9 @@ fn paid_resolution(
     max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
     let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
-    let (erased, deadline) = spend::constrain_job_recovery_in(tx, receipt, invocation, now)
-        .map_err(|_| JobError::Storage)?;
+    let (erased, deadline) =
+        spend::constrain_job_recovery_in(tx, &receipt.reservation.reference, invocation, now)
+            .map_err(|_| JobError::Storage)?;
     if erased || bytes > max_bytes {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
@@ -296,6 +297,7 @@ impl ModelJobs {
             }
         }
         let purging = matches!(request, JobRequest::PurgeOwner(_));
+        let confirming = matches!(request, JobRequest::Ack(_));
         if matches!(
             request,
             JobRequest::Completions { .. }
@@ -321,16 +323,14 @@ impl ModelJobs {
             let response = self.op(tx, now, request)?;
             for (key, kind) in enqueued {
                 if let Some(reference) = job_receipt_reference_in(tx, &self.scope, &key, &kind)
-                    .map_err(|_| JobError::Storage)?
-                    && let Some(receipt) = spend::receipt_in(tx, &reference)
-                        .map_err(|_| JobError::Storage)? {
-                    spend::constrain_job_recovery_in(tx, &receipt, &self.invocation_key(&key)?, now)
+                    .map_err(|_| JobError::Storage)? {
+                    spend::constrain_job_recovery_in(tx, &reference, &self.invocation_key(&key)?, now)
                         .map_err(|_| JobError::Storage)?;
                 }
             }
             for row in affected {
                 let attach_receipt = purging && row.state.unfinished();
-                let receipt = if purging && row.execution == Execution::Model {
+                let receipt = if (purging || confirming) && row.execution == Execution::Model {
                     job_receipt_reference_in(tx, &self.scope, &row.key, &row.kind)
                         .map_err(|_| JobError::Storage)?
                         .map(|reference| reference.as_str().to_string())
