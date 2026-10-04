@@ -4605,3 +4605,356 @@ async fn jobs_only_local_credential_failures_are_known_zero_charge() {
         }
     }
 }
+
+async fn reopen_jobs(fixture: &Fixture) -> CredentialProcess {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match CredentialProcess::open(fixture.config.clone()) {
+                Ok(process) => return process,
+                Err(EgressError::StateUnavailable) => tokio::task::yield_now().await,
+                Err(error) => panic!("reopen failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_not_attach() {
+    let mut fixture = Fixture::new(200, "saved answer".into(), Duration::ZERO).await;
+    let client = InProcessEgressClient::new(fixture.process().await);
+    let id = enqueue_id(&client, queued(&fixture, "saved")).await;
+    wait_job(&client, &id, JobState::Succeeded).await;
+    let mut waiting = queued(&fixture, "waiting");
+    waiting.admission.attempt.expires_at = unix_seconds();
+    waiting.admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(waiting.admission.attempt)
+        .unwrap();
+    let waiting = enqueue_id(&client, waiting).await;
+    wait_job(&client, &waiting, JobState::AwaitingAdmission).await;
+    drop(client);
+    fixture.config.routes[0].timeout_seconds += 1;
+    fixture.config.routes[0].max_in_flight += 1;
+    let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+    wait_job(&client, &id, JobState::Succeeded).await;
+    // Renewal stores unfinished work, but the changed execution binding refuses
+    // attachment. That refusal must not gate metadata or saved completions.
+    let (admission, _) = fixture.attempt("waiting", 2, 2);
+    assert!(matches!(
+        job_call(
+            &client,
+            JobsCommand::AdmitJob {
+                job: waiting.clone(),
+                admission: Box::new(admission)
+            }
+        )
+        .await,
+        Err(JobsClientError::Egress(EgressError::StateUnavailable))
+    ));
+    wait_job(&client, &waiting, JobState::Pending).await;
+
+    let JobsReply::Completions(page) = job_call(
+        &client,
+        JobsCommand::Completions {
+            limit: 1,
+            max_bytes: 65536,
+            wait_seconds: 0,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("completions")
+    };
+    assert_eq!(
+        page.items[0].output.as_ref().unwrap()["text"],
+        "saved answer"
+    );
+    job_call(
+        &client,
+        JobsCommand::AckJobs(vec![(
+            page.items[0].delivery.token.clone(),
+            Disposition::Accepted,
+        )]),
+    )
+    .await
+    .unwrap();
+    job_call(
+        &client,
+        JobsCommand::CancelJobs(Selector::Ids(vec![waiting.clone()])),
+    )
+    .await
+    .unwrap();
+    wait_job(&client, &waiting, JobState::Cancelled).await;
+    for n in 0..4 {
+        let mut scope = jobs_scope();
+        scope.queue = format!("missing-{n}");
+        let jobs = JobsClient::new(
+            client.clone(),
+            scope.clone(),
+            AdmissionKey::new(KEY.to_vec()).unwrap(),
+        );
+        let missing = JobId {
+            scope,
+            id: "missing".into(),
+        };
+        assert!(matches!(
+            jobs.request(JobsCommand::JobStatus(missing.clone())).await,
+            Err(JobsClientError::Job(JobError::NotFound))
+        ));
+        let (admission, _) = fixture.attempt("missing", 2, 2);
+        assert!(matches!(
+            jobs.request(JobsCommand::AdmitJob {
+                job: missing,
+                admission: Box::new(admission)
+            })
+            .await,
+            Err(JobsClientError::Job(JobError::NotFound))
+        ));
+        jobs.request(JobsCommand::Completions {
+            limit: 1,
+            max_bytes: 65536,
+            wait_seconds: 0,
+        })
+        .await
+        .unwrap();
+    }
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM model_job_bindings", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn jobs_refuse_signed_attempt_already_dispatched_directly_after_restart() {
+    let fixture = Fixture::new(200, "paid once".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let input = queued(&fixture, "shared-attempt");
+    let permit = permit(&process, &input.admission).await;
+    assert!(
+        dispatched(
+            exchange(
+                &process,
+                inject(input.admission.clone(), input.payload.clone(), permit)
+            )
+            .await
+            .unwrap()
+        )
+        .output
+        .is_some()
+    );
+    drop(process);
+    let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+    let id = enqueue_id(&client, input).await;
+    let row = wait_job(&client, &id, JobState::Refused).await;
+    assert_eq!(
+        row.diagnostic,
+        Some(symbiotic_ai_runtime::model::DiagnosticCode::InvocationCompleted)
+    );
+    assert!(row.receipt.is_none());
+    assert_eq!(row.generation, 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn jobs_keyless_completions_discard_raw_json_for_every_response_type() {
+    use symbiotic_ai_runtime::model::{ModelAdapter, RerankRequest};
+    for kind in ["chat", "embedding", "rerank"] {
+        let body = match kind {
+            "chat" => serde_json::json!({"choices":[{"message":{"content":"selected answer"}}]}),
+            "embedding" => serde_json::json!({"data":[{"index":0,"embedding":[1,2]}]}),
+            _ => serde_json::json!({"results":[{"index":0,"relevance_score":0.8}]}),
+        };
+        let mut body = body;
+        body["debug"] = serde_json::json!({"internal_prompt":"private-provider-debug"});
+        let mut fixture =
+            Fixture::with_http_response(200, body.to_string(), Duration::ZERO, "null", true, true)
+                .await;
+        fixture.config.routes[0].secret = SecretSource::None;
+        fixture.config.routes[0].secret_ref.clear();
+        if kind == "embedding" {
+            fixture.config.routes[0].provider = RouteProvider::CompatibleEmbedding {
+                adapter: ModelAdapter::OpenAiEmbedding,
+                operator: "test".into(),
+                dimensions: 2,
+                embedding_full_dimensions: 1024,
+                embedding_input_tokens: 16,
+            };
+        } else if kind == "rerank" {
+            fixture.config.routes[0].provider = RouteProvider::CohereRerank {
+                operator: "test".into(),
+                rerank_input_bytes: 64,
+                rerank_candidates: 2,
+                rerank_context_tokens: 16,
+                rerank_query_tokens: 8,
+            };
+        }
+        let mut input = queued(&fixture, kind);
+        if kind == "embedding" {
+            input.payload = ProviderPayload::Embedding(EmbeddingRequest {
+                inputs: vec!["input".into()],
+                dimensions: Some(2),
+                task: None,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            });
+        } else if kind == "rerank" {
+            input.payload = ProviderPayload::Rerank(RerankRequest {
+                query: "query".into(),
+                documents: vec!["candidate".into()],
+                top_k: Some(1),
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            });
+        }
+        input.admission.attempt.input_digest = input.payload.digest().unwrap();
+        input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(input.admission.attempt)
+            .unwrap();
+        let client = InProcessEgressClient::new(fixture.process().await);
+        let id = enqueue_id(&client, input).await;
+        wait_job(&client, &id, JobState::Succeeded).await;
+        let JobsReply::Completions(page) = job_call(
+            &client,
+            JobsCommand::Completions {
+                limit: 1,
+                max_bytes: 65536,
+                wait_seconds: 0,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("completions")
+        };
+        let output = page.items[0].output.as_ref().unwrap();
+        assert!(
+            output["raw_provider_response"].is_null(),
+            "raw response escaped for {kind}"
+        );
+        assert!(!output.to_string().contains("private-provider-debug"));
+        match kind {
+            "chat" => assert_eq!(output["text"], "selected answer"),
+            "embedding" => assert_eq!(output["vectors"], serde_json::json!([[1.0, 2.0]])),
+            _ => assert_eq!(output["hits"][0]["index"], 0),
+        }
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let recovery: String = conn
+            .query_row(
+                "SELECT recovery FROM spend_receipts WHERE recovery IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!recovery.contains("private-provider-debug"));
+    }
+}
+
+#[tokio::test]
+async fn jobs_and_direct_dispatch_share_atomic_signed_attempt_acceptance() {
+    for concurrent in [false, true] {
+        let fixture = Fixture::new(200, "one dispatch".into(), Duration::ZERO).await;
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process.clone());
+        let input = queued(&fixture, "atomic-attempt");
+        // Issuance alone does not accept a dispatch; either path may consume it.
+        let permit = permit(&process, &input.admission).await;
+        let operation = inject(
+            input.admission.clone(),
+            input.payload.clone(),
+            permit.clone(),
+        );
+        let id = if concurrent {
+            let (id, direct) = tokio::join!(
+                enqueue_id(&client, input.clone()),
+                exchange(&process, operation)
+            );
+            assert!(matches!(
+                direct,
+                Ok(Reply::Dispatched(_)) | Err(EgressError::PermitRefused)
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let JobsReply::Status(row) =
+                        job_call(&client, JobsCommand::JobStatus(id.clone()))
+                            .await
+                            .unwrap()
+                    else {
+                        panic!("status")
+                    };
+                    if matches!(row.state, JobState::Succeeded | JobState::Refused) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            id
+        } else {
+            let id = enqueue_id(&client, input.clone()).await;
+            wait_job(&client, &id, JobState::Succeeded).await;
+            assert!(matches!(
+                exchange(&process, operation).await,
+                Err(EgressError::PermitRefused)
+            ));
+            id
+        };
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        drop(client);
+        drop(process);
+        let process = reopen_jobs(&fixture).await;
+        assert!(matches!(
+            exchange(&process, inject(input.admission, input.payload, permit)).await,
+            Err(EgressError::PermitRefused)
+        ));
+        let client = InProcessEgressClient::new(process);
+        let JobsReply::Status(row) = job_call(&client, JobsCommand::JobStatus(id)).await.unwrap()
+        else {
+            panic!("status")
+        };
+        assert!(matches!(row.state, JobState::Succeeded | JobState::Refused));
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM egress_permits WHERE consumed=1",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+}

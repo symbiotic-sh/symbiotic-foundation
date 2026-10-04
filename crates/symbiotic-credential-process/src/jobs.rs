@@ -69,6 +69,34 @@ impl ModelJobAdmission for Admission {
         }
         Ok(true)
     }
+    fn accept(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        reservation: &SpendReservation,
+    ) -> Result<(), JobError> {
+        let process = self.process()?;
+        let signed = decode(row.admission.as_deref())?;
+        let route = process.validate_attempt(&signed.attempt).map_err(invalid)?;
+        crate::registry::Registry::accept_job_in(
+            tx,
+            &signed.attempt,
+            &reservation.reference,
+            route.max_attempts,
+        )
+        .map_err(|error| match error {
+            EgressError::StateUnavailable => JobError::Storage,
+            EgressError::BudgetRefused => {
+                JobError::Execution(model::DiagnosticCode::AttemptBudgetExhausted)
+            }
+            EgressError::PermitRefused
+            | EgressError::ReconciliationRequired
+            | EgressError::InvocationComplete => {
+                JobError::Execution(model::DiagnosticCode::InvocationCompleted)
+            }
+            other => invalid(other),
+        })
+    }
     fn claim(
         &self,
         tx: &Transaction<'_>,
@@ -149,6 +177,7 @@ impl ChatProvider for JobProvider {
             .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
             .chat(request)
             .await?;
+        response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -161,6 +190,7 @@ impl EmbeddingProvider for JobProvider {
             .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
             .embed(request)
             .await?;
+        response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -173,6 +203,7 @@ impl RerankProvider for JobProvider {
             .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
             .rerank(request)
             .await?;
+        response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -207,14 +238,26 @@ impl CredentialProcess {
             prototype,
         })
     }
-    async fn start_jobs(&self, scope: &JobScope, jobs: &ModelJobs) -> Result<(), EgressError> {
+    async fn start_jobs(
+        &self,
+        scope: &JobScope,
+        jobs: &ModelJobs,
+        kind: Option<&str>,
+    ) -> Result<(), EgressError> {
         let mut runners = self.inner.job_runners.lock().await;
         for route in self
             .inner
             .routes
             .values()
-            .filter(|r| r.tenant == scope.tenant)
+            .filter(|r| r.tenant == scope.tenant && kind.is_none_or(|kind| kind == r.route))
         {
+            if !jobs
+                .needs_execution(route.route.clone())
+                .await
+                .map_err(|_| EgressError::StateUnavailable)?
+            {
+                continue;
+            }
             let key = serde_json::to_string(&(scope, &route.route))
                 .map_err(|_| EgressError::InvalidRequest)?;
             if let Some(runner) = runners.get(&key) {
@@ -320,12 +363,43 @@ impl CredentialProcess {
             Ok(jobs) => jobs,
             Err(error) => return Ok(Reply::Jobs(Err(error))),
         };
-        self.start_jobs(&scope, &jobs).await?;
-        let result = self.run_jobs_command(&jobs, command).await;
+        let admitted = match &command {
+            JobsCommand::AdmitJob { job, .. } => Some(job.clone()),
+            _ => None,
+        };
+        let result = self.run_jobs_command(&scope, &jobs, command).await;
+        let mut execution = Vec::new();
+        if let Ok(reply) = &result {
+            match reply {
+                JobsReply::Enqueued(items) => {
+                    for item in items {
+                        if let Enqueued::Inserted(id) | Enqueued::Joined(id) = item {
+                            execution.push(id.clone());
+                        }
+                    }
+                }
+                JobsReply::Admitted => execution.extend(admitted),
+                _ => {}
+            }
+        }
+        for id in execution {
+            if let JobResponse::Job(Some(row)) = jobs
+                .request(JobRequest::Status(id))
+                .await
+                .map_err(|_| EgressError::StateUnavailable)?
+                && matches!(
+                    row.state,
+                    JobState::Pending | JobState::Running | JobState::Uncertain
+                )
+            {
+                self.start_jobs(&scope, &jobs, Some(&row.kind)).await?;
+            }
+        }
         Ok(Reply::Jobs(result))
     }
     async fn run_jobs_command(
         &self,
+        scope: &JobScope,
         jobs: &ModelJobs,
         command: JobsCommand,
     ) -> Result<JobsReply, JobError> {
@@ -484,6 +558,11 @@ impl CredentialProcess {
                             used += size;
                             page.notices.push(notice);
                         }
+                    }
+                    if page.items.is_empty() && page.notices.is_empty() {
+                        self.start_jobs(scope, jobs, None)
+                            .await
+                            .map_err(|_| JobError::Unavailable)?;
                     }
                     if !page.items.is_empty()
                         || !page.notices.is_empty()

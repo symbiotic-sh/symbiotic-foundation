@@ -41,6 +41,13 @@ pub trait ModelJobAdmission: Send + Sync {
     /// Validate a successor against the canonical frozen row and previous authority.
     /// False is an exact replay: leave the current lifecycle unchanged.
     fn admit(&self, row: &JobRecord, admission: &[u8]) -> Result<bool, JobError>;
+    /// Record signed-attempt acceptance in the claim/reservation transaction.
+    fn accept(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        reservation: &SpendReservation,
+    ) -> Result<(), JobError>;
     /// Recheck current authority after obtaining the account slot, before claim/reservation.
     fn claim(
         &self,
@@ -244,6 +251,17 @@ fn job_receipt_reference_in(
 }
 
 impl ModelJobs {
+    /// Derive whether a kind has work requiring execution or ledger recovery.
+    pub async fn needs_execution(&self, kind: String) -> Result<bool, JobError> {
+        let jobs = self.clone();
+        tokio::task::spawn_blocking(move || jobs.transaction(|tx, _| {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE scope=?1 AND kind=?2 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"'))",
+                params![serde_json::to_string(&jobs.scope).map_err(|_| JobError::Storage)?, kind],
+                |r| r.get(0),
+            ).map_err(|_| JobError::Storage)
+        })).await.map_err(|_| JobError::Storage)?
+    }
     /// Attach the trusted admission owner; signed jobs never retry automatically.
     pub fn with_admission(mut self, admission: Arc<dyn ModelJobAdmission>) -> Self {
         self.admission = Some(admission);
@@ -686,13 +704,17 @@ impl model::ModelJob for ClaimOwner {
             if !accepted {
                 return Err(JobError::Storage);
             }
+            if let Some(admission) = &self.jobs.admission {
+                admission.accept(tx, &row, reservation)?;
+            }
             Ok(Some(*row))
         });
         let result = match result {
             Ok(result) => result,
             Err(JobError::Execution(
                 code @ (DiagnosticCode::SpendBudgetExhausted
-                | DiagnosticCode::AttemptBudgetExhausted),
+                | DiagnosticCode::AttemptBudgetExhausted
+                | DiagnosticCode::InvocationCompleted),
             )) => {
                 model::ModelJob::refuse(self, code)?;
                 return Ok(None);
@@ -1222,6 +1244,14 @@ mod review_tests {
     async fn signed_claims_use_frozen_job_ceiling_across_successor_admissions() {
         struct Admitted;
         impl ModelJobAdmission for Admitted {
+            fn accept(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: &SpendReservation,
+            ) -> Result<(), JobError> {
+                Ok(())
+            }
             fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
                 Ok(())
             }
