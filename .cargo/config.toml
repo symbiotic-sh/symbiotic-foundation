@@ -7,7 +7,8 @@ trim-paths = true
 # Parallel compiler front end; its threads take slots from Cargo's job pool.
 rustflags = ["-Zthreads=8"]
 
-# Workspace-relative paths in compiled output, so builds do not depend on the checkout path.
+# Workspace-relative source paths in compiler output (diagnostics, debug info, panic locations).
+# Code that embeds a path itself, such as env!("CARGO_MANIFEST_DIR"), still records the checkout path.
 [profile.dev]
 trim-paths = "all"
 
