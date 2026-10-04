@@ -21,6 +21,47 @@ use tokio::{
 const SECRET: &str = "synthetic-WP14-credential-\"/+?=é-canary";
 const KEY: &[u8] = b"synthetic-admission-key-at-least-32-bytes";
 
+#[tokio::test]
+async fn configuration_refuses_removed_secret_backend_before_startup() {
+    let fixture = Fixture::new(200, "ok".into(), Duration::ZERO).await;
+    for admission in [true, false] {
+        let mut config = serde_json::to_value(&fixture.config).unwrap();
+        let source = serde_json::json!({
+            "backend": "macos_keychain",
+            "service": "synthetic-service",
+            "account": "synthetic-account"
+        });
+        if admission {
+            config["admission_key"] = source;
+        } else {
+            config["routes"][0]["secret"] = source;
+        }
+        let error = serde_json::from_value::<ProcessConfig>(config.clone())
+            .err()
+            .expect("removed secret backend must be refused during deserialization");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("unknown variant `macos_keychain`"));
+        assert!(diagnostic.contains("`none`"));
+        assert!(diagnostic.contains("`owner_only_file`"));
+
+        let path = fixture.dir.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap().trim(),
+            "invalid configuration: supported secret backends are `none` and `owner_only_file`"
+        );
+        assert!(!fixture.config.state_dir.exists());
+        assert!(!fixture.config.socket_path.exists());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: ProcessConfig,

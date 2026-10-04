@@ -1447,7 +1447,6 @@ dependencies = [
  "libc",
  "reqwest",
  "rusqlite",
- "security-framework",
  "serde",
  "serde_json",
  "socket2",

@@ -146,7 +146,7 @@ explicit. The canonical request-spend ledger shares the operational database wit
 
 The versioned WP14 schema/client is `symbiotic-egress`; Memory consumes its
 `EgressClient` trait. `symbiotic-credential-process` authenticates Memory's durable
-attempt records, issues/consumes single-use permits, resolves local file/keychain
+attempt records, issues/consumes single-use permits, resolves owner-only-file
 credentials and invokes existing HTTP adapters through `symbiotic-ai-runtime`.
 It extends the runtime database with durable replay metadata, has no second scheduler,
 and disables response caching. Details: [model egress](architecture/model-egress.md).
@@ -189,7 +189,7 @@ Auth is modeled as provider modes, not as one global OAuth abstraction:
 | `cli_session` | local tool session, e.g. Codex ChatGPT sign-in |
 
 These describe provider authentication, distinct from gateway authentication of
-callers. Current file/keychain support is described in
+callers. Current owner-only-file and keyless support is described in
 [model egress](architecture/model-egress.md).
 The full mode and ownership contract is in
 [boundary.md](architecture/boundary.md#supported-modes-and-trusted-channels).

@@ -310,21 +310,24 @@ Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.
 
-Both admission and provider sources use one of:
+Admission keys and authenticated provider routes use:
 
 ```json
 {"backend":"owner_only_file","path":"/private/egress/provider-key"}
 ```
 
+Keyless provider routes use:
+
 ```json
-{"backend":"macos_keychain","service":"foundation-egress","account":"tenant/provider-key"}
+{"backend":"none"}
 ```
 
+The `none` source is only for keyless provider routes, never admission keys.
+Unknown secret backends are refused during configuration deserialization.
 File values are exact UTF-8 bytes, with no automatic trimming. Files must be owned by
 the process UID, be regular, have no group/other permission bits, and not be symlinks.
-Keychain reads use Security.framework's generic-password API; non-macOS keychain
-configuration fails closed. No command-line keychain tool, remote backend or credential
-creation/rotation is performed. Secret buffers and adapter key storage zeroize on drop.
+No remote secret backend or credential creation/rotation is performed.
+Secret buffers and adapter key storage zeroize on drop.
 
 Configured providers include `open_ai_chat { operator }`,
 `gemini_embedding { dimensions }`, `compatible_embedding { adapter, operator,
@@ -381,8 +384,7 @@ response/error/log isolation, durable replay, grant-revision publication and acc
 cancellation, same-attempt attachment after lost permit/completion IPC replies, restart
 recovery, digest mismatch refusal, exclusive result expiry, no cache, new-attempt retry,
 pinned destinations, redirects, response/frame
-limits, file protection and real executable IPC. The macOS keychain API is compiled;
-no real user credential or keychain item is read or created by tests. These fixtures
+limits, file protection, unsupported secret backend refusal and real executable IPC. These fixtures
 are not a live-provider qualification or physical power-loss certification. The tests cover this backend's revision ordering and ledger accounting; Memory must
 implement the trusted publication integration and its data authorization checks.
 Memory input-authorization and guarded-commit verification belongs to Memory.
