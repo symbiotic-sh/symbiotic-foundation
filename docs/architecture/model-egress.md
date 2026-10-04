@@ -273,6 +273,15 @@ Keyless routes use `secret: {"backend":"none"}` and an empty `secret_ref` in
 configuration and admission. No credential is loaded or Authorization header sent.
 The admission MAC key still requires a real secret source.
 
+There are three sources: `none`, an owner-only file, and an app-supplied resolver.
+Thread-mode apps pass `SecretSource::Resolver` through `ProcessConfig`.
+The callback resolves a named key into zeroizing bytes. Foundation calls it only
+after process protection is active. Provider keys are resolved lazily after permit
+consumption. Resolver failures become `CredentialUnavailable`; their text is discarded.
+Resolver configs cannot be serialized. `ProcessConfig::validate_child_process()`
+refuses them with `ResolverRequiresThreadMode`; no callback crosses into a child.
+In thread mode, the credential boundary protects against accidents, not same-process code.
+
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
 must be an owner-only regular file. Before reading configuration or secrets, the executable
 sets both core resource limits to zero and, on Linux, clears dumpability with
@@ -310,7 +319,7 @@ Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.
 
-Admission keys and authenticated provider routes use:
+Child-process admission keys and authenticated provider routes use:
 
 ```json
 {"backend":"owner_only_file","path":"/private/egress/provider-key"}

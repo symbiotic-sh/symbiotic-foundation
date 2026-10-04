@@ -27,7 +27,7 @@ use symbiotic_ai_runtime::{Runtime, RuntimeConfig};
 use symbiotic_egress::*;
 
 /// Supported pinned provider transports.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteProvider {
     /// Existing OpenAI-compatible chat adapter.
@@ -70,7 +70,7 @@ pub enum RouteProvider {
 }
 
 /// Route configured by the credential-process owner. No defaults for safety limits.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Tenant namespace.
@@ -117,7 +117,7 @@ pub struct RouteConfig {
 }
 
 /// Versioned deployment configuration; only locations/references, no credential values.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Must equal protocol version 3.
@@ -142,6 +142,19 @@ pub struct ProcessConfig {
     pub clock_rollback_warning_tolerance_seconds: u64,
     /// Approved routes; no caller-supplied destinations or secret paths.
     pub routes: Vec<RouteConfig>,
+}
+
+impl ProcessConfig {
+    /// Refuse callbacks before launching a child; closures cannot cross that boundary.
+    pub fn validate_child_process(&self) -> Result<(), EgressError> {
+        if std::iter::once(&self.admission_key)
+            .chain(self.routes.iter().map(|route| &route.secret))
+            .any(|source| matches!(source, SecretSource::Resolver { .. }))
+        {
+            return Err(EgressError::ResolverRequiresThreadMode);
+        }
+        Ok(())
+    }
 }
 
 fn default_clock_rollback_warning_tolerance_seconds() -> u64 {

@@ -59,6 +59,9 @@ pub enum EgressError {
         "max_frame_bytes must fit the reply envelope plus max_field_bytes identity bounds and max_response_bytes response bound"
     )]
     InvalidFrameConfiguration,
+    /// App secret callbacks cannot be configured for a child process.
+    #[error("app secret resolver requires thread mode; unavailable in child-process mode")]
+    ResolverRequiresThreadMode,
     /// Admission authentication failed.
     #[error("invalid admission authentication")]
     Unauthorized,

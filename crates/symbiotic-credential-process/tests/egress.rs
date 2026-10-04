@@ -52,8 +52,7 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
             config["routes"][0]["secret"] = source;
         }
         let error = serde_json::from_value::<ProcessConfig>(config.clone())
-            .err()
-            .expect("removed secret backend must be refused during deserialization");
+            .expect_err("removed secret backend must be refused during deserialization");
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("unknown variant `macos_keychain`"));
         assert!(diagnostic.contains("`none`"));
@@ -3710,4 +3709,120 @@ async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_rese
         matches!(recovered.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
+    let mut fixture = Fixture::new(200, "resolver answer".into(), Duration::ZERO).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "named-provider-key".into(),
+        resolve: Arc::new(move |name| {
+            assert_eq!(name, "named-provider-key");
+            // The regression in secrets checks refusal before OS protection.
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(symbiotic_ai_runtime::model::SecretValue::new(
+                SECRET.as_bytes().to_vec(),
+            ))
+        }),
+    };
+    let process = fixture.process().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (admission, payload) = fixture.attempt("resolver", 1, 1);
+    let granted = permit(&process, &admission).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let result = dispatched(
+        exchange(&process, inject(admission, payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert!(
+        matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "resolver answer")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn resolver_config_debug_redacts_captured_key_without_invoking_callback() {
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let key = symbiotic_ai_runtime::model::SecretValue::new(SECRET.as_bytes().to_vec());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(key.clone())
+        }),
+    };
+    let diagnostic = format!("{:?}", fixture.config);
+    assert!(diagnostic.contains("Resolver { .. }"));
+    assert!(!diagnostic.contains("synthetic-WP14-credential"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn resolver_error_is_redacted_and_never_reaches_provider() {
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(|_| Err(std::io::Error::other(SECRET).into())),
+    };
+    let process = fixture.process().await;
+    let (admission, payload) = fixture.attempt("resolver-error", 1, 1);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(&process, inject(admission.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.error, Some(EgressError::CredentialUnavailable));
+    assert_eq!(result.receipt.status, DispatchStatus::CredentialUnavailable);
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("synthetic-WP14-credential")
+    );
+    assert!(!format!("{result:?}").contains("synthetic-WP14-credential"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    let AttemptStatus::Failed { result: recovered } = status(&process, &admission).await else {
+        panic!("expected retained redacted failure");
+    };
+    assert_eq!(recovered.error, Some(EgressError::CredentialUnavailable));
+    assert!(
+        !serde_json::to_string(&recovered)
+            .unwrap()
+            .contains("synthetic-WP14-credential")
+    );
+}
+
+#[tokio::test]
+async fn resolver_configuration_is_refused_in_child_mode_without_invoking_callback() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.validate_child_process().unwrap();
+    for admission in [true, false] {
+        let mut config = fixture.config.clone();
+        let source = SecretSource::Resolver {
+            name: "provider-key".into(),
+            resolve: Arc::new(|_| panic!("child configuration must never resolve a key")),
+        };
+        if admission {
+            config.admission_key = source;
+        } else {
+            config.routes[0].secret = source;
+        }
+        assert_eq!(
+            config.validate_child_process(),
+            Err(EgressError::ResolverRequiresThreadMode)
+        );
+        assert!(serde_json::to_vec(&config).is_err());
+        assert!(!config.state_dir.exists());
+    }
+    let mut json = serde_json::to_value(&fixture.config).unwrap();
+    json["routes"][0]["secret"] =
+        serde_json::json!({"backend": "resolver", "name": "provider-key"});
+    assert!(serde_json::from_value::<ProcessConfig>(json).is_err());
 }
