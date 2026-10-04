@@ -12,12 +12,18 @@ use std::process::Command;
 
 fn normal_dependencies(package: &str, extra: &[&str]) -> String {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    // Read when the test runs: a compiled-in path would tie this test build to one checkout.
+    let manifest = std::path::Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+    .join("Cargo.toml")
+    .to_string_lossy()
+    .into_owned();
     let output = Command::new(cargo)
         .args([
             "tree",
             "--manifest-path",
-            manifest,
+            manifest.as_str(),
             "--package",
             package,
             "--edges",
