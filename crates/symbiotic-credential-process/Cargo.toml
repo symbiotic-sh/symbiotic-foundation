@@ -26,9 +26,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 uuid.workspace = true
 zeroize = "1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
-
 [dev-dependencies]
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 rusqlite = { workspace = true, features = ["hooks"] }

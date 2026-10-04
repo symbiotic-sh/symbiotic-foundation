@@ -12,8 +12,6 @@ pub enum SecretSource {
     None,
     /// Exact owner-only file, opened without following its final symlink.
     OwnerOnlyFile { path: PathBuf },
-    /// Existing macOS generic password; no shell invocation or environment fallback.
-    MacosKeychain { service: String, account: String },
 }
 
 /// Owned credential; the shared model HTTP boundary rejects output echoes.
@@ -53,7 +51,6 @@ impl SecretSource {
         let bytes = match self {
             Self::None => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
-            Self::MacosKeychain { service, account } => keychain(service, account)?,
         };
         if bytes.is_empty() || bytes.len() > max_bytes {
             return Err(EgressError::CredentialUnavailable);
@@ -100,17 +97,6 @@ pub(crate) fn read_private_file(
         let _ = (path, max_bytes);
         Err(EgressError::CredentialUnavailable)
     }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain(service: &str, account: &str) -> Result<SecretValue<Vec<u8>>, EgressError> {
-    security_framework::passwords::get_generic_password(service, account)
-        .map(SecretValue::new)
-        .map_err(|_| EgressError::CredentialUnavailable)
-}
-#[cfg(not(target_os = "macos"))]
-fn keychain(_: &str, _: &str) -> Result<SecretValue<Vec<u8>>, EgressError> {
-    Err(EgressError::CredentialUnavailable)
 }
 
 #[cfg(test)]

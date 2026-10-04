@@ -9,7 +9,7 @@ async fn main() {
 }
 
 #[cfg(unix)]
-async fn run() -> Result<(), symbiotic_egress::EgressError> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use symbiotic_credential_process::{
         CredentialProcess, ProcessConfig, secrets::SecretSource, server,
     };
@@ -32,14 +32,15 @@ async fn run() -> Result<(), symbiotic_egress::EgressError> {
         first
     };
     if args.next().is_some() {
-        return Err(EgressError::InvalidRequest);
+        return Err(EgressError::InvalidRequest.into());
     }
     let bytes = SecretSource::OwnerOnlyFile { path: path.into() }.load(1024 * 1024)?;
-    let config: ProcessConfig =
-        serde_json::from_slice(&bytes).map_err(|_| EgressError::InvalidRequest)?;
+    let config: ProcessConfig = serde_json::from_slice(&bytes).map_err(
+        |_| "invalid configuration: supported secret backends are `none` and `owner_only_file`",
+    )?;
     let process = CredentialProcess::open(config)?;
     let listener = server::bind(&process)?;
-    server::serve(process, listener).await
+    Ok(server::serve(process, listener).await?)
 }
 
 #[cfg(not(unix))]
