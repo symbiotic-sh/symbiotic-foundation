@@ -30,6 +30,31 @@ pub fn protect_process() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Check the OS state rather than retaining a second protection flag.
+pub(crate) fn require_protection() -> std::io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes the initialized struct and retains no pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let protected = limit.rlim_cur == 0 && limit.rlim_max == 0;
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_GET_DUMPABLE accepts only integer arguments.
+        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+    }
+    if protected {
+        Ok(())
+    } else {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;

@@ -144,6 +144,19 @@ pub struct ProcessConfig {
     pub routes: Vec<RouteConfig>,
 }
 
+impl ProcessConfig {
+    /// Refuse callbacks before launching a child; closures cannot cross that boundary.
+    pub fn validate_child_process(&self) -> Result<(), EgressError> {
+        if std::iter::once(&self.admission_key)
+            .chain(self.routes.iter().map(|route| &route.secret))
+            .any(|source| matches!(source, SecretSource::Resolver { .. }))
+        {
+            return Err(EgressError::ResolverRequiresThreadMode);
+        }
+        Ok(())
+    }
+}
+
 fn default_clock_rollback_warning_tolerance_seconds() -> u64 {
     5
 }
@@ -170,6 +183,7 @@ pub struct CredentialProcess {
 impl CredentialProcess {
     /// Open bounded, protected state and configured local secret backends.
     /// Embedded callers must also call [`protect_process`] before reading configuration.
+    /// For resolver sources, first initialize [`secrets::initialize_resolver_panic_hook`].
     pub fn open(config: ProcessConfig) -> Result<Self, EgressError> {
         #[cfg(unix)]
         protect_process().map_err(|_| EgressError::StateUnavailable)?;

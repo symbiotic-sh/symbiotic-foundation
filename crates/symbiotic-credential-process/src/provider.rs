@@ -1,5 +1,8 @@
 //! Track dispatch and project sanitized model output into credential-process replies.
-use crate::{RouteConfig, RouteProvider, secrets::Secret};
+use crate::{
+    RouteConfig, RouteProvider,
+    secrets::{Secret, SecretSource},
+};
 use async_trait::async_trait;
 use std::sync::{
     Arc,
@@ -188,6 +191,23 @@ fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
     }
 }
 
+// Resolver revisions encode (route with a keyless placeholder, backend tag,
+// key name), in that order. Callback code and values have no stable serialization,
+// just as file contents are excluded. Other sources retain their route encoding.
+// Registration and accepted handoffs must use this same revision mechanism.
+fn route_revision(route: &RouteConfig) -> Result<String, EgressError> {
+    let revision = if let SecretSource::Resolver { name, .. } = &route.secret {
+        let mut metadata = route.clone();
+        metadata.secret = SecretSource::None;
+        model::configuration_revision(&(metadata, "resolver", name))
+    } else {
+        model::configuration_revision(route)
+    };
+    revision
+        .map(|revision| revision.0)
+        .map_err(|_| EgressError::InvalidRequest)
+}
+
 /// Compile deployment routes into the same validated registry used by embedded runtimes.
 pub(crate) fn configured_registry(
     routes: &[RouteConfig],
@@ -232,9 +252,7 @@ pub(crate) fn configured_registry(
             identity: BindingIdentity::new(
                 &route.tenant,
                 &route.route,
-                model::configuration_revision(route)
-                    .map_err(|_| EgressError::InvalidRequest)?
-                    .0,
+                route_revision(route)?,
                 &route.account,
             ),
             model: model_id,
@@ -408,9 +426,7 @@ pub(crate) fn accepted_handoff(
     let binding = BindingIdentity::new(
         &route.tenant,
         &route.route,
-        model::configuration_revision(route)
-            .map_err(|_| EgressError::InvalidRequest)?
-            .0,
+        route_revision(route)?,
         &route.account,
     );
     Ok(model::AcceptedSpendHandoff {

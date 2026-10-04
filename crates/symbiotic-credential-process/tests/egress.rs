@@ -10,7 +10,8 @@ use std::{
 };
 use symbiotic_credential_process::{
     CredentialProcess, InProcessEgressClient, ProcessConfig, RouteConfig, RouteProvider,
-    secrets::SecretSource, server,
+    secrets::{SecretSource, initialize_resolver_panic_hook},
+    server,
 };
 use symbiotic_egress::*;
 use tokio::{
@@ -20,6 +21,11 @@ use tokio::{
 
 const SECRET: &str = "synthetic-WP14-credential-\"/+?=é-canary";
 const KEY: &[u8] = b"synthetic-admission-key-at-least-32-bytes";
+
+fn initialize_panic_reporting() {
+    static INITIALIZE: std::sync::Once = std::sync::Once::new();
+    INITIALIZE.call_once(|| initialize_resolver_panic_hook(std::panic::take_hook()));
+}
 
 // Paths are read when the tests run, not compiled in: a compiled-in path makes this test build
 // specific to one checkout, so no other worktree can reuse it from the build cache.
@@ -3710,4 +3716,227 @@ async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_rese
         matches!(recovered.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
+    initialize_panic_reporting();
+    let mut fixture = Fixture::new(200, "resolver answer".into(), Duration::ZERO).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "named-provider-key".into(),
+        resolve: Arc::new(move |name| {
+            assert_eq!(name, "named-provider-key");
+            // The regression in secrets checks refusal before OS protection.
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(symbiotic_ai_runtime::model::SecretValue::new(
+                SECRET.as_bytes().to_vec(),
+            ))
+        }),
+    };
+    let process = fixture.process().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (admission, payload) = fixture.attempt("resolver", 1, 1);
+    let granted = permit(&process, &admission).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let result = dispatched(
+        exchange(&process, inject(admission, payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+    assert!(
+        matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "resolver answer")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn resolver_debug_redacts_captured_key_without_invoking_callback() {
+    let key = symbiotic_ai_runtime::model::SecretValue::new(SECRET.as_bytes().to_vec());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let source = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(key.clone())
+        }),
+    };
+    let diagnostic = format!("{source:?}");
+    assert!(diagnostic.contains("Resolver { .. }"));
+    assert!(!diagnostic.contains("synthetic-WP14-credential"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn resolver_error_is_redacted_and_never_reaches_provider() {
+    initialize_panic_reporting();
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(|_| Err(std::io::Error::other(SECRET).into())),
+    };
+    let process = fixture.process().await;
+    let (admission, payload) = fixture.attempt("resolver-error", 1, 1);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(&process, inject(admission.clone(), payload, granted))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.error, Some(EgressError::CredentialUnavailable));
+    assert_eq!(result.receipt.status, DispatchStatus::CredentialUnavailable);
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("synthetic-WP14-credential")
+    );
+    assert!(!format!("{result:?}").contains("synthetic-WP14-credential"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    let AttemptStatus::Failed { result: recovered } = status(&process, &admission).await else {
+        panic!("expected retained redacted failure");
+    };
+    assert_eq!(recovered.error, Some(EgressError::CredentialUnavailable));
+    assert!(
+        !serde_json::to_string(&recovered)
+            .unwrap()
+            .contains("synthetic-WP14-credential")
+    );
+}
+
+#[tokio::test]
+async fn resolver_panic_child() {
+    fn lookup() -> std::io::Result<symbiotic_ai_runtime::model::SecretValue<Vec<u8>>> {
+        Err(std::io::Error::other(SECRET))
+    }
+
+    let Some(mode) = std::env::var_os("RESOLVER_PANIC_TEST") else {
+        return;
+    };
+    // Use Rust's default reporter, rather than the test harness's hook.
+    drop(std::panic::take_hook());
+    initialize_resolver_panic_hook(std::panic::take_hook());
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let worker = mode == "worker";
+    let source = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(move |_| {
+            if worker {
+                return std::thread::spawn(|| lookup().expect("worker lookup failed"))
+                    .join()
+                    .map_err(|_| std::io::Error::other("lookup worker panicked").into());
+            }
+            Ok(lookup().expect("lookup failed"))
+        }),
+    };
+    if mode == "admission" {
+        fixture.config.admission_key = source;
+        assert!(matches!(
+            CredentialProcess::open(fixture.config.clone()),
+            Err(EgressError::CredentialUnavailable)
+        ));
+    } else {
+        assert!(mode == "provider" || mode == "worker" || mode == "reporter");
+        if mode == "reporter" {
+            fixture.config.admission_key = SecretSource::Resolver {
+                name: "admission-key".into(),
+                resolve: Arc::new(|_| {
+                    Ok(symbiotic_ai_runtime::model::SecretValue::new(KEY.to_vec()))
+                }),
+            };
+        }
+        fixture.config.routes[0].secret = source;
+        let process = fixture.process().await;
+        if mode == "reporter" {
+            // App reporter initialization follows a successful admission-key lookup.
+            initialize_resolver_panic_hook(|info| eprintln!("app reporter: {info}"));
+        }
+        let (admission, payload) = fixture.attempt("resolver-panic", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission.clone(), payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.error, Some(EgressError::CredentialUnavailable));
+        assert_eq!(result.receipt.status, DispatchStatus::CredentialUnavailable);
+        assert_eq!(result.receipt.spend_state, SpendState::Released);
+        assert!(result.output.is_none());
+        assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+        let AttemptStatus::Failed { result: recovered } = status(&process, &admission).await else {
+            panic!("expected retained redacted failure");
+        };
+        assert_eq!(recovered.error, Some(EgressError::CredentialUnavailable));
+        assert!(!serde_json::to_string(&recovered).unwrap().contains(SECRET));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // Unrelated panics must retain ordinary reporting after resolution too.
+    assert!(std::panic::catch_unwind(|| panic!("unrelated panic after resolution")).is_err());
+}
+
+fn assert_resolver_panic_is_redacted(mode: &str) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "resolver_panic_child", "--nocapture"])
+        .env("RESOLVER_PANIC_TEST", mode)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("synthetic-WP14-credential"));
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("credential resolver panicked").count(), 1);
+    assert!(stderr.contains("unrelated panic after resolution"));
+    if mode == "reporter" {
+        assert!(stderr.contains("app reporter:"));
+    }
+}
+
+#[test]
+fn resolver_panics_are_redacted_at_startup() {
+    assert_resolver_panic_is_redacted("admission");
+}
+
+#[test]
+fn resolver_panics_are_redacted_at_dispatch() {
+    assert_resolver_panic_is_redacted("provider");
+}
+
+#[test]
+fn resolver_panics_are_redacted_after_reporter_initialization() {
+    assert_resolver_panic_is_redacted("reporter");
+}
+
+#[test]
+fn resolver_worker_panics_are_redacted() {
+    assert_resolver_panic_is_redacted("worker");
+}
+
+#[tokio::test]
+async fn resolver_configuration_is_refused_in_child_mode_without_invoking_callback() {
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    fixture.config.validate_child_process().unwrap();
+    for admission in [true, false] {
+        let mut config = fixture.config.clone();
+        let source = SecretSource::Resolver {
+            name: "provider-key".into(),
+            resolve: Arc::new(|_| panic!("child configuration must never resolve a key")),
+        };
+        if admission {
+            config.admission_key = source;
+        } else {
+            config.routes[0].secret = source;
+        }
+        assert_eq!(
+            config.validate_child_process(),
+            Err(EgressError::ResolverRequiresThreadMode)
+        );
+        assert!(serde_json::to_vec(&config).is_err());
+    }
+    let mut json = serde_json::to_value(&fixture.config).unwrap();
+    json["routes"][0]["secret"] =
+        serde_json::json!({"backend": "resolver", "name": "provider-key"});
+    assert!(serde_json::from_value::<ProcessConfig>(json).is_err());
 }
