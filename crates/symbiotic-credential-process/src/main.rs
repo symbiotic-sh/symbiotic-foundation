@@ -38,7 +38,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config: ProcessConfig = serde_json::from_slice(&bytes).map_err(
         |_| "invalid configuration: supported secret backends are `none` and `owner_only_file`",
     )?;
-    config.validate_child_process()?;
     let process = CredentialProcess::open(config)?;
     let listener = server::bind(&process)?;
     Ok(server::serve(process, listener).await?)

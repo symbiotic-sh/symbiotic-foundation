@@ -27,7 +27,7 @@ use symbiotic_ai_runtime::{Runtime, RuntimeConfig};
 use symbiotic_egress::*;
 
 /// Supported pinned provider transports.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteProvider {
     /// Existing OpenAI-compatible chat adapter.
@@ -70,7 +70,7 @@ pub enum RouteProvider {
 }
 
 /// Route configured by the credential-process owner. No defaults for safety limits.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Tenant namespace.
@@ -117,7 +117,7 @@ pub struct RouteConfig {
 }
 
 /// Versioned deployment configuration; only locations/references, no credential values.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Must equal protocol version 3.

@@ -1,6 +1,14 @@
 //! Local secret resolution. Secret values never implement Debug or Serialize.
 use serde::{Deserialize, Serialize};
-use std::{fmt, fs::OpenOptions, io::Read, path::PathBuf, sync::Arc};
+use std::{
+    cell::Cell,
+    fmt,
+    fs::OpenOptions,
+    io::{Read, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::{Arc, Once},
+};
 use symbiotic_ai_runtime::model::SecretValue;
 use symbiotic_egress::EgressError;
 
@@ -35,6 +43,43 @@ impl fmt::Debug for SecretSource {
             Self::OwnerOnlyFile { .. } => f.write_str("OwnerOnlyFile { .. }"),
             Self::Resolver { .. } => f.write_str("Resolver { .. }"),
         }
+    }
+}
+
+std::thread_local! {
+    static IN_RESOLVER: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ResolverScope {
+    previous: bool,
+}
+
+impl ResolverScope {
+    fn enter() -> Self {
+        static INSTALL_HOOK: Once = Once::new();
+        // Install before entering app code; never swap global hooks per call.
+        INSTALL_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if IN_RESOLVER.with(Cell::get) {
+                    // A closed stderr must not turn the reporter into another panic.
+                    // The caller still receives CredentialUnavailable.
+                    let _ = writeln!(std::io::stderr().lock(), "credential resolver panicked");
+                } else {
+                    previous(info);
+                }
+            }));
+        });
+        Self {
+            previous: IN_RESOLVER.with(|active| active.replace(true)),
+        }
+    }
+}
+
+impl Drop for ResolverScope {
+    fn drop(&mut self) {
+        // Restore the enclosing scope when callbacks resolve another source.
+        IN_RESOLVER.with(|active| active.set(self.previous));
     }
 }
 
@@ -80,7 +125,11 @@ impl SecretSource {
             Self::None => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
             Self::Resolver { name, resolve } => {
-                resolve(name).map_err(|_| EgressError::CredentialUnavailable)?
+                let _scope = ResolverScope::enter();
+                catch_unwind(AssertUnwindSafe(|| {
+                    resolve(name).map_err(|_| EgressError::CredentialUnavailable)
+                }))
+                .unwrap_or(Err(EgressError::CredentialUnavailable))?
             }
         };
         if bytes.is_empty() || bytes.len() > max_bytes {
@@ -133,6 +182,21 @@ pub(crate) fn read_private_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_types_do_not_implement_debug() {
+        // Inference becomes ambiguous if a configuration gains Debug, refusing
+        // diagnostic formatting even before endpoint validation can run.
+        trait AmbiguousIfDebug<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousIfDebug<()> for T {}
+        impl<T: fmt::Debug> AmbiguousIfDebug<u8> for T {}
+        let _ = <crate::ProcessConfig as AmbiguousIfDebug<_>>::check;
+        let _ = <crate::RouteConfig as AmbiguousIfDebug<_>>::check;
+        let _ = <crate::RouteProvider as AmbiguousIfDebug<_>>::check;
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolver_protection_child() {

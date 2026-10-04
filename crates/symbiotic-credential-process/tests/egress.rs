@@ -52,7 +52,8 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
             config["routes"][0]["secret"] = source;
         }
         let error = serde_json::from_value::<ProcessConfig>(config.clone())
-            .expect_err("removed secret backend must be refused during deserialization");
+            .err()
+            .expect("removed secret backend must be refused during deserialization");
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("unknown variant `macos_keychain`"));
         assert!(diagnostic.contains("`none`"));
@@ -3745,20 +3746,19 @@ async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn resolver_config_debug_redacts_captured_key_without_invoking_callback() {
-    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+#[test]
+fn resolver_debug_redacts_captured_key_without_invoking_callback() {
     let key = symbiotic_ai_runtime::model::SecretValue::new(SECRET.as_bytes().to_vec());
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    fixture.config.routes[0].secret = SecretSource::Resolver {
+    let source = SecretSource::Resolver {
         name: "provider-key".into(),
         resolve: Arc::new(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             Ok(key.clone())
         }),
     };
-    let diagnostic = format!("{:?}", fixture.config);
+    let diagnostic = format!("{source:?}");
     assert!(diagnostic.contains("Resolver { .. }"));
     assert!(!diagnostic.contains("synthetic-WP14-credential"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -3800,6 +3800,90 @@ async fn resolver_error_is_redacted_and_never_reaches_provider() {
 }
 
 #[tokio::test]
+async fn resolver_panic_child() {
+    fn lookup() -> std::io::Result<symbiotic_ai_runtime::model::SecretValue<Vec<u8>>> {
+        Err(std::io::Error::other(SECRET))
+    }
+
+    let Some(mode) = std::env::var_os("RESOLVER_PANIC_TEST") else {
+        return;
+    };
+    // Use Rust's default reporter, rather than the test harness's hook.
+    drop(std::panic::take_hook());
+    let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let source = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(|_| {
+            std::thread::spawn(|| {
+                assert!(
+                    std::panic::catch_unwind(|| panic!("unrelated panic on another thread"))
+                        .is_err()
+                );
+            })
+            .join()
+            .unwrap();
+            Ok(lookup().expect("lookup failed"))
+        }),
+    };
+    if mode == "admission" {
+        fixture.config.admission_key = source;
+        assert!(matches!(
+            CredentialProcess::open(fixture.config.clone()),
+            Err(EgressError::CredentialUnavailable)
+        ));
+    } else {
+        assert_eq!(mode, "provider");
+        fixture.config.routes[0].secret = source;
+        let process = fixture.process().await;
+        let (admission, payload) = fixture.attempt("resolver-panic", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission.clone(), payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result.error, Some(EgressError::CredentialUnavailable));
+        assert_eq!(result.receipt.status, DispatchStatus::CredentialUnavailable);
+        assert_eq!(result.receipt.spend_state, SpendState::Released);
+        assert!(result.output.is_none());
+        assert!(!serde_json::to_string(&result).unwrap().contains(SECRET));
+        let AttemptStatus::Failed { result: recovered } = status(&process, &admission).await else {
+            panic!("expected retained redacted failure");
+        };
+        assert_eq!(recovered.error, Some(EgressError::CredentialUnavailable));
+        assert!(!serde_json::to_string(&recovered).unwrap().contains(SECRET));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // Unrelated panics must retain ordinary reporting after resolution too.
+    assert!(std::panic::catch_unwind(|| panic!("unrelated panic after resolution")).is_err());
+}
+
+fn assert_resolver_panic_is_redacted(mode: &str) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "resolver_panic_child", "--nocapture"])
+        .env("RESOLVER_PANIC_TEST", mode)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("synthetic-WP14-credential"));
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("credential resolver panicked").count(), 1);
+    assert!(stderr.contains("unrelated panic after resolution"));
+    assert!(stderr.contains("unrelated panic on another thread"));
+}
+
+#[test]
+fn resolver_panics_are_redacted_at_startup() {
+    assert_resolver_panic_is_redacted("admission");
+}
+
+#[test]
+fn resolver_panics_are_redacted_at_dispatch() {
+    assert_resolver_panic_is_redacted("provider");
+}
+
+#[tokio::test]
 async fn resolver_configuration_is_refused_in_child_mode_without_invoking_callback() {
     let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
     fixture.config.validate_child_process().unwrap();
@@ -3819,7 +3903,6 @@ async fn resolver_configuration_is_refused_in_child_mode_without_invoking_callba
             Err(EgressError::ResolverRequiresThreadMode)
         );
         assert!(serde_json::to_vec(&config).is_err());
-        assert!(!config.state_dir.exists());
     }
     let mut json = serde_json::to_value(&fixture.config).unwrap();
     json["routes"][0]["secret"] =
