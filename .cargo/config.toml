@@ -1,0 +1,15 @@
+# Build settings shared by local builds and CI (operator 2026-10-05). Developer machines add opt-level 0
+# in their own global Cargo config; CI keeps Cargo's default optimization.
+[unstable]
+trim-paths = true
+
+[build]
+# Parallel compiler front end; its threads take slots from Cargo's job pool.
+rustflags = ["-Zthreads=8"]
+
+# Workspace-relative paths in compiled output, so builds do not depend on the checkout path.
+[profile.dev]
+trim-paths = "all"
+
+[profile.release]
+trim-paths = "all"

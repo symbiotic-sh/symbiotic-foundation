@@ -18,8 +18,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.93.0
+      # The toolchain comes from rust-toolchain.toml (dated nightly).
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-03
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all -- --check

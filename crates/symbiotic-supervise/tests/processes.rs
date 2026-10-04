@@ -10,12 +10,16 @@ use common::{alive, policy, started, until};
 
 use symbiotic_supervise::{Error, Event, Supervisor};
 
+// Paths are read when the tests run, not compiled in: a compiled-in path makes this test build
+// specific to one checkout, so no other worktree can reuse it from the build cache.
+fn fixture_binary() -> std::path::PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_symbiotic-supervise-test-fixture")
+        .expect("cargo test sets CARGO_BIN_EXE_symbiotic-supervise-test-fixture")
+        .into()
+}
+
 fn fixture(role: &str, dir: &Path) -> Command {
-    common::fixture(
-        Path::new(env!("CARGO_BIN_EXE_symbiotic-supervise-test-fixture")),
-        role,
-        dir,
-    )
+    common::fixture(&fixture_binary(), role, dir)
 }
 
 struct Reap(Child);
@@ -201,7 +205,13 @@ fn shutdown_error_returns_after_emergency_cleanup() {
         let output = Command::new(compiler.next().unwrap())
             .args(compiler)
             .args(["-O2", "-dynamiclib"])
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/refuse_term.c"))
+            .arg(
+                std::path::Path::new(
+                    &std::env::var_os("CARGO_MANIFEST_DIR")
+                        .expect("cargo test sets CARGO_MANIFEST_DIR"),
+                )
+                .join("tests/refuse_term.c"),
+            )
             .arg("-o")
             .arg(&library)
             .output()

@@ -21,6 +21,21 @@ use tokio::{
 const SECRET: &str = "synthetic-WP14-credential-\"/+?=é-canary";
 const KEY: &[u8] = b"synthetic-admission-key-at-least-32-bytes";
 
+// Paths are read when the tests run, not compiled in: a compiled-in path makes this test build
+// specific to one checkout, so no other worktree can reuse it from the build cache.
+fn credential_process() -> std::path::PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_symbiotic-credential-process")
+        .expect("cargo test sets CARGO_BIN_EXE_symbiotic-credential-process")
+        .into()
+}
+
+#[cfg(target_os = "macos")]
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo test sets CARGO_MANIFEST_DIR")
+        .into()
+}
+
 #[tokio::test]
 async fn configuration_refuses_removed_secret_backend_before_startup() {
     let fixture = Fixture::new(200, "ok".into(), Duration::ZERO).await;
@@ -47,7 +62,7 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
         let path = fixture.dir.path().join("config.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"))
+        let output = std::process::Command::new(credential_process())
             .arg(&path)
             .output()
             .unwrap();
@@ -1400,8 +1415,7 @@ async fn executable_dispatch(
     let config_path = fixture.dir.path().join("config.json");
     std::fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"));
+    let mut command = std::process::Command::new(credential_process());
     // Isolate environment changes in the child; parallel tests retain their environment.
     for name in [
         "HTTP_PROXY",
@@ -2725,8 +2739,7 @@ fn supervised_credential_parent_entrypoint() {
     let pid_path = std::env::var_os("CREDENTIAL_CHILD_PID").unwrap();
     let supervisor = symbiotic_supervise::Supervisor::start(
         move || {
-            let mut command =
-                std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"));
+            let mut command = std::process::Command::new(credential_process());
             command.arg("--child").arg(&config);
             command
         },
@@ -2814,7 +2827,7 @@ async fn supervision_credential_child_exits_when_app_is_killed() {
 
 #[test]
 fn supervision_child_mode_requires_parent_pipe_before_configuration() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"))
+    let output = std::process::Command::new(credential_process())
         .args(["--child", "/nonexistent-config"])
         .env_remove("SYMBIOTIC_PARENT_FD")
         .output()
@@ -3078,10 +3091,7 @@ async fn protection_refusal_aborts_embedded_and_executable_startup_before_protec
         let output = std::process::Command::new(compiler.next().unwrap())
             .args(compiler)
             .args(["-O2", "-dynamiclib"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/refuse_protection.c"
-            ))
+            .arg(manifest_dir().join("tests/refuse_protection.c"))
             .arg("-o")
             .arg(&library)
             .output()
@@ -3129,8 +3139,7 @@ async fn protection_refusal_aborts_embedded_and_executable_startup_before_protec
                     .env("REFUSED_PROCESS_CONFIG", &config_json);
                 command
             } else {
-                let mut command =
-                    std::process::Command::new(env!("CARGO_BIN_EXE_symbiotic-credential-process"));
+                let mut command = std::process::Command::new(credential_process());
                 command.arg(&config_path);
                 command
             };
