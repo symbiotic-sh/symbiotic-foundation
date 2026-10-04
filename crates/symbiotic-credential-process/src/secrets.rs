@@ -1,13 +1,15 @@
 //! Local secret resolution. Secret values never implement Debug or Serialize.
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
     fmt,
     fs::OpenOptions,
     io::{Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Once},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use symbiotic_ai_runtime::model::SecretValue;
 use symbiotic_egress::EgressError;
@@ -16,6 +18,7 @@ use symbiotic_egress::EgressError;
 pub type ResolverError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Resolve a named key into the same zeroizing bytes used by file sources.
+/// Initialize [`initialize_resolver_panic_hook`] before loading a resolver source.
 pub type SecretResolver = dyn Fn(&str) -> Result<SecretValue<Vec<u8>>, ResolverError> + Send + Sync;
 
 /// Configured backend; references carry locations or callbacks, never secret values.
@@ -46,40 +49,48 @@ impl fmt::Debug for SecretSource {
     }
 }
 
-std::thread_local! {
-    static IN_RESOLVER: Cell<bool> = const { Cell::new(false) };
+static PANIC_HOOK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Install credential redaction with the app's ordinary panic reporter beneath it.
+///
+/// Call before the first resolver lookup. Initialize or replace app reporting through
+/// this function, including after a startup admission-key lookup; calling
+/// `std::panic::set_hook` directly afterward replaces credential protection.
+/// While any resolution is active, all threads report only a static diagnostic,
+/// covering joined lookup workers. Ordinary reporting resumes after the last
+/// resolution exits. As with `std::panic::set_hook`, do not call while panicking.
+pub fn initialize_resolver_panic_hook(
+    reporter: impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+) {
+    std::panic::set_hook(Box::new(move |info| {
+        if ACTIVE_RESOLUTIONS.load(Ordering::SeqCst) != 0 {
+            // A closed stderr must not turn the reporter into another panic.
+            // The caller still receives CredentialUnavailable.
+            let _ = writeln!(std::io::stderr().lock(), "credential resolver panicked");
+        } else {
+            reporter(info);
+        }
+    }));
+    PANIC_HOOK_INITIALIZED.store(true, Ordering::Release);
 }
 
-struct ResolverScope {
-    previous: bool,
-}
+struct ResolverScope;
 
 impl ResolverScope {
-    fn enter() -> Self {
-        static INSTALL_HOOK: Once = Once::new();
-        // Install before entering app code; never swap global hooks per call.
-        INSTALL_HOOK.call_once(|| {
-            let previous = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                if IN_RESOLVER.with(Cell::get) {
-                    // A closed stderr must not turn the reporter into another panic.
-                    // The caller still receives CredentialUnavailable.
-                    let _ = writeln!(std::io::stderr().lock(), "credential resolver panicked");
-                } else {
-                    previous(info);
-                }
-            }));
-        });
-        Self {
-            previous: IN_RESOLVER.with(|active| active.replace(true)),
+    fn enter() -> Result<Self, EgressError> {
+        if !PANIC_HOOK_INITIALIZED.load(Ordering::Acquire) {
+            return Err(EgressError::CredentialUnavailable);
         }
+        ACTIVE_RESOLUTIONS.fetch_add(1, Ordering::SeqCst);
+        Ok(Self)
     }
 }
 
 impl Drop for ResolverScope {
     fn drop(&mut self) {
-        // Restore the enclosing scope when callbacks resolve another source.
-        IN_RESOLVER.with(|active| active.set(self.previous));
+        // Nested and concurrent lookups remain protected until every scope exits.
+        ACTIVE_RESOLUTIONS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -125,7 +136,7 @@ impl SecretSource {
             Self::None => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
             Self::Resolver { name, resolve } => {
-                let _scope = ResolverScope::enter();
+                let _scope = ResolverScope::enter()?;
                 catch_unwind(AssertUnwindSafe(|| {
                     resolve(name).map_err(|_| EgressError::CredentialUnavailable)
                 }))
@@ -222,6 +233,12 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         crate::protect_process().unwrap();
+        assert!(matches!(
+            source.load(100),
+            Err(EgressError::CredentialUnavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        initialize_resolver_panic_hook(std::panic::take_hook());
         assert_eq!(&*source.load(100).unwrap(), b"synthetic-key");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
@@ -233,7 +250,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolver_refuses_calls_before_process_protection() {
+    fn resolver_refuses_calls_before_process_protection_or_hook_initialization() {
         assert!(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

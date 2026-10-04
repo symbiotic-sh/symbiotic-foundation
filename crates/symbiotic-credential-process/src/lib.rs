@@ -183,6 +183,7 @@ pub struct CredentialProcess {
 impl CredentialProcess {
     /// Open bounded, protected state and configured local secret backends.
     /// Embedded callers must also call [`protect_process`] before reading configuration.
+    /// For resolver sources, first initialize [`secrets::initialize_resolver_panic_hook`].
     pub fn open(config: ProcessConfig) -> Result<Self, EgressError> {
         #[cfg(unix)]
         protect_process().map_err(|_| EgressError::StateUnavailable)?;

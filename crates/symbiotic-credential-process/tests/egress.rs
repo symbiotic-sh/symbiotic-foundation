@@ -10,7 +10,8 @@ use std::{
 };
 use symbiotic_credential_process::{
     CredentialProcess, InProcessEgressClient, ProcessConfig, RouteConfig, RouteProvider,
-    secrets::SecretSource, server,
+    secrets::{SecretSource, initialize_resolver_panic_hook},
+    server,
 };
 use symbiotic_egress::*;
 use tokio::{
@@ -20,6 +21,11 @@ use tokio::{
 
 const SECRET: &str = "synthetic-WP14-credential-\"/+?=é-canary";
 const KEY: &[u8] = b"synthetic-admission-key-at-least-32-bytes";
+
+fn initialize_panic_reporting() {
+    static INITIALIZE: std::sync::Once = std::sync::Once::new();
+    INITIALIZE.call_once(|| initialize_resolver_panic_hook(std::panic::take_hook()));
+}
 
 // Paths are read when the tests run, not compiled in: a compiled-in path makes this test build
 // specific to one checkout, so no other worktree can reuse it from the build cache.
@@ -3714,6 +3720,7 @@ async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_rese
 
 #[tokio::test]
 async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
+    initialize_panic_reporting();
     let mut fixture = Fixture::new(200, "resolver answer".into(), Duration::ZERO).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
@@ -3766,6 +3773,7 @@ fn resolver_debug_redacts_captured_key_without_invoking_callback() {
 
 #[tokio::test]
 async fn resolver_error_is_redacted_and_never_reaches_provider() {
+    initialize_panic_reporting();
     let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
     fixture.config.routes[0].secret = SecretSource::Resolver {
         name: "provider-key".into(),
@@ -3810,18 +3818,17 @@ async fn resolver_panic_child() {
     };
     // Use Rust's default reporter, rather than the test harness's hook.
     drop(std::panic::take_hook());
+    initialize_resolver_panic_hook(std::panic::take_hook());
     let mut fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let worker = mode == "worker";
     let source = SecretSource::Resolver {
         name: "provider-key".into(),
-        resolve: Arc::new(|_| {
-            std::thread::spawn(|| {
-                assert!(
-                    std::panic::catch_unwind(|| panic!("unrelated panic on another thread"))
-                        .is_err()
-                );
-            })
-            .join()
-            .unwrap();
+        resolve: Arc::new(move |_| {
+            if worker {
+                return std::thread::spawn(|| lookup().expect("worker lookup failed"))
+                    .join()
+                    .map_err(|_| std::io::Error::other("lookup worker panicked").into());
+            }
             Ok(lookup().expect("lookup failed"))
         }),
     };
@@ -3832,9 +3839,21 @@ async fn resolver_panic_child() {
             Err(EgressError::CredentialUnavailable)
         ));
     } else {
-        assert_eq!(mode, "provider");
+        assert!(mode == "provider" || mode == "worker" || mode == "reporter");
+        if mode == "reporter" {
+            fixture.config.admission_key = SecretSource::Resolver {
+                name: "admission-key".into(),
+                resolve: Arc::new(|_| {
+                    Ok(symbiotic_ai_runtime::model::SecretValue::new(KEY.to_vec()))
+                }),
+            };
+        }
         fixture.config.routes[0].secret = source;
         let process = fixture.process().await;
+        if mode == "reporter" {
+            // App reporter initialization follows a successful admission-key lookup.
+            initialize_resolver_panic_hook(|info| eprintln!("app reporter: {info}"));
+        }
         let (admission, payload) = fixture.attempt("resolver-panic", 1, 1);
         let granted = permit(&process, &admission).await;
         let result = dispatched(
@@ -3870,7 +3889,9 @@ fn assert_resolver_panic_is_redacted(mode: &str) {
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stderr.matches("credential resolver panicked").count(), 1);
     assert!(stderr.contains("unrelated panic after resolution"));
-    assert!(stderr.contains("unrelated panic on another thread"));
+    if mode == "reporter" {
+        assert!(stderr.contains("app reporter:"));
+    }
 }
 
 #[test]
@@ -3881,6 +3902,16 @@ fn resolver_panics_are_redacted_at_startup() {
 #[test]
 fn resolver_panics_are_redacted_at_dispatch() {
     assert_resolver_panic_is_redacted("provider");
+}
+
+#[test]
+fn resolver_panics_are_redacted_after_reporter_initialization() {
+    assert_resolver_panic_is_redacted("reporter");
+}
+
+#[test]
+fn resolver_worker_panics_are_redacted() {
+    assert_resolver_panic_is_redacted("worker");
 }
 
 #[tokio::test]
