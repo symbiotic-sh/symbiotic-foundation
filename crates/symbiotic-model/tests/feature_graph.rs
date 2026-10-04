@@ -16,14 +16,11 @@ fn normal_dependencies(package: &str, extra: &[&str]) -> String {
     let manifest = std::path::Path::new(
         &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
     )
-    .join("Cargo.toml")
-    .to_string_lossy()
-    .into_owned();
+    .join("Cargo.toml");
     let output = Command::new(cargo)
+        .args(["tree", "--manifest-path"])
+        .arg(&manifest)
         .args([
-            "tree",
-            "--manifest-path",
-            manifest.as_str(),
             "--package",
             package,
             "--edges",
