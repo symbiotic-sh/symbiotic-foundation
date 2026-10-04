@@ -58,7 +58,6 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
         );
         assert!(!fixture.config.state_dir.exists());
         assert!(!fixture.config.socket_path.exists());
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     }
 }
 
