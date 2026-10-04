@@ -254,13 +254,18 @@ impl ModelJobs {
     /// Derive whether a kind has work requiring execution or ledger recovery.
     pub async fn needs_execution(&self, kind: String) -> Result<bool, JobError> {
         let jobs = self.clone();
-        tokio::task::spawn_blocking(move || jobs.transaction(|tx, _| {
-            tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM jobs WHERE scope=?1 AND kind=?2 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"'))",
-                params![serde_json::to_string(&jobs.scope).map_err(|_| JobError::Storage)?, kind],
-                |r| r.get(0),
-            ).map_err(|_| JobError::Storage)
-        })).await.map_err(|_| JobError::Storage)?
+        tokio::task::spawn_blocking(move || {
+            jobs.transaction(|tx, now| {
+                symbiotic_queue_sqlite::jobs::jobs_need_execution_in_transaction(
+                    tx,
+                    &jobs.scope,
+                    kind,
+                    now,
+                )
+            })
+        })
+        .await
+        .map_err(|_| JobError::Storage)?
     }
     /// Attach the trusted admission owner; signed jobs never retry automatically.
     pub fn with_admission(mut self, admission: Arc<dyn ModelJobAdmission>) -> Self {
@@ -1155,6 +1160,125 @@ mod review_tests {
             JobResponse::Changed(1)
         ));
         assert_eq!(conn.query_row("SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL", [], |r| r.get::<_, usize>(0)).expect("erased recovery"), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_lookup_ignores_retained_history_and_waiting_admission() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let scope = JobScope {
+            tenant: "tenant".into(),
+            incarnation: "1".into(),
+            queue: "q".into(),
+        };
+        let jobs = runtime
+            .model_jobs(scope.clone(), JobConfig::default())
+            .expect("jobs");
+        let steps = Arc::new(AtomicUsize::new(0));
+        let mut measurements = Vec::new();
+        let mut previous = 0;
+        for retained in [10, 10_000] {
+            {
+                let mut conn = jobs.ledger.0.lock().expect("ledger");
+                let tx = conn.transaction().expect("transaction");
+                for id in previous..retained {
+                    tx.execute(
+                        "INSERT INTO jobs(scope,id,key,digest,kind,state,delivery_generation) VALUES (?1,?2,?2,'digest','chat','\"Accepted\"',1)",
+                        params![serde_json::to_string(&scope).expect("scope"), id.to_string()],
+                    )
+                    .expect("tombstone");
+                }
+                tx.commit().expect("commit");
+                let steps = steps.clone();
+                conn.progress_handler(
+                    1,
+                    Some(move || {
+                        steps.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                );
+            }
+            assert!(!jobs.needs_execution("chat".into()).await.expect("lookup"));
+            jobs.ledger
+                .0
+                .lock()
+                .expect("ledger")
+                .progress_handler(0, None::<fn() -> bool>);
+            measurements.push(steps.swap(0, Ordering::Relaxed));
+            previous = retained;
+        }
+        assert_eq!(
+            measurements[0], measurements[1],
+            "retained history must not affect lookup work: {measurements:?}"
+        );
+        eprintln!("execution lookup VM steps at 10 vs 10,000 tombstones: {measurements:?}");
+
+        // An existence lookup must not decode payloads or other job content.
+        for state in [
+            JobState::AwaitingAdmission,
+            JobState::Pending,
+            JobState::Running,
+            JobState::Uncertain,
+            JobState::Succeeded,
+            JobState::Failed,
+        ] {
+            jobs.ledger
+                .0
+                .lock()
+                .expect("ledger")
+                .execute(
+                    "UPDATE jobs SET state=?1, payload=42 WHERE id='0'",
+                    [serde_json::to_string(&state).expect("state")],
+                )
+                .expect("state");
+            assert_eq!(
+                jobs.needs_execution("chat".into()).await.expect("lookup"),
+                matches!(
+                    state,
+                    JobState::Pending | JobState::Running | JobState::Uncertain
+                ),
+                "{state:?}"
+            );
+        }
+        jobs.ledger
+            .0
+            .lock()
+            .expect("ledger")
+            .execute("UPDATE jobs SET state='\"Pending\"' WHERE id='0'", [])
+            .expect("pending");
+        assert!(
+            !jobs
+                .needs_execution("embedding".into())
+                .await
+                .expect("other kind")
+        );
+        let other = runtime
+            .model_jobs(
+                JobScope {
+                    queue: "other".into(),
+                    ..scope
+                },
+                JobConfig::default(),
+            )
+            .expect("other scope");
+        assert!(
+            !other
+                .needs_execution("chat".into())
+                .await
+                .expect("other scope lookup")
+        );
     }
 
     #[tokio::test]

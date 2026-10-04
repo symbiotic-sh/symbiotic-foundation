@@ -210,6 +210,20 @@ pub fn jobs_in_transaction(
     Ok(response)
 }
 
+/// Derive whether a scoped kind needs execution or recovery through the unfinished
+/// job index. Jobs awaiting renewed admission do not require an execution owner.
+/// Reads at most one content-free match; work never visits retained final history.
+pub fn jobs_need_execution_in_transaction(
+    tx: &Transaction<'_>,
+    scope: &JobScope,
+    kind: String,
+    now: DateTime<Utc>,
+) -> Result<bool, JobError> {
+    Ok(!SqlRows::new(tx)
+        .select_with(scope, JobQuery::Execution(kind), now, 1, ("1", |_| Ok(())))?
+        .is_empty())
+}
+
 /// Receipt owners affected by deletion, selected before the transition removes
 /// owner membership or tombstones metadata. Work is bounded by the live population.
 /// SQL for job selection remains exclusively in this backend.
@@ -487,6 +501,10 @@ impl SqlRows<'_> {
         let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
         let (filter, order, index) = match query {
             JobQuery::Admission => ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state='\"AwaitingAdmission\"'".to_string(), "id", "jobs_claim"),
+            JobQuery::Execution(kind) => {
+                args.push(kind.into());
+                ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state!='\"AwaitingAdmission\"' AND kind=?2".to_string(), "created_at, id", "jobs_claim")
+            }
             JobQuery::Group(group) => {
                 args.push(group.into());
                 (
@@ -589,6 +607,8 @@ impl SqliteQueue {
 #[derive(Clone, Debug)]
 enum JobQuery {
     Admission,
+    /// Unfinished work requiring execution or recovery, excluding admission waits.
+    Execution(String),
     /// Unfinished scoped group scan for atomic group cancellation.
     Group(String),
     /// Indexed owner membership, chunked in ascending ID order.
