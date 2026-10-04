@@ -284,7 +284,7 @@ pub struct RerankResponse {
 /// let key = "synthetic-validation-key";
 /// let error = ModelError::Auth(format!("invalid key {key}"));
 /// ```
-#[derive(Clone, Copy, Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ModelError {
     #[error("provider unavailable: {0}")]
     Unavailable(symbiotic_core::DiagnosticCode),
@@ -306,6 +306,15 @@ pub enum ModelError {
     Queue(symbiotic_core::DiagnosticCode),
     #[error("model cache failed: {0}")]
     Cache(symbiotic_core::DiagnosticCode),
+    /// Original failure with additional closed diagnostics from the same attempt.
+    #[error("{primary}; secondary diagnostics: {secondary:?}")]
+    Diagnostics {
+        /// Original provider or runtime failure, preserving its class.
+        #[source]
+        primary: Box<ModelError>,
+        /// Additional failures in append order; contains no adapter text.
+        secondary: Vec<DiagnosticCode>,
+    },
 }
 
 impl ModelError {
@@ -322,6 +331,36 @@ impl ModelError {
             Self::Queue(code) => *code,
             Self::Cache(code) => *code,
             Self::Unsupported(_) => DiagnosticCode::InvalidConfiguration,
+            Self::Diagnostics { primary, .. } => primary.code(),
+        }
+    }
+
+    /// Additional closed diagnostics accompanying the original failure.
+    pub fn diagnostics(&self) -> &[DiagnosticCode] {
+        match self {
+            Self::Diagnostics { secondary, .. } => secondary,
+            _ => &[],
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    fn with_diagnostics(self, diagnostics: impl IntoIterator<Item = DiagnosticCode>) -> Self {
+        let mut diagnostics = diagnostics.into_iter().peekable();
+        if diagnostics.peek().is_none() {
+            return self;
+        }
+        match self {
+            Self::Diagnostics {
+                primary,
+                mut secondary,
+            } => {
+                secondary.extend(diagnostics);
+                Self::Diagnostics { primary, secondary }
+            }
+            primary => Self::Diagnostics {
+                primary: Box::new(primary),
+                secondary: diagnostics.collect(),
+            },
         }
     }
 }
@@ -1217,21 +1256,29 @@ impl<Req> QueuedCall<Req> {
         dead: &QueueItem,
         err: &ModelError,
     ) -> Result<Option<EnqueueOutcome>, ModelError> {
-        reenqueue_dead_item(
-            self.queue.as_ref(),
-            &self.queue_id,
-            &self.descriptor,
-            self.capability,
-            &self.kind,
-            &self.request_hash,
-            &self.idempotency_key,
-            dead,
-            &self.config,
-            err,
-            self.retry_state(Some(dead)).await?,
-            self.invocation_key.is_some(),
-        )
-        .await
+        let outcome = async {
+            reenqueue_dead_item(
+                self.queue.as_ref(),
+                &self.queue_id,
+                &self.descriptor,
+                self.capability,
+                &self.kind,
+                &self.request_hash,
+                &self.idempotency_key,
+                dead,
+                &self.config,
+                err,
+                self.retry_state(Some(dead)).await?,
+                self.invocation_key.is_some(),
+            )
+            .await
+        }
+        .await;
+        outcome.map_err(|failure| {
+            err.clone().with_diagnostics(
+                std::iter::once(failure.code()).chain(failure.diagnostics().iter().copied()),
+            )
+        })
     }
 }
 
@@ -1368,11 +1415,14 @@ impl<Req> QueuedCall<Req> {
         response
     }
 
-    /// Trace a failed call. A failed trace write is logged; the call still
-    /// fails with its own error.
-    async fn trace_failure(&self, queue_item_id: Option<QueueItemId>, err: &ModelError) {
+    /// Trace a failed call and return any trace write failure to the caller.
+    async fn trace_failure(
+        &self,
+        queue_item_id: Option<QueueItemId>,
+        err: &ModelError,
+    ) -> Result<(), ModelError> {
         let Some(trace_sink) = &self.trace_sink else {
-            return;
+            return Ok(());
         };
         let written = trace_sink
             .record_model_invocation(ModelInvocationTrace {
@@ -1393,13 +1443,7 @@ impl<Req> QueuedCall<Req> {
                 timestamp: Utc::now(),
             })
             .await;
-        if let Err(trace_err) = written {
-            warn_side_effect(
-                &self.queue_id,
-                "failure_trace_write_failed",
-                trace_err.code(),
-            );
-        }
+        written.map_err(|trace_error| err.clone().with_diagnostics([trace_error.code()]))
     }
 }
 
@@ -2084,19 +2128,22 @@ where
             Ok(AttemptEnd::Succeeded(response))
         }
         Settled::Retryable { err, failed } => {
-            if failed.map_err(queue_error)? == FailOutcome::RetryScheduled {
+            if failed
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?
+                == FailOutcome::RetryScheduled
+            {
                 return Ok(AttemptEnd::Retry(None));
             }
             let dead_item = queue
                 .get_item(&item.item_id)
                 .await
-                .map_err(queue_error)?
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?
                 .unwrap_or(item);
             if let Some(next) = this.continue_chain(&dead_item, &err).await? {
                 return Ok(AttemptEnd::Retry(Some(Box::new(next))));
             }
             this.trace_failure(Some(dead_item.item_id.clone()), &err)
-                .await;
+                .await?;
             Err(exhausted_request_error(
                 &this.queue_id,
                 &dead_item,
@@ -2105,8 +2152,9 @@ where
             ))
         }
         Settled::Failed { err, failed } => {
-            failed.map_err(queue_error)?;
-            this.trace_failure(Some(item.item_id), &err).await;
+            failed
+                .map_err(|failure| err.clone().with_diagnostics([queue_error(failure).code()]))?;
+            this.trace_failure(Some(item.item_id), &err).await?;
             Err(err)
         }
     }
@@ -2375,7 +2423,14 @@ where
         ),
     };
     let owner = job.clone();
-    run_blocking(move || owner.finish(state, usage, output, failure, retry)).await?;
+    if let Err(error) =
+        run_blocking(move || owner.finish(state, usage, output, failure, retry)).await
+    {
+        return combine_attempt_errors(
+            result,
+            std::iter::once(error).chain(side_error).chain(monitoring),
+        );
+    }
     let outcome = match result {
         Ok(response) => {
             let (response, diagnostic) = this.record_success_diagnostic(response).await;
@@ -2412,14 +2467,33 @@ where
                     },
                 )
                 .await;
-            this.trace_failure(None, &error).await;
-            Err(error)
+            match this.trace_failure(None, &error).await {
+                Ok(()) => Err(error),
+                Err(trace_error) => Err(trace_error),
+            }
         }
     };
-    if let Some(error) = side_error.or_else(|| monitoring.into_iter().next()) {
-        return Err(error);
-    }
-    outcome
+    combine_attempt_errors(outcome, side_error.into_iter().chain(monitoring))
+}
+
+#[cfg(feature = "queue")]
+fn combine_attempt_errors<T>(
+    outcome: Result<T, ModelError>,
+    diagnostics: impl IntoIterator<Item = ModelError>,
+) -> Result<T, ModelError> {
+    let mut diagnostics = diagnostics.into_iter();
+    let primary = match outcome {
+        Err(error) => error,
+        Ok(value) => match diagnostics.next() {
+            Some(error) => error,
+            None => return Ok(value),
+        },
+    };
+    Err(primary.with_diagnostics(diagnostics.flat_map(|error| {
+        std::iter::once(error.code())
+            .chain(error.diagnostics().iter().copied())
+            .collect::<Vec<_>>()
+    })))
 }
 
 // One renewal owner covers both receipt preparation and dispatched transport.
@@ -2537,6 +2611,17 @@ where
         provider_ms: Some(provider_ms),
     };
 
+    if let Err(err) = &result {
+        this.receipts
+            .record(
+                ReceiptStatus::Failed,
+                Some(item),
+                None,
+                Some(err.code()),
+                failed_timing(),
+            )
+            .await;
+    }
     let known_zero = result.as_ref().err().is_some_and(|err| {
         !matches!(err, ModelError::Timeout(_))
             && provider.failure_charge(err) == FailureCharge::KnownZero
@@ -2560,6 +2645,10 @@ where
                 },
             )
             .await;
+        let err = match result {
+            Err(provider_err) => provider_err.with_diagnostics([err.code()]),
+            Ok(_) => err,
+        };
         return Settled::Failed { err, failed };
     }
     match result {
@@ -2630,15 +2719,6 @@ where
             }
         }
         Err(err) if known_zero && is_retryable(&err, config) => {
-            this.receipts
-                .record(
-                    ReceiptStatus::Failed,
-                    Some(item),
-                    None,
-                    Some(err.code()),
-                    failed_timing(),
-                )
-                .await;
             let delay_ms = match retry_delay_ms(
                 item.attempt,
                 config,
@@ -2679,7 +2759,7 @@ where
                     )
                     .await;
                 return Settled::Failed {
-                    err: cooldown_err,
+                    err: err.with_diagnostics([cooldown_err.code()]),
                     failed,
                 };
             }
@@ -2716,19 +2796,10 @@ where
                     )
                     .await;
                 return Settled::Failed {
-                    err: failure,
+                    err: err.with_diagnostics([failure.code()]),
                     failed,
                 };
             }
-            this.receipts
-                .record(
-                    ReceiptStatus::Failed,
-                    Some(item),
-                    None,
-                    Some(err.code()),
-                    failed_timing(),
-                )
-                .await;
             let failed = queue
                 .fail_with(
                     &item.item_id,
@@ -2983,6 +3054,7 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 #[cfg(feature = "queue")]
 fn error_class(err: &ModelError) -> FailureClass {
     match err {
+        ModelError::Diagnostics { primary, .. } => error_class(primary),
         ModelError::Unavailable(_) => FailureClass::Unavailable,
         ModelError::Auth(_) => FailureClass::Auth,
         ModelError::RateLimited(_) => FailureClass::RateLimited,
@@ -3217,6 +3289,10 @@ fn exhausted_request_error(
     last_error: &ModelError,
 ) -> ModelError {
     match last_error {
+        ModelError::Diagnostics { primary, secondary } => {
+            exhausted_request_error(_queue_id, _item, _config, primary)
+                .with_diagnostics(secondary.iter().copied())
+        }
         ModelError::RateLimited(_) => {
             ModelError::RateLimited(DiagnosticCode::AttemptBudgetExhausted)
         }

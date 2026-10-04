@@ -112,7 +112,9 @@ fn paid_resolution(
     max_bytes: usize,
 ) -> Result<JobResolution, JobError> {
     let bytes: usize = tx.query_row("SELECT coalesce(length(CAST(recovery AS BLOB)),0) FROM spend_receipts WHERE reference=?1", [receipt.reservation.reference.as_str()], |r| r.get(0)).map_err(|_| JobError::Storage)?;
-    let erased = spend::recovery_erased(tx, Some(invocation)).map_err(|_| JobError::Storage)?;
+    let (erased, deadline) =
+        spend::constrain_job_recovery_in(tx, &receipt.reservation.reference, invocation, now)
+            .map_err(|_| JobError::Storage)?;
     if erased || bytes > max_bytes {
         tx.execute(
             "UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1",
@@ -128,21 +130,37 @@ fn paid_resolution(
             },
         });
     }
-    let deadline: Option<String> = tx
-        .query_row(
-            "SELECT recovery_expires_at FROM spend_receipts WHERE reference=?1",
-            [receipt.reservation.reference.as_str()],
-            |r| r.get(0),
-        )
-        .map_err(|_| JobError::Storage)?;
-    let deadline = deadline
-        .map(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|_| JobError::Storage)?;
     Ok(JobResolution::PaidResult {
         receipt: receipt.reservation.reference.as_str().into(),
         recovery_until: Some(deadline.unwrap_or(now)),
     })
+}
+
+// One terminal receipt resolution serves both expired claims and pending jobs
+// whose direct invocation committed before the job claimed its first attempt.
+fn receipt_resolution(
+    tx: &Transaction<'_>,
+    receipt: &crate::SpendReceipt,
+    invocation: &str,
+    now: chrono::DateTime<Utc>,
+    max_bytes: usize,
+) -> Result<JobResolution, JobError> {
+    if receipt.output.is_some() {
+        paid_resolution(tx, receipt, invocation, now, max_bytes)
+    } else if receipt.state == SpendState::Released {
+        Ok(JobResolution::KnownZeroCharge {
+            receipt: receipt.reservation.reference.as_str().into(),
+        })
+    } else if receipt.state == SpendState::Settled {
+        Ok(JobResolution::Failed {
+            receipt: receipt.reservation.reference.as_str().into(),
+            diagnostic: DiagnosticCode::InvocationCompleted,
+        })
+    } else {
+        Ok(JobResolution::Uncertain {
+            receipt: receipt.reservation.reference.as_str().into(),
+        })
+    }
 }
 
 // This canonical registration survives confirmation and erasure: neither removes
@@ -176,6 +194,33 @@ fn bind_kind(
     )
     .map_err(|_| JobError::Storage)?;
     Ok(())
+}
+
+// Resolve through the frozen registry even after cancellation removes payloads.
+// Latest receipt wins: a Pending job may still point at a Released predecessor.
+fn job_receipt_reference_in(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &symbiotic_queue::jobs::JobScope,
+    key: &str,
+    kind: &str,
+) -> Result<Option<crate::SpendReceiptRef>, ModelError> {
+    let binding: String = tx
+        .query_row(
+            "SELECT binding FROM model_job_bindings WHERE scope=?1 AND kind=?2",
+            params![serde_json::to_string(scope).map_err(storage)?, kind],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let (identity, sharing): (
+        symbiotic_core::BindingIdentity,
+        Option<symbiotic_core::AccountSharingKey>,
+    ) = serde_json::from_str(&binding).map_err(storage)?;
+    let account = crate::account_scope(&identity, sharing.as_ref())?;
+    let invocation = symbiotic_model::execution_invocation_identity(
+        &identity,
+        &spend::job_invocation_key(scope, key)?,
+    )?;
+    spend::invocation_reference_in(tx, &account, &invocation)
 }
 
 impl ModelJobs {
@@ -252,6 +297,7 @@ impl ModelJobs {
             }
         }
         let purging = matches!(request, JobRequest::PurgeOwner(_));
+        let confirming = matches!(request, JobRequest::Ack(_));
         if matches!(
             request,
             JobRequest::Completions { .. }
@@ -270,22 +316,32 @@ impl ModelJobs {
                 }
             }
             let affected = symbiotic_queue_sqlite::jobs::paid_copies_for_request(tx, &self.scope, &self.config, now, &request)?;
+            let enqueued = match &request {
+                JobRequest::Enqueue(specs) => specs.iter().map(|spec| (spec.key.clone(), spec.kind.clone())).collect(),
+                _ => Vec::new(),
+            };
             let response = self.op(tx, now, request)?;
+            for (key, kind) in enqueued {
+                if let Some(reference) = job_receipt_reference_in(tx, &self.scope, &key, &kind)
+                    .map_err(|_| JobError::Storage)? {
+                    spend::constrain_job_recovery_in(tx, &reference, &self.invocation_key(&key)?, now)
+                        .map_err(|_| JobError::Storage)?;
+                }
+            }
             for row in affected {
-                let receipt = match row.receipt {
-                    reference if !(purging && row.state.unfinished()) => reference,
-                    _ if purging && row.execution == Execution::Model && row.payload.is_some() => {
-                        let (identity, sharing, _) = input(row.payload.as_deref().ok_or(JobError::InvalidRequest)?)?;
-                        let account = crate::account_scope(&identity, sharing.as_ref()).map_err(|_| JobError::Storage)?;
-                        let invocation = model::execution_invocation_identity(&identity, &self.invocation_key(&row.key)?).map_err(|_| JobError::Storage)?;
-                        spend::invocation_in(tx, &account, &invocation).map_err(|_| JobError::Storage)?.map(|r| r.reservation.reference.as_str().to_string())
-                    }
-                    _ => row.receipt,
+                let attach_receipt = purging && row.state.unfinished();
+                let receipt = if (purging || confirming) && row.execution == Execution::Model {
+                    job_receipt_reference_in(tx, &self.scope, &row.key, &row.kind)
+                        .map_err(|_| JobError::Storage)?
+                        .map(|reference| reference.as_str().to_string())
+                        .or(row.receipt)
+                } else {
+                    row.receipt
                 };
                 if let Some(receipt) = receipt
                     && let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(row.id))?
                     && (row.state.acked() || row.purged || row.result_expired) {
-                    if purging {
+                    if attach_receipt {
                         tx.execute("UPDATE jobs SET receipt=?3 WHERE scope=?1 AND id=?2", params![serde_json::to_string(&row.id.scope).map_err(|_| JobError::Storage)?, row.id.id, receipt]).map_err(|_| JobError::Storage)?;
                     }
                     tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [&receipt]).map_err(|_| JobError::Storage)?;
@@ -395,13 +451,7 @@ impl ModelJobs {
                 for row in rows {
                     let reference = crate::SpendReceiptRef::new(row.receipt.as_deref().ok_or(JobError::Storage)?).map_err(|_| JobError::Storage)?;
                     let receipt = spend::receipt_in(tx, &reference).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
-                    let resolution = if receipt.output.is_some() {
-                        paid_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?
-                    } else if receipt.state == SpendState::Released {
-                        JobResolution::KnownZeroCharge { receipt: receipt.reservation.reference.as_str().into() }
-                    } else if receipt.state == SpendState::Settled {
-                        JobResolution::Failed { receipt: receipt.reservation.reference.as_str().into(), diagnostic: DiagnosticCode::InvocationCompleted }
-                    } else { JobResolution::Uncertain { receipt: receipt.reservation.reference.as_str().into() } };
+                    let resolution = receipt_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?;
                     jobs.op(tx, now, JobRequest::Resolve { job: row.id.clone(), generation: row.generation, resolution })?;
                     if row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
                         tx.execute("UPDATE spend_receipts SET recovery=NULL,recovery_expires_at=NULL WHERE reference=?1", [receipt.reservation.reference.as_str()]).map_err(|_| JobError::Storage)?;
@@ -464,14 +514,14 @@ impl ClaimOwner {
             return Err(JobError::KeyConflict);
         }
         if let Some(receipt) = &previous
-            && receipt.output.is_some()
+            && (receipt.output.is_some() || receipt.state == SpendState::Settled)
         {
             self.resolve(
                 tx,
                 &current.id,
                 current.generation,
                 now,
-                paid_resolution(
+                receipt_resolution(
                     tx,
                     receipt,
                     &self.jobs.invocation_key(&current.key)?,
@@ -866,8 +916,11 @@ macro_rules! model_runner {
                                     continue;
                                 }
                                 if let Err(error) = result
-                                    && (!owner.finished.load(Ordering::SeqCst) || matches!(error, ModelError::Queue(_)) && error.code() != DiagnosticCode::InvocationCompleted) {
-                                    return Err(JobError::Execution(error.code()).into());
+                                    && (!owner.finished.load(Ordering::SeqCst) || !error.diagnostics().is_empty() || matches!(error, ModelError::Queue(_)) && error.code() != DiagnosticCode::InvocationCompleted) {
+                                    if error.diagnostics().is_empty() {
+                                        return Err(JobError::Execution(error.code()).into());
+                                    }
+                                    return Err(RunnerError::Workers(std::iter::once(error.code()).chain(error.diagnostics().iter().copied()).map(|code| JobError::Execution(code).into()).collect()));
                                 }
                             } else {
                                 tokio::select! { _ = stop.changed() => {}, _ = tokio::time::sleep(poll) => {} }
@@ -915,6 +968,112 @@ model_runner!(
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trial_purge_discovers_receipts_without_reading_saved_answers() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs");
+        let binding = ModelBinding::new(model::StaticChatProvider::new("paid answer"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"))
+            .with_policy(crate::ModelQueueConfig::default());
+        let request = crate::ChatRequest {
+            messages: vec![],
+            max_output_tokens: None,
+            temperature: None,
+            response_format: None,
+            role_binding: None,
+            source: None,
+            metadata: serde_json::json!({}),
+        };
+        let spec = JobSpec {
+            key: "key".into(),
+            group: None,
+            owners: vec!["owner".into()],
+            kind: "chat".into(),
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &request).expect("payload"),
+            limits: JobLimits { max_attempts: 1 },
+            recovery_until: None,
+        };
+        runtime
+            .execute_chat(binding, &jobs.invocation_key("key").expect("key"), request)
+            .await
+            .expect("paid answer");
+        let JobResponse::Enqueued(rows) = jobs
+            .request_sync(JobRequest::Enqueue(vec![spec]))
+            .expect("enqueue")
+        else {
+            panic!("enqueue response")
+        };
+        let Enqueued::Inserted(id) = &rows[0] else {
+            panic!("inserted")
+        };
+        jobs.transaction(|tx, now| {
+            let reference: String = tx
+                .query_row(
+                    "SELECT reference FROM spend_receipts WHERE recovery IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("saved answer");
+            jobs.op(
+                tx,
+                now,
+                JobRequest::Resolve {
+                    job: id.clone(),
+                    generation: 0,
+                    resolution: JobResolution::PaidResult {
+                        receipt: reference,
+                        recovery_until: None,
+                    },
+                },
+            )?;
+            Ok(())
+        })
+        .expect("completed paid job with receipt");
+        jobs.ledger
+            .0
+            .lock()
+            .expect("ledger")
+            .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Read {
+                    table_name: "spend_receipts",
+                    column_name: "recovery" | "output",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+        let result = jobs.request_sync(JobRequest::PurgeOwner("owner".into()));
+        let conn = jobs.ledger.0.lock().expect("ledger");
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert!(matches!(
+            result.expect("purge without answer reads"),
+            JobResponse::Changed(1)
+        ));
+        assert_eq!(conn.query_row("SELECT count(*) FROM spend_receipts WHERE recovery IS NOT NULL OR recovery_expires_at IS NOT NULL", [], |r| r.get::<_, usize>(0)).expect("erased recovery"), 0);
+    }
 
     #[tokio::test]
     async fn review_17_claim_retains_only_metadata_for_heartbeats() {

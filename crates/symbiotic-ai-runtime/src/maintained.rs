@@ -104,7 +104,7 @@ impl Maintenance {
 
     /// Retain the latest static failure diagnostic for the runtime handle.
     pub(crate) fn last_error(&self) -> Option<ModelError> {
-        *self.errors.borrow()
+        self.errors.borrow().clone()
     }
 }
 

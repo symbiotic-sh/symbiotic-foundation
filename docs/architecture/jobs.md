@@ -90,4 +90,4 @@ byte-array representation for exact page preflight, while the result limit and
 maintenance budget count raw bytes. Diagnostics and expiry maintenance use
 content-free projections; expiry deletes copies directly. Encoded lengths and
 all indexes are rebuildable from canonical rows. The unreleased SQLite schema
-version is 15; older layouts are refused without migration.
+version is 16; older layouts are refused without migration.

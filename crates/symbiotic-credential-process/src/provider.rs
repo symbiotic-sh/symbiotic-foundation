@@ -580,7 +580,7 @@ mod tests {
     #[async_trait]
     impl ChatProvider for RejectBeforeTransport {
         async fn chat(&self, _: ChatRequest) -> Result<ChatResponse, ModelError> {
-            Err(self.error)
+            Err(self.error.clone())
         }
     }
     #[tokio::test]

@@ -145,7 +145,7 @@ impl ChatProvider for Loopback {
         tokio::time::sleep(self.delay).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         if let Some(err) = &self.fail {
-            return Err(*err.as_ref());
+            return Err(err.as_ref().clone());
         }
         Ok(ChatResponse {
             text: format!(
@@ -1917,7 +1917,7 @@ async fn restored_stopped_and_exhausted_dead_items_cannot_surface_stored_text() 
         } else {
             ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable)
         };
-        let broken = Loopback::new(unique_identity()).failing(failure);
+        let broken = Loopback::new(unique_identity()).failing(failure.clone());
         let bind = || {
             binding(broken.clone())
                 .with_policy(policy())
