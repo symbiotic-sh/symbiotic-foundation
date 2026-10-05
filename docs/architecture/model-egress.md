@@ -128,12 +128,64 @@ foreign scopes/MAC tampering, and executable kill/restart without resending.
 versus remote rejection; `admission_bytes_share_maintenance_budget` in the SQLite
 job tests covers admission deletion under the existing maintenance byte budget.
 
+## Shared direct-request failure budget
+
+`RouteConfig.request_budget` optionally configures `{"attempts": 3,
+"renewal_seconds": null}`. `attempts` must be positive. Omission preserves
+per-call dispatch behavior and omits the field from route serialization, so
+existing route revisions stay unchanged. A configured budget participates in
+the route revision. This implements the 2026-10-05 revised SO-0 shared failure
+budget decision; signed jobs keep their existing per-job allowance.
+
+Direct egress counts failed sends across invocations under a digest of
+`(tenant, route, credential fingerprint, signed input_digest)`. The fingerprint
+uses the shared model credential helper; keyless routes use its absent value.
+The signed digest covers the exact typed payload before Foundation replaces
+trace metadata/source labels. Credential rotation and different input digests
+start separate budgets. No request or answer content enters the budget table.
+
+`renewal_seconds: null` never renews, including across restart. A positive
+interval renews after that many seconds since the last failed send; clock
+rollback cannot renew early. Zero gives each call a fresh budget. A successful
+response deletes the key. Local credential/setup failures and trusted
+pre-send failures do not count as failed sends. HTTP failures keep their
+existing unknown-charge accounting and count against this shared allowance;
+the budget introduces no retry inside an invocation.
+
+After single-use permit consumption and credential resolution, an exhausted
+key returns `DispatchResult.error = RequestBudgetExhausted` (wire code
+`request_budget_exhausted`), no output, and a released spend receipt: no HTTP
+send or spend. With retained recovery the typed failure is recoverable; with
+`answer_recovery: "off"` only the existing completion/receipt evidence persists.
+The permit stays consumed. Budget lookup failure refuses execution visibly.
+
+The existing process state lock excludes other processes. One in-memory async
+lock serializes configured budget dispatches from lookup through completion,
+including unrelated budget keys; unconfigured dispatches retain their existing
+concurrency. Failure counts and last-failure Unix seconds live in the single
+`egress_request_failures` table in the existing SQLite operational database.
+Budget updates commit atomically with egress completion and spend bookkeeping.
+A failed completion write reports `receipt_persisted: false` and retains unknown
+spend; a process crash before completion likewise preserves the existing
+uncertain attempt and does not record a completed failure count. Neither case
+authorizes resending that uncertain attempt inside its invocation.
+
+Evidence: the `regression_request_budget_*` tests in
+`crates/symbiotic-credential-process/tests/egress.rs` cover three sends for six
+identical HTTP-400 classifier calls, restart, fresh-per-call renewal, separate
+inputs and rotated credentials, two HTTP-401 sends, concurrent exhaustion,
+positive renewal, success clearing, omission/validation, and no request,
+answer or credential content in state under `off`.
+
 ## Same-attempt recovery (v4)
 
 V4 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 6 and queue schema is 17.
+versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 8 and queue schema is 17.
 Opening a registry with a different stamp fails with `Version`; no migration or reset is
-performed. Operators must reconcile any old live attempts before provisioning fresh state;
+performed. An incomplete registry refuses startup instead of recreating lost
+canonical permit, grant-revision or request-budget tables. Its result-expiry index
+remains rebuildable from the permit records. `lost_canonical_registry_tables_are_refused_without_recreation`
+in the registry unit tests covers these source-table losses. Operators must reconcile any old live attempts before provisioning fresh state;
 never delete active replay history.
 The crate package version remains 0.2.0 on this unreleased branch.
 

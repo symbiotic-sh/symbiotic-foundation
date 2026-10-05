@@ -87,6 +87,9 @@ pub enum EgressError {
     /// Limits or enforceable reservation missing.
     #[error("egress budget refused")]
     BudgetRefused,
+    /// Identical requests exhausted their shared failed-send allowance; no HTTP or charge.
+    #[error("request failure budget exhausted; no provider send or charge")]
+    RequestBudgetExhausted,
     /// Credential backend unavailable or incorrectly protected.
     #[error("credential unavailable")]
     CredentialUnavailable,

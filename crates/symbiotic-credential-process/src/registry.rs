@@ -1,5 +1,5 @@
 //! Durable permit replay protection and bounded result recovery; no provider credentials.
-use crate::AnswerRecovery;
+use crate::{AnswerRecovery, RequestBudget};
 use rusqlite::{Connection, OptionalExtension, params};
 use symbiotic_ai_runtime::{model::AcceptedSpendHandoff, spend::SqliteSpendLedger};
 use symbiotic_egress::*;
@@ -9,7 +9,7 @@ pub(crate) struct Registry(Connection);
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 7;
+const REGISTRY_SCHEMA_VERSION: u16 = 8;
 
 // Stored receipt identity/status; accounting is projected from the ledger on reads.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -55,7 +55,8 @@ impl Registry {
             .map_err(state)?;
         let existing: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='egress_permits')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN
+                 ('egress_schema','egress_permits','egress_grant_revisions','egress_request_failures'))",
                 [],
                 |row| row.get(0),
             )
@@ -67,12 +68,23 @@ impl Registry {
             if version != REGISTRY_SCHEMA_VERSION {
                 return Err(EgressError::Version);
             }
+            // Canonical source tables cannot be rebuilt like the result-expiry
+            // index. A partial registry must never silently reset replay,
+            // revocation or request budgets through CREATE IF NOT EXISTS.
+            let tables: u32 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN
+                 ('egress_schema','egress_permits','egress_grant_revisions','egress_request_failures')",
+                [], |row| row.get(0),
+            ).map_err(state)?;
+            if tables != 4 {
+                return Err(EgressError::StateUnavailable);
+            }
         }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 7 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 8 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -96,6 +108,11 @@ impl Registry {
             CREATE TABLE IF NOT EXISTS egress_grant_revisions (
                 grant_key TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS egress_request_failures (
+                request_key TEXT PRIMARY KEY,
+                failed_sends INTEGER NOT NULL CHECK(failed_sends > 0),
+                last_failure INTEGER NOT NULL
             ); COMMIT;",
         )
         .map_err(state)?;
@@ -338,10 +355,43 @@ impl Registry {
         Ok(receipt)
     }
 
+    /// Check while holding the process's budget dispatch lock until finish commits.
+    pub(crate) fn check_request_budget(
+        &mut self,
+        key: &str,
+        policy: &RequestBudget,
+    ) -> Result<(), EgressError> {
+        let row: Option<(u32, u64)> = self.0.query_row(
+            "SELECT failed_sends, last_failure FROM egress_request_failures WHERE request_key=?1",
+            [key], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(state)?;
+        if let Some((failures, last_failure)) = row {
+            let current_time = now()?;
+            let renewed = policy.renewal_seconds.is_some_and(|seconds| {
+                // Zero renews every call, even after clock rollback. Positive
+                // intervals cannot renew early when the clock moves backwards.
+                seconds == 0
+                    || current_time >= last_failure && current_time - last_failure >= seconds
+            });
+            if renewed {
+                self.0
+                    .execute(
+                        "DELETE FROM egress_request_failures WHERE request_key=?1",
+                        [key],
+                    )
+                    .map_err(state)?;
+            } else if failures >= policy.attempts {
+                return Err(EgressError::RequestBudgetExhausted);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(
         &mut self,
         mode: AnswerRecovery,
         result: &DispatchResult,
+        request_budget_key: Option<&str>,
     ) -> Result<(), EgressError> {
         let stored_receipt = serde_json::to_value(StoredReceipt::from(&result.receipt))
             .map_err(|_| EgressError::StateUnavailable)?;
@@ -394,6 +444,23 @@ impl Registry {
                 .map(|_| serde_json::json!({"output_received": true})),
         )
         .map_err(ledger_error)?;
+        if let Some(key) = request_budget_key {
+            if result.output.is_some() {
+                tx.execute(
+                    "DELETE FROM egress_request_failures WHERE request_key=?1",
+                    [key],
+                )
+                .map_err(state)?;
+            } else {
+                tx.execute(
+                    "INSERT INTO egress_request_failures(request_key, failed_sends, last_failure)
+                     VALUES (?1, 1, ?2) ON CONFLICT(request_key) DO UPDATE SET
+                     failed_sends=failed_sends+1, last_failure=excluded.last_failure",
+                    params![key, now()?],
+                )
+                .map_err(state)?;
+            }
+        }
         tx.commit().map_err(state)
     }
 
@@ -673,6 +740,7 @@ mod tests {
                     diagnostics: Vec::new(),
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
     }
@@ -1008,6 +1076,7 @@ mod tests {
                     diagnostics: Vec::new(),
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
         assert!(matches!(
@@ -1085,6 +1154,7 @@ mod tests {
                     error: None,
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
         // A large cohort sharing one deadline must take multiple bounded sweeps.
@@ -1170,6 +1240,7 @@ mod tests {
                     error: Some(EgressError::CredentialUnavailable),
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
         // Populate settled zero-charge predecessors in one transaction. Each has
@@ -1238,6 +1309,7 @@ mod tests {
                     error: Some(EgressError::CredentialUnavailable),
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
         attempt.attempt_ordinal += 1;
@@ -1351,6 +1423,7 @@ mod tests {
                         error: Some(EgressError::CredentialUnavailable),
                         receipt_persisted: true,
                     },
+                    None,
                 )
                 .unwrap();
             attempt.attempt_ordinal += 1;
@@ -1403,6 +1476,7 @@ mod tests {
                     error: None,
                     receipt_persisted: true,
                 },
+                None,
             )
             .unwrap();
         let id = attempt.attempt_id();
@@ -1439,7 +1513,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 4, 5, 6, 8] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
@@ -1460,6 +1534,35 @@ mod tests {
                     .unwrap(),
                 version
             );
+        }
+    }
+
+    #[test]
+    fn lost_canonical_registry_tables_are_refused_without_recreation() {
+        for (table, expected) in [
+            ("egress_schema", EgressError::Version),
+            ("egress_permits", EgressError::StateUnavailable),
+            ("egress_grant_revisions", EgressError::StateUnavailable),
+            ("egress_request_failures", EgressError::StateUnavailable),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("registry.sqlite");
+            let registry = open(&path);
+            registry
+                .0
+                .execute_batch(&format!("DROP TABLE {table}"))
+                .unwrap();
+            drop(registry);
+            assert_eq!(Registry::open(&path).err(), Some(expected), "lost {table}");
+            let conn = Connection::open(&path).unwrap();
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "recreated lost {table}");
         }
     }
 }

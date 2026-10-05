@@ -261,6 +261,7 @@ impl Fixture {
                 account_sharing_key: None,
                 provider_request_limit: None,
                 max_attempts: 3,
+                request_budget: None,
                 route: "chat".into(),
                 secret_ref: "provider-key".into(),
                 secret: SecretSource::OwnerOnlyFile {
@@ -6907,4 +6908,437 @@ async fn regression_answer_recovery_crash_after_answer_before_consumption() {
             CLASSIFY_RECOVERY_MARKER
         ));
     }
+}
+
+fn configure_request_budget(fixture: &mut Fixture, attempts: u32, renewal: Option<u64>) {
+    let mut config = serde_json::to_value(&fixture.config).unwrap();
+    config["routes"][0]["request_budget"] =
+        serde_json::json!({"attempts": attempts, "renewal_seconds": renewal});
+    fixture.config = serde_json::from_value(config).unwrap();
+}
+
+async fn request_budget_call(
+    fixture: &Fixture,
+    process: &CredentialProcess,
+    invocation: &str,
+    classify: bool,
+    different_input: bool,
+) -> DispatchResult {
+    let (signed, mut payload) = if classify {
+        rabbithole_classify_attempt(fixture)
+    } else {
+        fixture.attempt(invocation, 1, 1)
+    };
+    if different_input {
+        match &mut payload {
+            ProviderPayload::Chat(request) => request.messages[0].content.push_str(" different"),
+            ProviderPayload::Classify(request) => {
+                request
+                    .state
+                    .insert("different".into(), serde_json::json!(true));
+            }
+            _ => panic!("unsupported test payload"),
+        }
+    }
+    let mut attempt = signed.attempt;
+    attempt.invocation_id = invocation.into();
+    attempt.input_digest = payload.digest().unwrap();
+    let admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(attempt)
+        .unwrap();
+    let granted = permit(process, &admission).await;
+    dispatched(
+        exchange_wire(process, inject(admission, payload, granted))
+            .await
+            .unwrap(),
+    )
+}
+
+fn assert_request_budget_refused(result: &DispatchResult) {
+    assert_eq!(
+        serde_json::to_value(result.error).unwrap(),
+        "request_budget_exhausted"
+    );
+    assert_eq!(result.receipt.spend_state, SpendState::Released);
+    assert!(result.output.is_none());
+    assert!(result.receipt_persisted);
+}
+
+#[tokio::test]
+async fn regression_request_budget_failed_sends_survive_restart_without_content() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for restart in [false, true] {
+            let mut fixture =
+                Fixture::new(400, ANSWER_RECOVERY_MARKER.into(), Duration::ZERO).await;
+            fixture.config.routes[0].provider = RouteProvider::JevClassifier {
+                operator: "test".into(),
+            };
+            fixture.config.routes[0].answer_recovery =
+                symbiotic_credential_process::AnswerRecovery::Off;
+            configure_request_budget(&mut fixture, 3, None);
+            let mut process = fixture.process().await;
+            for call in 0..6 {
+                if restart && call == 3 {
+                    drop(process);
+                    process = fixture.process().await;
+                }
+                let result =
+                    request_budget_call(&fixture, &process, &format!("budget-{call}"), true, false)
+                        .await;
+                if call < 3 {
+                    assert!(matches!(
+                        result.error,
+                        Some(EgressError::Provider { status: Some(400) })
+                    ));
+                    assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+                } else {
+                    assert_request_budget_refused(&result);
+                }
+            }
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+            assert!(!state_has_bytes(&fixture.config.state_dir, "hello"));
+            assert!(!state_has_bytes(
+                &fixture.config.state_dir,
+                "Does m000 continue"
+            ));
+            assert!(!state_has_bytes(
+                &fixture.config.state_dir,
+                ANSWER_RECOVERY_MARKER
+            ));
+            assert!(!state_has_bytes(&fixture.config.state_dir, SECRET));
+        }
+    })
+    .await
+    .expect("bounded request budget restart regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_zero_renewal_and_omission_send_every_call() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for configured in [false, true] {
+            let mut fixture = Fixture::new(400, "rejected".into(), Duration::ZERO).await;
+            if configured {
+                configure_request_budget(&mut fixture, 3, Some(0));
+            }
+            let process = fixture.process().await;
+            for call in 0..6 {
+                let result =
+                    request_budget_call(&fixture, &process, &format!("renew-{call}"), false, false)
+                        .await;
+                assert!(matches!(
+                    result.error,
+                    Some(EgressError::Provider { status: Some(400) })
+                ));
+            }
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
+        }
+    })
+    .await
+    .expect("bounded per-call budget regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_input_and_rotated_credentials_have_fresh_budgets() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut fixture = Fixture::new(401, "revoked".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 2, None);
+        let process = fixture.process().await;
+        for call in 0..3 {
+            let result =
+                request_budget_call(&fixture, &process, &format!("revoked-{call}"), false, false)
+                    .await;
+            if call < 2 {
+                assert!(matches!(
+                    result.error,
+                    Some(EgressError::Provider { status: Some(401) })
+                ));
+                assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+            } else {
+                assert_request_budget_refused(&result);
+            }
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+        for call in 0..3 {
+            let result = request_budget_call(
+                &fixture,
+                &process,
+                &format!("different-{call}"),
+                false,
+                true,
+            )
+            .await;
+            if call == 2 {
+                assert_request_budget_refused(&result);
+            }
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
+        std::fs::write(
+            fixture.dir.path().join("provider"),
+            format!("{SECRET}-rotated"),
+        )
+        .unwrap();
+        for call in 0..3 {
+            let result =
+                request_budget_call(&fixture, &process, &format!("rotated-{call}"), false, false)
+                    .await;
+            if call == 2 {
+                assert_request_budget_refused(&result);
+            }
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
+    })
+    .await
+    .expect("bounded request budget key regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_concurrent_dispatches_cannot_overspend() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut fixture = Fixture::new(400, "rejected".into(), Duration::from_millis(100)).await;
+        configure_request_budget(&mut fixture, 3, None);
+        let process = fixture.process().await;
+        let (a, b, c, d, e, f) = tokio::join!(
+            request_budget_call(&fixture, &process, "parallel-a", false, false),
+            request_budget_call(&fixture, &process, "parallel-b", false, false),
+            request_budget_call(&fixture, &process, "parallel-c", false, false),
+            request_budget_call(&fixture, &process, "parallel-d", false, false),
+            request_budget_call(&fixture, &process, "parallel-e", false, false),
+            request_budget_call(&fixture, &process, "parallel-f", false, false),
+        );
+        let results = [a, b, c, d, e, f];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.receipt.spend_state == SpendState::Unknown)
+                .count(),
+            3
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.error == Some(EgressError::RequestBudgetExhausted))
+                .count(),
+            3
+        );
+        for result in results
+            .iter()
+            .filter(|r| r.error == Some(EgressError::RequestBudgetExhausted))
+        {
+            assert_request_budget_refused(result);
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+    })
+    .await
+    .expect("bounded concurrent request budget regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_positive_renewal_and_success_clear() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut fixture = Fixture::new(400, "rejected".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 2, Some(60));
+        let process = fixture.process().await;
+        for call in 0..2 {
+            request_budget_call(&fixture, &process, &format!("initial-{call}"), false, false).await;
+        }
+        let database = fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        // Simulate time, including rollback, without waiting for production renewal.
+        conn.execute(
+            "UPDATE egress_request_failures SET last_failure=?1",
+            [unix_seconds() + 3600],
+        )
+        .unwrap();
+        assert_request_budget_refused(
+            &request_budget_call(&fixture, &process, "rollback", false, false).await,
+        );
+        conn.execute(
+            "UPDATE egress_request_failures SET last_failure=?1",
+            [unix_seconds() - 60],
+        )
+        .unwrap();
+        let renewed = request_budget_call(&fixture, &process, "renewed", false, false).await;
+        assert!(matches!(
+            renewed.error,
+            Some(EgressError::Provider { status: Some(400) })
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+        let count: u32 = conn
+            .query_row(
+                "SELECT failed_sends FROM egress_request_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(process);
+        // Change the configured destination of the same route to a successful mock.
+        // Its failure key is still the route+credential+input, independent of revision.
+        let success = Fixture::new(200, ANSWER_RECOVERY_MARKER.into(), Duration::ZERO).await;
+        fixture.config.routes[0].destination = success.config.routes[0].destination.clone();
+        fixture.config.routes[0].answer_recovery =
+            symbiotic_credential_process::AnswerRecovery::Off;
+        let process = fixture.process().await;
+        let result = request_budget_call(&fixture, &process, "success", false, false).await;
+        assert!(result.error.is_none());
+        assert!(result.output.is_some());
+        assert_eq!(success.calls.load(Ordering::SeqCst), 1);
+        let rows: u32 = conn
+            .query_row("SELECT count(*) FROM egress_request_failures", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(!state_has_bytes(
+            &fixture.config.state_dir,
+            ANSWER_RECOVERY_MARKER
+        ));
+        assert!(!state_has_bytes(
+            &fixture.config.state_dir,
+            "private test input"
+        ));
+    })
+    .await
+    .expect("bounded renewal and success regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_config_omission_and_zero_refusal() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "ok".into(), Duration::ZERO).await;
+        let original = serde_json::to_value(&fixture.config.routes[0]).unwrap();
+        assert!(original.get("request_budget").is_none());
+        let mut explicit_none = original.clone();
+        explicit_none["request_budget"] = serde_json::Value::Null;
+        let route: RouteConfig = serde_json::from_value(explicit_none).unwrap();
+        assert_eq!(serde_json::to_value(&route).unwrap(), original);
+        assert_eq!(
+            symbiotic_ai_runtime::model::configuration_revision(&route).unwrap(),
+            symbiotic_ai_runtime::model::configuration_revision(&fixture.config.routes[0]).unwrap()
+        );
+        configure_request_budget(&mut fixture, 0, None);
+        assert!(matches!(
+            CredentialProcess::open(fixture.config.clone()),
+            Err(EgressError::InvalidRequest)
+        ));
+        assert!(!fixture.config.state_dir.exists());
+    })
+    .await
+    .expect("bounded request budget configuration regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_pre_send_failures_leave_allowance_unused() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for credential_failure in [false, true] {
+            let mut fixture = Fixture::new(400, "rejected".into(), Duration::ZERO).await;
+            configure_request_budget(&mut fixture, 1, None);
+            let destination = fixture.config.routes[0].destination.clone();
+            if credential_failure {
+                std::fs::remove_file(fixture.dir.path().join("provider")).unwrap();
+            } else {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                fixture.config.routes[0].destination =
+                    format!("http://{}/v1", listener.local_addr().unwrap());
+                drop(listener);
+            }
+            let process = fixture.process().await;
+            for call in 0..if credential_failure { 2 } else { 1 } {
+                let result = request_budget_call(
+                    &fixture,
+                    &process,
+                    &format!("unsent-{call}"),
+                    false,
+                    false,
+                )
+                .await;
+                assert!(result.error.is_some());
+                assert_ne!(result.error, Some(EgressError::RequestBudgetExhausted));
+                assert_eq!(result.receipt.spend_state, SpendState::Released);
+                assert!(result.receipt_persisted);
+            }
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+            let conn = rusqlite::Connection::open(
+                fixture
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            let rows: u32 = conn
+                .query_row("SELECT count(*) FROM egress_request_failures", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0);
+            // A connection failure starts the existing provider cooldown. Its
+            // empty budget table proves the allowance was not consumed without
+            // waiting for, bypassing or changing that independent runtime policy.
+            if !credential_failure {
+                continue;
+            }
+            drop(process);
+            fixture.config.routes[0].destination = destination;
+            if credential_failure {
+                let path = fixture.dir.path().join("provider");
+                std::fs::write(&path, SECRET).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let process = fixture.process().await;
+            let sent = request_budget_call(&fixture, &process, "first-send", false, false).await;
+            assert!(matches!(
+                sent.error,
+                Some(EgressError::Provider { status: Some(400) })
+            ));
+            assert_request_budget_refused(
+                &request_budget_call(&fixture, &process, "exhausted", false, false).await,
+            );
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        }
+    })
+    .await
+    .expect("bounded pre-send budget regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_lookup_failure_refuses_before_http() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(400, "rejected".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 2, None);
+        let process = fixture.process().await;
+        let database = fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let conn = rusqlite::Connection::open(database).unwrap();
+        conn.execute("DROP TABLE egress_request_failures", [])
+            .unwrap();
+        let result = request_budget_call(&fixture, &process, "unavailable", false, false).await;
+        assert_eq!(result.error, Some(EgressError::StateUnavailable));
+        assert_eq!(result.receipt.spend_state, SpendState::Released);
+        assert!(result.receipt_persisted);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        drop(process);
+        assert!(matches!(
+            CredentialProcess::open(fixture.config.clone()),
+            Err(EgressError::StateUnavailable)
+        ));
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='egress_request_failures')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !exists,
+            "restart must not recreate lost canonical budget state"
+        );
+    })
+    .await
+    .expect("bounded budget storage-failure regression");
 }
