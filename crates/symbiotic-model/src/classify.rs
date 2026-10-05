@@ -1105,14 +1105,11 @@ impl ClassifierProvider for JevClassifierProvider {
         secrets::credential_boundary(
             (async {
                 self.validate_configuration()?;
-                request.validate()?;
-                Self::check_limits(&request)?;
-                let wire = JevWireRequest {
-                    model: &self.descriptor.identity.model.0,
-                    state: &request.state,
-                    questions: &request.questions,
-                };
-                let body = wire::encode(&wire, self.max_request_bytes)?;
+                let body = jev_classify_body(
+                    &self.descriptor.identity.model.0,
+                    &request,
+                    self.max_request_bytes,
+                )?;
                 let started = Instant::now();
                 let builder = self
                     .client
@@ -1167,6 +1164,26 @@ impl ClassifierProvider for JevClassifierProvider {
             &self.api_key,
         )
     }
+}
+
+/// Validate Jev's question/token bounds and encode the complete System One body.
+/// Admission and transport share this encoder; question and option order is preserved.
+/// Local metadata and state descriptions are excluded from the provider body.
+pub fn jev_classify_body(
+    model: &str,
+    request: &ClassifyRequest,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ModelError> {
+    request.validate()?;
+    JevClassifierProvider::check_limits(request)?;
+    wire::encode(
+        &JevWireRequest {
+            model,
+            state: &request.state,
+            questions: &request.questions,
+        },
+        max_bytes,
+    )
 }
 
 // Questions and Choice options are JSON maps whose order is the presentation
@@ -2657,6 +2674,21 @@ mod tests {
             .unwrap();
             assert!(matches!(err, ModelError::Auth(_)));
         }
+    }
+
+    #[test]
+    fn rabbithole_jev_encoder_enforces_exact_wire_bound_and_excludes_local_metadata() {
+        let request = request(vec![route_question(), goal_question()]);
+        let body = jev_classify_body("test-model", &request, None).unwrap();
+        assert_eq!(
+            jev_classify_body("test-model", &request, Some(body.len())).unwrap(),
+            body
+        );
+        assert!(jev_classify_body("test-model", &request, Some(body.len() - 1)).is_err());
+        let text = String::from_utf8(body).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 3);
+        assert!(json.get("source").is_none() && json.get("metadata").is_none());
     }
 
     #[test]

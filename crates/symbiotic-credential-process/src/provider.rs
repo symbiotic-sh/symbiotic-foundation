@@ -15,7 +15,9 @@ use symbiotic_ai_runtime::{
     },
     *,
 };
-use symbiotic_egress::{DispatchDiagnostic, EgressError, ProviderOutput, ProviderPayload};
+use symbiotic_egress::{
+    DispatchDiagnostic, EgressError, FinishReason, ProviderOutput, ProviderPayload,
+};
 use symbiotic_trace::{ModelInvocationTrace, UsageTrace};
 
 #[derive(Clone)]
@@ -56,6 +58,15 @@ impl<P: ChatProvider> ChatProvider for Dispatched<P> {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
         let mut response = self.outcome(self.inner.chat(request).await)?;
+        response.trace.metadata = serde_json::Value::Null;
+        Ok(response)
+    }
+}
+#[async_trait]
+impl<P: ClassifierProvider> ClassifierProvider for Dispatched<P> {
+    async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        self.started.store(true, Ordering::SeqCst);
+        let mut response = self.outcome(self.inner.classify(request).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -140,8 +151,19 @@ pub(crate) fn route_settings(
 ) -> (model::ModelAdapter, &str, model::TransportSettings) {
     let mut settings = model::TransportSettings::default();
     let (adapter, operator) = match &route.provider {
-        RouteProvider::OpenAiChat { operator } => {
+        RouteProvider::OpenAiChat {
+            operator,
+            thinking,
+            reasoning_effort,
+        } => {
+            settings.thinking = *thinking;
+            settings.reasoning_effort = reasoning_effort
+                .map(crate::ReasoningEffort::as_str)
+                .map(str::to_owned);
             (model::ModelAdapter::OpenAiChat, operator.as_str())
+        }
+        RouteProvider::JevClassifier { operator } => {
+            (model::ModelAdapter::JevClassifier, operator.as_str())
         }
         RouteProvider::AnthropicChat { operator, thinking } => {
             settings.thinking = *thinking;
@@ -220,6 +242,7 @@ pub(crate) fn configured_registry(
         let operation = match adapter.capability() {
             model::ModelCapability::Chat => "chat",
             model::ModelCapability::Rerank => "rerank",
+            model::ModelCapability::Classify => "classify",
             _ => "embedding",
         };
         let identity = model::ModelIdentity::new(operation, operator, &route.model);
@@ -321,36 +344,16 @@ pub(crate) fn validate_binding(runtime: &Runtime, route: &RouteConfig) -> Result
                 )
                 .map(|_| ())
         }
-        RouteProvider::AnthropicChat { operator, thinking } => runtime
+        RouteProvider::AnthropicChat { .. } | RouteProvider::OpenAiChat { .. } => runtime
             .chat(
-                route_binding(
-                    runtime,
-                    route,
-                    AnthropicChatProvider::new(operator, &route.model, &route.destination, "")
-                        .with_request_limit(route.max_input_bytes)
-                        .with_response_limit(route.max_response_bytes)
-                        .with_output_limit(route.max_output_tokens)
-                        .with_thinking(*thinking),
-                )?
-                .with_response_cache(ResponseCacheMode::Off),
+                route_binding(runtime, route, chat_adapter(route, "")?)?
+                    .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
-        RouteProvider::OpenAiChat { operator } => runtime
-            .chat(
-                route_binding(
-                    runtime,
-                    route,
-                    OpenAiCompatibleChatProvider::new(
-                        operator,
-                        &route.model,
-                        &route.destination,
-                        "",
-                    )
-                    .with_request_limit(route.max_input_bytes)
-                    .with_response_limit(route.max_response_bytes)
-                    .with_output_limit(route.max_output_tokens),
-                )?
-                .with_response_cache(ResponseCacheMode::Off),
+        RouteProvider::JevClassifier { .. } => runtime
+            .classifier(
+                route_binding(runtime, route, classifier_adapter(route, "")?)?
+                    .with_response_cache(ResponseCacheMode::Off),
             )
             .map(|_| ()),
         RouteProvider::GeminiEmbedding { dimensions } => runtime
@@ -403,6 +406,11 @@ pub(crate) fn prepare_payload(payload: &mut ProviderPayload, attempt_digest: &st
             request.role_binding = None;
             request.metadata = serde_json::Value::Null;
         }
+        ProviderPayload::Classify(request) => {
+            request.source = Some(attempt_digest.to_owned());
+            request.role_binding = None;
+            request.metadata = serde_json::Value::Null;
+        }
         ProviderPayload::Rerank(request) => {
             request.source = Some(attempt_digest.to_owned());
             request.role_binding = None;
@@ -422,6 +430,7 @@ pub(crate) fn accepted_handoff(
             ("embedding", model::configuration_revision(request))
         }
         ProviderPayload::Rerank(request) => ("rerank", model::configuration_revision(request)),
+        ProviderPayload::Classify(request) => ("classify", model::configuration_revision(request)),
     };
     let binding = BindingIdentity::new(
         &route.tenant,
@@ -444,8 +453,8 @@ pub(crate) fn chat_adapter(
     route: &RouteConfig,
     secret: &str,
 ) -> Result<Arc<dyn ChatProvider>, EgressError> {
-    let (RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. }) =
-        &route.provider
+    let (RouteProvider::OpenAiChat { operator, .. }
+    | RouteProvider::AnthropicChat { operator, .. }) = &route.provider
     else {
         return Err(EgressError::InvalidRequest);
     };
@@ -459,17 +468,56 @@ pub(crate) fn chat_adapter(
                 .with_output_limit(route.max_output_tokens)
                 .with_thinking(*thinking),
         ),
-        _ => Arc::new(
-            OpenAiCompatibleChatProvider::new(operator, &route.model, &route.destination, secret)
-                .with_timeout(route.timeout_seconds)
-                .map_err(|_| EgressError::InvalidRequest)?
-                .with_request_limit(route.max_input_bytes)
-                .with_response_limit(route.max_response_bytes)
-                .with_output_limit(route.max_output_tokens),
-        ),
+        RouteProvider::OpenAiChat {
+            thinking,
+            reasoning_effort,
+            ..
+        } => {
+            let mut raw = OpenAiCompatibleChatProvider::new(
+                operator,
+                &route.model,
+                &route.destination,
+                secret,
+            )
+            .with_timeout(route.timeout_seconds)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .with_request_limit(route.max_input_bytes)
+            .with_response_limit(route.max_response_bytes)
+            .with_output_limit(route.max_output_tokens)
+            .with_thinking(*thinking);
+            if let Some(effort) = reasoning_effort {
+                raw = raw.with_reasoning_effort(effort.as_str());
+            }
+            Arc::new(raw)
+        }
+        _ => return Err(EgressError::InvalidRequest),
     };
 
     Ok(inner)
+}
+
+pub(crate) fn classifier_adapter(
+    route: &RouteConfig,
+    secret: &str,
+) -> Result<Arc<dyn ClassifierProvider>, EgressError> {
+    let RouteProvider::JevClassifier { operator } = &route.provider else {
+        return Err(EgressError::InvalidRequest);
+    };
+    Ok(Arc::new(
+        model::JevClassifierProvider::new(operator, &route.model, &route.destination, secret)
+            .with_timeout(route.timeout_seconds)
+            .map_err(|_| EgressError::InvalidRequest)?
+            .with_request_limit(route.max_input_bytes)
+            .with_response_limit(route.max_response_bytes),
+    ))
+}
+
+fn finish_reason(reason: Option<&str>) -> Option<FinishReason> {
+    reason.map(|reason| match reason {
+        "stop" | "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "length" | "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
+        _ => FinishReason::Other,
+    })
 }
 
 pub(crate) fn embedding_adapter(
@@ -534,6 +582,7 @@ pub(crate) async fn execute(
             Ok(completed(
                 ProviderOutput::Chat {
                     text: response.text,
+                    finish_reason: finish_reason(response.finish_reason.as_deref()),
                 },
                 response.trace,
             ))
@@ -557,6 +606,25 @@ pub(crate) async fn execute(
                 ProviderOutput::Embedding {
                     vectors: response.vectors,
                     dimensions: response.dimensions,
+                },
+                response.trace,
+            ))
+        }
+        (RouteProvider::JevClassifier { .. }, ProviderPayload::Classify(request)) => {
+            let provider = Dispatched {
+                inner: classifier_adapter(route, secret.value())?,
+                started: started.clone(),
+            };
+            let provider = runtime
+                .classifier(accepted_route_binding(runtime, route, provider, handoff)?)
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let response = provider
+                .classify(request)
+                .await
+                .map_err(|error| execute_error(error, &started))?;
+            Ok(completed(
+                ProviderOutput::Classify {
+                    answers: response.answers,
                 },
                 response.trace,
             ))

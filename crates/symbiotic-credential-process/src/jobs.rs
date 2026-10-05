@@ -137,6 +137,7 @@ enum PreparedAdapter {
     Chat(Arc<dyn ChatProvider>),
     Embedding(Arc<dyn EmbeddingProvider>),
     Rerank(Arc<dyn RerankProvider>),
+    Classifier(Arc<dyn ClassifierProvider>),
 }
 // Only local resolution produces this authentication/configuration failure.
 // Remote authentication rejection is not evidence of zero charge.
@@ -173,6 +174,9 @@ impl ModelProvider for JobProvider {
                         .map_err(invalid)?,
                 )
             }
+            RouteProvider::JevClassifier { .. } => PreparedAdapter::Classifier(
+                provider::classifier_adapter(&self.route, secret.value()).map_err(invalid)?,
+            ),
             RouteProvider::CohereRerank { .. } => PreparedAdapter::Rerank(
                 provider::rerank_adapter(&self.runtime, &self.route, secret.value())
                     .map_err(invalid)?,
@@ -212,6 +216,20 @@ impl ChatProvider for JobProvider {
             ));
         };
         let mut response = adapter.chat(request).await?;
+        response.raw_provider_response = None;
+        response.trace.metadata = serde_json::Value::Null;
+        Ok(response)
+    }
+}
+#[async_trait]
+impl ClassifierProvider for JobProvider {
+    async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
+        let Some(PreparedAdapter::Classifier(adapter)) = &self.prepared else {
+            return Err(ModelError::InvalidRequest(
+                model::DiagnosticCode::InvalidConfiguration,
+            ));
+        };
+        let mut response = adapter.classify(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -266,6 +284,7 @@ impl CredentialProcess {
             RouteProvider::GeminiEmbedding { .. } | RouteProvider::CompatibleEmbedding { .. } => {
                 provider::embedding_adapter(runtime, route, "")?
             }
+            RouteProvider::JevClassifier { .. } => provider::classifier_adapter(route, "")?,
             RouteProvider::CohereRerank { .. } => provider::rerank_adapter(runtime, route, "")?,
         };
         Ok(JobProvider {
@@ -313,6 +332,10 @@ impl CredentialProcess {
                 RouteProvider::GeminiEmbedding { .. }
                 | RouteProvider::CompatibleEmbedding { .. } => {
                     jobs.start_embedding(binding, config, route.route.clone())
+                        .await
+                }
+                RouteProvider::JevClassifier { .. } => {
+                    jobs.start_classifier(binding, config, route.route.clone())
                         .await
                 }
                 RouteProvider::CohereRerank { .. } => {
@@ -499,6 +522,7 @@ impl CredentialProcess {
                             model_job_payload(&binding, request)?
                         }
                         ProviderPayload::Rerank(request) => model_job_payload(&binding, request)?,
+                        ProviderPayload::Classify(request) => model_job_payload(&binding, request)?,
                     };
                     // Bind immutable caller/manifest/provider fields to key-conflict checks,
                     // while excluding renewable authority and attempt ordinals.
