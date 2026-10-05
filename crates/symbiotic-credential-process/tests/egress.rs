@@ -7022,6 +7022,297 @@ async fn request_budget_call(
     )
 }
 
+async fn validated_request_budget_call<F>(
+    fixture: &Fixture,
+    process: &CredentialProcess,
+    invocation: &str,
+    validate: F,
+) -> DispatchResult
+where
+    F: Fn(&ProviderOutput) -> bool + Send + Sync + 'static,
+{
+    let (admission, payload) = fixture.attempt(invocation, 1, 1);
+    let granted = permit(process, &admission).await;
+    let client = InProcessEgressClient::new(process.clone()).with_answer_validation(validate);
+    dispatched(
+        client
+            .exchange(Request {
+                version: PROTOCOL_VERSION,
+                operation: inject(admission, payload, granted),
+            })
+            .await
+            .unwrap()
+            .result
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn regression_request_budget_answer_rejections_share_allowance_across_restart() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for restart in [true, false] {
+            for (text, reason) in [
+                ("{}".to_owned(), "length"),
+                (
+                    format!("{{\"invalid\":\"{ANSWER_RECOVERY_MARKER}\"}}"),
+                    "stop",
+                ),
+            ] {
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": text}, "finish_reason": reason}]
+                })
+                .to_string();
+                let mut fixture =
+                    Fixture::with_http_response(200, body, Duration::ZERO, "null", true, false)
+                        .await;
+                fixture.config.routes[0].answer_recovery =
+                    symbiotic_credential_process::AnswerRecovery::Off;
+                configure_request_budget(&mut fixture, 3, None);
+                let mut process = fixture.process().await;
+                let mut results = Vec::new();
+                for call in 0..6 {
+                    if restart && call == 2 {
+                        drop(process);
+                        process = fixture.process().await;
+                    }
+                    let result = validated_request_budget_call(
+                        &fixture,
+                        &process,
+                        &format!("invalid-{call}"),
+                        |answer| {
+                            matches!(answer, ProviderOutput::Chat {
+                                text, finish_reason: Some(FinishReason::Stop),
+                            } if text == "valid")
+                        },
+                    )
+                    .await;
+                    results.push(result);
+                }
+                assert_eq!(
+                    fixture.calls.load(Ordering::SeqCst),
+                    3,
+                    "six rejected answers share three sends, restart={restart}"
+                );
+                for (call, result) in results.iter().enumerate() {
+                    if call < 3 {
+                        assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+                        assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+                        assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+                        assert!(result.receipt_persisted && result.output.is_none());
+                    } else {
+                        assert_request_budget_refused(result);
+                    }
+                }
+                let conn = rusqlite::Connection::open(
+                    fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
+                .unwrap();
+                let failures: u32 = conn
+                    .query_row(
+                        "SELECT failed_sends FROM egress_request_failures",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(failures, 3);
+                let observed: u32 = conn.query_row(
+                    "SELECT count(*) FROM spend_receipts WHERE output='{\"output_received\":true}'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    observed, 3,
+                    "rejection preserves paid completion evidence without usage"
+                );
+                assert!(!state_has_bytes(
+                    &fixture.config.state_dir,
+                    ANSWER_RECOVERY_MARKER
+                ));
+                assert!(!state_has_bytes(&fixture.config.state_dir, "hello"));
+                assert!(!state_has_bytes(&fixture.config.state_dir, SECRET));
+            }
+        }
+    })
+    .await
+    .expect("bounded caller answer rejection regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_answer_validation_precedes_completion_and_updates_renewal() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "invalid".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 1, Some(60));
+        let process = fixture.process().await;
+        let database = fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let during_validation = database.clone();
+        let completion_floor = unix_seconds();
+        let result = validated_request_budget_call(&fixture, &process, "rejected", move |_| {
+            let conn = rusqlite::Connection::open(&during_validation).unwrap();
+            let finished: u32 = conn
+                .query_row("SELECT finished FROM egress_permits", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                finished, 0,
+                "validator must run before egress completion commits"
+            );
+            // Simulate elapsed time without sleeping: completion must replace
+            // the older admission timestamp, preserving the existing renewal rule.
+            assert_eq!(
+                conn.execute(
+                    "UPDATE egress_request_failures SET last_failure=?1",
+                    [completion_floor - 60]
+                )
+                .unwrap(),
+                1
+            );
+            false
+        })
+        .await;
+        assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+        assert!(result.receipt_persisted);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        let (failures, last_failure): (u32, u64) = conn
+            .query_row(
+                "SELECT failed_sends, last_failure FROM egress_request_failures",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+        assert!(
+            last_failure >= completion_floor,
+            "renewal starts at rejected completion"
+        );
+        assert_request_budget_refused(
+            &validated_request_budget_call(&fixture, &process, "refused", |_| {
+                panic!("exhausted budget must not reach validation")
+            })
+            .await,
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded validation completion-order regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_answer_validation_success_clears_allowance() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "valid".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 1, None);
+        let process = fixture.process().await;
+        for call in 0..6 {
+            let result = validated_request_budget_call(
+                &fixture,
+                &process,
+                &format!("valid-{call}"),
+                |answer| matches!(answer, ProviderOutput::Chat { text, .. } if text == "valid"),
+            )
+            .await;
+            assert!(result.error.is_none() && result.output.is_some() && result.receipt_persisted);
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let rows: u32 = conn
+            .query_row("SELECT count(*) FROM egress_request_failures", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+    })
+    .await
+    .expect("bounded accepted answer regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_answer_rejected_then_valid_resets_allowance() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+        configure_request_budget(&mut fixture, 2, None);
+        let process = fixture.process().await;
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        for (call, accepted, failures) in
+            [(0, false, 1), (1, true, 0), (2, false, 1), (3, false, 2)]
+        {
+            let result = validated_request_budget_call(
+                &fixture,
+                &process,
+                &format!("sequence-{call}"),
+                move |_| accepted,
+            )
+            .await;
+            assert_eq!(result.error.is_none(), accepted);
+            assert_eq!(
+                result.receipt.spend_state,
+                SpendState::Settled,
+                "rejection keeps measured usage"
+            );
+            assert_eq!(result.receipt.usage.input_tokens, Some(7));
+            let count: u32 = conn
+                .query_row(
+                    "SELECT coalesce(sum(failed_sends), 0) FROM egress_request_failures",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, failures);
+        }
+        assert_request_budget_refused(
+            &validated_request_budget_call(&fixture, &process, "sequence-exhausted", |_| {
+                panic!("no answer to validate when exhausted")
+            })
+            .await,
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
+    })
+    .await
+    .expect("bounded rejected then accepted answer regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_answer_rejections_preserve_per_call_routes() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for configured in [false, true] {
+            let mut fixture = Fixture::new(200, "invalid".into(), Duration::ZERO).await;
+            if configured {
+                configure_request_budget(&mut fixture, 3, Some(0));
+            }
+            let process = fixture.process().await;
+            for call in 0..6 {
+                let result = validated_request_budget_call(
+                    &fixture,
+                    &process,
+                    &format!("per-call-{call}"),
+                    |_| false,
+                )
+                .await;
+                assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+                assert!(result.output.is_none() && result.receipt_persisted);
+            }
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
+        }
+    })
+    .await
+    .expect("bounded unchanged per-call answer validation regression");
+}
+
 fn assert_request_budget_refused(result: &DispatchResult) {
     assert_eq!(
         serde_json::to_value(result.error).unwrap(),
@@ -7035,7 +7326,12 @@ fn assert_request_budget_refused(result: &DispatchResult) {
 #[tokio::test]
 async fn regression_request_budget_durable_completion_failure_keeps_allowance_consumed() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        for (status_code, pre_send_failure) in [(400, false), (200, false), (400, true)] {
+        for (status_code, pre_send_failure, reject_answer) in [
+            (400, false, false),
+            (200, false, false),
+            (400, true, false),
+            (200, false, true),
+        ] {
             for restart in [false, true] {
                 let mut fixture = Fixture::new(status_code, "answer".into(), Duration::ZERO).await;
                 configure_request_budget(&mut fixture, 1, None);
@@ -7060,11 +7356,20 @@ async fn regression_request_budget_durable_completion_failure_keeps_allowance_co
                      BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;",
                 )
                 .unwrap();
-                let result =
-                    request_budget_call(&fixture, &process, "unfinished", false, false).await;
+                let result = if reject_answer {
+                    validated_request_budget_call(&fixture, &process, "unfinished", |_| false).await
+                } else {
+                    request_budget_call(&fixture, &process, "unfinished", false, false).await
+                };
                 assert!(!result.receipt_persisted);
                 assert_eq!(result.receipt.spend_state, SpendState::Unknown);
-                assert_eq!(result.output.is_some(), status_code == 200);
+                assert_eq!(
+                    result.output.is_some(),
+                    status_code == 200 && !reject_answer
+                );
+                if reject_answer {
+                    assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+                }
                 conn.execute_batch("DROP TRIGGER reject_completion")
                     .unwrap();
                 if restart {

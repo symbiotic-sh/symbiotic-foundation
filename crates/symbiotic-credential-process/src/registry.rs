@@ -415,6 +415,7 @@ impl Registry {
         mode: AnswerRecovery,
         result: &DispatchResult,
         request_budget: Option<&RequestBudgetAdmission>,
+        output_received: bool,
     ) -> Result<(), EgressError> {
         let stored_receipt = serde_json::to_value(StoredReceipt::from(&result.receipt))
             .map_err(|_| EgressError::StateUnavailable)?;
@@ -451,7 +452,7 @@ impl Registry {
         }
         // Response identity is still recoverable when token usage is absent.
         // Settlement remains governed by measured usage, independently of metadata.
-        let usage = (result.output.is_some()
+        let usage = (output_received
             || symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage))
         .then(|| mode.stored_usage(result.receipt.usage.clone()));
         SqliteSpendLedger::finish_in(
@@ -461,10 +462,7 @@ impl Registry {
             usage,
             // Output bytes live only in bounded egress recovery. The ledger keeps
             // completion evidence so commit refusal cannot release missing-usage spend.
-            result
-                .output
-                .as_ref()
-                .map(|_| serde_json::json!({"output_received": true})),
+            output_received.then(|| serde_json::json!({"output_received": true})),
         )
         .map_err(ledger_error)?;
         if let Some(budget) = request_budget {
@@ -783,6 +781,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                false,
             )
             .unwrap();
     }
@@ -855,6 +854,7 @@ mod tests {
                             receipt_persisted: true,
                         },
                         Some(&admission),
+                        false,
                     )
                     .unwrap();
                 let remaining: Option<(u32, u64)> = registry
@@ -1192,6 +1192,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                true,
             )
             .unwrap();
         assert!(matches!(
@@ -1270,6 +1271,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                true,
             )
             .unwrap();
         // A large cohort sharing one deadline must take multiple bounded sweeps.
@@ -1356,6 +1358,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                false,
             )
             .unwrap();
         // Populate settled zero-charge predecessors in one transaction. Each has
@@ -1425,6 +1428,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                false,
             )
             .unwrap();
         attempt.attempt_ordinal += 1;
@@ -1539,6 +1543,7 @@ mod tests {
                         receipt_persisted: true,
                     },
                     None,
+                    false,
                 )
                 .unwrap();
             attempt.attempt_ordinal += 1;
@@ -1592,6 +1597,7 @@ mod tests {
                     receipt_persisted: true,
                 },
                 None,
+                true,
             )
             .unwrap();
         let id = attempt.attempt_id();

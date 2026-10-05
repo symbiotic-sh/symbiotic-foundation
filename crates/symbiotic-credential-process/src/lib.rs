@@ -16,6 +16,7 @@ pub mod secrets;
 #[cfg(unix)]
 pub mod server;
 
+use in_process::AnswerValidator;
 use registry::Registry;
 use secrets::{Secret, SecretSource};
 use serde::{Deserialize, Serialize};
@@ -358,10 +359,18 @@ impl CredentialProcess {
 
     /// Handle the shared protocol in process (the socket server calls this method).
     pub async fn handle(&self, request: Request) -> Response {
+        self.handle_with_answer_validation(request, None).await
+    }
+
+    async fn handle_with_answer_validation(
+        &self,
+        request: Request,
+        answer_validator: Option<AnswerValidator>,
+    ) -> Response {
         let result = if request.version != PROTOCOL_VERSION {
             Err(EgressError::Version)
         } else {
-            self.operation(request.operation).await
+            self.operation(request.operation, answer_validator).await
         };
         Response {
             version: PROTOCOL_VERSION,
@@ -369,7 +378,11 @@ impl CredentialProcess {
         }
     }
 
-    async fn operation(&self, operation: Operation) -> Result<Reply, EgressError> {
+    async fn operation(
+        &self,
+        operation: Operation,
+        answer_validator: Option<AnswerValidator>,
+    ) -> Result<Reply, EgressError> {
         self.purge_expired_results()?;
         match operation {
             Operation::EnqueueJobs(signed)
@@ -502,7 +515,14 @@ impl CredentialProcess {
                 let input_digest = request.admission.attempt.input_digest;
                 let task = tokio::spawn(async move {
                     process
-                        .dispatch(route, payload, receipt, handoff, input_digest)
+                        .dispatch(
+                            route,
+                            payload,
+                            receipt,
+                            handoff,
+                            input_digest,
+                            answer_validator,
+                        )
                         .await
                 });
                 self.warn_if_attempt_time_ahead(
@@ -599,6 +619,7 @@ impl CredentialProcess {
         mut receipt: DispatchReceipt,
         handoff: symbiotic_ai_runtime::model::AcceptedSpendHandoff,
         input_digest: String,
+        answer_validator: Option<AnswerValidator>,
     ) -> DispatchResult {
         let _budget_guard = if route.request_budget.is_some() {
             Some(self.inner.request_budget_dispatch.lock().await)
@@ -682,6 +703,16 @@ impl CredentialProcess {
                 receipt.spend_state = SpendState::Released;
             }
         }
+        // Observation and caller acceptance are separate: even a rejected answer
+        // is paid completion evidence, independently of whether usage was measured.
+        let output_received = output.is_some();
+        if let (Some(answer), Some(validate)) = (&output, answer_validator)
+            && !validate(answer)
+        {
+            error = Some(EgressError::Provider { status: None });
+            receipt.status = DispatchStatus::ProviderFailed;
+            output = None;
+        }
         // A paid answer is returned even if its bookkeeping write fails. The
         // previously committed Unknown remains conservative for restart/reconciliation.
         let mut result = DispatchResult {
@@ -693,7 +724,12 @@ impl CredentialProcess {
         };
         result.receipt_persisted = self.inner.registry.lock().is_ok_and(|mut registry| {
             registry
-                .finish(route.answer_recovery, &result, budget_admission.as_ref())
+                .finish(
+                    route.answer_recovery,
+                    &result,
+                    budget_admission.as_ref(),
+                    output_received,
+                )
                 .is_ok()
         });
         if !result.receipt_persisted {
