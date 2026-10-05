@@ -483,8 +483,10 @@ pub(crate) fn chat_adapter(
             .map_err(|_| EgressError::InvalidRequest)?
             .with_request_limit(route.max_input_bytes)
             .with_response_limit(route.max_response_bytes)
-            .with_output_limit(route.max_output_tokens)
-            .with_thinking(*thinking);
+            .with_output_limit(route.max_output_tokens);
+            if let Some(thinking) = thinking {
+                raw = raw.with_thinking(Some(*thinking));
+            }
             if let Some(effort) = reasoning_effort {
                 raw = raw.with_reasoning_effort(effort.as_str());
             }

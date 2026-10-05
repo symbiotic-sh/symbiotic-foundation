@@ -5329,6 +5329,200 @@ async fn rabbithole_unset_settings_preserve_route_identity_and_job_reattachment(
 }
 
 #[tokio::test]
+async fn unset_thinking_retry_preserves_prechange_spend_binding_after_reopen() {
+    use symbiotic_ai_runtime::{
+        BindingIdentity, ModelBinding, ModelProvider, SpendLedger, SpendReceiptRef,
+        SpendReservation, SpendState,
+        jobs::model_job_payload,
+        model::{OpenAiCompatibleChatProvider, configuration_revision},
+        spend::SqliteSpendLedger,
+    };
+    use symbiotic_queue::jobs::{
+        Execution, JobLimits, JobRequest, JobResolution, JobResponse, JobSpec,
+    };
+    use symbiotic_queue_sqlite::jobs::jobs_in_transaction;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "authorized retry".into(), Duration::ZERO).await;
+        // Initialize the same route registry and grant revision, without starting a worker.
+        drop(fixture.process().await);
+        let route = &fixture.config.routes[0];
+        let input = queued(&fixture, "prechange-reservation");
+        let scope = jobs_scope();
+        let invocation =
+            serde_json::to_string(&(&scope, &input.admission.attempt.invocation_id)).unwrap();
+        let ProviderPayload::Chat(mut request) = input.payload else {
+            panic!("chat payload")
+        };
+        request.source = Some(invocation.clone());
+
+        // Historical adapter construction: optional thinking/effort setters were absent.
+        let legacy =
+            OpenAiCompatibleChatProvider::new("test", &route.model, &route.destination, "")
+                .with_timeout(route.timeout_seconds)
+                .unwrap()
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens);
+        let binding = ModelBinding::new(legacy).with_identity(BindingIdentity::new(
+            &route.tenant,
+            &route.route,
+            configuration_revision(route).unwrap().0,
+            &route.account,
+        ));
+        let mut descriptor = binding.provider.descriptor().clone();
+        descriptor.metadata = serde_json::json!({
+            "configuration": descriptor.metadata, "binding": binding.identity
+        });
+        let reservation = SpendReservation {
+            reference: SpendReceiptRef::new("job:prechange-reservation").unwrap(),
+            account: symbiotic_ai_runtime::account_scope(binding.identity.as_ref().unwrap(), None)
+                .unwrap(),
+            invocation: symbiotic_ai_runtime::model::execution_invocation_identity(
+                binding.identity.as_ref().unwrap(),
+                &invocation,
+            )
+            .unwrap(),
+            binding: configuration_revision(&(
+                "chat",
+                &descriptor,
+                &binding.identity,
+                configuration_revision(&request).unwrap().0,
+            ))
+            .unwrap()
+            .0,
+            request_limit: route.provider_request_limit,
+        };
+        let path = fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        assert!(
+            ledger
+                .reserve_explicit(&reservation, route.max_attempts)
+                .unwrap()
+        );
+        drop(ledger);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let mut tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let JobResponse::Enqueued(items) = jobs_in_transaction(
+            &mut tx,
+            &scope,
+            &fixture.config.jobs,
+            chrono::Utc::now(),
+            JobRequest::Enqueue(vec![JobSpec {
+                key: input.admission.attempt.invocation_id.clone(),
+                kind: route.route.clone(),
+                group: input.group,
+                owners: input.owners,
+                execution: Execution::Model,
+                payload: model_job_payload(&binding, &request).unwrap(),
+                admission: Some(serde_json::to_vec(&input.admission).unwrap()),
+                limits: JobLimits {
+                    max_attempts: route.max_attempts,
+                },
+                recovery_until: chrono::DateTime::from_timestamp(
+                    input.admission.attempt.recovery_expires_at as i64,
+                    0,
+                ),
+            }]),
+        )
+        .unwrap() else {
+            panic!("historical enqueue")
+        };
+        let Enqueued::Inserted(id) = &items[0] else {
+            panic!("historical job")
+        };
+        let id = id.clone();
+        assert!(matches!(
+            jobs_in_transaction(
+                &mut tx,
+                &scope,
+                &fixture.config.jobs,
+                chrono::Utc::now(),
+                JobRequest::ClaimPaid {
+                    job: id.clone(),
+                    receipt: reservation.reference.as_str().into(),
+                },
+            )
+            .unwrap(),
+            JobResponse::Job(Some(_))
+        ));
+        tx.commit().unwrap();
+        drop(conn); // Crash after reservation, before HTTP.
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+
+        // Trusted evidence that transport never started releases the historical receipt.
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        ledger
+            .release_before_dispatch(&reservation.reference)
+            .unwrap();
+        let receipt = ledger.receipt(&reservation.reference).unwrap().unwrap();
+        assert_eq!(receipt.state, SpendState::Released);
+        assert!(receipt.pre_dispatch_released);
+        assert_eq!(receipt.attempt_limit, Some(route.max_attempts));
+        assert_eq!(receipt.attempts_used, 0);
+        drop(ledger);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let mut tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        jobs_in_transaction(
+            &mut tx,
+            &scope,
+            &fixture.config.jobs,
+            chrono::Utc::now(),
+            JobRequest::Resolve {
+                job: id.clone(),
+                generation: 1,
+                resolution: JobResolution::KnownZeroCharge {
+                    receipt: reservation.reference.as_str().into(),
+                },
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+        let waiting = wait_job(&client, &id, JobState::AwaitingAdmission).await;
+        assert_eq!(
+            waiting.receipt.as_deref(),
+            Some(reservation.reference.as_str())
+        );
+        assert_eq!(waiting.generation, 1);
+        let (admission, _) = fixture.job_attempt("prechange-reservation", 2, 2);
+        job_call(
+            &client,
+            JobsCommand::AdmitJob {
+                job: id.clone(),
+                admission: Box::new(admission),
+            },
+        )
+        .await
+        .unwrap();
+        let completed = wait_job(&client, &id, JobState::Succeeded).await;
+        assert_eq!(completed.generation, 2);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        let receipt = ledger
+            .receipt(&SpendReceiptRef::new(completed.receipt.unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, SpendState::Settled);
+        assert_eq!(receipt.reservation.binding, reservation.binding);
+        let new_id = enqueue_id(&client, queued(&fixture, "after-retry")).await;
+        wait_job(&client, &new_id, JobState::Succeeded).await;
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("released historical reservation must retry within five seconds");
+}
+
+#[tokio::test]
 async fn rabbithole_jobs_preserve_canonical_completion_shapes() {
     for classify in [false, true] {
         let mut fixture = if classify {
