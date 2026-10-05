@@ -515,6 +515,9 @@ pub enum JobError {
     /// Invalid configuration, state transition or page bound.
     #[error("invalid job request")]
     InvalidRequest,
+    /// Signed authority elapsed before final claim acceptance; await renewal.
+    #[error("job authority expired")]
+    AuthorityExpired,
     /// Expired or superseded claim.
     #[error("stale job claim")]
     StaleClaim,

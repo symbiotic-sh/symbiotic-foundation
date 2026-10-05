@@ -198,9 +198,9 @@ impl CredentialProcess {
         if config.version != PROTOCOL_VERSION {
             return Err(EgressError::Version);
         }
-        // Even the smallest route needs three one-byte identities and a
+        // Even the smallest route needs four one-byte identities and a
         // one-byte response in addition to the fixed envelope allowance.
-        if (config.max_frame_bytes as usize) < REPLY_ENVELOPE_BYTES + 3 * 6 + 4 {
+        if (config.max_frame_bytes as usize) < REPLY_ENVELOPE_BYTES + 4 * 6 + 4 {
             return Err(EgressError::InvalidFrameConfiguration);
         }
         if config.max_secret_bytes < 32
@@ -459,6 +459,9 @@ impl CredentialProcess {
         if fields
             .iter()
             .any(|field| field.is_empty() || field.len() > route.max_field_bytes)
+            || a.job_queue
+                .as_ref()
+                .is_some_and(|queue| queue.is_empty() || queue.len() > route.max_field_bytes)
             || a.secret_ref.len() > route.max_field_bytes
             || a.attempt_ordinal == 0
             || a.grant_revision == 0
@@ -567,12 +570,12 @@ fn is_digest(value: &str) -> bool {
 }
 
 fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError> {
-    // Every receipt echoes three identity strings; JSON can encode each input
+    // A receipt can echo four identity strings; JSON can encode each input
     // byte as six bytes (\\u00xx). Preserve the existing fourfold response
     // allowance, plus room for the fixed receipt/status/permit envelopes.
     let reply_bound = route
         .max_field_bytes
-        .checked_mul(3 * 6)
+        .checked_mul(4 * 6)
         .and_then(|identity| {
             route
                 .max_response_bytes
@@ -797,7 +800,7 @@ fn spend_reservation(
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| EgressError::InvalidRequest)?,
-        invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?,
+        invocation: a.attempt_id().invocation_key()?,
         binding: invocation_binding(a)?,
         request_limit: route.provider_request_limit,
     })

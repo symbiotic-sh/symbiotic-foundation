@@ -110,6 +110,9 @@ pub struct DurableAttempt {
     pub incarnation: String,
     /// Logical invocation, stable across retries.
     pub invocation_id: String,
+    /// Authenticated queue namespace for a job invocation; None for unqueued work.
+    /// Direct consumption of a job attempt carries the same namespace.
+    pub job_queue: Option<String>,
     /// One-based attempt ordinal, strictly increasing; unissued attempts may leave gaps.
     pub attempt_ordinal: u32,
     /// Position of this attempt in Memory K's serialization order.
@@ -154,8 +157,23 @@ pub struct AttemptId {
     pub incarnation: String,
     /// Logical invocation.
     pub invocation_id: String,
+    /// Authenticated queue namespace for a job invocation; None for unqueued work.
+    /// Direct consumption of a job attempt carries the same namespace.
+    pub job_queue: Option<String>,
     /// One-based ordinal within the invocation.
     pub attempt_ordinal: u32,
+}
+
+impl AttemptId {
+    /// Canonical signed invocation identity shared by issuance, consumption and lookup.
+    pub fn invocation_key(&self) -> Result<String, EgressError> {
+        digest(&(
+            &self.tenant,
+            &self.incarnation,
+            &self.job_queue,
+            &self.invocation_id,
+        ))
+    }
 }
 
 impl DurableAttempt {
@@ -165,6 +183,7 @@ impl DurableAttempt {
             tenant: self.tenant.clone(),
             incarnation: self.incarnation.clone(),
             invocation_id: self.invocation_id.clone(),
+            job_queue: self.job_queue.clone(),
             attempt_ordinal: self.attempt_ordinal,
         }
     }

@@ -375,6 +375,14 @@ pub enum FailureCharge {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> &ProviderDescriptor;
+    /// Prepare an adapter owned by one job call before its dispatch boundary.
+    /// The job lease monitors this work; cancellation releases unsent spend.
+    async fn prepare_call(&self) -> Result<Self, ModelError>
+    where
+        Self: Sized + Clone,
+    {
+        Ok(self.clone())
+    }
     /// Override only with evidence that the failed attempt incurred no charge.
     fn failure_charge(&self, _error: &ModelError) -> FailureCharge {
         FailureCharge::Unknown
@@ -2274,7 +2282,7 @@ where
         return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
     };
     // All preparation failures share the durable no-dispatch release path.
-    // No provider future exists until this block succeeds.
+    // No transport future exists until this block succeeds.
     let attempt = job.attempt()?;
     let item_id = QueueItemId(reference.as_str().into());
     let mut monitoring = Vec::new();
@@ -2306,6 +2314,7 @@ where
                 AttemptTiming::NONE,
             )
             .await;
+        let provider = provider.prepare_call().await?;
         let owner = job.clone();
         if run_blocking(move || owner.heartbeat()).await? {
             return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
@@ -2313,14 +2322,25 @@ where
         if let Some(rate) = rate {
             rate.charge()?;
         }
-        Ok::<_, ModelError>(())
+        Ok::<_, ModelError>(provider)
     })
     .await;
-    if let Err(error) = prepared {
-        let owner = job.clone();
-        run_blocking(move || owner.release()).await?;
-        return Err(error);
-    }
+    let provider = match prepared {
+        Ok(provider) => provider,
+        Err(error) => {
+            let owner = job.clone();
+            let failure = error.code();
+            if provider.failure_charge(&error) == FailureCharge::KnownZero {
+                run_blocking(move || {
+                    owner.finish(SpendState::Released, None, None, Some(failure), false)
+                })
+                .await?;
+            } else {
+                run_blocking(move || owner.release()).await?;
+            }
+            return Err(error);
+        }
+    };
     let provider_started = Instant::now();
     let dispatch = this.clone();
     let transport_provider = provider.clone();

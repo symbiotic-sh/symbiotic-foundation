@@ -8,7 +8,7 @@ pub(crate) struct Registry(Connection);
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 6;
+const REGISTRY_SCHEMA_VERSION: u16 = 7;
 
 // Stored receipt identity/status; accounting is projected from the ledger on reads.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -71,7 +71,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 6 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 7 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -126,7 +126,7 @@ impl Registry {
         max_attempts: u32,
     ) -> Result<PermitGrant, EgressError> {
         let attempt_digest = digest(a)?;
-        let invocation_key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
+        let invocation_key = a.attempt_id().invocation_key()?;
         let grant_key = digest(&(&a.tenant, &a.incarnation))?;
         let binding = crate::invocation_binding(a)?;
         Self::check_revision(tx, a)?;
@@ -260,11 +260,7 @@ impl Registry {
         reference: &SpendReceiptRef,
         max_attempts: u32,
     ) -> Result<(), EgressError> {
-        let key = digest(&(
-            &attempt.tenant,
-            &attempt.incarnation,
-            &attempt.invocation_id,
-        ))?;
+        let key = attempt.attempt_id().invocation_key()?;
         let existing: Option<(String, String)> = tx.query_row(
             "SELECT attempt_digest, token FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
             params![key, attempt.attempt_ordinal], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -384,7 +380,7 @@ impl Registry {
     }
 
     pub(crate) fn existing(&self, a: &DurableAttempt) -> Result<Option<PermitGrant>, EgressError> {
-        let key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
+        let key = a.attempt_id().invocation_key()?;
         let existing: Option<(String, String)> = self.0.query_row(
             "SELECT attempt_digest, token FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
             params![key, a.attempt_ordinal], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -410,7 +406,7 @@ impl Registry {
         id: &AttemptId,
         time: u64,
     ) -> Result<AttemptStatus, EgressError> {
-        let key = digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?;
+        let key = id.invocation_key()?;
         let row = self
             .0
             .query_row(
@@ -540,7 +536,7 @@ impl Registry {
             .0
             .query_row(
                 "SELECT receipt FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2 AND consumed=1",
-                params![digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?, id.attempt_ordinal],
+                params![id.invocation_key()?, id.attempt_ordinal],
                 |row| row.get(0),
             )
             .optional()
@@ -616,7 +612,7 @@ mod tests {
             reservation: SpendReservation {
                 reference: crate::egress_reference(a).unwrap(),
                 account: "test-account".into(),
-                invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id)).unwrap(),
+                invocation: a.attempt_id().invocation_key().unwrap(),
                 binding: crate::invocation_binding(a).unwrap(),
                 request_limit: None,
             },
@@ -1393,7 +1389,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 4, 5, 7] {
+        for version in [1, 2, 3, 4, 5, 6, 8] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();

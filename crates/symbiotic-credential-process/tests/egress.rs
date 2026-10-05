@@ -281,6 +281,7 @@ impl Fixture {
             tenant: "tenant".into(),
             incarnation: "incarnation".into(),
             invocation_id: invocation.into(),
+            job_queue: None,
             attempt_ordinal: ordinal,
             record_sequence: sequence,
             recorded_at: 100,
@@ -297,6 +298,23 @@ impl Fixture {
             input_digest: payload.digest().unwrap(),
             grant_revision: 1,
         };
+        (
+            AdmissionKey::new(KEY.to_vec())
+                .unwrap()
+                .sign_attempt(attempt)
+                .unwrap(),
+            payload,
+        )
+    }
+    fn job_attempt(
+        &self,
+        invocation: &str,
+        ordinal: u32,
+        sequence: u64,
+    ) -> (SignedAttempt, ProviderPayload) {
+        let (signed, payload) = self.attempt(invocation, ordinal, sequence);
+        let mut attempt = signed.attempt;
+        attempt.job_queue = Some(jobs_scope().queue);
         (
             AdmissionKey::new(KEY.to_vec())
                 .unwrap()
@@ -2636,7 +2654,7 @@ async fn failed_settlement_keeps_typed_receipt_unknown_and_preserves_paid_output
 async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response() {
     let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     let response_bytes = fixture.config.routes[0].max_response_bytes;
-    let largest_field = (fixture.config.max_frame_bytes as usize - 4096 - 4 * response_bytes) / 18;
+    let largest_field = (fixture.config.max_frame_bytes as usize - 4096 - 4 * response_bytes) / 24;
     fixture.config.routes[0].max_field_bytes = largest_field;
     let process = CredentialProcess::open(fixture.config.clone()).unwrap();
     drop(process);
@@ -2659,14 +2677,14 @@ async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response(
     fixture.config.routes[0].max_field_bytes = 1;
     fixture.config.routes[0].max_response_bytes = 1;
     fixture.config.routes[0].max_input_bytes = 1;
-    for frame_bytes in [4096, 4117] {
+    for frame_bytes in [4096, 4123] {
         fixture.config.max_frame_bytes = frame_bytes;
         let error = CredentialProcess::open(fixture.config.clone())
             .err()
             .expect("frame must fit envelope and one field");
         assert!(error.to_string().contains("max_frame_bytes"));
     }
-    fixture.config.max_frame_bytes = 4118;
+    fixture.config.max_frame_bytes = 4124;
     CredentialProcess::open(fixture.config.clone()).unwrap();
 }
 
@@ -3970,7 +3988,7 @@ async fn job_call(
     .await
 }
 fn queued(fixture: &Fixture, key: &str) -> EnqueueJob {
-    let (admission, payload) = fixture.attempt(key, 1, 1);
+    let (admission, payload) = fixture.job_attempt(key, 1, 1);
     EnqueueJob {
         group: Some("task".into()),
         owners: vec!["input-owner".into()],
@@ -4454,7 +4472,7 @@ async fn jobs_kill_after_dispatch_recovers_uncertain_without_resending() {
     assert_eq!(row.generation, 1);
     assert!(row.receipt.is_some());
     // A successor cannot turn uncertain accounting into another paid dispatch.
-    let (admission, _) = fixture.attempt("crashed", 2, 2);
+    let (admission, _) = fixture.job_attempt("crashed", 2, 2);
     assert!(matches!(
         job_call(
             &client,
@@ -4589,7 +4607,7 @@ async fn jobs_only_local_credential_failures_are_known_zero_charge() {
             usize::from(!missing_secret)
         );
         if !missing_secret {
-            let (admission, _) = fixture.attempt("credential-failure", 2, 2);
+            let (admission, _) = fixture.job_attempt("credential-failure", 2, 2);
             assert!(matches!(
                 job_call(
                     &client,
@@ -4641,7 +4659,7 @@ async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_n
     wait_job(&client, &id, JobState::Succeeded).await;
     // Renewal stores unfinished work, but the changed execution binding refuses
     // attachment. That refusal must not gate metadata or saved completions.
-    let (admission, _) = fixture.attempt("waiting", 2, 2);
+    let (admission, _) = fixture.job_attempt("waiting", 2, 2);
     assert!(matches!(
         job_call(
             &client,
@@ -4703,7 +4721,12 @@ async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_n
             jobs.request(JobsCommand::JobStatus(missing.clone())).await,
             Err(JobsClientError::Job(JobError::NotFound))
         ));
-        let (admission, _) = fixture.attempt("missing", 2, 2);
+        let (mut admission, _) = fixture.attempt("missing", 2, 2);
+        admission.attempt.job_queue = Some(missing.scope.queue.clone());
+        admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(admission.attempt)
+            .unwrap();
         assert!(matches!(
             jobs.request(JobsCommand::AdmitJob {
                 job: missing,
@@ -4957,4 +4980,278 @@ async fn jobs_and_direct_dispatch_share_atomic_signed_attempt_acceptance() {
         );
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn jobs_cancel_during_credential_resolution_releases_without_http() {
+    initialize_panic_reporting();
+    let mut fixture = Fixture::new(200, "unsent".into(), Duration::ZERO).await;
+    fixture.config.job_runner.heartbeat_interval_ms = Some(10);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_resolver = entered.clone();
+    let resolved = Arc::new(tokio::sync::Notify::new());
+    let resolved_resolver = resolved.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let receive = std::sync::Mutex::new(receive);
+    fixture.config.routes[0].secret = SecretSource::Resolver {
+        name: "provider-key".into(),
+        resolve: Arc::new(move |_| {
+            entered_resolver.notify_one();
+            receive.lock().unwrap().recv().unwrap();
+            // Use the existing protected fixture source; no credential is logged.
+            let secret = symbiotic_ai_runtime::model::SecretValue::new(SECRET.as_bytes().to_vec());
+            resolved_resolver.notify_one();
+            Ok(secret)
+        }),
+    };
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process);
+    let id = enqueue_id(&client, queued(&fixture, "resolve-cancel")).await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    job_call(
+        &client,
+        JobsCommand::CancelJobs(Selector::Ids(vec![id.clone()])),
+    )
+    .await
+    .unwrap();
+    // Keep resolution blocked until the heartbeat observes cancellation.
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_job(&client, &id, JobState::Cancelled),
+    )
+    .await;
+    send.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), resolved.notified())
+        .await
+        .unwrap();
+    let row = result.expect("cancellation must finish while the resolver is blocked");
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM spend_receipts WHERE reference=?1",
+            [row.receipt.unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "released");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn jobs_signed_queue_scopes_execute_independently_and_fence_replay() {
+    let fixture = Fixture::new(200, "scoped".into(), Duration::ZERO).await;
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process.clone());
+    let first = queued(&fixture, "same-key");
+    let id = enqueue_id(&client, first.clone()).await;
+    wait_job(&client, &id, JobState::Succeeded).await;
+    let mut second = first.clone();
+    second.admission.attempt.job_queue = Some("another-queue".into());
+    // Different signed contents must not conflict either.
+    second.admission.attempt.caller_binding = "another-caller".into();
+    second.admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(second.admission.attempt)
+        .unwrap();
+    let scope = JobScope {
+        queue: "another-queue".into(),
+        ..jobs_scope()
+    };
+    let scoped_client = JobsClient::new(
+        InProcessEgressClient::new(process.clone()),
+        scope,
+        AdmissionKey::new(KEY.to_vec()).unwrap(),
+    );
+    let permit = permit(&process, &second.admission).await;
+    let JobsReply::Enqueued(items) = scoped_client
+        .request(JobsCommand::EnqueueJobs(vec![second.clone()]))
+        .await
+        .unwrap()
+    else {
+        panic!("enqueue")
+    };
+    let Enqueued::Inserted(second_id) = &items[0] else {
+        panic!("inserted")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let JobsReply::Status(row) = scoped_client
+                .request(JobsCommand::JobStatus(second_id.clone()))
+                .await
+                .unwrap()
+            else {
+                panic!("status")
+            };
+            assert_ne!(row.state, JobState::Refused);
+            if row.state == JobState::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        scoped_client
+            .request(JobsCommand::EnqueueJobs(vec![first.clone()]))
+            .await,
+        Err(JobsClientError::Egress(EgressError::Unauthorized))
+    ));
+    assert!(matches!(
+        exchange(
+            &process,
+            inject(second.admission.clone(), second.payload, permit)
+        )
+        .await,
+        Err(EgressError::PermitRefused)
+    ));
+    for admission in [&first.admission, &second.admission] {
+        let id = signed_id(admission);
+        assert!(matches!(
+            exchange(&process, Operation::AttemptStatus(id.clone())).await,
+            Ok(Reply::AttemptStatus(AttemptStatus::Dispatched { .. }))
+        ));
+        let Ok(Reply::Receipt(Some(receipt))) = exchange(&process, Operation::Receipt(id)).await
+        else {
+            panic!("scoped receipt");
+        };
+        assert_eq!(receipt.attempt_id, admission.attempt.attempt_id());
+    }
+}
+
+#[tokio::test]
+async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
+    let logs = CapturedLogs::default();
+    let _subscriber = tracing::subscriber::set_default(logs.clone());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fixture = Fixture::with_response_gate(
+        200,
+        "paid".into(),
+        Duration::ZERO,
+        "null",
+        false,
+        false,
+        Some(gate.clone()),
+    )
+    .await;
+    fixture.config.job_runner.heartbeat_interval_ms = Some(10);
+    let process = fixture.process().await;
+    let client = InProcessEgressClient::new(process);
+    let id = enqueue_id(&client, queued(&fixture, "heartbeat-failure")).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let conn = rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_job_heartbeat BEFORE UPDATE OF lease_until ON jobs WHEN NEW.state='\"Running\"' BEGIN SELECT RAISE(ABORT, 'heartbeat refused'); END;").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !logs
+            .0
+            .lock()
+            .unwrap()
+            .contains("model job heartbeat failed")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("heartbeat fails before the provider finishes");
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = conn
+                .query_row("SELECT state FROM jobs WHERE id=?1", [&id.id], |r| r.get(0))
+                .unwrap();
+            if state == "\"Succeeded\"" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        loop {
+            if matches!(
+                job_call(&client, JobsCommand::JobStatus(id.clone())).await,
+                Err(JobsClientError::Egress(EgressError::StateUnavailable))
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finished workers must report their heartbeat failure");
+    assert!(matches!(
+        job_call(
+            &client,
+            JobsCommand::Completions {
+                limit: 1,
+                max_bytes: 65536,
+                wait_seconds: 0
+            }
+        )
+        .await,
+        Err(JobsClientError::Egress(EgressError::StateUnavailable))
+    ));
+    // Read canonical completion through the trusted runtime to obtain an ack token.
+    let runtime = symbiotic_ai_runtime::Runtime::open(symbiotic_ai_runtime::RuntimeConfig {
+        state_dir: Some(fixture.config.state_dir.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    let jobs = runtime
+        .model_jobs(jobs_scope(), fixture.config.jobs.clone())
+        .unwrap();
+    let page = jobs.completions(1, 65536).await.unwrap();
+    let token = page[0].delivery.token.clone();
+    for command in [
+        JobsCommand::JobStatus(id.clone()),
+        JobsCommand::AckJobs(vec![(token.clone(), Disposition::Accepted)]),
+        JobsCommand::CancelJobs(Selector::Ids(vec![id.clone()])),
+        JobsCommand::Completions {
+            limit: 1,
+            max_bytes: 65536,
+            wait_seconds: 0,
+        },
+    ] {
+        assert!(matches!(
+            job_call(&client, command).await,
+            Err(JobsClientError::Egress(EgressError::StateUnavailable))
+        ));
+    }
+    jobs.request(symbiotic_queue::jobs::JobRequest::Ack(vec![(
+        token,
+        Disposition::Accepted,
+    )]))
+    .await
+    .unwrap();
+    assert!(matches!(
+        job_call(
+            &client,
+            JobsCommand::Completions {
+                limit: 1,
+                max_bytes: 65536,
+                wait_seconds: 0
+            }
+        )
+        .await,
+        Err(JobsClientError::Egress(EgressError::StateUnavailable))
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }

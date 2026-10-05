@@ -678,6 +678,10 @@ impl model::ModelJob for ClaimOwner {
                     return Ok(None);
                 }
             }
+            if self.jobs.admission.is_some() {
+                tx.execute_batch("SAVEPOINT model_acceptance")
+                    .map_err(|_| JobError::Storage)?;
+            }
             let JobResponse::Job(row) = self.jobs.op(
                 tx,
                 now,
@@ -710,7 +714,18 @@ impl model::ModelJob for ClaimOwner {
                 return Err(JobError::Storage);
             }
             if let Some(admission) = &self.jobs.admission {
-                admission.accept(tx, &row, reservation)?;
+                match admission.accept(tx, &row, reservation) {
+                    Ok(()) => {}
+                    Err(JobError::AuthorityExpired) => {
+                        tx.execute_batch("ROLLBACK TO model_acceptance; RELEASE model_acceptance")
+                            .map_err(|_| JobError::Storage)?;
+                        self.jobs.op(tx, now, JobRequest::AwaitAdmission(row.id))?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+                tx.execute_batch("RELEASE model_acceptance")
+                    .map_err(|_| JobError::Storage)?;
             }
             Ok(Some(*row))
         });
@@ -1054,6 +1069,163 @@ model_runner!(
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn final_acceptance_expiry_rolls_back_and_resumes_the_same_runner() {
+        struct Expiring(AtomicBool);
+        impl ModelJobAdmission for Expiring {
+            fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn admit(&self, _: &JobRecord, _: &[u8]) -> Result<bool, JobError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(true)
+            }
+            fn claim(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: chrono::DateTime<Utc>,
+            ) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn accept(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: &SpendReservation,
+            ) -> Result<(), JobError> {
+                if self.0.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(JobError::AuthorityExpired)
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs")
+            .with_admission(Arc::new(Expiring(AtomicBool::new(false))));
+        let binding = ModelBinding::new(model::StaticChatProvider::new("renewed answer"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"))
+            .with_policy(crate::ModelQueueConfig::default());
+        let request = crate::ChatRequest {
+            messages: vec![],
+            max_output_tokens: None,
+            temperature: None,
+            response_format: None,
+            role_binding: None,
+            source: None,
+            metadata: serde_json::Value::Null,
+        };
+        let spec = JobSpec {
+            key: "expiry".into(),
+            kind: "chat".into(),
+            group: None,
+            owners: vec![],
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &request).expect("payload"),
+            admission: Some(b"first".to_vec()),
+            limits: JobLimits { max_attempts: 1 },
+            recovery_until: None,
+        };
+        let JobResponse::Enqueued(items) = jobs
+            .request(JobRequest::Enqueue(vec![spec]))
+            .await
+            .expect("enqueue")
+        else {
+            panic!("enqueued")
+        };
+        let Enqueued::Inserted(id) = &items[0] else {
+            panic!("inserted")
+        };
+        let runner = jobs
+            .start_chat(
+                binding,
+                RunnerConfig {
+                    poll_interval_ms: 1,
+                    ..Default::default()
+                },
+                "chat".into(),
+            )
+            .await
+            .expect("runner");
+        let row = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let JobResponse::Job(Some(row)) = jobs
+                    .request(JobRequest::Get(id.clone()))
+                    .await
+                    .expect("row")
+                else {
+                    panic!("row")
+                };
+                assert!(!runner.is_finished(), "expiry must not stop the worker");
+                if row.state == JobState::AwaitingAdmission {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("await admission");
+        assert_eq!(row.generation, 0);
+        assert!(row.receipt.is_none());
+        assert_eq!(row.admission.as_deref(), Some(b"first".as_slice()));
+        {
+            let conn = jobs.ledger.0.lock().expect("ledger");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                    .get::<_, usize>(0))
+                    .expect("reservations"),
+                0
+            );
+        }
+        jobs.request(JobRequest::Admit {
+            job: id.clone(),
+            admission: b"renewed".to_vec(),
+        })
+        .await
+        .expect("renewal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let JobResponse::Job(Some(row)) = jobs
+                    .request(JobRequest::Get(id.clone()))
+                    .await
+                    .expect("row")
+                else {
+                    panic!("row")
+                };
+                assert!(!runner.is_finished());
+                if row.state == JobState::Succeeded {
+                    assert_eq!(row.generation, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same worker resumes");
+        runner.shutdown().await.expect("healthy runner");
+    }
 
     #[tokio::test]
     async fn trial_purge_discovers_receipts_without_reading_saved_answers() {

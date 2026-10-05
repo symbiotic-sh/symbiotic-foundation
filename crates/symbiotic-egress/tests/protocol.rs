@@ -137,6 +137,7 @@ async fn recovery_status_method_uses_v4_and_rejects_old_replies() {
             tenant: "tenant".into(),
             incarnation: "incarnation".into(),
             invocation_id: "invocation".into(),
+            job_queue: None,
             attempt_ordinal: 1,
         })
         .unwrap();
@@ -190,6 +191,7 @@ fn accepted_receipt_identity_and_reference_round_trip_without_consumer_spend_fie
             tenant: "tenant".into(),
             incarnation: "incarnation".into(),
             invocation_id: "invocation".into(),
+            job_queue: None,
             attempt_ordinal: 1,
         },
         reference: SpendReceiptRef::new("egress:accepted-attempt").unwrap(),

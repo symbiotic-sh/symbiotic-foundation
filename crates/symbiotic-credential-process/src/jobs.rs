@@ -86,6 +86,7 @@ impl ModelJobAdmission for Admission {
         )
         .map_err(|error| match error {
             EgressError::StateUnavailable => JobError::Storage,
+            EgressError::AuthorityExpired => JobError::AuthorityExpired,
             EgressError::BudgetRefused => {
                 JobError::Execution(model::DiagnosticCode::AttemptBudgetExhausted)
             }
@@ -129,6 +130,13 @@ struct JobProvider {
     route: RouteConfig,
     max_secret_bytes: usize,
     prototype: Arc<dyn ModelProvider>,
+    prepared: Option<PreparedAdapter>,
+}
+#[derive(Clone)]
+enum PreparedAdapter {
+    Chat(Arc<dyn ChatProvider>),
+    Embedding(Arc<dyn EmbeddingProvider>),
+    Rerank(Arc<dyn RerankProvider>),
 }
 // Only local resolution produces this authentication/configuration failure.
 // Remote authentication rejection is not evidence of zero charge.
@@ -148,7 +156,33 @@ impl JobProvider {
         .map_err(credential_unavailable)
     }
 }
+#[async_trait]
 impl ModelProvider for JobProvider {
+    async fn prepare_call(&self) -> Result<Self, ModelError> {
+        let secret = self.secret().await?;
+        let invalid = |_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration);
+        let prepared = match self.route.provider {
+            RouteProvider::OpenAiChat { .. } | RouteProvider::AnthropicChat { .. } => {
+                PreparedAdapter::Chat(
+                    provider::chat_adapter(&self.route, secret.value()).map_err(invalid)?,
+                )
+            }
+            RouteProvider::GeminiEmbedding { .. } | RouteProvider::CompatibleEmbedding { .. } => {
+                PreparedAdapter::Embedding(
+                    provider::embedding_adapter(&self.runtime, &self.route, secret.value())
+                        .map_err(invalid)?,
+                )
+            }
+            RouteProvider::CohereRerank { .. } => PreparedAdapter::Rerank(
+                provider::rerank_adapter(&self.runtime, &self.route, secret.value())
+                    .map_err(invalid)?,
+            ),
+        };
+        Ok(Self {
+            prepared: Some(prepared),
+            ..self.clone()
+        })
+    }
     fn descriptor(&self) -> &ProviderDescriptor {
         self.prototype.descriptor()
     }
@@ -172,11 +206,12 @@ impl ModelProvider for JobProvider {
 #[async_trait]
 impl ChatProvider for JobProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        let secret = self.secret().await?;
-        let mut response = provider::chat_adapter(&self.route, secret.value())
-            .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
-            .chat(request)
-            .await?;
+        let Some(PreparedAdapter::Chat(adapter)) = &self.prepared else {
+            return Err(ModelError::InvalidRequest(
+                model::DiagnosticCode::InvalidConfiguration,
+            ));
+        };
+        let mut response = adapter.chat(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -185,11 +220,12 @@ impl ChatProvider for JobProvider {
 #[async_trait]
 impl EmbeddingProvider for JobProvider {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
-        let secret = self.secret().await?;
-        let mut response = provider::embedding_adapter(&self.runtime, &self.route, secret.value())
-            .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
-            .embed(request)
-            .await?;
+        let Some(PreparedAdapter::Embedding(adapter)) = &self.prepared else {
+            return Err(ModelError::InvalidRequest(
+                model::DiagnosticCode::InvalidConfiguration,
+            ));
+        };
+        let mut response = adapter.embed(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -198,11 +234,12 @@ impl EmbeddingProvider for JobProvider {
 #[async_trait]
 impl RerankProvider for JobProvider {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
-        let secret = self.secret().await?;
-        let mut response = provider::rerank_adapter(&self.runtime, &self.route, secret.value())
-            .map_err(|_| ModelError::InvalidRequest(model::DiagnosticCode::InvalidConfiguration))?
-            .rerank(request)
-            .await?;
+        let Some(PreparedAdapter::Rerank(adapter)) = &self.prepared else {
+            return Err(ModelError::InvalidRequest(
+                model::DiagnosticCode::InvalidConfiguration,
+            ));
+        };
+        let mut response = adapter.rerank(request).await?;
         response.raw_provider_response = None;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
@@ -236,6 +273,7 @@ impl CredentialProcess {
             route: route.clone(),
             max_secret_bytes: self.inner.config.max_secret_bytes,
             prototype,
+            prepared: None,
         })
     }
     async fn start_jobs(
@@ -251,6 +289,9 @@ impl CredentialProcess {
             .values()
             .filter(|r| r.tenant == scope.tenant && kind.is_none_or(|kind| kind == r.route))
         {
+            let key = serde_json::to_string(&(scope, &route.route))
+                .map_err(|_| EgressError::InvalidRequest)?;
+            Self::check_job_runner(&mut runners, &key).await?;
             if !jobs
                 .needs_execution(route.route.clone())
                 .await
@@ -258,19 +299,7 @@ impl CredentialProcess {
             {
                 continue;
             }
-            let key = serde_json::to_string(&(scope, &route.route))
-                .map_err(|_| EgressError::InvalidRequest)?;
-            if let Some(runner) = runners.get(&key) {
-                if runner.as_ref().is_none_or(JobRunner::is_finished) {
-                    if let Some(runner) = runners.insert(key, None).flatten() {
-                        // Consume the failure once, but keep the failed attachment visible.
-                        runner
-                            .wait()
-                            .await
-                            .map_err(|_| EgressError::StateUnavailable)?;
-                    }
-                    return Err(EgressError::StateUnavailable);
-                }
+            if runners.contains_key(&key) {
                 continue;
             }
             let binding =
@@ -293,6 +322,37 @@ impl CredentialProcess {
             }
             .map_err(|_| EgressError::StateUnavailable)?;
             runners.insert(key, Some(runner));
+        }
+        Ok(())
+    }
+    async fn check_job_runner(
+        runners: &mut std::collections::HashMap<String, Option<JobRunner>>,
+        key: &str,
+    ) -> Result<(), EgressError> {
+        if let Some(runner) = runners.get(key)
+            && runner.as_ref().is_none_or(JobRunner::is_finished)
+        {
+            if let Some(runner) = runners.insert(key.into(), None).flatten() {
+                runner
+                    .wait()
+                    .await
+                    .map_err(|_| EgressError::StateUnavailable)?;
+            }
+            return Err(EgressError::StateUnavailable);
+        }
+        Ok(())
+    }
+    async fn check_job_runners(&self, scope: &JobScope) -> Result<(), EgressError> {
+        let mut runners = self.inner.job_runners.lock().await;
+        for route in self
+            .inner
+            .routes
+            .values()
+            .filter(|route| route.tenant == scope.tenant)
+        {
+            let key = serde_json::to_string(&(scope, &route.route))
+                .map_err(|_| EgressError::InvalidRequest)?;
+            Self::check_job_runner(&mut runners, &key).await?;
         }
         Ok(())
     }
@@ -333,6 +393,7 @@ impl CredentialProcess {
                 scoped(job)?;
                 if admission.attempt.tenant != scope.tenant
                     || admission.attempt.incarnation != scope.incarnation
+                    || admission.attempt.job_queue.as_deref() != Some(scope.queue.as_str())
                 {
                     return Err(EgressError::Unauthorized);
                 }
@@ -352,6 +413,7 @@ impl CredentialProcess {
                 for item in items {
                     if item.admission.attempt.tenant != scope.tenant
                         || item.admission.attempt.incarnation != scope.incarnation
+                        || item.admission.attempt.job_queue.as_deref() != Some(scope.queue.as_str())
                     {
                         return Err(EgressError::Unauthorized);
                     }
@@ -359,6 +421,7 @@ impl CredentialProcess {
             }
             _ => {}
         }
+        self.check_job_runners(&scope).await?;
         let jobs = match self.model_jobs(scope.clone()) {
             Ok(jobs) => jobs,
             Err(error) => return Ok(Reply::Jobs(Err(error))),
