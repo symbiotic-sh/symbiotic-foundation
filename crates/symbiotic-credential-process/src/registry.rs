@@ -971,6 +971,7 @@ mod tests {
                 receipt,
                 output: Some(ProviderOutput::Chat {
                     text: "accepted answer".into(),
+                    finish_reason: None,
                 }),
                 error: None,
                 diagnostics: Vec::new(),
@@ -1045,6 +1046,7 @@ mod tests {
                 receipt,
                 output: Some(ProviderOutput::Chat {
                     text: "retained".into(),
+                    finish_reason: None,
                 }),
                 error: None,
                 receipt_persisted: true,
@@ -1350,6 +1352,7 @@ mod tests {
                 receipt,
                 output: Some(ProviderOutput::Chat {
                     text: "retained".into(),
+                    finish_reason: None,
                 }),
                 error: None,
                 receipt_persisted: true,

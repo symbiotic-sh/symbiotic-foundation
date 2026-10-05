@@ -25,12 +25,12 @@ The schema is defined in `crates/symbiotic-egress/src/lib.rs` and `jobs_client.r
 | `Reply` | `Permit(PermitGrant)`, `Dispatched(DispatchResult)`, `GrantRevisionPublished`, `Receipt(Option<DispatchReceipt>)`, `AttemptStatus(AttemptStatus)` |
 | `DurableAttempt` | Exact record binding described below |
 | `AdmissionKey` | Non-Debug/non-Serialize, zeroized HMAC key; `sign_attempt`, `verify_attempt`, `sign_attempt_id`, `verify_attempt_id`, `sign_grant_revision`, `verify_grant_revision` |
-| `ProviderPayload` | `Chat(ChatRequest)`, `Embedding(EmbeddingRequest)` or `Rerank(RerankRequest)`; use its `digest()` helper, never a separately implemented serialization |
+| `ProviderPayload` | `Chat(ChatRequest)`, `Embedding(EmbeddingRequest)`, `Rerank(RerankRequest)` or `Classify(ClassifyRequest)`; use its `digest()` helper, never a separately implemented serialization |
 | `DispatchPermit { token, attempt_digest }` | Opaque random capability, accepted exactly once, including across process restarts |
 | `InjectProviderCredential` | `operation_version`, `admission`, `permit`, `payload` |
 | `DispatchResult` | `receipt`, optional typed `output`, optional static `error: EgressError`, typed `diagnostics: Vec<DispatchDiagnostic>`, `receipt_persisted` |
 | `DispatchReceipt` | `attempt_digest`, `AttemptId`, typed `SpendReceiptRef`, `DispatchStatus`, provider-reported `UsageTrace`, read-only `SpendState` |
-| `ProviderOutput` | Chat text, embedding vectors/dimensions or rerank hits; no raw provider response, raw error, credentials or trace metadata |
+| `ProviderOutput` | Chat text with optional typed finish reason, embedding vectors/dimensions, rerank hits or typed classifier answers; no raw provider response, raw error, credentials or trace metadata |
 
 `DurableAttempt` and related wire types are defined in
 [`crates/symbiotic-egress/src/lib.rs`](../../crates/symbiotic-egress/src/lib.rs).
@@ -408,7 +408,8 @@ the process UID, be regular, have no group/other permission bits, and not be sym
 No remote secret backend or credential creation/rotation is performed.
 Secret buffers and adapter key storage zeroize on drop.
 
-Configured providers include `open_ai_chat { operator }`,
+Configured providers include `open_ai_chat { operator, thinking, reasoning_effort }`,
+`anthropic_chat { operator, thinking }`, `jev_classifier { operator }`,
 `gemini_embedding { dimensions }`, `compatible_embedding { adapter, operator,
 dimensions, embedding_full_dimensions, embedding_input_tokens }` (adapter `open_ai_embedding` or
 `ollama_embedding`), and `cohere_rerank { operator, rerank_input_bytes,
@@ -423,6 +424,54 @@ to `https://generativelanguage.googleapis.com/v1beta` and safe model-name charac
 HTTPS is required except explicitly enabled loopback HTTP. Userinfo, URL queries,
 fragments, caller-controlled hosts and redirects are refused. The credential process ignores
 ambient HTTP/HTTPS/ALL proxy settings so only the configured destination receives secrets.
+
+OpenAI-compatible `thinking` is optional (`enabled` or `disabled`) and sends
+`{"thinking":{"type":"enabled"}}` or `{"thinking":{"type":"disabled"}}` only
+when configured. Optional typed `reasoning_effort` (`low`, `medium`, `high`) sends
+that string only when configured; combining it with disabled thinking is refused.
+Rabbithole's deployed DeepSeek profile uses enabled thinking and low effort. These
+settings participate in the existing route configuration revision and use the same
+encoder for admission byte checks and HTTP transmission.
+
+Direct dispatch `DispatchResult` chat output includes
+`finish_reason: Option<FinishReason>`. OpenAI `stop` and
+Anthropic `end_turn`/`stop_sequence` map to `stop`; OpenAI `length` and Anthropic
+`max_tokens`/`model_context_window_exceeded` map to `length`; other reported values
+map to `other`. An absent provider reason remains absent. Token-limited text remains
+available with its finish reason and accounting receipt, including recovery.
+Arbitrary provider reason strings are excluded from direct dispatch output.
+Anthropic tool, pause and refusal outcomes remain visible errors under the existing
+Messages adapter contract; their partial text is never returned as a supported chat answer.
+
+`ProviderPayload::Classify(ClassifyRequest)` uses the existing Jev System One
+adapter at `POST {destination}/systemone`. The state is a JSON object containing
+application data; questions are typed Noul, Choice or Score values. No arbitrary
+HTTP body or provider options pass through. Question and option vector order is
+the provider presentation order; returned answers preserve question order. The
+route model is also the expected served model. Direct dispatch returns only the
+validated `ClassifierAnswer` vector; raw response, provider metadata and local
+trace labels are excluded. Applications own classification meaning and thresholds.
+
+Job completions retain the sanitized canonical runtime response, as described by
+`JobDelivery::output`: chat retains the provider's finish-reason string, and
+classification includes `served_model` and `trace` alongside `answers`. Raw
+provider responses and provider trace metadata are removed; runtime bookkeeping
+remains in the trace. The direct dispatch normalization and answers-only
+guarantees do not apply to job completions.
+
+Classification uses the same signed payload digest, grant revision acceptance,
+exclusive authority deadline, permit consumption, account reservation and recovery
+path as chat. Admission and transmission share the Jev encoder and question/token
+checks. One permit authorizes one HTTP send; reattachment or recovery never resends
+it. A crash after sending and before durable completion retains unknown spend and
+refuses replay. Existing model jobs also execute classification through their shared
+runner. No new database, index, queue, cache or scheduler is introduced.
+
+The `rabbithole_*` integration tests in
+`crates/symbiotic-credential-process/tests/egress.rs` cover settings omission and
+exact request bodies, finish reasons and recovered output, typed Jev answers and
+once-only accounting, pre-consumption validation, and executable kill/reopen
+without a second provider request.
 
 `max_input_bytes` bounds both the typed payload and the complete encoded HTTP body,
 including model names, repeated Gemini batch wrappers and JSON escaping. The same capped

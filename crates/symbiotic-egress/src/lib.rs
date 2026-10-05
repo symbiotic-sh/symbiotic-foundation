@@ -3,7 +3,8 @@
 //! All protocol timestamps are absolute Unix seconds (UTC), never milliseconds.
 
 pub use symbiotic_model::{
-    ChatMessage, ChatRequest, EmbeddingRequest, SpendReceiptRef, SpendState,
+    ChatMessage, ChatRequest, ClassifierAnswer, ClassifierQuestion, ClassifyRequest,
+    EmbeddingRequest, SpendReceiptRef, SpendState,
 };
 
 use async_trait::async_trait;
@@ -199,16 +200,18 @@ pub struct SignedAttemptId {
     pub authentication: String,
 }
 
-/// One supported provider call; neither variant contains credentials or URLs.
+/// One supported provider call; no variant contains credentials or URLs.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
 pub enum ProviderPayload {
-    /// Chat through a configured OpenAI-compatible route.
+    /// Chat through a configured OpenAI-compatible or Anthropic route.
     Chat(symbiotic_model::ChatRequest),
     /// Embeddings through a configured embedding adapter.
     Embedding(symbiotic_model::EmbeddingRequest),
     /// Reranking through a configured Cohere-compatible adapter.
     Rerank(symbiotic_model::RerankRequest),
+    /// Typed state and questions through a configured Jev route.
+    Classify(ClassifyRequest),
 }
 
 impl ProviderPayload {
@@ -380,8 +383,13 @@ pub struct InjectProviderCredential {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderOutput {
-    /// Model text.
-    Chat { text: String },
+    /// Model text and the provider's completion category when reported.
+    Chat {
+        /// Returned text, including output stopped at a token limit.
+        text: String,
+        /// None only when the provider did not report a finish reason.
+        finish_reason: Option<FinishReason>,
+    },
     /// Embedding vectors.
     Embedding {
         #[serde(deserialize_with = "deserialize_output_numbers")]
@@ -392,6 +400,12 @@ pub enum ProviderOutput {
     Rerank {
         #[serde(deserialize_with = "deserialize_output_numbers")]
         hits: Vec<symbiotic_model::RerankHit>,
+    },
+    /// Validated classification answers in request question order.
+    Classify {
+        /// Typed probabilities, choices and scores; no raw response or metadata.
+        #[serde(deserialize_with = "deserialize_output_numbers")]
+        answers: Vec<ClassifierAnswer>,
     },
 }
 
@@ -405,6 +419,18 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// Direct dispatch completion category; provider strings are normalized here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// Normal completion or a requested stop sequence.
+    Stop,
+    /// Output or context token capacity was exhausted.
+    Length,
+    /// Another provider-reported completion reason.
+    Other,
 }
 
 /// Outcome of one attempted dispatch, safe to log (no provider error strings).

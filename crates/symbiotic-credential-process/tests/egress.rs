@@ -86,6 +86,7 @@ struct Fixture {
     dir: tempfile::TempDir,
     config: ProcessConfig,
     calls: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
 }
 impl Fixture {
     async fn new(status: u16, output: String, delay: Duration) -> Self {
@@ -138,10 +139,13 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let output = output.clone();
                 let count = count.clone();
+                let captured = captured.clone();
                 let response_gate = response_gate.clone();
                 tokio::spawn(async move {
                     let mut data = Vec::new();
@@ -180,6 +184,13 @@ impl Fixture {
                                     !String::from_utf8_lossy(&data[header_end + 4..])
                                         .contains("synthetic-WP14-credential")
                                 );
+                                captured.lock().unwrap().push((
+                                    headers.lines().next().unwrap().to_owned(),
+                                    serde_json::from_slice(
+                                        &data[header_end + 4..header_end + 4 + len],
+                                    )
+                                    .unwrap(),
+                                ));
                                 break;
                             }
                         }
@@ -236,6 +247,8 @@ impl Fixture {
                 model: "test-model".into(),
                 provider: RouteProvider::OpenAiChat {
                     operator: "test".into(),
+                    thinking: None,
+                    reasoning_effort: None,
                 },
                 allow_loopback_http: true,
                 max_input_bytes: 32768,
@@ -248,7 +261,12 @@ impl Fixture {
                 timeout_seconds: 1,
             }],
         };
-        Self { dir, config, calls }
+        Self {
+            dir,
+            config,
+            calls,
+            requests,
+        }
     }
     async fn process(&self) -> CredentialProcess {
         let process = CredentialProcess::open(self.config.clone()).unwrap();
@@ -1570,7 +1588,7 @@ async fn executable_dispatch(
     );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert!(
-        matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "process answer")
+        matches!(&result.output, Some(ProviderOutput::Chat { text, .. }) if text == "process answer")
     );
     child.0.kill().unwrap();
     child.0.wait().unwrap();
@@ -1784,7 +1802,9 @@ async fn runtime_bookkeeping_failure_retains_paid_output_and_safe_diagnostic() {
     assert_eq!(result.error, None);
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert!(result.receipt_persisted);
-    assert!(matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "paid answer"));
+    assert!(
+        matches!(result.output, Some(ProviderOutput::Chat { text, .. }) if text == "paid answer")
+    );
     assert_eq!(result.receipt.usage.input_tokens, Some(7));
     assert_eq!(result.receipt.usage.output_tokens, Some(3));
     assert_eq!(result.receipt.spend_state, SpendState::Settled);
@@ -3007,7 +3027,7 @@ async fn supervision_engine_restart_consumes_saved_completion_without_second_pay
     assert_ne!(first_pid, second_pid);
     let result = dispatched(dispatch.await.unwrap().result.unwrap());
     assert!(
-        matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "saved completion")
+        matches!(&result.output, Some(ProviderOutput::Chat { text, .. }) if text == "saved completion")
     );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !fixture.dir.path().join("engine.result").exists() {
@@ -3270,7 +3290,7 @@ async fn anthropic_route_dispatches_only_through_the_credential_permit_and_recov
                     .unwrap(),
             );
             assert!(
-                matches!(&result.output, Some(ProviderOutput::Chat {text}) if text == "answer")
+                matches!(&result.output, Some(ProviderOutput::Chat {text, ..}) if text == "answer")
             );
             assert_eq!(result.receipt.usage.input_tokens, Some(7));
             assert_eq!(result.receipt.usage.output_tokens, Some(348));
@@ -3411,7 +3431,7 @@ async fn in_process_nonfinite_temperatures_cannot_alias_an_admitted_request() {
             .unwrap(),
     );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
-    assert!(matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "answer"));
+    assert!(matches!(result.output, Some(ProviderOutput::Chat { text, .. }) if text == "answer"));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
 }
@@ -3601,7 +3621,7 @@ async fn in_process_oversized_recovered_response_is_refused_without_losing_the_a
             .unwrap(),
     );
     assert!(result.receipt_persisted);
-    assert!(matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == &answer));
+    assert!(matches!(&result.output, Some(ProviderOutput::Chat { text, .. }) if text == &answer));
     drop(process);
 
     let mut smaller = fixture.config.clone();
@@ -3720,7 +3740,7 @@ async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_rese
     .await
     .unwrap();
     assert!(
-        matches!(&result.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
+        matches!(&result.output, Some(ProviderOutput::Chat { text, .. }) if text == "thread answer")
     );
     assert!(result.receipt_persisted);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
@@ -3733,7 +3753,7 @@ async fn in_process_exchange_survives_a_dropped_caller_and_recovers_without_rese
     };
     assert_eq!(result.receipt.reference, recovered.receipt.reference);
     assert!(
-        matches!(recovered.output, Some(ProviderOutput::Chat { text }) if text == "thread answer")
+        matches!(recovered.output, Some(ProviderOutput::Chat { text, .. }) if text == "thread answer")
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
@@ -3767,7 +3787,7 @@ async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
     );
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert!(
-        matches!(result.output, Some(ProviderOutput::Chat { text }) if text == "resolver answer")
+        matches!(result.output, Some(ProviderOutput::Chat { text, .. }) if text == "resolver answer")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
@@ -5254,4 +5274,708 @@ async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
         Err(JobsClientError::Egress(EgressError::StateUnavailable))
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn rabbithole_unset_settings_preserve_route_identity_and_job_reattachment() {
+    let fixture = Fixture::new(200, "reattached answer".into(), Duration::ZERO).await;
+    let route = &fixture.config.routes[0];
+    // This is the provider encoding before optional OpenAI settings existed.
+    assert_eq!(
+        serde_json::to_string(&route.provider).unwrap(),
+        r#"{"kind":"open_ai_chat","operator":"test"}"#
+    );
+    let revision = symbiotic_ai_runtime::model::configuration_revision(route).unwrap();
+    for (thinking, reasoning_effort) in [(Some("enabled"), None), (None, Some("low"))] {
+        let mut configured = route.clone();
+        configured.provider = serde_json::from_value(serde_json::json!({
+            "kind": "open_ai_chat", "operator": "test",
+            "thinking": thinking, "reasoning_effort": reasoning_effort
+        }))
+        .unwrap();
+        assert_ne!(
+            symbiotic_ai_runtime::model::configuration_revision(&configured).unwrap(),
+            revision
+        );
+    }
+
+    let client = InProcessEgressClient::new(fixture.process().await);
+    let mut input = queued(&fixture, "reattach");
+    input.admission.attempt.expires_at = unix_seconds();
+    input.admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(input.admission.attempt)
+        .unwrap();
+    let id = enqueue_id(&client, input.clone()).await;
+    wait_job(&client, &id, JobState::AwaitingAdmission).await;
+    drop(client);
+
+    let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+    assert_eq!(enqueue_id(&client, input).await, id);
+    let (admission, _) = fixture.job_attempt("reattach", 2, 2);
+    job_call(
+        &client,
+        JobsCommand::AdmitJob {
+            job: id.clone(),
+            admission: Box::new(admission),
+        },
+    )
+    .await
+    .unwrap();
+    wait_job(&client, &id, JobState::Succeeded).await;
+    let new_id = enqueue_id(&client, queued(&fixture, "new-job")).await;
+    wait_job(&client, &new_id, JobState::Succeeded).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unset_thinking_retry_preserves_prechange_spend_binding_after_reopen() {
+    use symbiotic_ai_runtime::{
+        BindingIdentity, ModelBinding, ModelProvider, SpendLedger, SpendReceiptRef,
+        SpendReservation, SpendState,
+        jobs::model_job_payload,
+        model::{OpenAiCompatibleChatProvider, configuration_revision},
+        spend::SqliteSpendLedger,
+    };
+    use symbiotic_queue::jobs::{
+        Execution, JobLimits, JobRequest, JobResolution, JobResponse, JobSpec,
+    };
+    use symbiotic_queue_sqlite::jobs::jobs_in_transaction;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "authorized retry".into(), Duration::ZERO).await;
+        // Initialize the same route registry and grant revision, without starting a worker.
+        drop(fixture.process().await);
+        let route = &fixture.config.routes[0];
+        let input = queued(&fixture, "prechange-reservation");
+        let scope = jobs_scope();
+        let invocation =
+            serde_json::to_string(&(&scope, &input.admission.attempt.invocation_id)).unwrap();
+        let ProviderPayload::Chat(mut request) = input.payload else {
+            panic!("chat payload")
+        };
+        request.source = Some(invocation.clone());
+
+        // Historical adapter construction: optional thinking/effort setters were absent.
+        let legacy =
+            OpenAiCompatibleChatProvider::new("test", &route.model, &route.destination, "")
+                .with_timeout(route.timeout_seconds)
+                .unwrap()
+                .with_request_limit(route.max_input_bytes)
+                .with_response_limit(route.max_response_bytes)
+                .with_output_limit(route.max_output_tokens);
+        let binding = ModelBinding::new(legacy).with_identity(BindingIdentity::new(
+            &route.tenant,
+            &route.route,
+            configuration_revision(route).unwrap().0,
+            &route.account,
+        ));
+        let mut descriptor = binding.provider.descriptor().clone();
+        descriptor.metadata = serde_json::json!({
+            "configuration": descriptor.metadata, "binding": binding.identity
+        });
+        let reservation = SpendReservation {
+            reference: SpendReceiptRef::new("job:prechange-reservation").unwrap(),
+            account: symbiotic_ai_runtime::account_scope(binding.identity.as_ref().unwrap(), None)
+                .unwrap(),
+            invocation: symbiotic_ai_runtime::model::execution_invocation_identity(
+                binding.identity.as_ref().unwrap(),
+                &invocation,
+            )
+            .unwrap(),
+            binding: configuration_revision(&(
+                "chat",
+                &descriptor,
+                &binding.identity,
+                configuration_revision(&request).unwrap().0,
+            ))
+            .unwrap()
+            .0,
+            request_limit: route.provider_request_limit,
+        };
+        let path = fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        assert!(
+            ledger
+                .reserve_explicit(&reservation, route.max_attempts)
+                .unwrap()
+        );
+        drop(ledger);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let mut tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let JobResponse::Enqueued(items) = jobs_in_transaction(
+            &mut tx,
+            &scope,
+            &fixture.config.jobs,
+            chrono::Utc::now(),
+            JobRequest::Enqueue(vec![JobSpec {
+                key: input.admission.attempt.invocation_id.clone(),
+                kind: route.route.clone(),
+                group: input.group,
+                owners: input.owners,
+                execution: Execution::Model,
+                payload: model_job_payload(&binding, &request).unwrap(),
+                admission: Some(serde_json::to_vec(&input.admission).unwrap()),
+                limits: JobLimits {
+                    max_attempts: route.max_attempts,
+                },
+                recovery_until: chrono::DateTime::from_timestamp(
+                    input.admission.attempt.recovery_expires_at as i64,
+                    0,
+                ),
+            }]),
+        )
+        .unwrap() else {
+            panic!("historical enqueue")
+        };
+        let Enqueued::Inserted(id) = &items[0] else {
+            panic!("historical job")
+        };
+        let id = id.clone();
+        assert!(matches!(
+            jobs_in_transaction(
+                &mut tx,
+                &scope,
+                &fixture.config.jobs,
+                chrono::Utc::now(),
+                JobRequest::ClaimPaid {
+                    job: id.clone(),
+                    receipt: reservation.reference.as_str().into(),
+                },
+            )
+            .unwrap(),
+            JobResponse::Job(Some(_))
+        ));
+        tx.commit().unwrap();
+        drop(conn); // Crash after reservation, before HTTP.
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+
+        // Trusted evidence that transport never started releases the historical receipt.
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        ledger
+            .release_before_dispatch(&reservation.reference)
+            .unwrap();
+        let receipt = ledger.receipt(&reservation.reference).unwrap().unwrap();
+        assert_eq!(receipt.state, SpendState::Released);
+        assert!(receipt.pre_dispatch_released);
+        assert_eq!(receipt.attempt_limit, Some(route.max_attempts));
+        assert_eq!(receipt.attempts_used, 0);
+        drop(ledger);
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let mut tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        jobs_in_transaction(
+            &mut tx,
+            &scope,
+            &fixture.config.jobs,
+            chrono::Utc::now(),
+            JobRequest::Resolve {
+                job: id.clone(),
+                generation: 1,
+                resolution: JobResolution::KnownZeroCharge {
+                    receipt: reservation.reference.as_str().into(),
+                },
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+        let waiting = wait_job(&client, &id, JobState::AwaitingAdmission).await;
+        assert_eq!(
+            waiting.receipt.as_deref(),
+            Some(reservation.reference.as_str())
+        );
+        assert_eq!(waiting.generation, 1);
+        let (admission, _) = fixture.job_attempt("prechange-reservation", 2, 2);
+        job_call(
+            &client,
+            JobsCommand::AdmitJob {
+                job: id.clone(),
+                admission: Box::new(admission),
+            },
+        )
+        .await
+        .unwrap();
+        let completed = wait_job(&client, &id, JobState::Succeeded).await;
+        assert_eq!(completed.generation, 2);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let ledger = SqliteSpendLedger::open(&path).unwrap();
+        let receipt = ledger
+            .receipt(&SpendReceiptRef::new(completed.receipt.unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, SpendState::Settled);
+        assert_eq!(receipt.reservation.binding, reservation.binding);
+        let new_id = enqueue_id(&client, queued(&fixture, "after-retry")).await;
+        wait_job(&client, &new_id, JobState::Succeeded).await;
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("released historical reservation must retry within five seconds");
+}
+
+#[tokio::test]
+async fn rabbithole_jobs_preserve_canonical_completion_shapes() {
+    for classify in [false, true] {
+        let mut fixture = if classify {
+            rabbithole_jev_fixture(None).await
+        } else {
+            Fixture::with_http_response(
+                200,
+                serde_json::json!({"choices":[{"message":{"content":"answer"},
+                    "finish_reason":"content_filter"}],
+                    "usage":{"prompt_tokens":7,"completion_tokens":3}})
+                .to_string(),
+                Duration::ZERO,
+                "0",
+                true,
+                false,
+            )
+            .await
+        };
+        fixture.config.routes[0].provider_request_limit = None;
+        let process = fixture.process().await;
+        let (admission, payload) = if classify {
+            rabbithole_classify_attempt(&fixture)
+        } else {
+            fixture.attempt("direct-shape", 1, 1)
+        };
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission, payload.clone(), granted))
+                .await
+                .unwrap(),
+        );
+        assert!(result.error.is_none());
+        let direct = serde_json::to_value(result.output).unwrap();
+        if classify {
+            assert_eq!(direct.as_object().unwrap().len(), 2); // kind and answers
+        } else {
+            assert_eq!(direct["finish_reason"], "other");
+        }
+
+        let client = InProcessEgressClient::new(process);
+        let mut input = queued(&fixture, "job-shape");
+        input.payload = payload;
+        input.admission.attempt.input_digest = input.payload.digest().unwrap();
+        input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(input.admission.attempt)
+            .unwrap();
+        let id = enqueue_id(&client, input).await;
+        wait_job(&client, &id, JobState::Succeeded).await;
+        let JobsReply::Completions(page) = job_call(
+            &client,
+            JobsCommand::Completions {
+                limit: 1,
+                max_bytes: 65536,
+                wait_seconds: 0,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("completions")
+        };
+        let output = page.items[0].output.as_ref().unwrap();
+        assert!(output["raw_provider_response"].is_null());
+        assert!(output["trace"].is_object());
+        let metadata = output["trace"]["metadata"].as_object().unwrap();
+        assert!(metadata["value"].is_null());
+        assert!(metadata.get("provider").is_none());
+        assert!(metadata["spend_receipt"].is_string());
+        if classify {
+            assert_eq!(output["served_model"], "test-model");
+            assert_eq!(output["answers"], direct["answers"]);
+        } else {
+            assert_eq!(output["finish_reason"], "content_filter");
+            assert_eq!(output["text"], direct["text"]);
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn rabbithole_deepseek_settings_reach_wire_only_when_configured() {
+    for configured in [false, true] {
+        let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+        if configured {
+            fixture.config.routes[0].provider = serde_json::from_value(serde_json::json!({
+                "kind":"open_ai_chat", "operator":"test",
+                "thinking":"enabled", "reasoning_effort":"low"
+            }))
+            .unwrap();
+        }
+        let process = fixture.process().await;
+        let (admission, payload) = fixture.attempt("deepseek", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission, payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert!(result.error.is_none());
+        let requests = fixture.requests.lock().unwrap();
+        let body = &requests[0].1;
+        if configured {
+            assert_eq!(body["thinking"], serde_json::json!({"type":"enabled"}));
+            assert_eq!(body["reasoning_effort"], "low");
+        } else {
+            assert!(body.get("thinking").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rabbithole_chat_finish_reasons_survive_in_process_and_recovery() {
+    for (anthropic, reason, expected) in [
+        (false, "stop", "stop"),
+        (false, "length", "length"),
+        (false, "content_filter", "other"),
+        (false, "", "absent"),
+        (true, "end_turn", "stop"),
+        (true, "stop_sequence", "stop"),
+        (true, "max_tokens", "length"),
+        (true, "model_context_window_exceeded", "length"),
+        (true, "tool_use", "refused"),
+    ] {
+        let mut body = if anthropic {
+            serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":reason,
+                "usage":{"input_tokens":7,"output_tokens":3}})
+        } else {
+            serde_json::json!({"choices":[{"message":{"content":"answer"},"finish_reason":reason}],
+                "usage":{"prompt_tokens":7,"completion_tokens":3}})
+        };
+        if expected == "absent" {
+            body["choices"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("finish_reason");
+        }
+        let mut fixture =
+            Fixture::with_http_response(200, body.to_string(), Duration::ZERO, "0", true, false)
+                .await;
+        if anthropic {
+            fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+                operator: "test".into(),
+                thinking: None,
+            };
+        }
+        let process = fixture.process().await;
+        let (admission, payload) = fixture.attempt("finish", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission.clone(), payload, granted))
+                .await
+                .unwrap(),
+        );
+        if expected == "refused" {
+            assert_eq!(result.error, Some(EgressError::Transport));
+            assert!(result.output.is_none());
+            assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+            drop(process);
+            let process = fixture.process().await;
+            assert!(matches!(
+                status(&process, &admission).await,
+                AttemptStatus::Failed { .. }
+            ));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            continue;
+        }
+        assert!(result.error.is_none(), "{reason}: {:?}", result.error);
+        let output = serde_json::to_value(&result.output).unwrap();
+        if expected == "absent" {
+            assert!(output["finish_reason"].is_null());
+        } else {
+            assert_eq!(output["finish_reason"], expected);
+        }
+        assert!(result.receipt_persisted);
+        drop(process);
+        let process = fixture.process().await;
+        let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await
+        else {
+            panic!("missing chat completion")
+        };
+        assert_eq!(serde_json::to_value(recovered.output).unwrap(), output);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+async fn rabbithole_jev_fixture(gate: Option<Arc<tokio::sync::Semaphore>>) -> Fixture {
+    let body = serde_json::json!({"model":"test-model", "answers":{
+        "continue":{"type":"noul","noul":0.1200},
+        "parent":{"type":"choice","choice":"none","probabilities":{"previous":0.25,"none":0.75}},
+        "strength":{"type":"score","score":0.75,"probabilities":{"0":0.25,"1":0.75}}
+    }, "usage":{"input_tokens":612,"output_tokens":20,"cost":"0.001"}, "debug":"private-provider-debug"});
+    let mut fixture = Fixture::with_response_gate(
+        200,
+        body.to_string(),
+        Duration::ZERO,
+        "0",
+        true,
+        false,
+        gate,
+    )
+    .await;
+    fixture.config.routes[0].provider =
+        serde_json::from_value(serde_json::json!({"kind":"jev_classifier","operator":"test"}))
+            .unwrap();
+    fixture.config.routes[0].provider_request_limit = Some(1);
+    fixture.config.routes[0].timeout_seconds = 5;
+    fixture
+}
+
+fn rabbithole_classify_attempt(fixture: &Fixture) -> (SignedAttempt, ProviderPayload) {
+    let request = ClassifyRequest::new(
+        serde_json::from_value(serde_json::json!({"lines":{"m000":{"text":"hello","seconds_since_previous":12,"weight":0.25}}})).unwrap(),
+        vec![
+            ClassifierQuestion::noul("continue", "Does m000 continue an exchange?", None, None),
+            ClassifierQuestion::choice(
+                "parent",
+                "Which line?",
+                [("previous", "Earlier line"), ("none", "No line")],
+            ),
+            ClassifierQuestion::score("strength", "How strong?", ["Weak", "Strong"]),
+        ],
+    );
+    let payload: ProviderPayload =
+        serde_json::from_value(serde_json::json!({"kind":"classify","request":request})).unwrap();
+    let (signed, _) = fixture.attempt("classification", 1, 1);
+    let mut attempt = signed.attempt;
+    attempt.input_digest = payload.digest().unwrap();
+    (
+        AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(attempt)
+            .unwrap(),
+        payload,
+    )
+}
+
+#[tokio::test]
+async fn rabbithole_classification_charges_once_and_recovers_typed_answers() {
+    let fixture = rabbithole_jev_fixture(None).await;
+    let process = fixture.process().await;
+    let (admission, payload) = rabbithole_classify_attempt(&fixture);
+    let granted = permit(&process, &admission).await;
+    let result = dispatched(
+        exchange(
+            &process,
+            inject(admission.clone(), payload.clone(), granted.clone()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(result.error.is_none());
+    assert!(result.receipt_persisted);
+    assert_eq!(result.receipt.spend_state, SpendState::Settled);
+    assert_eq!(result.receipt.usage.input_tokens, Some(612));
+    assert_eq!(
+        result.receipt.usage.reported_cost_usd.as_deref(),
+        Some("0.001")
+    );
+    let output = serde_json::to_value(&result.output).unwrap();
+    assert_eq!(output["kind"], "classify");
+    assert_eq!(output["answers"][0]["question_id"], "continue");
+    assert_eq!(output["answers"][0]["value"]["noul"]["probability"], 0.12);
+    assert_eq!(output["answers"][1]["value"]["choice"]["chosen"], "none");
+    assert_eq!(output["answers"][2]["value"]["score"]["value"], 0.75);
+    assert!(output.get("raw_provider_response").is_none());
+    {
+        let requests = fixture.requests.lock().unwrap();
+        assert!(requests[0].0.starts_with("POST /v1/systemone "));
+        assert_eq!(requests[0].1["state"]["lines"]["m000"]["text"], "hello");
+        assert_eq!(
+            requests[0].1["state"]["lines"]["m000"]["seconds_since_previous"],
+            12
+        );
+        assert_eq!(requests[0].1["state"]["lines"]["m000"]["weight"], 0.25);
+        assert_eq!(requests[0].1["questions"]["continue"]["type"], "noul");
+        assert!(requests[0].1.get("metadata").is_none());
+    }
+    drop(process);
+    let process = fixture.process().await;
+    let AttemptStatus::Completed { result: recovered } = status(&process, &admission).await else {
+        panic!("missing classification")
+    };
+    assert_eq!(serde_json::to_value(recovered.output).unwrap(), output);
+    assert!(matches!(
+        exchange(&process, inject(admission, payload, granted)).await,
+        Err(EgressError::PermitRefused)
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
+#[tokio::test]
+async fn rabbithole_classification_crash_never_resends_or_charges_again() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = rabbithole_jev_fixture(Some(Arc::new(tokio::sync::Semaphore::new(0)))).await;
+    let config = fixture.dir.path().join("config.json");
+    std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = std::process::Command::new(credential_process());
+    command
+        .arg(&config)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = Child(command.spawn().unwrap());
+    let client = socket::UnixEgressClient {
+        path: fixture.config.socket_path.clone(),
+        max_frame_bytes: fixture.config.max_frame_bytes,
+        timeout: Duration::from_secs(2),
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            assert!(child.0.try_wait().unwrap().is_none());
+            match exchange_client(&client, publish_revision(1)).await {
+                Ok(Reply::GrantRevisionPublished) => break,
+                Err(EgressError::Transport) => tokio::time::sleep(Duration::from_millis(10)).await,
+                _ => panic!("child startup failed"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let (admission, payload) = rabbithole_classify_attempt(&fixture);
+    let Reply::Permit(grant) =
+        exchange_client(&client, Operation::IssuePermit(admission.clone().into()))
+            .await
+            .unwrap()
+    else {
+        panic!("missing permit")
+    };
+    let peer = send_without_reading(
+        &client,
+        inject(admission.clone(), payload.clone(), grant.permit.clone()),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.calls.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    drop(peer);
+    let before = ledger_totals(&fixture);
+    let process = fixture.process().await;
+    let AttemptStatus::Dispatched { receipt } = status(&process, &admission).await else {
+        panic!("crash must retain unknown dispatch")
+    };
+    assert_eq!(receipt.spend_state, SpendState::Unknown);
+    assert!(matches!(
+        exchange(&process, inject(admission.clone(), payload, grant.permit)).await,
+        Err(EgressError::PermitRefused)
+    ));
+    let reattached = permit(&process, &admission).await;
+    assert!(!reattached.token.is_empty());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), before);
+}
+
+#[tokio::test]
+async fn rabbithole_classification_validation_precedes_consumption() {
+    let fixture = rabbithole_jev_fixture(None).await;
+    let process = fixture.process().await;
+    for (invocation, questions) in [
+        ("empty", vec![]),
+        (
+            "options",
+            vec![ClassifierQuestion::choice(
+                "parent",
+                "Which line?",
+                (0..256).map(|i| (format!("m{i}"), "Earlier line")),
+            )],
+        ),
+    ] {
+        let request = ClassifyRequest::new(serde_json::Map::new(), questions);
+        let payload: ProviderPayload =
+            serde_json::from_value(serde_json::json!({"kind":"classify","request":request}))
+                .unwrap();
+        let (signed, _) = fixture.attempt(invocation, 1, 1);
+        let mut attempt = signed.attempt;
+        attempt.input_digest = payload.digest().unwrap();
+        let signed = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(attempt)
+            .unwrap();
+        let granted = permit(&process, &signed).await;
+        assert!(matches!(
+            exchange(&process, inject(signed.clone(), payload, granted)).await,
+            Err(EgressError::InvalidRequest)
+        ));
+        assert!(matches!(
+            status(&process, &signed).await,
+            AttemptStatus::Permitted
+        ));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger_totals(&fixture), (0, 0));
+}
+
+#[tokio::test]
+async fn rabbithole_classification_jobs_reuse_runner_and_strip_raw_response() {
+    let fixture = rabbithole_jev_fixture(None).await;
+    let client = InProcessEgressClient::new(fixture.process().await);
+    let (signed, payload) = rabbithole_classify_attempt(&fixture);
+    let mut attempt = signed.attempt;
+    attempt.job_queue = Some(jobs_scope().queue);
+    let input = EnqueueJob {
+        group: None,
+        owners: vec![],
+        payload,
+        admission: AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(attempt)
+            .unwrap(),
+    };
+    let id = enqueue_id(&client, input.clone()).await;
+    assert_eq!(enqueue_id(&client, input).await, id);
+    wait_job(&client, &id, JobState::Succeeded).await;
+    let JobsReply::Completions(page) = job_call(
+        &client,
+        JobsCommand::Completions {
+            limit: 1,
+            max_bytes: 65536,
+            wait_seconds: 0,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("missing completion")
+    };
+    let output = page.items[0].output.as_ref().unwrap();
+    assert_eq!(output["answers"][0]["question_id"], "continue");
+    assert_eq!(output["answers"][1]["value"]["choice"]["chosen"], "none");
+    assert!(output["raw_provider_response"].is_null());
+    assert!(!output.to_string().contains("private-provider-debug"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger_totals(&fixture), (1, 1));
 }

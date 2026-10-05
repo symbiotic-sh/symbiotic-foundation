@@ -412,6 +412,8 @@ mod clients {
                 model: "model".into(),
                 provider: RouteProvider::OpenAiChat {
                     operator: "test".into(),
+                    thinking: None,
+                    reasoning_effort: None,
                 },
                 allow_loopback_http: false,
                 max_input_bytes: 32768,
@@ -453,4 +455,42 @@ mod clients {
     async fn socket_client_preserves_the_egress_protocol() {
         run(false).await;
     }
+}
+
+#[test]
+fn rabbithole_outputs_round_trip_finish_reasons_and_classification_numbers() {
+    for output in [
+        serde_json::json!({"kind":"chat", "text":"partial", "finish_reason":"length"}),
+        serde_json::json!({"kind":"chat", "text":"answer", "finish_reason":"stop"}),
+        serde_json::json!({"kind":"chat", "text":"answer", "finish_reason":"other"}),
+        serde_json::json!({"kind":"chat", "text":"answer", "finish_reason":null}),
+        serde_json::json!({"kind":"classify", "answers":[
+            {"question_id":"n", "value":{"noul":{"probability":0.12}}},
+            {"question_id":"c", "value":{"choice":{"chosen":"a", "probabilities":[{"id":"a","probability":0.75},{"id":"b","probability":0.25}],"confidence":0.6}}},
+            {"question_id":"s", "value":{"score":{"value":0.75,"probabilities":[0.25,0.75],"confidence":null}}}
+        ]}),
+    ] {
+        let decoded: ProviderOutput =
+            serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), output);
+    }
+}
+
+#[test]
+fn rabbithole_classification_payload_preserves_numeric_state_and_digest() {
+    let state = serde_json::from_str(r#"{"count":12,"fraction":0.1200,"nested":[{"value":0.25}]}"#)
+        .unwrap();
+    let payload = ProviderPayload::Classify(ClassifyRequest::new(
+        state,
+        vec![ClassifierQuestion::noul(
+            "continue",
+            "Does this continue an exchange?",
+            None,
+            None,
+        )],
+    ));
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let decoded: ProviderPayload = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded.digest().unwrap(), payload.digest().unwrap());
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }

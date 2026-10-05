@@ -32,13 +32,27 @@ use symbiotic_egress::*;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteProvider {
     /// Existing OpenAI-compatible chat adapter.
-    OpenAiChat { operator: String },
+    OpenAiChat {
+        /// Provider identity.
+        operator: String,
+        /// Omitted unless configured; encoded as {"type":"enabled"|"disabled"}.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
+        /// Omitted unless configured; refused with disabled thinking.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     /// Anthropic Messages with explicit thinking mode.
     AnthropicChat {
         /// Provider identity.
         operator: String,
         /// Enabled maps to adaptive thinking; Disabled is explicit; None omits it.
         thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
+    },
+    /// Existing System One transport with typed state and questions.
+    JevClassifier {
+        /// Provider identity; the expected served model is the route model.
+        operator: String,
     },
     /// Existing Gemini embedding adapter, pinned to Google's service.
     GeminiEmbedding { dimensions: usize },
@@ -68,6 +82,27 @@ pub enum RouteProvider {
         /// Provider/model query token capacity.
         rerank_query_tokens: usize,
     },
+}
+
+/// Optional reasoning effort for an OpenAI-compatible route.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Low effort, as used by Rabbithole's deployed DeepSeek profile.
+    Low,
+    /// Medium effort.
+    Medium,
+    /// High effort.
+    High,
+}
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 /// Route configured by the credential-process owner. No defaults for safety limits.
@@ -632,7 +667,9 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         {
             Err(EgressError::InvalidRequest)
         }
-        RouteProvider::OpenAiChat { operator } | RouteProvider::AnthropicChat { operator, .. }
+        RouteProvider::OpenAiChat { operator, .. }
+        | RouteProvider::AnthropicChat { operator, .. }
+        | RouteProvider::JevClassifier { operator }
             if operator.is_empty() =>
         {
             Err(EgressError::InvalidRequest)
@@ -647,6 +684,15 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
         return Err(EgressError::LimitExceeded);
     }
     match (&route.provider, payload) {
+        (RouteProvider::JevClassifier { .. }, ProviderPayload::Classify(request)) => {
+            symbiotic_ai_runtime::model::wire::jev_classify_body(
+                &route.model,
+                request,
+                Some(route.max_input_bytes),
+            )
+            .map(|_| ())
+            .map_err(payload_error)
+        }
         (RouteProvider::CompatibleEmbedding { .. }, ProviderPayload::Embedding(request)) => {
             let (adapter, _, settings) = provider::route_settings(route);
             symbiotic_ai_runtime::model::wire::compatible_embedding_body(
@@ -692,13 +738,18 @@ fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<()
                         Some(route.max_input_bytes),
                     )
                 }
-                _ => symbiotic_ai_runtime::model::wire::openai_chat_body(
+                RouteProvider::OpenAiChat {
+                    thinking,
+                    reasoning_effort,
+                    ..
+                } => symbiotic_ai_runtime::model::wire::openai_chat_body(
                     &route.model,
                     request,
-                    None,
-                    None,
+                    *thinking,
+                    reasoning_effort.map(ReasoningEffort::as_str),
                     Some(route.max_input_bytes),
                 ),
+                _ => return Err(EgressError::InvalidRequest),
             }
             .map(|_| ())
             .map_err(payload_error)

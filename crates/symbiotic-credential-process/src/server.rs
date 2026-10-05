@@ -163,6 +163,7 @@ mod tests {
                     },
                     output: Some(symbiotic_egress::ProviderOutput::Chat {
                         text: "paid answer".repeat(1024),
+                        finish_reason: None,
                     }),
                 },
             )),
