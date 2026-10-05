@@ -3367,3 +3367,266 @@ async fn proc1_distinct_accepted_handoffs_consume_their_own_reservations() {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
+
+#[tokio::test]
+async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_telemetry() {
+    assert_answer_recovery_off_privacy(true, None).await;
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_off_rejects_invalid_cost_telemetry() {
+    assert_answer_recovery_off_privacy(false, Some("RuntimeAnswerOffMarker910b")).await;
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_off_preserves_valid_cost_telemetry() {
+    assert_answer_recovery_off_privacy(false, Some("0.000042123456789")).await;
+}
+
+async fn assert_answer_recovery_off_privacy(
+    provider_fields: bool,
+    reported_cost: Option<&'static str>,
+) {
+    const MARKER: &str = "RuntimeAnswerOffMarker910b";
+    #[derive(Clone)]
+    struct Answer {
+        inner: symbiotic_ai_runtime::model::StaticChatProvider,
+        calls: Arc<AtomicUsize>,
+        measured: bool,
+        provider_fields: bool,
+        reported_cost: Option<&'static str>,
+    }
+    impl ModelProvider for Answer {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            self.inner.descriptor()
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for Answer {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut response = self.inner.chat(request).await?;
+            if self.provider_fields {
+                response.trace.trace_id = TraceId(MARKER.into());
+                response.trace.model = ModelIdentity::new(MARKER, MARKER, MARKER);
+                response.trace.source = Some(MARKER.into());
+                response.trace.role_binding = Some(MARKER.into());
+                response.trace.audit_refs = vec![MARKER.into()];
+            }
+            response.trace.usage.reported_cost_usd = self.reported_cost.map(String::from);
+            response.trace.response_hash = Some(MARKER.into());
+            response.trace.metadata = json!({"diagnostic":MARKER});
+            response.trace.usage.response_id = Some(MARKER.into());
+            response.trace.usage.served_model = Some(MARKER.into());
+            if self.measured {
+                response.trace.usage.input_tokens = Some(7);
+            }
+            Ok(response)
+        }
+    }
+    fn has_marker(path: &std::path::Path) -> bool {
+        std::fs::read_dir(path).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                has_marker(&path)
+            } else {
+                std::fs::read(path)
+                    .unwrap()
+                    .windows(MARKER.len())
+                    .any(|bytes| bytes == MARKER.as_bytes())
+            }
+        })
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Changing the policy never reads an earlier retained answer through recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(RuntimeConfig {
+            state_dir: Some(dir.path().join("state")),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let retain = binding(Answer {
+            inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
+            calls: calls.clone(),
+            measured: true,
+            provider_fields,
+            reported_cost,
+        })
+        .with_policy(policy());
+        assert!(
+            runtime
+                .execute_chat(retain.clone(), "retained", request("input"))
+                .await
+                .unwrap()
+                .attempt
+                .unwrap()
+                .unwrap()
+                .output_available
+        );
+        let off = retain.with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off);
+        assert_eq!(
+            runtime
+                .execute_chat(off, "retained", request("input"))
+                .await
+                .unwrap_err()
+                .source
+                .code(),
+            symbiotic_core::DiagnosticCode::InvocationCompleted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for token_usage in [false, true] {
+            let invalid_cost = reported_cost == Some(MARKER);
+            let measured = token_usage || reported_cost.is_some_and(|_| !invalid_cost);
+            for custom_cache in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let trace = Arc::new(symbiotic_trace::InMemoryTraceSink::default());
+                let receipts = Arc::new(InMemoryReceiptSink::default());
+                let persistent_trace =
+                    symbiotic_trace::JsonlTraceSink::open(dir.path().join("traces.jsonl")).unwrap();
+                let runtime = Runtime::open(RuntimeConfig {
+                    state_dir: Some(dir.path().join("state")),
+                    trace_sink: Some(Arc::new(symbiotic_trace::FanoutTraceSink::new(vec![
+                        Box::new((*trace).clone()),
+                        Box::new(persistent_trace),
+                    ]))),
+                    receipt_sink: Some(receipts.clone()),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let configured = binding(Answer {
+                    inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
+                    calls: calls.clone(),
+                    measured: token_usage,
+                    provider_fields,
+                    reported_cost,
+                })
+                .with_policy(policy())
+                .with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off)
+                .with_response_cache(if custom_cache {
+                    ResponseCacheMode::Custom(Arc::new(DirResponseCache::new(
+                        dir.path().join("custom"),
+                    )))
+                } else {
+                    ResponseCacheMode::Default
+                });
+                let provider = runtime.chat(configured.clone()).unwrap();
+                let response = provider.chat(request("input")).await.unwrap();
+                assert_eq!(response.text, MARKER);
+                assert_eq!(
+                    response.trace.usage.reported_cost_usd.as_deref(),
+                    reported_cost
+                );
+                if invalid_cost {
+                    assert!(
+                        response.trace.metadata[symbiotic_ai_runtime::model::RUNTIME_DIAGNOSTICS]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry["error"]
+                                == symbiotic_core::DiagnosticCode::InvalidResponse.code())
+                    );
+                }
+                if measured {
+                    assert_eq!(provider.chat(request("input")).await.unwrap().text, MARKER);
+                } else {
+                    assert_eq!(
+                        provider.chat(request("input")).await.unwrap_err().code(),
+                        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+                    );
+                }
+                let expected_calls = if measured { 3 } else { 2 };
+                let executed = runtime
+                    .execute_chat(configured.clone(), "explicit", request("input"))
+                    .await
+                    .unwrap();
+                assert_eq!(executed.output.text, MARKER);
+                let attempt = executed.attempt.unwrap().unwrap();
+                assert!(!attempt.output_available);
+                assert_eq!(
+                    attempt.state,
+                    if measured {
+                        symbiotic_ai_runtime::SpendState::Settled
+                    } else {
+                        symbiotic_ai_runtime::SpendState::Unknown
+                    }
+                );
+                let receipt = runtime.spend_receipt(&attempt.reference).unwrap().unwrap();
+                assert!(receipt.recovery.is_none());
+                assert_eq!(receipt.output, Some(json!({"output_received":true})));
+                assert_eq!(
+                    receipt.usage.as_ref().and_then(|u| u.input_tokens),
+                    token_usage.then_some(7)
+                );
+                assert_eq!(
+                    receipt
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.reported_cost_usd.as_deref()),
+                    reported_cost.filter(|_| !invalid_cost)
+                );
+                if invalid_cost {
+                    assert!(
+                        executed.output.trace.metadata
+                            [symbiotic_ai_runtime::model::RUNTIME_DIAGNOSTICS]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry["error"]
+                                == symbiotic_core::DiagnosticCode::InvalidResponse.code())
+                    );
+                }
+                assert_eq!(
+                    runtime
+                        .execute_chat(configured.clone(), "explicit", request("input"))
+                        .await
+                        .unwrap_err()
+                        .source
+                        .code(),
+                    symbiotic_core::DiagnosticCode::InvocationCompleted
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                assert!(
+                    !std::fs::read_to_string(dir.path().join("traces.jsonl"))
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                for stored in trace.records() {
+                    assert_eq!(stored.model, provider.descriptor().identity);
+                }
+                assert!(
+                    !serde_json::to_string(&trace.records())
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                assert!(
+                    !serde_json::to_string(&receipts.receipts())
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                assert!(!has_marker(dir.path()));
+                drop(provider);
+                drop(runtime);
+                let runtime = Runtime::open(RuntimeConfig {
+                    state_dir: Some(dir.path().join("state")),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                assert_eq!(
+                    runtime
+                        .execute_chat(configured, "explicit", request("input"))
+                        .await
+                        .unwrap_err()
+                        .source
+                        .code(),
+                    symbiotic_core::DiagnosticCode::InvocationCompleted
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                assert!(!has_marker(dir.path()));
+            }
+        }
+    })
+    .await
+    .expect("bounded runtime privacy regression");
+}

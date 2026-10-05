@@ -117,7 +117,8 @@ restart). Dropped consumer futures leave Foundation-owned execution running.
 The process state lock remains held until its runners drain. Worker failures
 are reported by subsequent job requests and a failed attachment stays refused.
 Ledger-first recovery preserves `Uncertain` after a kill during dispatch and never
-resends it; final output is retained only by the ledger's existing recovery owner.
+resends it; with `answer_recovery: "retain"`, final output is retained only by the
+ledger's existing recovery owner.
 
 The acceptance tests are `jobs_*` in
 `crates/symbiotic-credential-process/tests/egress.rs`: both transports, keyed joins,
@@ -370,6 +371,74 @@ redirects and ambient proxies are disabled; runtime retry budgets are one.
 No monetary reservation is supported or hard dollar ceiling promised; see
 [the spend contract](boundary.md#spend-ledger-and-budgets).
 
+## Per-route answer recovery
+
+`RouteConfig.answer_recovery` accepts `"retain"` (the default when omitted) or
+`"off"`. The setting belongs to the credential owner, participates in the frozen
+route revision, and applies to every capability on that route. Omitting it also
+omits it from route serialization, preserving the existing default route revision.
+This implements the lead's 2026-10-05 “Egress answer persistence for SmartOffice”
+decision: answers derived from messages must never be written to disk; permits,
+attempt state and spend receipts remain durable.
+
+With `off`, direct dispatch returns the paid answer in memory, including its live
+usage and static diagnostics. Its completion transaction stores no `DispatchResult`
+or answer-derived fields. `egress_permits.result` stays SQL NULL; the existing
+`finished` state records 0 (not finished), 1 (default completion), or 2 (finished
+without a retained answer). Recovery returns
+`AttemptStatus::FinishedWithoutAnswer { receipt }`, including after its unused
+answer-recovery deadline. The deadline remains part of the immutable signed
+attempt but need not be later than `recorded_at` in this mode; the existing nonzero
+and integer bounds remain. No new table, column, index or recovery store is added.
+
+The receipt retains its identity, dispatch status, numeric token/media counts,
+validated decimal cost and spend state. Provider-controlled response ID and
+served-model text are omitted from durable usage. The canonical ledger retains
+only its existing `output_received` completion evidence, never the answer or an
+answer hash. Persistent trace/receipt sinks receive numeric usage and operational
+state without response hashes or arbitrary response metadata. Live diagnostics
+remain visible; persistence failures retain the existing conservative accounting
+behavior. The setting is prospective: it does not erase answers previously
+retained by a route configured with `retain`. An `off` runtime binding refuses direct
+explicit-invocation replay of an earlier retained answer for that same invocation.
+Previously retained job answers remain deliverable through job adoption and
+completion delivery until their existing recovery deadline.
+
+All answer-bearing write paths share this policy:
+
+| Path | Behavior with `off` |
+| --- | --- |
+| Direct in-process and socket egress | Answer travels only in the live reply; registry result is NULL |
+| AI runtime explicit invocation recovery | No saved answer; status has `output_available = false`; replay returns `InvocationCompleted` |
+| Runtime default, configured-directory and custom response caches | Neither read nor written |
+| Model job spend-ledger recovery | No saved response; numeric spend and completion evidence commit with final job state |
+| `symbiotic-queue-sqlite` model job results | Model jobs pass no output to the queue; successful completion has `output = None`, `result_expired = true`, and its receipt reference |
+| Trace and usage-receipt sinks | No response hash, provider identity text or response metadata |
+| Queue waiting payload, admission, request hashes, permits and account pacing | Contain input or operational authority/accounting only; provider answers do not enter these fields |
+
+Jobs newly executed under `off` deliver completion and spend references, not
+answer content, even without a crash. Apps needing the live classifier/chat answer
+use direct dispatch on that route. A crash after durable completion but before consuming a
+live reply loses that answer. A caller still needing it starts a **new logical
+invocation**, subject to the same admission, spend and retry rules. Neither
+same-attempt replay nor uncertain-charge recovery resends the old request.
+The equivalent runtime binding setting is
+`ModelBinding::with_answer_recovery(AnswerRecovery::Off)`; egress supplies it from
+the route for direct calls and durable job runners.
+
+Evidence: `regression_answer_recovery_direct_never_writes_answers_or_usage_text`
+checks chat/classifier answer markers in the database and WAL files, numeric
+spend, restart recovery and unchanged default retention.
+`regression_answer_recovery_jobs_never_write_paid_results` covers both queued
+capabilities, reopen, content-free ledger evidence and once-only execution.
+`regression_answer_recovery_crash_after_answer_before_consumption` kills the
+executable after durable completion while the reply remains unread, then checks
+finished-without-answer recovery and refusal to resend.
+`regression_answer_recovery_off_disables_caches_recovery_and_answer_telemetry`
+checks default/custom caches, explicit invocation restart, trace/receipt projection
+and measured/missing-usage accounting. These are synthetic tests, not physical
+power-loss qualification.
+
 ## Deployment and credentials
 
 This section applies to the supported Unix same-UID local backend. It is one
@@ -525,7 +594,8 @@ route model is also the expected served model. Direct dispatch returns only the
 validated `ClassifierAnswer` vector; raw response, provider metadata and local
 trace labels are excluded. Applications own classification meaning and thresholds.
 
-Job completions retain the sanitized canonical runtime response, as described by
+With `answer_recovery: "retain"`, job completions retain the sanitized canonical
+runtime response, as described by
 `JobDelivery::output`: chat retains the provider's finish-reason string, and
 classification includes `served_model` and `trace` alongside `answers`. Raw
 provider responses and provider trace metadata are removed; runtime bookkeeping

@@ -255,6 +255,7 @@ impl Fixture {
             jobs: Default::default(),
             job_runner: Default::default(),
             routes: vec![RouteConfig {
+                answer_recovery: Default::default(),
                 tenant: "tenant".into(),
                 account: "account".into(),
                 account_sharing_key: None,
@@ -6515,4 +6516,341 @@ async fn regression_egress_invalid_retry_hint_preserves_failure_and_diagnostic()
     })
     .await
     .expect("invalid retry hint fixtures must finish within five seconds");
+}
+
+const ANSWER_RECOVERY_MARKER: &str = "AnswerRecoveryOffMarker7e41";
+const CLASSIFY_RECOVERY_MARKER: &str = "0.3141592653589793";
+
+fn state_has_bytes(dir: &std::path::Path, marker: &str) -> bool {
+    std::fs::read_dir(dir).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            state_has_bytes(&path, marker)
+        } else {
+            std::fs::read(&path)
+                .unwrap()
+                .windows(marker.len())
+                .any(|bytes| bytes == marker.as_bytes())
+        }
+    })
+}
+
+async fn answer_recovery_fixture(classify: bool) -> Fixture {
+    let body = if classify {
+        serde_json::json!({"model":"test-model", "id":ANSWER_RECOVERY_MARKER,
+            "answers":{"continue":{"type":"noul","noul":0.3141592653589793},
+            "parent":{"type":"choice","choice":"none","probabilities":{"previous":0.25,"none":0.75}},
+            "strength":{"type":"score","score":0.75,"probabilities":{"0":0.25,"1":0.75}}},
+            "usage":{"input_tokens":7,"output_tokens":3,"cost":"0.001"},
+            "debug":ANSWER_RECOVERY_MARKER})
+    } else {
+        serde_json::json!({"model":ANSWER_RECOVERY_MARKER, "id":ANSWER_RECOVERY_MARKER,
+            "choices":[{"message":{"content":ANSWER_RECOVERY_MARKER,"reasoning_content":ANSWER_RECOVERY_MARKER},
+                "finish_reason":ANSWER_RECOVERY_MARKER}],
+            "usage":{"prompt_tokens":7,"completion_tokens":3,"cost":"0.001"}})
+    };
+    let mut fixture =
+        Fixture::with_http_response(200, body.to_string(), Duration::ZERO, "0", true, false).await;
+    if classify {
+        fixture.config.routes[0].provider = RouteProvider::JevClassifier {
+            operator: "test".into(),
+        };
+    }
+    fixture
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_direct_never_writes_answers_or_usage_text() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for classify in [false, true] {
+            for off in [false, true] {
+                let mut fixture = answer_recovery_fixture(classify).await;
+                if off {
+                    fixture.config.routes[0].answer_recovery =
+                        symbiotic_credential_process::AnswerRecovery::Off;
+                }
+                let process = fixture.process().await;
+                let (mut admission, payload) = if classify {
+                    rabbithole_classify_attempt(&fixture)
+                } else {
+                    fixture.attempt("answer-recovery", 1, 1)
+                };
+                // Off does not require a future answer recovery window.
+                if off {
+                    admission.attempt.recovery_expires_at = admission.attempt.recorded_at;
+                    admission = AdmissionKey::new(KEY.to_vec())
+                        .unwrap()
+                        .sign_attempt(admission.attempt)
+                        .unwrap();
+                }
+                let granted = permit(&process, &admission).await;
+                let result = dispatched(
+                    exchange(
+                        &process,
+                        inject(admission.clone(), payload.clone(), granted.clone()),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                assert!(result.error.is_none() && result.receipt_persisted);
+                let live = serde_json::to_string(&result.output).unwrap();
+                assert!(live.contains(if classify {
+                    CLASSIFY_RECOVERY_MARKER
+                } else {
+                    ANSWER_RECOVERY_MARKER
+                }));
+                let reference = result.receipt.reference.clone();
+                assert_eq!(result.receipt.usage.input_tokens, Some(7));
+                assert_eq!(
+                    result.receipt.usage.reported_cost_usd.as_deref(),
+                    Some("0.001")
+                );
+                // Check while WAL and shared-memory files exist, then after reopen too.
+                assert_eq!(
+                    state_has_bytes(&fixture.config.state_dir, ANSWER_RECOVERY_MARKER),
+                    !off
+                );
+                if classify {
+                    assert_eq!(
+                        state_has_bytes(&fixture.config.state_dir, CLASSIFY_RECOVERY_MARKER),
+                        !off
+                    );
+                }
+                drop(result);
+                drop(process);
+                let process = fixture.process().await;
+                let receipt = match status(&process, &admission).await {
+                    AttemptStatus::FinishedWithoutAnswer { receipt } if off => receipt,
+                    AttemptStatus::Completed { result } if !off => {
+                        assert!(serde_json::to_string(&result.output).unwrap().contains(
+                            if classify {
+                                CLASSIFY_RECOVERY_MARKER
+                            } else {
+                                ANSWER_RECOVERY_MARKER
+                            }
+                        ));
+                        result.receipt
+                    }
+                    _ => panic!("wrong recovered state"),
+                };
+                assert_eq!(receipt.reference, reference);
+                assert_eq!(receipt.status, DispatchStatus::Succeeded);
+                assert_eq!(receipt.spend_state, SpendState::Settled);
+                assert_eq!(receipt.usage.input_tokens, Some(7));
+                assert_eq!(receipt.usage.output_tokens, Some(3));
+                assert_eq!(receipt.usage.reported_cost_usd.as_deref(), Some("0.001"));
+                assert_eq!(receipt.usage.response_id.is_none(), off);
+                assert_eq!(receipt.usage.served_model.is_none(), off);
+                assert_eq!(
+                    state_has_bytes(&fixture.config.state_dir, ANSWER_RECOVERY_MARKER),
+                    !off
+                );
+                assert!(matches!(
+                    exchange(&process, inject(admission, payload, granted)).await,
+                    Err(EgressError::PermitRefused)
+                ));
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(ledger_totals(&fixture), (1, 1));
+            }
+        }
+    })
+    .await
+    .expect("bounded direct answer recovery test");
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_jobs_never_write_paid_results() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for classify in [false, true] {
+            let mut fixture = answer_recovery_fixture(classify).await;
+            fixture.config.routes[0].answer_recovery =
+                symbiotic_credential_process::AnswerRecovery::Off;
+            let client = InProcessEgressClient::new(fixture.process().await);
+            let mut input = queued(&fixture, "no-answer-job");
+            if classify {
+                let (_, payload) = rabbithole_classify_attempt(&fixture);
+                input.payload = payload;
+                input.admission.attempt.input_digest = input.payload.digest().unwrap();
+                input.admission = AdmissionKey::new(KEY.to_vec())
+                    .unwrap()
+                    .sign_attempt(input.admission.attempt)
+                    .unwrap();
+            }
+            let id = enqueue_id(&client, input.clone()).await;
+            let row = wait_job(&client, &id, JobState::Succeeded).await;
+            let reference = row.receipt.clone().unwrap();
+            assert!(row.result_expired && row.output.is_none());
+            assert!(!state_has_bytes(
+                &fixture.config.state_dir,
+                ANSWER_RECOVERY_MARKER
+            ));
+            assert!(!state_has_bytes(
+                &fixture.config.state_dir,
+                CLASSIFY_RECOVERY_MARKER
+            ));
+            drop(client);
+            let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+            let JobsReply::Completions(page) = job_call(
+                &client,
+                JobsCommand::Completions {
+                    limit: 1,
+                    max_bytes: 65536,
+                    wait_seconds: 0,
+                },
+            )
+            .await
+            .unwrap() else {
+                panic!("completions")
+            };
+            assert_eq!(page.items.len(), 1);
+            assert!(page.items[0].output.is_none());
+            assert!(page.items[0].delivery.completion.result_expired);
+            assert_eq!(page.items[0].delivery.completion.state, JobState::Succeeded);
+            assert_eq!(
+                page.items[0].delivery.completion.receipt.as_deref(),
+                Some(reference.as_str())
+            );
+            let conn = rusqlite::Connection::open(
+                fixture
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            let (usage, recovery, output): (String, Option<String>, String) = conn
+                .query_row(
+                    "SELECT usage,recovery,output FROM spend_receipts WHERE reference=?1",
+                    [&reference],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let usage: serde_json::Value = serde_json::from_str(&usage).unwrap();
+            assert_eq!(usage["input_tokens"], 7);
+            assert_eq!(usage["output_tokens"], 3);
+            assert_eq!(usage["reported_cost_usd"], "0.001");
+            assert!(usage["response_id"].is_null() && usage["served_model"].is_null());
+            assert!(recovery.is_none());
+            assert_eq!(output, r#"{"output_received":true}"#);
+            assert_eq!(enqueue_id(&client, input).await, id);
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(ledger_totals(&fixture), (1, 1));
+            assert!(!state_has_bytes(
+                &fixture.config.state_dir,
+                ANSWER_RECOVERY_MARKER
+            ));
+        }
+    })
+    .await
+    .expect("bounded queued answer recovery test");
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_crash_after_answer_before_consumption() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for classify in [false, true] {
+        let mut fixture = answer_recovery_fixture(classify).await;
+        fixture.config.routes[0].answer_recovery =
+            symbiotic_credential_process::AnswerRecovery::Off;
+        let config = fixture.dir.path().join("config.json");
+        std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut child = Child(
+            std::process::Command::new(credential_process())
+                .arg(config)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let client = socket::UnixEgressClient {
+            path: fixture.config.socket_path.clone(),
+            max_frame_bytes: fixture.config.max_frame_bytes,
+            timeout: Duration::from_secs(2),
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none());
+                match exchange_client(&client, publish_revision(1)).await {
+                    Ok(Reply::GrantRevisionPublished) => break,
+                    Err(EgressError::Transport) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    _ => panic!("startup failed"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (admission, payload) = if classify {
+            rabbithole_classify_attempt(&fixture)
+        } else {
+            fixture.attempt("lost-answer", 1, 1)
+        };
+        let Reply::Permit(grant) =
+            exchange_client(&client, Operation::IssuePermit(admission.clone().into()))
+                .await
+                .unwrap()
+        else {
+            panic!("permit")
+        };
+        let peer = send_without_reading(
+            &client,
+            inject(admission.clone(), payload.clone(), grant.permit.clone()),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let conn = rusqlite::Connection::open(
+                    fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
+                .unwrap();
+                let finished: u8 = conn
+                    .query_row("SELECT finished FROM egress_permits", [], |r| r.get(0))
+                    .unwrap();
+                if finished == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("answer must be durably finished before killing child");
+        assert!(!state_has_bytes(
+            &fixture.config.state_dir,
+            ANSWER_RECOVERY_MARKER
+        ));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        drop(peer);
+        let process = fixture.process().await;
+        let AttemptStatus::FinishedWithoutAnswer { receipt } = status(&process, &admission).await
+        else {
+            panic!("finished without answer")
+        };
+        assert_eq!(receipt.spend_state, SpendState::Settled);
+        assert_eq!(receipt.usage.input_tokens, Some(7));
+        assert_eq!(ledger_totals(&fixture), (1, 1));
+        assert!(matches!(
+            exchange(&process, inject(admission, payload, grant.permit)).await,
+            Err(EgressError::PermitRefused)
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(!state_has_bytes(
+            &fixture.config.state_dir,
+            ANSWER_RECOVERY_MARKER
+        ));
+        assert!(!state_has_bytes(
+            &fixture.config.state_dir,
+            CLASSIFY_RECOVERY_MARKER
+        ));
+    }
 }

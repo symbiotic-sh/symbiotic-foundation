@@ -1,4 +1,5 @@
 //! Durable permit replay protection and bounded result recovery; no provider credentials.
+use crate::AnswerRecovery;
 use rusqlite::{Connection, OptionalExtension, params};
 use symbiotic_ai_runtime::{model::AcceptedSpendHandoff, spend::SqliteSpendLedger};
 use symbiotic_egress::*;
@@ -337,22 +338,39 @@ impl Registry {
         Ok(receipt)
     }
 
-    pub(crate) fn finish(&mut self, result: &DispatchResult) -> Result<(), EgressError> {
-        let mut json = serde_json::to_value(result).map_err(|_| EgressError::StateUnavailable)?;
-        json["receipt"] = serde_json::to_value(StoredReceipt::from(&result.receipt))
+    pub(crate) fn finish(
+        &mut self,
+        mode: AnswerRecovery,
+        result: &DispatchResult,
+    ) -> Result<(), EgressError> {
+        let stored_receipt = serde_json::to_value(StoredReceipt::from(&result.receipt))
             .map_err(|_| EgressError::StateUnavailable)?;
-        let receipt = json["receipt"].to_string();
-        let json = json.to_string();
+        let receipt = stored_receipt.to_string();
+        let json = if mode == AnswerRecovery::Retain {
+            let mut json =
+                serde_json::to_value(result).map_err(|_| EgressError::StateUnavailable)?;
+            json["receipt"] = stored_receipt;
+            Some(json.to_string())
+        } else {
+            None
+        };
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
         let changed = tx
             .execute(
-                "UPDATE egress_permits SET receipt=?1, finished=1,
+                // finished: 0 = in flight, 1 = recoverable completion, 2 = no retained answer.
+                "UPDATE egress_permits SET receipt=?1, finished=CASE WHEN ?5 THEN 2 ELSE 1 END,
              result=CASE WHEN recovery_expires_at>?4 THEN ?2 ELSE NULL END
              WHERE attempt_digest=?3 AND consumed=1 AND finished=0",
-                params![receipt, json, result.receipt.attempt_digest, now()?],
+                params![
+                    receipt,
+                    json,
+                    result.receipt.attempt_digest,
+                    now()?,
+                    mode == AnswerRecovery::Off
+                ],
             )
             .map_err(state)?;
         if changed != 1 {
@@ -362,7 +380,7 @@ impl Registry {
         // Settlement remains governed by measured usage, independently of metadata.
         let usage = (result.output.is_some()
             || symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage))
-        .then(|| result.receipt.usage.clone());
+        .then(|| mode.stored_usage(result.receipt.usage.clone()));
         SqliteSpendLedger::finish_in(
             &tx,
             &result.receipt.reference,
@@ -420,7 +438,7 @@ impl Registry {
                 |row| {
                     Ok((
                         row.get::<_, bool>(0)?,
-                        row.get::<_, bool>(1)?,
+                        row.get::<_, u8>(1)?,
                         row.get::<_, u64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
@@ -454,8 +472,16 @@ impl Registry {
                 },
             );
         }
-        if !finished {
+        if finished == 0 {
             return Ok(AttemptStatus::Dispatched {
+                receipt: self.project_receipt(
+                    serde_json::from_str(&receipt.ok_or(EgressError::StateUnavailable)?)
+                        .map_err(|_| EgressError::StateUnavailable)?,
+                )?,
+            });
+        }
+        if finished == 2 {
+            return Ok(AttemptStatus::FinishedWithoutAnswer {
                 receipt: self.project_receipt(
                     serde_json::from_str(&receipt.ok_or(EgressError::StateUnavailable)?)
                         .map_err(|_| EgressError::StateUnavailable)?,
@@ -638,13 +664,16 @@ mod tests {
         receipt.status = DispatchStatus::CredentialUnavailable;
         receipt.spend_state = SpendState::Released;
         registry
-            .finish(&DispatchResult {
-                receipt,
-                output: None,
-                error: Some(EgressError::CredentialUnavailable),
-                diagnostics: Vec::new(),
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    receipt,
+                    output: None,
+                    error: Some(EgressError::CredentialUnavailable),
+                    diagnostics: Vec::new(),
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
     }
 
@@ -967,16 +996,19 @@ mod tests {
         receipt.spend_state = SpendState::Settled;
         receipt.usage.input_tokens = Some(1);
         registry
-            .finish(&DispatchResult {
-                receipt,
-                output: Some(ProviderOutput::Chat {
-                    text: "accepted answer".into(),
-                    finish_reason: None,
-                }),
-                error: None,
-                diagnostics: Vec::new(),
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    receipt,
+                    output: Some(ProviderOutput::Chat {
+                        text: "accepted answer".into(),
+                        finish_reason: None,
+                    }),
+                    error: None,
+                    diagnostics: Vec::new(),
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
         assert!(matches!(
             registry
@@ -1041,16 +1073,19 @@ mod tests {
             .consume(&attempt, &grant.permit, &reservation(&attempt), 20000)
             .unwrap();
         registry
-            .finish(&DispatchResult {
-                diagnostics: Vec::new(),
-                receipt,
-                output: Some(ProviderOutput::Chat {
-                    text: "retained".into(),
-                    finish_reason: None,
-                }),
-                error: None,
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    diagnostics: Vec::new(),
+                    receipt,
+                    output: Some(ProviderOutput::Chat {
+                        text: "retained".into(),
+                        finish_reason: None,
+                    }),
+                    error: None,
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
         // A large cohort sharing one deadline must take multiple bounded sweeps.
         registry
@@ -1126,13 +1161,16 @@ mod tests {
         receipt.status = DispatchStatus::CredentialUnavailable;
         receipt.spend_state = SpendState::Released;
         registry
-            .finish(&DispatchResult {
-                diagnostics: Vec::new(),
-                receipt,
-                output: None,
-                error: Some(EgressError::CredentialUnavailable),
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    diagnostics: Vec::new(),
+                    receipt,
+                    output: None,
+                    error: Some(EgressError::CredentialUnavailable),
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
         // Populate settled zero-charge predecessors in one transaction. Each has
         // the same immutable binding; only sequence, ordinal and digest differ.
@@ -1191,13 +1229,16 @@ mod tests {
         receipt.status = DispatchStatus::CredentialUnavailable;
         receipt.spend_state = SpendState::Released;
         registry
-            .finish(&DispatchResult {
-                diagnostics: Vec::new(),
-                receipt,
-                output: None,
-                error: Some(EgressError::CredentialUnavailable),
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    diagnostics: Vec::new(),
+                    receipt,
+                    output: None,
+                    error: Some(EgressError::CredentialUnavailable),
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
         attempt.attempt_ordinal += 1;
         attempt.record_sequence += 1;
@@ -1301,13 +1342,16 @@ mod tests {
                 receipt.usage.input_tokens = Some(1);
             }
             registry
-                .finish(&DispatchResult {
-                    diagnostics: Vec::new(),
-                    receipt,
-                    output: None,
-                    error: Some(EgressError::CredentialUnavailable),
-                    receipt_persisted: true,
-                })
+                .finish(
+                    AnswerRecovery::Retain,
+                    &DispatchResult {
+                        diagnostics: Vec::new(),
+                        receipt,
+                        output: None,
+                        error: Some(EgressError::CredentialUnavailable),
+                        receipt_persisted: true,
+                    },
+                )
                 .unwrap();
             attempt.attempt_ordinal += 1;
             attempt.record_sequence += 1;
@@ -1347,16 +1391,19 @@ mod tests {
         receipt.spend_state = SpendState::Settled;
         receipt.usage.input_tokens = Some(1);
         registry
-            .finish(&DispatchResult {
-                diagnostics: Vec::new(),
-                receipt,
-                output: Some(ProviderOutput::Chat {
-                    text: "retained".into(),
-                    finish_reason: None,
-                }),
-                error: None,
-                receipt_persisted: true,
-            })
+            .finish(
+                AnswerRecovery::Retain,
+                &DispatchResult {
+                    diagnostics: Vec::new(),
+                    receipt,
+                    output: Some(ProviderOutput::Chat {
+                        text: "retained".into(),
+                        finish_reason: None,
+                    }),
+                    error: None,
+                    receipt_persisted: true,
+                },
+            )
             .unwrap();
         let id = attempt.attempt_id();
         assert!(matches!(
