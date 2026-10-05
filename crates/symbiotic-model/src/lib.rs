@@ -1019,13 +1019,25 @@ pub enum AnswerRecovery {
 }
 
 impl AnswerRecovery {
-    /// Remove provider-controlled text identities from usage when answers are not retained.
+    /// Omit provider text identities and invalid cost text when answers are not retained.
     pub fn stored_usage(self, mut usage: UsageTrace) -> UsageTrace {
         if self == Self::Off {
             usage.response_id = None;
             usage.served_model = None;
+            if self.usage_diagnostic(&usage).is_some() {
+                usage.reported_cost_usd = None;
+            }
         }
         usage
+    }
+
+    fn usage_diagnostic(self, usage: &UsageTrace) -> Option<DiagnosticCode> {
+        (self == Self::Off
+            && usage
+                .reported_cost_usd
+                .as_deref()
+                .is_some_and(|cost| !valid_reported_cost_usd(cost)))
+        .then_some(DiagnosticCode::InvalidResponse)
     }
 
     #[cfg(feature = "queue")]
@@ -1034,6 +1046,9 @@ impl AnswerRecovery {
         if self == Self::Off {
             trace.usage = self.stored_usage(trace.usage);
             trace.response_hash = None;
+            trace.source = None;
+            trace.role_binding = None;
+            trace.audit_refs.clear();
             trace.metadata = Value::Null;
         }
         trace
@@ -1457,7 +1472,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     where
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
-        let mut diagnostic = None;
+        let mut diagnostic = self
+            .answer_recovery
+            .usage_diagnostic(&response.trace().usage);
         let mut response = response;
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
@@ -2307,16 +2324,24 @@ enum Settled<Res> {
 
 /// Shared transport boundary for direct calls and jobs already holding their slot.
 #[cfg(feature = "queue")]
-async fn dispatch_model<P: ModelProvider, T: Serialize + for<'de> Deserialize<'de>>(
+async fn dispatch_model<
+    P: ModelProvider,
+    T: Serialize + for<'de> Deserialize<'de> + TraceCarrier,
+>(
     queue: &QueueId,
     config: &ModelQueueConfig,
+    answer_recovery: AnswerRecovery,
     provider: &P,
     call: impl std::future::Future<Output = Result<T, ModelError>>,
 ) -> Result<T, ModelError> {
-    secrets::composed_result(
+    let mut response = secrets::composed_result(
         provider,
         within_timeout(queue, config.request_timeout_seconds, call).await,
-    )
+    )?;
+    if let Some(error) = answer_recovery.usage_diagnostic(&response.trace().usage) {
+        note_side_effect(&mut response, queue, "invalid_reported_cost", error);
+    }
+    Ok(response)
 }
 
 #[cfg(feature = "queue")]
@@ -2466,6 +2491,7 @@ where
         dispatch_model(
             &dispatch.queue_id,
             &dispatch.config,
+            dispatch.answer_recovery,
             &transport_provider,
             call(transport_provider.clone(), dispatch.request.clone()),
         )
@@ -2739,6 +2765,7 @@ where
     let result = dispatch_model(
         &this.queue_id,
         config,
+        this.answer_recovery,
         &provider,
         call(provider.clone(), this.request.clone()),
     )
@@ -4150,8 +4177,12 @@ fn reported_cost_usd(raw: &Value) -> Option<String> {
         Value::String(value) => value.clone(),
         _ => return None,
     };
-    let number = text.parse::<f64>().ok()?;
-    (number.is_finite() && number >= 0.0).then_some(text)
+    valid_reported_cost_usd(&text).then_some(text)
+}
+
+fn valid_reported_cost_usd(text: &str) -> bool {
+    text.parse::<f64>()
+        .is_ok_and(|number| number.is_finite() && number >= 0.0)
 }
 
 #[async_trait]

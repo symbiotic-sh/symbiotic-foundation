@@ -3370,12 +3370,31 @@ async fn proc1_distinct_accepted_handoffs_consume_their_own_reservations() {
 
 #[tokio::test]
 async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_telemetry() {
+    assert_answer_recovery_off_privacy(true, None).await;
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_off_rejects_invalid_cost_telemetry() {
+    assert_answer_recovery_off_privacy(false, Some("RuntimeAnswerOffMarker910b")).await;
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_off_preserves_valid_cost_telemetry() {
+    assert_answer_recovery_off_privacy(false, Some("0.000042123456789")).await;
+}
+
+async fn assert_answer_recovery_off_privacy(
+    provider_fields: bool,
+    reported_cost: Option<&'static str>,
+) {
     const MARKER: &str = "RuntimeAnswerOffMarker910b";
     #[derive(Clone)]
     struct Answer {
         inner: symbiotic_ai_runtime::model::StaticChatProvider,
         calls: Arc<AtomicUsize>,
         measured: bool,
+        provider_fields: bool,
+        reported_cost: Option<&'static str>,
     }
     impl ModelProvider for Answer {
         fn descriptor(&self) -> &ProviderDescriptor {
@@ -3387,6 +3406,12 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut response = self.inner.chat(request).await?;
+            if self.provider_fields {
+                response.trace.source = Some(MARKER.into());
+                response.trace.role_binding = Some(MARKER.into());
+                response.trace.audit_refs = vec![MARKER.into()];
+            }
+            response.trace.usage.reported_cost_usd = self.reported_cost.map(String::from);
             response.trace.response_hash = Some(MARKER.into());
             response.trace.metadata = json!({"diagnostic":MARKER});
             response.trace.usage.response_id = Some(MARKER.into());
@@ -3423,6 +3448,8 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
             inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
             calls: calls.clone(),
             measured: true,
+            provider_fields,
+            reported_cost,
         })
         .with_policy(policy());
         assert!(
@@ -3446,14 +3473,21 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
             symbiotic_core::DiagnosticCode::InvocationCompleted
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        for measured in [false, true] {
+        for token_usage in [false, true] {
+            let invalid_cost = reported_cost == Some(MARKER);
+            let measured = token_usage || reported_cost.is_some_and(|_| !invalid_cost);
             for custom_cache in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let trace = Arc::new(symbiotic_trace::InMemoryTraceSink::default());
                 let receipts = Arc::new(InMemoryReceiptSink::default());
+                let persistent_trace =
+                    symbiotic_trace::JsonlTraceSink::open(dir.path().join("traces.jsonl")).unwrap();
                 let runtime = Runtime::open(RuntimeConfig {
                     state_dir: Some(dir.path().join("state")),
-                    trace_sink: Some(trace.clone()),
+                    trace_sink: Some(Arc::new(symbiotic_trace::FanoutTraceSink::new(vec![
+                        Box::new((*trace).clone()),
+                        Box::new(persistent_trace),
+                    ]))),
                     receipt_sink: Some(receipts.clone()),
                     ..RuntimeConfig::default()
                 })
@@ -3462,7 +3496,9 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
                 let configured = binding(Answer {
                     inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
                     calls: calls.clone(),
-                    measured,
+                    measured: token_usage,
+                    provider_fields,
+                    reported_cost,
                 })
                 .with_policy(policy())
                 .with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off)
@@ -3474,7 +3510,22 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
                     ResponseCacheMode::Default
                 });
                 let provider = runtime.chat(configured.clone()).unwrap();
-                assert_eq!(provider.chat(request("input")).await.unwrap().text, MARKER);
+                let response = provider.chat(request("input")).await.unwrap();
+                assert_eq!(response.text, MARKER);
+                assert_eq!(
+                    response.trace.usage.reported_cost_usd.as_deref(),
+                    reported_cost
+                );
+                if invalid_cost {
+                    assert!(
+                        response.trace.metadata[symbiotic_ai_runtime::model::RUNTIME_DIAGNOSTICS]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry["error"]
+                                == symbiotic_core::DiagnosticCode::InvalidResponse.code())
+                    );
+                }
                 if measured {
                     assert_eq!(provider.chat(request("input")).await.unwrap().text, MARKER);
                 } else {
@@ -3504,8 +3555,26 @@ async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_tele
                 assert_eq!(receipt.output, Some(json!({"output_received":true})));
                 assert_eq!(
                     receipt.usage.as_ref().and_then(|u| u.input_tokens),
-                    measured.then_some(7)
+                    token_usage.then_some(7)
                 );
+                assert_eq!(
+                    receipt
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.reported_cost_usd.as_deref()),
+                    reported_cost.filter(|_| !invalid_cost)
+                );
+                if invalid_cost {
+                    assert!(
+                        executed.output.trace.metadata
+                            [symbiotic_ai_runtime::model::RUNTIME_DIAGNOSTICS]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry["error"]
+                                == symbiotic_core::DiagnosticCode::InvalidResponse.code())
+                    );
+                }
                 assert_eq!(
                     runtime
                         .execute_chat(configured.clone(), "explicit", request("input"))

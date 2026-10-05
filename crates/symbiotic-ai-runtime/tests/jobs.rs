@@ -15,7 +15,7 @@ use symbiotic_ai_runtime::{
 use symbiotic_core::{ModelIdentity, TraceId};
 use symbiotic_queue::{
     jobs::*,
-    runner::{JobRunner, RunnerConfig},
+    runner::{JobRunner, RunnerConfig, RunnerError},
 };
 use symbiotic_trace::{InvocationOutcome, ModelInvocationTrace, UsageTrace};
 use tokio::sync::Notify;
@@ -29,6 +29,7 @@ struct Provider {
     failures: usize,
     known_zero: bool,
     panic: bool,
+    usage: UsageTrace,
 }
 impl Provider {
     fn new() -> Self {
@@ -46,6 +47,10 @@ impl Provider {
             failures: 0,
             known_zero: false,
             panic: false,
+            usage: UsageTrace {
+                input_tokens: Some(3),
+                ..Default::default()
+            },
         }
     }
 }
@@ -91,10 +96,7 @@ impl ChatProvider for Provider {
                 request_hash: String::new(),
                 response_hash: None,
                 cache: Default::default(),
-                usage: UsageTrace {
-                    input_tokens: Some(3),
-                    ..Default::default()
-                },
+                usage: self.usage.clone(),
                 timing: Default::default(),
                 outcome: InvocationOutcome::Succeeded,
                 error_class: None,
@@ -263,6 +265,95 @@ async fn case_1_paid_commit_and_separate_direct_answer_recover_together() {
     let j = jobs(&runtime(dir.path()), JobConfig::default());
     assert_eq!(row(&j, &id).await.state, JobState::Succeeded);
     assert_eq!(copies(dir.path()), 1);
+}
+
+#[tokio::test]
+async fn regression_off_job_delivers_previously_retained_direct_answer() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let p = Provider::new();
+        r.execute_chat(
+            binding(p.clone()),
+            &j.invocation_key("retained").unwrap(),
+            request(),
+        )
+        .await
+        .unwrap();
+        let id = enqueue(&j, spec("retained", &p)).await;
+        let runner = j
+            .start_chat(
+                binding(p.clone()).with_answer_recovery(AnswerRecovery::Off),
+                RunnerConfig {
+                    poll_interval_ms: 5,
+                    ..Default::default()
+                },
+                "chat".into(),
+            )
+            .await
+            .unwrap();
+        wait_state(&j, &id, JobState::Succeeded).await;
+        runner.shutdown().await.unwrap();
+        let delivery = j.completions(1, 10000).await.unwrap().remove(0);
+        assert_eq!(delivery.output.unwrap()["text"], "paid answer");
+        assert!(!delivery.delivery.completion.result_expired);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded previously retained job delivery");
+}
+
+#[tokio::test]
+async fn regression_off_job_reports_invalid_cost_without_persisting_or_retrying_it() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir().unwrap();
+        let r = runtime(dir.path());
+        let j = jobs(&r, JobConfig::default());
+        let mut p = Provider::new();
+        p.usage = UsageTrace {
+            reported_cost_usd: Some("paid answer".into()),
+            ..Default::default()
+        };
+        let id = enqueue(&j, spec("invalid-cost", &p)).await;
+        let runner = j
+            .start_chat(
+                binding(p.clone()).with_answer_recovery(AnswerRecovery::Off),
+                RunnerConfig {
+                    poll_interval_ms: 5,
+                    ..Default::default()
+                },
+                "chat".into(),
+            )
+            .await
+            .unwrap();
+        let error = runner.wait().await.unwrap_err();
+        let RunnerError::Workers(errors) = error else {
+            panic!("unexpected runner error: {error:?}")
+        };
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            RunnerError::Store(JobError::Execution(
+                symbiotic_core::DiagnosticCode::InvalidResponse
+            ))
+        )));
+        let completed = row(&j, &id).await;
+        assert_eq!(completed.state, JobState::Succeeded);
+        let receipt = r
+            .spend_receipt(&SpendReceiptRef::new(completed.receipt.unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, SpendState::Unknown);
+        assert!(receipt.usage.is_none());
+        assert!(receipt.recovery.is_none());
+        assert_eq!(
+            receipt.output,
+            Some(serde_json::json!({"output_received": true}))
+        );
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded invalid job cost regression");
 }
 
 #[tokio::test]

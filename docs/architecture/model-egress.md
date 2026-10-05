@@ -399,8 +399,10 @@ answer hash. Persistent trace/receipt sinks receive numeric usage and operationa
 state without response hashes or arbitrary response metadata. Live diagnostics
 remain visible; persistence failures retain the existing conservative accounting
 behavior. The setting is prospective: it does not erase answers previously
-retained by a route configured with `retain`. An `off` runtime binding also refuses
-to recover an earlier retained answer for that same invocation.
+retained by a route configured with `retain`. An `off` runtime binding refuses direct
+explicit-invocation replay of an earlier retained answer for that same invocation.
+Previously retained job answers remain deliverable through job adoption and
+completion delivery until their existing recovery deadline.
 
 All answer-bearing write paths share this policy:
 
@@ -414,9 +416,9 @@ All answer-bearing write paths share this policy:
 | Trace and usage-receipt sinks | No response hash, provider identity text or response metadata |
 | Queue waiting payload, admission, request hashes, permits and account pacing | Contain input or operational authority/accounting only; provider answers do not enter these fields |
 
-Queued `off` routes deliver completion and spend references, not answer content,
-even without a crash. Apps needing the live classifier/chat answer use direct
-dispatch on that route. A crash after durable completion but before consuming a
+Jobs newly executed under `off` deliver completion and spend references, not
+answer content, even without a crash. Apps needing the live classifier/chat answer
+use direct dispatch on that route. A crash after durable completion but before consuming a
 live reply loses that answer. A caller still needing it starts a **new logical
 invocation**, subject to the same admission, spend and retry rules. Neither
 same-attempt replay nor uncertain-charge recovery resends the old request.
