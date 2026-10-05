@@ -1870,6 +1870,13 @@ async fn expanded_wire_payload_is_refused(adapter: u8) {
 async fn zero_request_pacing_is_refused_at_route_validation() {
     let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     fixture.config.routes[0].requests_per_minute = Some(0);
+    assert_eq!(
+        symbiotic_credential_process::validate_routes(
+            &fixture.config.routes,
+            fixture.config.max_frame_bytes,
+        ),
+        Err(EgressError::InvalidRequest)
+    );
     assert!(matches!(
         CredentialProcess::open(fixture.config.clone()),
         Err(EgressError::InvalidRequest)
@@ -1883,6 +1890,13 @@ async fn zero_request_pacing_is_refused_at_route_validation() {
 async fn zero_input_pacing_is_refused_at_route_validation() {
     let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     fixture.config.routes[0].input_units_per_minute = Some(0);
+    assert_eq!(
+        symbiotic_credential_process::validate_routes(
+            &fixture.config.routes,
+            fixture.config.max_frame_bytes,
+        ),
+        Err(EgressError::InvalidRequest)
+    );
     assert!(matches!(
         CredentialProcess::open(fixture.config.clone()),
         Err(EgressError::InvalidRequest)
@@ -1951,6 +1965,10 @@ async fn conflicting_shared_route_limits_are_refused_at_startup() {
             _ => second.input_units_per_minute = Some(1000),
         }
         config.routes.push(second);
+        assert_eq!(
+            symbiotic_credential_process::validate_routes(&config.routes, config.max_frame_bytes),
+            Err(EgressError::InvalidRequest)
+        );
         let opened = CredentialProcess::open(config);
         assert!(
             matches!(&opened, Err(EgressError::InvalidRequest)),
@@ -2024,10 +2042,18 @@ async fn conflicting_shared_route_limits_are_validated_before_state_in_every_ord
                     Some(symbiotic_ai_runtime::AccountSharingKey::new("other-pool"));
                 let routes = [first, second, independent, other_pool];
                 for order in &orders {
+                    let mut config = fixture.config.clone();
+                    config.routes = order.iter().map(|&i| routes[i].clone()).collect();
+                    assert_eq!(
+                        symbiotic_credential_process::validate_routes(
+                            &config.routes,
+                            config.max_frame_bytes,
+                        ),
+                        Err(EgressError::InvalidRequest)
+                    );
                     // Rebuilding the registry also varies its HashMaps' random seeds.
                     for state_dir in [&fixture.config.state_dir, &unopened, &blocked] {
-                        let mut config = fixture.config.clone();
-                        config.routes = order.iter().map(|&i| routes[i].clone()).collect();
+                        let mut config = config.clone();
                         config.state_dir = state_dir.clone();
                         let opened = CredentialProcess::open(config);
                         assert!(
@@ -2805,6 +2831,13 @@ async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response(
         let error = CredentialProcess::open(fixture.config.clone())
             .err()
             .expect("oversized route must be refused");
+        assert_eq!(
+            symbiotic_credential_process::validate_routes(
+                &fixture.config.routes,
+                fixture.config.max_frame_bytes,
+            ),
+            Err(error)
+        );
         for setting in ["max_frame_bytes", "max_field_bytes", "max_response_bytes"] {
             assert!(
                 error.to_string().contains(setting),
@@ -2820,6 +2853,13 @@ async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response(
         let error = CredentialProcess::open(fixture.config.clone())
             .err()
             .expect("frame must fit envelope and one field");
+        assert_eq!(
+            symbiotic_credential_process::validate_routes(
+                &fixture.config.routes,
+                fixture.config.max_frame_bytes,
+            ),
+            Err(error)
+        );
         assert!(error.to_string().contains("max_frame_bytes"));
     }
     fixture.config.max_frame_bytes = 4124;
@@ -6118,6 +6158,13 @@ async fn route_byte_defaults_and_overrides_work_in_process() {
             let parsed: ProcessConfig =
                 serde_json::from_value(value).expect("route limits may be omitted");
             assert_eq!(
+                symbiotic_credential_process::validate_routes(
+                    &parsed.routes,
+                    parsed.max_frame_bytes,
+                ),
+                Ok(())
+            );
+            assert_eq!(
                 parsed.routes[0].max_input_bytes,
                 if omitted.contains(&"max_input_bytes") {
                     DEFAULT_MAX_REQUEST_BYTES
@@ -6141,7 +6188,14 @@ async fn route_byte_defaults_and_overrides_work_in_process() {
         for field in ["max_input_bytes", "max_response_bytes"] {
             let mut zero = serde_json::to_value(&fixture.config).unwrap();
             zero["routes"][0][field] = serde_json::json!(0);
-            let invalid = serde_json::from_value(zero).unwrap();
+            let invalid: ProcessConfig = serde_json::from_value(zero).unwrap();
+            assert_eq!(
+                symbiotic_credential_process::validate_routes(
+                    &invalid.routes,
+                    invalid.max_frame_bytes,
+                ),
+                Err(EgressError::InvalidRequest)
+            );
             assert!(matches!(
                 CredentialProcess::open(invalid),
                 Err(EgressError::InvalidRequest)

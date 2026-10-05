@@ -493,6 +493,22 @@ Route and registry validation runs before creating state, acquiring the process
 lock, loading the admission key or opening the runtime. Frame-bound conflicts
 return `InvalidFrameConfiguration`; other configuration conflicts return
 `InvalidRequest`; actual state/IO failures return `StateUnavailable`.
+
+Applications can check deployment routes before startup with the public
+`symbiotic_credential_process::validate_routes(&config.routes, config.max_frame_bytes)`
+API. It uses the same route and registry checks as `CredentialProcess::open`,
+including destination restrictions, loopback HTTP opt-in, provider settings,
+byte limits, accepted-attempt limits, request budgets and shared account policies.
+It opens no files or runtime, loads no secrets and invokes no secret resolvers;
+validating with a nonexistent state directory does not create it. Process-wide
+settings, OS protection, state availability and credential availability remain
+startup checks. Validation returns the first refusal in startup order, using the
+same `EgressError`; it does not accumulate errors. Frame bounds require
+`max_frame_bytes >= 4096 + 24 * max_field_bytes + 4 * max_response_bytes`, with a
+minimum of 4124 bytes, and `max_input_bytes <= max_frame_bytes / 2`.
+Deserialize into `RouteConfig` first: unsupported `answer_recovery`, `thinking`
+and `reasoning_effort` values are refused there with their supported enum values.
+
 Dropping the last process handle explicitly releases its lock so descriptors
 inherited by concurrently spawned children cannot delay a subsequent reopen.
 Unknown config fields
