@@ -526,6 +526,7 @@ pub(crate) struct QueueRuntime {
     pub(crate) admission: Option<ModelAdmission>,
     pub(crate) rate_state: crate::ModelRateState,
     pub(crate) spend: Arc<dyn crate::SpendLedger>,
+    pub(crate) answer_recovery: crate::AnswerRecovery,
     pub(crate) accepted_spend: Option<crate::AcceptedSpendHandoff>,
     pub(crate) job: Option<Arc<dyn ModelJob>>,
     pub(crate) invocation: Option<String>,
@@ -552,6 +553,7 @@ impl QueueRuntime {
             admission: None,
             rate_state: crate::ModelRateState::default(),
             spend: Arc::new(crate::UnavailableSpendLedger),
+            answer_recovery: crate::AnswerRecovery::default(),
             accepted_spend: None,
             job: None,
             invocation: None,
@@ -567,6 +569,9 @@ impl QueueRuntime {
     /// The explicit cache, else a [`DirResponseCache`] at the configured
     /// directory, else none.
     pub(crate) fn cache(&self) -> Option<Arc<dyn ResponseCache>> {
+        if self.answer_recovery == crate::AnswerRecovery::Off {
+            return None;
+        }
         self.response_cache.clone().or_else(|| {
             self.config
                 .response_cache_dir
@@ -587,6 +592,12 @@ macro_rules! queue_runtime_builders {
         /// Deliver per-attempt usage receipts to `sink`.
         pub fn with_receipt_sink(mut self, sink: Arc<dyn $crate::QueueReceiptSink>) -> Self {
             self.runtime.receipt_sink = Some(sink);
+            self
+        }
+
+        /// Choose whether provider answers may be persisted for recovery or caching.
+        pub fn with_answer_recovery(mut self, mode: $crate::AnswerRecovery) -> Self {
+            self.runtime.answer_recovery = mode;
             self
         }
 

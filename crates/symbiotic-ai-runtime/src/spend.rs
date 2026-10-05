@@ -300,6 +300,10 @@ impl SqliteSpendLedger {
         invocation: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), ModelError> {
+        // Content-free completion evidence is never a recoverable provider response.
+        if output.as_ref() == Some(&serde_json::json!({"output_received": true})) {
+            return Ok(());
+        }
         let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
         let (erased, job_deadline) =
             job_recovery_policy(tx, invocation, &old.reservation.invocation)?;

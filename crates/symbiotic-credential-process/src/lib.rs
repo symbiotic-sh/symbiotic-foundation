@@ -24,6 +24,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+pub use symbiotic_ai_runtime::AnswerRecovery;
 use symbiotic_ai_runtime::{Runtime, RuntimeConfig};
 use symbiotic_egress::*;
 
@@ -105,6 +106,10 @@ impl ReasoningEffort {
     }
 }
 
+fn answer_recovery_is_default(mode: &AnswerRecovery) -> bool {
+    *mode == AnswerRecovery::default()
+}
+
 /// Route configured by the credential-process owner, with shared provider byte defaults.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +125,9 @@ pub struct RouteConfig {
     pub provider_request_limit: Option<u64>,
     /// Foundation-owned finite accepted-handoff allowance per invocation.
     pub max_attempts: u32,
+    /// Retain answers by default; Off persists only completion and numeric spend evidence.
+    #[serde(default, skip_serializing_if = "answer_recovery_is_default")]
+    pub answer_recovery: AnswerRecovery,
     /// Provider route identifier.
     pub route: String,
     /// Opaque reference scoped to this tenant; empty only for `secret.backend: none`.
@@ -510,7 +518,9 @@ impl CredentialProcess {
             || a.recorded_at >= a.expires_at
             || a.expires_at > i64::MAX as u64
             || a.recovery_expires_at == 0
-            || a.attempt_ordinal == 1 && a.recovery_expires_at <= a.recorded_at
+            || route.answer_recovery != AnswerRecovery::Off
+                && a.attempt_ordinal == 1
+                && a.recovery_expires_at <= a.recorded_at
             || a.recovery_expires_at > i64::MAX as u64
             || !is_digest(&a.input_digest)
             || !is_digest(&a.input_manifest_digest)
@@ -592,7 +602,7 @@ impl CredentialProcess {
             .inner
             .registry
             .lock()
-            .is_ok_and(|mut registry| registry.finish(&result).is_ok());
+            .is_ok_and(|mut registry| registry.finish(route.answer_recovery, &result).is_ok());
         if !result.receipt_persisted {
             // Observed usage and output remain useful, but cannot claim a durable
             // settlement or release when the atomic completion transaction failed.

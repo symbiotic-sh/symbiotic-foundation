@@ -870,6 +870,7 @@ where
 /// Usage receipts of one queued call.
 #[cfg(feature = "queue")]
 struct CallReceipts {
+    answer_recovery: AnswerRecovery,
     attempt_context: ExecutionAttemptContext,
     sink: Option<Arc<dyn QueueReceiptSink>>,
     binding: Option<symbiotic_core::BindingIdentity>,
@@ -943,9 +944,11 @@ impl CallReceipts {
             attempt: item.map_or(0, |item| item.1),
             request_units: 1,
             input_units: self.input_units,
-            usage: trace.map(|trace| trace.usage.clone()),
+            usage: trace.map(|trace| self.answer_recovery.stored_usage(trace.usage.clone())),
             cache: trace.map(|trace| trace.cache.clone()),
-            metadata: trace.map_or(Value::Null, |trace| trace.metadata.clone()),
+            metadata: trace.map_or(Value::Null, |trace| {
+                self.answer_recovery.stored_trace(trace).metadata
+            }),
             error,
             queue_wait_ms: timing.queue_wait_ms,
             throttle_wait_ms: timing.throttle_wait_ms,
@@ -1004,6 +1007,39 @@ fn elapsed_ms(since: std::time::Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether a route retains provider answers for recovery. Numeric spend evidence is retained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerRecovery {
+    /// Retain answers under the existing recovery deadline and cache policy.
+    #[default]
+    Retain,
+    /// Return answers only in memory; persist only completion and numeric spend evidence.
+    Off,
+}
+
+impl AnswerRecovery {
+    /// Remove provider-controlled text identities from usage when answers are not retained.
+    pub fn stored_usage(self, mut usage: UsageTrace) -> UsageTrace {
+        if self == Self::Off {
+            usage.response_id = None;
+            usage.served_model = None;
+        }
+        usage
+    }
+
+    #[cfg(feature = "queue")]
+    fn stored_trace(self, trace: &ModelInvocationTrace) -> ModelInvocationTrace {
+        let mut trace = trace.clone();
+        if self == Self::Off {
+            trace.usage = self.stored_usage(trace.usage);
+            trace.response_hash = None;
+            trace.metadata = Value::Null;
+        }
+        trace
+    }
+}
+
 /// What every attempt of one queued call shares: the backend and policy,
 /// the request with its identity and cache entry, and the call's sinks.
 #[cfg(feature = "queue")]
@@ -1012,6 +1048,7 @@ struct QueuedCall<Req> {
     queue: Arc<dyn QueueBackend>,
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
+    answer_recovery: AnswerRecovery,
     invocation: String,
     invocation_key: Option<String>,
     attempt_binding: String,
@@ -1048,6 +1085,7 @@ impl<Req> QueuedCall<Req> {
         let invocation = self.invocation.clone();
         let binding = self.attempt_binding.clone();
         let context = self.attempt_context.clone();
+        let answer_recovery = self.answer_recovery;
         run_blocking(move || {
             let receipt = spend.invocation(&account, &invocation)?;
             if receipt
@@ -1061,6 +1099,10 @@ impl<Req> QueuedCall<Req> {
             };
             if receipt.output.is_some() {
                 context.capture(&receipt.reservation.reference)?;
+                if answer_recovery == AnswerRecovery::Off {
+                    return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
+                }
+
                 return receipt
                     .recovery
                     .map(Some)
@@ -1444,7 +1486,7 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         }
         if let Some(trace_sink) = &self.trace_sink
             && let Err(err) = trace_sink
-                .record_model_invocation(response.trace().clone())
+                .record_model_invocation(self.answer_recovery.stored_trace(response.trace()))
                 .await
         {
             diagnostic = Some(err.code());
@@ -1478,7 +1520,9 @@ impl<Req> QueuedCall<Req> {
         trace.timestamp = Utc::now();
         response.set_trace(trace.clone());
         if let Some(trace_sink) = &self.trace_sink
-            && let Err(err) = trace_sink.record_model_invocation(trace).await
+            && let Err(err) = trace_sink
+                .record_model_invocation(self.answer_recovery.stored_trace(&trace))
+                .await
         {
             note_side_effect(
                 &mut response,
@@ -1643,6 +1687,7 @@ where
         queue: runtime.queue.clone(),
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
+        answer_recovery: runtime.answer_recovery,
         invocation,
         invocation_key: runtime.invocation.clone(),
         attempt_binding,
@@ -1650,6 +1695,7 @@ where
         worker_id: runtime.worker_id.clone(),
         config: runtime.config.clone(),
         receipts: CallReceipts {
+            answer_recovery: runtime.answer_recovery,
             attempt_context,
             sink: runtime.receipt_sink.clone(),
             binding: runtime.binding_identity.clone(),
@@ -2489,7 +2535,9 @@ where
     }
     let (state, usage, output, failure) = match &result {
         Ok(response) => {
-            let usage = response.trace().usage.clone();
+            let usage = this
+                .answer_recovery
+                .stored_usage(response.trace().usage.clone());
             let measured = has_measured_usage(&usage);
             (
                 if measured {
@@ -2763,7 +2811,9 @@ where
                 serde_json::to_value(&this.binding_identity).expect("binding identity serializes");
             response.set_trace(trace);
             if this.accepted_spend.is_none() {
-                let usage = response.trace().usage.clone();
+                let usage = this
+                    .answer_recovery
+                    .stored_usage(response.trace().usage.clone());
                 let state = if has_measured_usage(&usage) {
                     SpendState::Settled
                 } else {
@@ -2773,9 +2823,13 @@ where
                 let spend = this.spend.clone();
                 let reference = reference.clone();
                 let invocation_key = this.invocation_key.clone();
+                let answer_recovery = this.answer_recovery;
                 let saved = run_blocking(move || {
-                    let output =
-                        serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?;
+                    let output = if answer_recovery == AnswerRecovery::Off {
+                        serde_json::json!({"output_received": true})
+                    } else {
+                        serde_json::to_value(&response_to_save).map_err(|_| spend::storage())?
+                    };
                     let usage = has_measured_usage(&usage).then_some(usage);
                     spend.finish(
                         &reference,

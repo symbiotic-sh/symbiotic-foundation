@@ -74,11 +74,11 @@ use maintained::{Maintenance, ResponseRetention, Sweep};
 /// unsupported.
 pub use symbiotic_model as model;
 pub use symbiotic_model::{
-    CacheEntry, CachedResponse, ChatProvider, ChatRequest, ChatResponse, ClassifierProvider,
-    ClassifyRequest, ClassifyResponse, DirResponseCache, EmbeddingProvider, EmbeddingRequest,
-    EmbeddingResponse, InMemoryReceiptSink, ModelError, ModelProvider, ModelQueueConfig,
-    ProviderDescriptor, QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus,
-    RerankProvider, RerankRequest, RerankResponse, ResponseCache,
+    AnswerRecovery, CacheEntry, CachedResponse, ChatProvider, ChatRequest, ChatResponse,
+    ClassifierProvider, ClassifyRequest, ClassifyResponse, DirResponseCache, EmbeddingProvider,
+    EmbeddingRequest, EmbeddingResponse, InMemoryReceiptSink, ModelError, ModelProvider,
+    ModelQueueConfig, ProviderDescriptor, QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS,
+    ReceiptStatus, RerankProvider, RerankRequest, RerankResponse, ResponseCache,
 };
 
 /// File name of the persistent queue database inside `state_dir`.
@@ -185,6 +185,8 @@ pub struct ModelBinding<P> {
     pub policy: Option<ModelQueueConfig>,
     /// Select the runtime cache, disable caching or supply a custom cache.
     pub response_cache: ResponseCacheMode,
+    /// Whether answers may reach recovery storage, response caches or telemetry.
+    pub answer_recovery: AnswerRecovery,
     /// Overrides the runtime's receipt sink for this binding.
     pub receipt_sink: Option<Arc<dyn QueueReceiptSink>>,
     /// Overrides the runtime's trace sink for this binding.
@@ -204,6 +206,7 @@ impl<P> ModelBinding<P> {
             account_sharing_key: None,
             policy: None,
             response_cache: ResponseCacheMode::Default,
+            answer_recovery: AnswerRecovery::default(),
             receipt_sink: None,
             trace_sink: None,
         }
@@ -237,6 +240,12 @@ impl<P> ModelBinding<P> {
     /// Set the account execution policy; registry bindings must match their configured policy.
     pub fn with_policy(mut self, policy: ModelQueueConfig) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Choose whether this binding retains answers. Off also disables all response caches.
+    pub fn with_answer_recovery(mut self, mode: AnswerRecovery) -> Self {
+        self.answer_recovery = mode;
         self
     }
 
@@ -914,6 +923,7 @@ impl Runtime {
             policy,
             sinks: Sinks {
                 maintenance: self.inner.maintenance.clone(),
+                answer_recovery: binding.answer_recovery,
                 invocation: binding.invocation.clone(),
                 attempt_context: binding.attempt_context.clone(),
                 queue_id,
@@ -964,6 +974,7 @@ struct Bound {
 }
 
 struct Sinks {
+    answer_recovery: AnswerRecovery,
     maintenance: Option<Arc<Maintenance>>,
     invocation: Option<String>,
     attempt_context: Option<model::ExecutionAttemptContext>,
@@ -979,7 +990,8 @@ macro_rules! apply_sinks {
         fn $name<P>(self, mut provider: $ty<P>) -> $ty<P> {
             provider = provider
                 .with_queue_id(self.queue_id)
-                .with_binding_identity(self.identity);
+                .with_binding_identity(self.identity)
+                .with_answer_recovery(self.answer_recovery);
             if let Some(owner) = self.maintenance {
                 provider = provider.with_maintenance_owner(owner);
             }

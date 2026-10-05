@@ -523,6 +523,9 @@ pub enum AttemptStatus {
     Invalidated,
     /// Permit consumed; completion is not durably known (including a process crash).
     Dispatched { receipt: DispatchReceipt },
+    /// Attempt durably finished with answer recovery disabled; spend remains queryable.
+    /// A caller needing an answer must start a new logical invocation.
+    FinishedWithoutAnswer { receipt: DispatchReceipt },
     /// Recoverable typed output, usage and settlement.
     Completed { result: DispatchResult },
     /// Recoverable static safe error and settlement, possibly an unknown charge.

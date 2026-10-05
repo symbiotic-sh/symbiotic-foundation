@@ -215,8 +215,17 @@ fn accepted_receipt_identity_and_reference_round_trip_without_consumer_spend_fie
         SpendReceiptRef::new("egress:accepted-attempt").unwrap()
     );
     assert_eq!(receipt.spend_state, SpendState::Unknown);
-    let value = serde_json::to_value(receipt).unwrap();
+    let value = serde_json::to_value(&receipt).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 6);
+    let status = AttemptStatus::FinishedWithoutAnswer { receipt };
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert_eq!(encoded["state"], "finished_without_answer");
+    assert!(encoded.get("result").is_none());
+    let AttemptStatus::FinishedWithoutAnswer { receipt } = serde_json::from_value(encoded).unwrap()
+    else {
+        panic!("missing content-free completion")
+    };
+    assert_eq!(receipt.spend_state, SpendState::Unknown);
 }
 
 fn protocol_attempt() -> DurableAttempt {
@@ -400,6 +409,7 @@ mod clients {
             jobs: Default::default(),
             job_runner: Default::default(),
             routes: vec![RouteConfig {
+                answer_recovery: Default::default(),
                 tenant: "tenant".into(),
                 account: "account".into(),
                 account_sharing_key: None,

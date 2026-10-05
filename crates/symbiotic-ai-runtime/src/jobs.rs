@@ -535,6 +535,7 @@ struct Claim {
     max_attempts: u32,
 }
 struct ClaimOwner {
+    answer_recovery: crate::AnswerRecovery,
     jobs: ModelJobs,
     candidate: JobId,
     claim: Mutex<Option<Claim>>,
@@ -801,6 +802,7 @@ impl model::ModelJob for ClaimOwner {
         let row = self.claim_record()?;
         let oversized = output
             .as_ref()
+            .filter(|_| self.answer_recovery != crate::AnswerRecovery::Off)
             .map(serde_json::to_vec)
             .transpose()
             .map_err(storage)?
@@ -808,7 +810,12 @@ impl model::ModelJob for ClaimOwner {
         let evidence = output
             .as_ref()
             .map(|_| serde_json::json!({"output_received": true}));
-        if oversized {
+        let answer_not_retained =
+            evidence.is_some() && self.answer_recovery == crate::AnswerRecovery::Off;
+        if answer_not_retained {
+            output = None;
+        }
+        if oversized && !answer_not_retained {
             output = None;
             failure = Some(DiagnosticCode::QueueResultTooLarge);
         }
@@ -851,7 +858,12 @@ impl model::ModelJob for ClaimOwner {
                     )?;
                     return Ok(());
                 }
-                let resolution = if output.is_some() {
+                let resolution = if answer_not_retained {
+                    JobResolution::PaidResult {
+                        receipt: reference.as_str().into(),
+                        recovery_until: Some(now),
+                    }
+                } else if output.is_some() {
                     let receipt = spend::receipt_in(tx, &reference)
                         .map_err(|_| JobError::Storage)?
                         .ok_or(JobError::Storage)?;
@@ -998,7 +1010,7 @@ macro_rules! model_runner {
                             let JobResponse::Candidates(rows) = response else { return Err(JobError::InvalidRequest.into()) };
                             if let Some(mut candidate) = rows.into_iter().next() {
                                 if candidate.execution != Execution::Model { return Err(JobError::InvalidRequest.into()); }
-                                let owner = Arc::new(ClaimOwner { jobs: jobs.clone(), candidate: candidate.id.clone(), claim: Mutex::new(None), heartbeat, finished: AtomicBool::new(false), stop: stop.clone() });
+                                let owner = Arc::new(ClaimOwner { answer_recovery: binding.answer_recovery, jobs: jobs.clone(), candidate: candidate.id.clone(), claim: Mutex::new(None), heartbeat, finished: AtomicBool::new(false), stop: stop.clone() });
                                 let request = {
                                     let payload = candidate.payload.take().ok_or(JobError::InvalidRequest)?;
                                     input(&payload).and_then(|(_, _, request)| serde_json::from_value::<$request>(request).map_err(|_| JobError::InvalidRequest))
@@ -1510,6 +1522,7 @@ mod review_tests {
         };
         let (_stop, stop) = watch::channel(false);
         let owner = ClaimOwner {
+            answer_recovery: crate::AnswerRecovery::default(),
             jobs,
             candidate: candidate.id.clone(),
             claim: Mutex::new(None),
@@ -1612,6 +1625,7 @@ mod review_tests {
         };
         let (_stop, stop) = watch::channel(false);
         let owner = ClaimOwner {
+            answer_recovery: crate::AnswerRecovery::default(),
             jobs: jobs.clone(),
             candidate: id.clone(),
             claim: Mutex::new(None),

@@ -3367,3 +3367,187 @@ async fn proc1_distinct_accepted_handoffs_consume_their_own_reservations() {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
+
+#[tokio::test]
+async fn regression_answer_recovery_off_disables_caches_recovery_and_answer_telemetry() {
+    const MARKER: &str = "RuntimeAnswerOffMarker910b";
+    #[derive(Clone)]
+    struct Answer {
+        inner: symbiotic_ai_runtime::model::StaticChatProvider,
+        calls: Arc<AtomicUsize>,
+        measured: bool,
+    }
+    impl ModelProvider for Answer {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            self.inner.descriptor()
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for Answer {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut response = self.inner.chat(request).await?;
+            response.trace.response_hash = Some(MARKER.into());
+            response.trace.metadata = json!({"diagnostic":MARKER});
+            response.trace.usage.response_id = Some(MARKER.into());
+            response.trace.usage.served_model = Some(MARKER.into());
+            if self.measured {
+                response.trace.usage.input_tokens = Some(7);
+            }
+            Ok(response)
+        }
+    }
+    fn has_marker(path: &std::path::Path) -> bool {
+        std::fs::read_dir(path).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                has_marker(&path)
+            } else {
+                std::fs::read(path)
+                    .unwrap()
+                    .windows(MARKER.len())
+                    .any(|bytes| bytes == MARKER.as_bytes())
+            }
+        })
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Changing the policy never reads an earlier retained answer through recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(RuntimeConfig {
+            state_dir: Some(dir.path().join("state")),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let retain = binding(Answer {
+            inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
+            calls: calls.clone(),
+            measured: true,
+        })
+        .with_policy(policy());
+        assert!(
+            runtime
+                .execute_chat(retain.clone(), "retained", request("input"))
+                .await
+                .unwrap()
+                .attempt
+                .unwrap()
+                .unwrap()
+                .output_available
+        );
+        let off = retain.with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off);
+        assert_eq!(
+            runtime
+                .execute_chat(off, "retained", request("input"))
+                .await
+                .unwrap_err()
+                .source
+                .code(),
+            symbiotic_core::DiagnosticCode::InvocationCompleted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for measured in [false, true] {
+            for custom_cache in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let trace = Arc::new(symbiotic_trace::InMemoryTraceSink::default());
+                let receipts = Arc::new(InMemoryReceiptSink::default());
+                let runtime = Runtime::open(RuntimeConfig {
+                    state_dir: Some(dir.path().join("state")),
+                    trace_sink: Some(trace.clone()),
+                    receipt_sink: Some(receipts.clone()),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let configured = binding(Answer {
+                    inner: symbiotic_ai_runtime::model::StaticChatProvider::new(MARKER),
+                    calls: calls.clone(),
+                    measured,
+                })
+                .with_policy(policy())
+                .with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off)
+                .with_response_cache(if custom_cache {
+                    ResponseCacheMode::Custom(Arc::new(DirResponseCache::new(
+                        dir.path().join("custom"),
+                    )))
+                } else {
+                    ResponseCacheMode::Default
+                });
+                let provider = runtime.chat(configured.clone()).unwrap();
+                assert_eq!(provider.chat(request("input")).await.unwrap().text, MARKER);
+                if measured {
+                    assert_eq!(provider.chat(request("input")).await.unwrap().text, MARKER);
+                } else {
+                    assert_eq!(
+                        provider.chat(request("input")).await.unwrap_err().code(),
+                        symbiotic_core::DiagnosticCode::SpendReconciliationRequired
+                    );
+                }
+                let expected_calls = if measured { 3 } else { 2 };
+                let executed = runtime
+                    .execute_chat(configured.clone(), "explicit", request("input"))
+                    .await
+                    .unwrap();
+                assert_eq!(executed.output.text, MARKER);
+                let attempt = executed.attempt.unwrap().unwrap();
+                assert!(!attempt.output_available);
+                assert_eq!(
+                    attempt.state,
+                    if measured {
+                        symbiotic_ai_runtime::SpendState::Settled
+                    } else {
+                        symbiotic_ai_runtime::SpendState::Unknown
+                    }
+                );
+                let receipt = runtime.spend_receipt(&attempt.reference).unwrap().unwrap();
+                assert!(receipt.recovery.is_none());
+                assert_eq!(receipt.output, Some(json!({"output_received":true})));
+                assert_eq!(
+                    receipt.usage.as_ref().and_then(|u| u.input_tokens),
+                    measured.then_some(7)
+                );
+                assert_eq!(
+                    runtime
+                        .execute_chat(configured.clone(), "explicit", request("input"))
+                        .await
+                        .unwrap_err()
+                        .source
+                        .code(),
+                    symbiotic_core::DiagnosticCode::InvocationCompleted
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                assert!(
+                    !serde_json::to_string(&trace.records())
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                assert!(
+                    !serde_json::to_string(&receipts.receipts())
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                assert!(!has_marker(dir.path()));
+                drop(provider);
+                drop(runtime);
+                let runtime = Runtime::open(RuntimeConfig {
+                    state_dir: Some(dir.path().join("state")),
+                    ..RuntimeConfig::default()
+                })
+                .unwrap();
+                assert_eq!(
+                    runtime
+                        .execute_chat(configured, "explicit", request("input"))
+                        .await
+                        .unwrap_err()
+                        .source
+                        .code(),
+                    symbiotic_core::DiagnosticCode::InvocationCompleted
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                assert!(!has_marker(dir.path()));
+            }
+        }
+    })
+    .await
+    .expect("bounded runtime privacy regression");
+}

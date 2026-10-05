@@ -129,6 +129,7 @@ pub(crate) fn route_binding<P>(
             &model::ProviderPrincipalId(route.route.clone()),
             provider,
         )
+        .map(|binding| binding.with_answer_recovery(route.answer_recovery))
         .map_err(|_| EgressError::InvalidRequest)
 }
 
