@@ -110,6 +110,17 @@ fn answer_recovery_is_default(mode: &AnswerRecovery) -> bool {
     *mode == AnswerRecovery::default()
 }
 
+/// Allowance shared by identical direct-egress requests after failed or uncertain sends.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestBudget {
+    /// Maximum failed or uncertain sends per tenant/route, credential fingerprint and input digest.
+    pub attempts: u32,
+    /// Renew after this many seconds since failure completion or an uncertain admission.
+    /// None never renews. Zero gives every call a fresh budget.
+    pub renewal_seconds: Option<u64>,
+}
+
 /// Route configured by the credential-process owner, with shared provider byte defaults.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,6 +136,9 @@ pub struct RouteConfig {
     pub provider_request_limit: Option<u64>,
     /// Foundation-owned finite accepted-handoff allowance per invocation.
     pub max_attempts: u32,
+    /// Optional shared failed-request allowance; omitted preserves per-call behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<RequestBudget>,
     /// Retain answers by default; Off persists only completion and numeric spend evidence.
     #[serde(default, skip_serializing_if = "answer_recovery_is_default")]
     pub answer_recovery: AnswerRecovery,
@@ -265,6 +279,10 @@ struct Inner {
     key: AdmissionKey,
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
+    // Hold from budget lookup through durable completion. The process state lock
+    // excludes other processes; this lock prevents simultaneous sends overspending
+    // a request key without another durable in-flight owner.
+    request_budget_dispatch: tokio::sync::Mutex<()>,
     runtime: Runtime,
     job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
     _process_lock: Arc<ProcessLock>,
@@ -325,6 +343,7 @@ impl CredentialProcess {
                 key,
                 routes,
                 registry: Mutex::new(registry),
+                request_budget_dispatch: tokio::sync::Mutex::new(()),
                 runtime,
                 job_runners: tokio::sync::Mutex::new(HashMap::new()),
                 _process_lock: Arc::new(process_lock),
@@ -480,8 +499,11 @@ impl CredentialProcess {
                 // between. Client cancellation cannot leave a consumed-but-cancelled
                 // live task; a process crash leaves the durable unknown receipt.
                 let process = self.clone();
+                let input_digest = request.admission.attempt.input_digest;
                 let task = tokio::spawn(async move {
-                    process.dispatch(route, payload, receipt, handoff).await
+                    process
+                        .dispatch(route, payload, receipt, handoff, input_digest)
+                        .await
                 });
                 self.warn_if_attempt_time_ahead(
                     request.admission.attempt.recorded_at,
@@ -576,7 +598,13 @@ impl CredentialProcess {
         payload: ProviderPayload,
         mut receipt: DispatchReceipt,
         handoff: symbiotic_ai_runtime::model::AcceptedSpendHandoff,
+        input_digest: String,
     ) -> DispatchResult {
+        let _budget_guard = if route.request_budget.is_some() {
+            Some(self.inner.request_budget_dispatch.lock().await)
+        } else {
+            None
+        };
         let source = route.secret.clone();
         let max = self.inner.config.max_secret_bytes;
         let secret = tokio::task::spawn_blocking(move || match source {
@@ -587,17 +615,49 @@ impl CredentialProcess {
         let mut output = None;
         let mut error = None;
         let mut diagnostics = Vec::new();
+        let mut budget_admission = None;
         match secret {
             Ok(Ok(secret)) => {
-                match provider::execute(
-                    &self.inner.runtime,
-                    &route,
-                    Arc::new(secret),
-                    payload,
-                    handoff,
-                )
-                .await
-                {
+                let budget_key = route
+                    .request_budget
+                    .as_ref()
+                    .map(|_| {
+                        symbiotic_ai_runtime::model::configuration_revision(&(
+                            &route.tenant,
+                            &route.route,
+                            symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
+                            &input_digest,
+                        ))
+                        .map(|digest| digest.0)
+                        .map_err(|_| EgressError::StateUnavailable)
+                    })
+                    .transpose();
+                let admission = budget_key.and_then(|key| {
+                    key.zip(route.request_budget.as_ref())
+                        .map(|(key, policy)| {
+                            self.inner
+                                .registry
+                                .lock()
+                                .map_err(|_| EgressError::StateUnavailable)?
+                                .admit_request_budget(key, policy)
+                        })
+                        .transpose()
+                });
+                let execution = match admission {
+                    Ok(admission) => {
+                        budget_admission = admission;
+                        provider::execute(
+                            &self.inner.runtime,
+                            &route,
+                            Arc::new(secret),
+                            payload,
+                            handoff,
+                        )
+                        .await
+                    }
+                    Err(code) => Err(code.into()),
+                };
+                match execution {
                     Ok((answer, usage, runtime_diagnostics)) => {
                         diagnostics = runtime_diagnostics;
                         receipt.status = DispatchStatus::Succeeded;
@@ -631,11 +691,11 @@ impl CredentialProcess {
             output,
             receipt_persisted: true,
         };
-        result.receipt_persisted = self
-            .inner
-            .registry
-            .lock()
-            .is_ok_and(|mut registry| registry.finish(route.answer_recovery, &result).is_ok());
+        result.receipt_persisted = self.inner.registry.lock().is_ok_and(|mut registry| {
+            registry
+                .finish(route.answer_recovery, &result, budget_admission.as_ref())
+                .is_ok()
+        });
         if !result.receipt_persisted {
             // Observed usage and output remain useful, but cannot claim a durable
             // settlement or release when the atomic completion transaction failed.
@@ -682,6 +742,10 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
         || route.requests_per_minute == Some(0)
         || route.input_units_per_minute == Some(0)
         || route.max_attempts == 0
+        || route
+            .request_budget
+            .as_ref()
+            .is_some_and(|budget| budget.attempts == 0)
         || route.timeout_seconds == 0
         || route.max_input_bytes > max_frame as usize / 2
     {

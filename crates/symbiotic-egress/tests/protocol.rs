@@ -415,6 +415,7 @@ mod clients {
                 account_sharing_key: None,
                 provider_request_limit: None,
                 max_attempts: 3,
+                request_budget: None,
                 route: "provider".into(),
                 secret_ref: String::new(),
                 secret: SecretSource::None,
