@@ -57,7 +57,8 @@ impl<P: ModelProvider> ModelProvider for Dispatched<P> {
 impl<P: ChatProvider> ChatProvider for Dispatched<P> {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.outcome(self.inner.chat(request).await)?;
+        let mut response =
+            self.outcome(model::with_egress_http_observations(self.inner.chat(request)).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -66,7 +67,8 @@ impl<P: ChatProvider> ChatProvider for Dispatched<P> {
 impl<P: ClassifierProvider> ClassifierProvider for Dispatched<P> {
     async fn classify(&self, request: ClassifyRequest) -> Result<ClassifyResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.outcome(self.inner.classify(request).await)?;
+        let mut response =
+            self.outcome(model::with_egress_http_observations(self.inner.classify(request)).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -75,7 +77,8 @@ impl<P: ClassifierProvider> ClassifierProvider for Dispatched<P> {
 impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.outcome(self.inner.embed(request).await)?;
+        let mut response =
+            self.outcome(model::with_egress_http_observations(self.inner.embed(request)).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -84,7 +87,8 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
 impl<P: RerankProvider> RerankProvider for Dispatched<P> {
     async fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, ModelError> {
         self.started.store(true, Ordering::SeqCst);
-        let mut response = self.outcome(self.inner.rerank(request).await)?;
+        let mut response =
+            self.outcome(model::with_egress_http_observations(self.inner.rerank(request)).await)?;
         response.trace.metadata = serde_json::Value::Null;
         Ok(response)
     }
@@ -96,6 +100,7 @@ impl<P: RerankProvider> RerankProvider for Dispatched<P> {
 pub(crate) struct ExecuteError {
     pub(crate) code: EgressError,
     pub(crate) may_have_dispatched: bool,
+    pub(crate) diagnostics: Vec<DispatchDiagnostic>,
 }
 
 impl From<EgressError> for ExecuteError {
@@ -103,6 +108,7 @@ impl From<EgressError> for ExecuteError {
         Self {
             code,
             may_have_dispatched: false,
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -212,14 +218,25 @@ fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
             _ if error.http_details().is_some() => EgressError::Provider {
                 status: error.http_details().map(|(status, _)| status),
             },
-            ModelError::Provider(_) | ModelError::Auth(_) | ModelError::BudgetExhausted(_) => {
-                EgressError::Provider { status: None }
-            }
+            ModelError::Unavailable(model::DiagnosticCode::InvalidResponse)
+            | ModelError::Provider(_)
+            | ModelError::Auth(_)
+            | ModelError::BudgetExhausted(_) => EgressError::Provider { status: None },
             ModelError::Queue(_) => EgressError::StateUnavailable,
             ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
             _ => EgressError::Transport,
         },
         may_have_dispatched: started.load(Ordering::SeqCst),
+        diagnostics: error
+            .diagnostics()
+            .iter()
+            .filter_map(|code| match code {
+                model::DiagnosticCode::InvalidResponse => {
+                    Some(DispatchDiagnostic::InvalidRetryAfter)
+                }
+                _ => None,
+            })
+            .collect(),
     }
 }
 

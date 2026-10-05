@@ -375,7 +375,6 @@ impl ModelError {
         }
     }
 
-    #[cfg(feature = "queue")]
     fn with_diagnostics(self, diagnostics: impl IntoIterator<Item = DiagnosticCode>) -> Self {
         let mut diagnostics = diagnostics.into_iter().peekable();
         if diagnostics.peek().is_none() {
@@ -3997,9 +3996,10 @@ pub fn prompt_cache_counts(
     hit: Option<u64>,
     miss: Option<u64>,
     nested_hit: Option<u64>,
-) -> (Option<u64>, Option<u64>) {
+) -> Result<(Option<u64>, Option<u64>), ModelError> {
+    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
     if hit.zip(nested_hit).is_some_and(|(a, b)| a != b) {
-        return (None, None);
+        return Err(invalid());
     }
     let hit = hit.or(nested_hit).or_else(|| {
         total
@@ -4017,9 +4017,9 @@ pub fn prompt_cache_counts(
             .zip(hit.zip(miss))
             .is_some_and(|(total, (hit, miss))| hit.checked_add(miss) != Some(total))
     {
-        return (None, None);
+        return Err(invalid());
     }
-    (hit, miss)
+    Ok((hit, miss))
 }
 
 fn reported_cost_usd(raw: &Value) -> Option<String> {
@@ -4114,10 +4114,10 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     usage.prompt_cache_hit_tokens,
                     usage.prompt_cache_miss_tokens,
                     nested_hit,
-                );
+                )?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
-                provider_usage_identity(&mut trace.usage, &raw);
+                provider_usage_identity(&mut trace.usage, &raw)?;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -4482,6 +4482,17 @@ async fn bounded_response_bytes(
     Ok(bytes)
 }
 
+tokio::task_local! {
+    static EGRESS_HTTP_OBSERVATIONS: ();
+}
+
+/// Include safe HTTP observations in failures during credential-owned egress.
+/// Ordinary adapter calls retain their original top-level error variants.
+/// The scope lasts only for this future and does not propagate to spawned tasks.
+pub async fn with_egress_http_observations<F: std::future::Future>(future: F) -> F::Output {
+    EGRESS_HTTP_OBSERVATIONS.scope((), future).await
+}
+
 /// Bounded HTTP decoding. Credential policy belongs exclusively to the final
 /// adapter-result boundary, including errors raised after this helper returns.
 async fn provider_response_json(
@@ -4492,26 +4503,29 @@ async fn provider_response_json(
     let response = builder.send().await.map_err(http_transport_error)?;
     let status = response.status();
     if !status.is_success() {
-        let retry_after_seconds = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .map(|header| parse_retry_after(header, Utc::now()))
-            .transpose()
-            .map_err(|primary| ModelError::Http {
-                primary: Box::new(primary),
-                status: status.as_u16(),
-                retry_after_seconds: None,
-            })?;
         let primary = if status.is_redirection() {
             ModelError::Provider(DiagnosticCode::ProviderRedirectRefused)
         } else {
             status_error(status.as_u16())
         };
+        if EGRESS_HTTP_OBSERVATIONS.try_with(|_| ()).is_err() {
+            return Err(primary);
+        }
+        let retry = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|header| parse_retry_after(header, Utc::now()))
+            .transpose();
+        let (retry_after_seconds, hint_error) = match retry {
+            Ok(delay) => (delay, None),
+            Err(invalid) => (None, Some(invalid.code())),
+        };
         return Err(ModelError::Http {
             primary: Box::new(primary),
             status: status.as_u16(),
             retry_after_seconds,
-        });
+        }
+        .with_diagnostics(hint_error));
     }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
     let text = String::from_utf8(bytes).map_err(|_| {
@@ -4539,14 +4553,48 @@ fn parse_retry_after(
     if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
         return text.parse().map_err(|_| invalid());
     }
-    let deadline = chrono::DateTime::parse_from_rfc2822(text).map_err(|_| invalid())?;
+    let deadline: chrono::DateTime<Utc> = httpdate::parse_http_date(text)
+        .map_err(|_| invalid())?
+        .into();
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
 }
 
-fn provider_usage_identity(usage: &mut UsageTrace, raw: &Value) {
-    usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
-    usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
-    usage.created = raw.get("created").and_then(Value::as_i64);
+fn provider_usage_identity(usage: &mut UsageTrace, raw: &Value) -> Result<(), ModelError> {
+    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
+    let identity = |field: &str| -> Result<Option<String>, ModelError> {
+        raw.get(field)
+            .map(|value| {
+                let text = value.as_str().ok_or_else(invalid)?;
+                // Provider IDs and model names are ASCII tokens, not free-form text.
+                // Model names also permit namespace and version separators.
+                if text.is_empty()
+                    || !text.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || b"-_.".contains(&byte)
+                            || (field == "model" && b"/:".contains(&byte))
+                    })
+                {
+                    return Err(invalid());
+                }
+                Ok(text.to_owned())
+            })
+            .transpose()
+    };
+    let response_id = identity("id")?;
+    let served_model = identity("model")?;
+    let created = raw
+        .get("created")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|seconds| *seconds >= 0)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    usage.response_id = response_id;
+    usage.served_model = served_model;
+    usage.created = created;
+    Ok(())
 }
 
 fn status_error(status: u16) -> ModelError {
@@ -6020,6 +6068,50 @@ mod egress_http_tests {
     use super::*;
 
     #[test]
+    fn usage_identity_validates_tokens_and_supplied_types_before_projection() {
+        for raw in [
+            serde_json::json!({"id":null}),
+            serde_json::json!({"id":123}),
+            serde_json::json!({"id":""}),
+            serde_json::json!({"id":"private\nanswer"}),
+            serde_json::json!({"model":false}),
+            serde_json::json!({"model":"private answer"}),
+            serde_json::json!({"created":null}),
+            serde_json::json!({"created":1.5}),
+            serde_json::json!({"created":u64::MAX}),
+        ] {
+            let mut usage = UsageTrace::default();
+            assert!(matches!(
+                provider_usage_identity(&mut usage, &raw),
+                Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
+            ));
+            assert!(usage.response_id.is_none());
+            assert!(usage.served_model.is_none());
+            assert!(usage.created.is_none());
+        }
+        for (id, model) in [
+            ("msg_0123456789abcdef", "claude-sonnet-4-20250514"),
+            ("7c971547-8bcc-4a91-8e10-00466eef5216", "deepseek-chat"),
+            ("chatcmpl-123", "namespace/model:version"),
+        ] {
+            let mut usage = UsageTrace::default();
+            provider_usage_identity(
+                &mut usage,
+                &serde_json::json!({"id":id,"model":model,"created":0}),
+            )
+            .unwrap();
+            assert_eq!(usage.response_id.as_deref(), Some(id));
+            assert_eq!(usage.served_model.as_deref(), Some(model));
+            assert_eq!(usage.created, Some(0));
+        }
+        let mut absent = UsageTrace::default();
+        provider_usage_identity(&mut absent, &serde_json::json!({})).unwrap();
+        assert!(absent.response_id.is_none());
+        assert!(absent.served_model.is_none());
+        assert!(absent.created.is_none());
+    }
+
+    #[test]
     fn rabbithole_retry_after_is_typed_and_survives_diagnostics() {
         let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:27:00 GMT")
             .unwrap()
@@ -6027,6 +6119,8 @@ mod egress_http_tests {
         for (value, seconds) in [
             ("7", 7),
             ("Wed, 21 Oct 2015 07:28:00 GMT", 60),
+            ("Wednesday, 21-Oct-15 07:28:00 GMT", 60),
+            ("Wed Oct 21 07:28:00 2015", 60),
             ("Wed, 21 Oct 2015 07:26:00 GMT", 0),
         ] {
             assert_eq!(
@@ -6073,10 +6167,11 @@ mod egress_http_tests {
                     stream.read_exact(&mut buffer).await.unwrap();
                     stream.write_all(format!("HTTP/1.1 429 Limited\r\n{hint}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                 });
-                let error = provider_response_json(http_client(Some(1)).unwrap().get(url), Some(1024), ModelError::Unavailable).await.unwrap_err();
+                let error = with_egress_http_observations(provider_response_json(http_client(Some(1)).unwrap().get(url), Some(1024), ModelError::Unavailable)).await.unwrap_err();
                 server.await.unwrap();
                 if hint.contains("invalid") {
-                    assert!(matches!(error.primary(), ModelError::Provider(DiagnosticCode::InvalidResponse)));
+                    assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+                    assert_eq!(error.diagnostics(), &[DiagnosticCode::InvalidResponse]);
                     assert_eq!(error.http_details(), Some((429, None)));
                 } else {
                     assert!(matches!(error.primary(), ModelError::RateLimited(_)));

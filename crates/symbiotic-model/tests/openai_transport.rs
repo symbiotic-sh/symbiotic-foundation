@@ -160,30 +160,30 @@ async fn disabled_thinking_and_nullable_content_keep_identity() {
 
 #[test]
 fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(4), Some(6), Some(5)),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(4), Some(7), None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, Some(11), None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, Some(6), None),
-        (Some(4), Some(6))
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, None, None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(0), None, None),
-        (Some(0), Some(10))
-    );
+    for (total, hit, miss, nested) in [
+        (Some(10), Some(4), Some(6), Some(5)),
+        (Some(10), Some(4), Some(7), None),
+        (Some(10), None, Some(11), None),
+        (Some(10), Some(11), None, None),
+        (Some(u64::MAX), Some(u64::MAX), Some(1), None),
+    ] {
+        assert!(matches!(
+            prompt_cache_counts(total, hit, miss, nested),
+            Err(symbiotic_model::ModelError::Provider(
+                symbiotic_core::DiagnosticCode::InvalidResponse
+            ))
+        ));
+    }
+    for (hit, miss, expected) in [
+        (None, Some(6), (Some(4), Some(6))),
+        (None, None, (None, None)),
+        (Some(0), None, (Some(0), Some(10))),
+    ] {
+        assert_eq!(
+            prompt_cache_counts(Some(10), hit, miss, None).unwrap(),
+            expected
+        );
+    }
 }
 
 #[tokio::test]

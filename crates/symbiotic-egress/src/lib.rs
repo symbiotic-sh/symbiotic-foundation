@@ -478,10 +478,12 @@ pub struct DispatchReceipt {
     pub spend_state: SpendState,
 }
 
-/// Static runtime bookkeeping failures; never contain raw diagnostic text.
+/// Static provider-observation and runtime failures; never contain raw diagnostic text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchDiagnostic {
+    /// The provider supplied a malformed Retry-After hint; the HTTP class is preserved.
+    InvalidRetryAfter,
     /// The paid response could not be recorded as complete in the runtime queue.
     QueueCompleteFailed,
     /// The runtime could not persist the invocation trace.
@@ -496,7 +498,7 @@ pub enum DispatchDiagnostic {
 pub struct DispatchResult {
     /// Static failure code alongside accounting; absent only on success.
     pub error: Option<EgressError>,
-    /// Runtime side effects that failed without discarding the paid answer or usage.
+    /// Additional provider-observation or runtime failures accompanying this result.
     pub diagnostics: Vec<DispatchDiagnostic>,
     /// False if completion/settlement failed; accounting remains unknown until recovery.
     pub receipt_persisted: bool,

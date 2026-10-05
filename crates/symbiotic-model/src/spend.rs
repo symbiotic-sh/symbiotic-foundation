@@ -257,7 +257,9 @@ impl SpendLedger for UnavailableSpendLedger {
 
 /// Whether usage was actually reported; absent fields never stand for zero.
 pub fn has_measured_usage(u: &UsageTrace) -> bool {
-    u.input_tokens.is_some()
+    u.cache_hit_tokens.is_some()
+        || u.cache_miss_tokens.is_some()
+        || u.input_tokens.is_some()
         || u.output_tokens.is_some()
         || u.reasoning_tokens.is_some()
         || u.media_units.is_some()

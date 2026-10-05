@@ -1148,13 +1148,13 @@ impl ClassifierProvider for JevClassifierProvider {
                 trace.usage.input_tokens = usage("input_tokens");
                 trace.usage.output_tokens = usage("output_tokens");
                 trace.usage.reported_cost_usd = reported_cost_usd(&raw);
-                provider_usage_identity(&mut trace.usage, &raw);
+                provider_usage_identity(&mut trace.usage, &raw)?;
                 let (hit, miss) = prompt_cache_counts(
                     trace.usage.input_tokens,
                     usage("cache_hit_tokens"),
                     usage("cache_miss_tokens"),
                     None,
-                );
+                )?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
                 trace.metadata = serde_json::json!({

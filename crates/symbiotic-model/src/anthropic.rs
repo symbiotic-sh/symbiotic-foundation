@@ -193,10 +193,10 @@ impl ChatProvider for AnthropicChatProvider {
                     ..UsageTrace::default()
                 };
                 let (hit, miss) =
-                    prompt_cache_counts(input, usage.cache_read_input_tokens, None, None);
+                    prompt_cache_counts(input, usage.cache_read_input_tokens, None, None)?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
-                provider_usage_identity(&mut trace.usage, &raw);
+                provider_usage_identity(&mut trace.usage, &raw)?;
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(input, hit, miss),

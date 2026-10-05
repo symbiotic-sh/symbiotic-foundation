@@ -129,6 +129,27 @@ impl Fixture {
         keyless: bool,
         response_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
+        Self::with_response_options(
+            status,
+            output,
+            delay,
+            cost_json,
+            raw_response,
+            keyless,
+            (response_gate, "7"),
+        )
+        .await
+    }
+    async fn with_response_options(
+        status: u16,
+        output: String,
+        delay: Duration,
+        cost_json: &'static str,
+        raw_response: bool,
+        keyless: bool,
+        response_options: (Option<Arc<tokio::sync::Semaphore>>, &'static str),
+    ) -> Self {
+        let (response_gate, retry_hint) = response_options;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for (name, value) in [("provider", SECRET.as_bytes()), ("admission", KEY)] {
@@ -212,7 +233,7 @@ impl Fixture {
                         output
                     };
                     let response = format!(
-                        "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nLocation: /not-approved\r\nRetry-After: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nLocation: /not-approved\r\nRetry-After: {retry_hint}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
@@ -6223,4 +6244,188 @@ async fn rabbithole_response_identity_without_token_usage_recovers() {
         assert_eq!(result.receipt.spend_state,SpendState::Unknown);
         assert_eq!(fixture.calls.load(Ordering::SeqCst),1);
     }).await.expect("identity-only recovery must finish within five seconds");
+}
+
+#[tokio::test]
+async fn regression_egress_rejects_malformed_usage_identity() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for anthropic in [false, true] {
+            for (field, value) in [
+                ("id", serde_json::json!("answer\nprivate text")),
+                ("id", serde_json::json!({})),
+                ("model", serde_json::json!("answer with spaces")),
+                ("created", serde_json::json!("invalid")),
+                ("created", serde_json::json!(-1)),
+            ] {
+                let mut body = if anthropic {
+                    serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn"})
+                } else {
+                    serde_json::json!({"choices":[{"message":{"content":"answer"}}]})
+                };
+                body[field] = value;
+                let mut fixture = Fixture::with_http_response(200, body.to_string(), Duration::ZERO, "0", true, false).await;
+                if anthropic { fixture.config.routes[0].provider = RouteProvider::AnthropicChat {operator:"test".into(),thinking:None}; }
+                let process = fixture.process().await;
+                let (admission, payload) = fixture.attempt("invalid-identity",1,1);
+                let granted = permit(&process,&admission).await;
+                let result = dispatched(exchange(&process, inject(admission.clone(),payload,granted)).await.unwrap());
+                assert_eq!(result.error, Some(EgressError::Provider {status:None}), "{field}, anthropic={anthropic}");
+                assert!(result.output.is_none());
+                assert_eq!(result.receipt.usage.response_id,None);
+                let AttemptStatus::Failed {result:recovered} = status(&process,&admission).await else {panic!("missing failure")};
+                assert_eq!(recovered.error,result.error);
+            }
+        }
+    }).await.expect("identity fixtures must finish within five seconds");
+}
+
+#[tokio::test]
+async fn regression_egress_cache_only_usage_settles_and_recovers() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for field in ["prompt_cache_hit_tokens", "prompt_cache_miss_tokens"] {
+            let mut body =
+                serde_json::json!({"choices":[{"message":{"content":"answer"}}],"usage":{}});
+            body["usage"][field] = serde_json::json!(7);
+            let fixture = Fixture::with_http_response(
+                200,
+                body.to_string(),
+                Duration::ZERO,
+                "0",
+                true,
+                false,
+            )
+            .await;
+            let process = fixture.process().await;
+            let (admission, payload) = fixture.attempt("cache-only", 1, 1);
+            let granted = permit(&process, &admission).await;
+            let result = dispatched(
+                exchange(&process, inject(admission.clone(), payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert!(result.error.is_none());
+            assert_eq!(result.receipt.spend_state, SpendState::Settled);
+            let usage = serde_json::to_value(result.receipt.usage).unwrap();
+            assert!(usage["input_tokens"].is_null());
+            drop(process);
+            let process = fixture.process().await;
+            let AttemptStatus::Completed { result } = status(&process, &admission).await else {
+                panic!("missing completion")
+            };
+            assert_eq!(result.receipt.spend_state, SpendState::Settled);
+            assert_eq!(serde_json::to_value(result.receipt.usage).unwrap(), usage);
+        }
+    })
+    .await
+    .expect("cache-only fixtures must finish within five seconds");
+}
+
+#[tokio::test]
+async fn regression_egress_classification_rejects_cache_contradictions() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let body = serde_json::json!({"model":"test-model", "answers":{
+            "continue":{"type":"noul","noul":0.12},
+            "parent":{"type":"choice","choice":"none","probabilities":{"previous":0.25,"none":0.75}},
+            "strength":{"type":"score","score":0.75,"probabilities":{"0":0.25,"1":0.75}}
+        },"usage":{"input_tokens":100,"cache_hit_tokens":80,"cache_miss_tokens":30}});
+        let mut fixture = Fixture::with_http_response(200,body.to_string(),Duration::ZERO,"0",true,false).await;
+        fixture.config.routes[0].provider = RouteProvider::JevClassifier {operator:"test".into()};
+        let process = fixture.process().await;
+        let (admission,payload) = rabbithole_classify_attempt(&fixture);
+        let granted = permit(&process,&admission).await;
+        let result = dispatched(exchange(&process,inject(admission,payload,granted)).await.unwrap());
+        assert_eq!(result.error,Some(EgressError::Provider {status:None}));
+        assert!(result.output.is_none());
+    }).await.expect("contradictory classification must finish within five seconds");
+}
+
+#[tokio::test]
+async fn regression_egress_invalid_chat_json_is_provider_failure() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for anthropic in [false, true] {
+            let mut fixture = Fixture::with_http_response(
+                200,
+                "invalid JSON".into(),
+                Duration::ZERO,
+                "0",
+                true,
+                false,
+            )
+            .await;
+            if anthropic {
+                fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+                    operator: "test".into(),
+                    thinking: None,
+                };
+            }
+            let process = fixture.process().await;
+            let (admission, payload) = fixture.attempt("invalid-json", 1, 1);
+            let granted = permit(&process, &admission).await;
+            let result = dispatched(
+                exchange(&process, inject(admission.clone(), payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+            drop(process);
+            let process = fixture.process().await;
+            let AttemptStatus::Failed { result } = status(&process, &admission).await else {
+                panic!("missing failure")
+            };
+            assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+        }
+    })
+    .await
+    .expect("invalid JSON fixtures must finish within five seconds");
+}
+
+#[tokio::test]
+async fn regression_egress_invalid_retry_hint_preserves_failure_and_diagnostic() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (code, expected) in [
+            (
+                429,
+                EgressError::RateLimited {
+                    retry_after_seconds: None,
+                },
+            ),
+            (504, EgressError::Timeout),
+        ] {
+            let fixture = Fixture::with_response_options(
+                code,
+                "private provider body".into(),
+                Duration::ZERO,
+                "0",
+                true,
+                false,
+                (None, "invalid"),
+            )
+            .await;
+            let process = fixture.process().await;
+            let (admission, payload) = fixture.attempt("invalid-hint", 1, 1);
+            let granted = permit(&process, &admission).await;
+            let result = dispatched(
+                exchange(&process, inject(admission.clone(), payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result.error, Some(expected));
+            assert_eq!(
+                serde_json::to_value(&result.diagnostics).unwrap(),
+                serde_json::json!(["invalid_retry_after"])
+            );
+            drop(process);
+            let process = fixture.process().await;
+            let AttemptStatus::Failed { result } = status(&process, &admission).await else {
+                panic!("missing failure")
+            };
+            assert_eq!(result.error, Some(expected));
+            assert_eq!(
+                serde_json::to_value(result.diagnostics).unwrap(),
+                serde_json::json!(["invalid_retry_after"])
+            );
+        }
+    })
+    .await
+    .expect("invalid retry hint fixtures must finish within five seconds");
 }
