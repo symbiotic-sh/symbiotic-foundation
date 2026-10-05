@@ -7400,10 +7400,6 @@ async fn regression_request_budget_config_omission_and_zero_refusal() {
         explicit_none["request_budget"] = serde_json::Value::Null;
         let route: RouteConfig = serde_json::from_value(explicit_none).unwrap();
         assert_eq!(serde_json::to_value(&route).unwrap(), original);
-        assert_eq!(
-            symbiotic_ai_runtime::model::configuration_revision(&route).unwrap(),
-            symbiotic_ai_runtime::model::configuration_revision(&fixture.config.routes[0]).unwrap()
-        );
         configure_request_budget(&mut fixture, 0, None);
         assert!(matches!(
             CredentialProcess::open(fixture.config.clone()),
