@@ -105,7 +105,7 @@ impl ReasoningEffort {
     }
 }
 
-/// Route configured by the credential-process owner. No defaults for safety limits.
+/// Route configured by the credential-process owner, with shared provider byte defaults.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
@@ -134,9 +134,13 @@ pub struct RouteConfig {
     pub provider: RouteProvider,
     /// Permit loopback HTTP for local models/tests; otherwise HTTPS is required.
     pub allow_loopback_http: bool,
-    /// Maximum complete encoded provider payload.
+    /// Maximum typed payload and complete encoded provider body; defaults to
+    /// [`symbiotic_ai_runtime::model::DEFAULT_MAX_REQUEST_BYTES`]. Zero is refused.
+    #[serde(default = "symbiotic_ai_runtime::model::default_max_request_bytes")]
     pub max_input_bytes: usize,
-    /// Maximum provider HTTP response body.
+    /// Maximum provider HTTP success body; defaults to
+    /// [`symbiotic_ai_runtime::model::DEFAULT_MAX_RESPONSE_BYTES`]. Zero is refused.
+    #[serde(default = "symbiotic_ai_runtime::model::default_max_response_bytes")]
     pub max_response_bytes: usize,
     /// Maximum metadata/identity field bytes in an attempt.
     pub max_field_bytes: usize,

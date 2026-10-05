@@ -1658,14 +1658,15 @@ fn binding_without_policy<P>(provider: P) -> ModelBinding<P> {
 }
 
 #[test]
-fn supported_http_bindings_require_finite_request_and_response_limits() {
+fn supported_http_bindings_default_byte_limits_preserve_overrides_and_refuse_zero() {
     use symbiotic_ai_runtime::model::{
-        GeminiEmbeddingProvider, JevClassifierProvider, OpenAiCompatibleChatProvider,
+        DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES, GeminiEmbeddingProvider,
+        JevClassifierProvider, OpenAiCompatibleChatProvider,
     };
     let runtime = Runtime::in_memory().unwrap();
     for request_limit in [None, Some(0), Some(1024)] {
         for response_limit in [None, Some(0), Some(1024)] {
-            let valid = request_limit == Some(1024) && response_limit == Some(1024);
+            let valid = request_limit != Some(0) && response_limit != Some(0);
             let mut chat = OpenAiCompatibleChatProvider::new(
                 "synthetic",
                 "synthetic",
@@ -1685,22 +1686,29 @@ fn supported_http_bindings_require_finite_request_and_response_limits() {
                 embedding = embedding.with_response_limit(limit);
                 classifier = classifier.with_response_limit(limit);
             }
-            assert_eq!(
-                runtime.chat(binding(chat).with_policy(policy())).is_ok(),
-                valid
-            );
-            assert_eq!(
+            for result in [
+                runtime
+                    .chat(binding(chat).with_policy(policy()))
+                    .map(|provider| provider.descriptor().metadata.clone()),
                 runtime
                     .embedding(binding(embedding).with_policy(policy()))
-                    .is_ok(),
-                valid
-            );
-            assert_eq!(
+                    .map(|provider| provider.descriptor().metadata.clone()),
                 runtime
                     .classifier(binding(classifier).with_policy(policy()))
-                    .is_ok(),
-                valid
-            );
+                    .map(|provider| provider.descriptor().metadata.clone()),
+            ] {
+                assert_eq!(result.is_ok(), valid);
+                if let Ok(metadata) = result {
+                    assert_eq!(
+                        metadata["max_request_bytes"],
+                        request_limit.unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+                    );
+                    assert_eq!(
+                        metadata["max_response_bytes"],
+                        response_limit.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
+                    );
+                }
+            }
         }
     }
     let zero_output =

@@ -3787,7 +3787,8 @@ fn validate_chat_settings(
 }
 
 impl OpenAiCompatibleChatProvider {
-    /// Construct a compatible chat transport; finite byte and output limits are required to execute.
+    /// Construct a compatible chat transport with shared byte defaults.
+    /// A finite output-token bound is still required to execute.
     pub fn new(
         operator: impl Into<String>,
         model: impl Into<String>,
@@ -3820,6 +3821,8 @@ impl OpenAiCompatibleChatProvider {
             reasoning_effort: None,
             max_output_tokens: None,
         }
+        .with_request_limit(default_max_request_bytes())
+        .with_response_limit(default_max_response_bytes())
     }
 
     /// Clients cannot be injected through the public API.
@@ -4160,6 +4163,8 @@ impl GeminiEmbeddingProvider {
             #[cfg(test)]
             test_endpoint: None,
         }
+        .with_request_limit(default_max_request_bytes())
+        .with_response_limit(default_max_response_bytes())
     }
 
     /// Clients cannot be injected through the public API.

@@ -366,8 +366,9 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
 Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
 isolation, or explicitly pools execution across routes or tenants. Shared bindings
-must agree on account limits. Each route requires all `RouteConfig` fields documented in the Rust type, including
-finite field/input/response/token/concurrency/timeout settings. The escaped identity
+must agree on account limits. Each route requires the `RouteConfig` fields documented
+in the Rust type, with defaults for omitted request/response byte limits as described
+below. Field/token/concurrency/timeout settings remain explicit and finite. The escaped identity
 field bounds, response allowance and reply envelope must fit `max_frame_bytes`
 together; invalid bounds name `max_frame_bytes`, `max_field_bytes` and
 `max_response_bytes`, and an oversized reply returns `LimitExceeded`.
@@ -388,6 +389,43 @@ inherited by concurrently spawned children cannot delay a subsequent reopen.
 Unknown config fields
 are refused. `requests_per_minute` and `input_units_per_minute` must be positive
 when present; null leaves pacing unrestricted.
+
+### Default provider byte limits
+
+Omitting route `max_input_bytes` or `max_response_bytes` selects **1,048,576 bytes
+(1 MiB)** for that field. Explicit positive values override the defaults; zero
+and JSON null are refused. The same defaults apply to omitted
+`ProviderLimits.max_request_bytes` / `.max_response_bytes` in version-1 registry
+bindings and to directly constructed HTTP adapters. The `limits` object itself
+remains required for a registry binding. The named constants
+[`DEFAULT_MAX_REQUEST_BYTES` and `DEFAULT_MAX_RESPONSE_BYTES`](../../crates/symbiotic-model/src/registry.rs)
+live in `symbiotic-model`, re-exported through `symbiotic_ai_runtime::model`.
+Credential-process version-4 route deserialization and the adapters use that
+shared definition; applications need no local copy.
+
+These are **provisional configured hard limits per provider call**, not measured
+capacity or guaranteed production provider maxima. Repository evidence is limited
+to the [example registry's 8,192-token context](../../examples/model-registry.json),
+[Jev's 64,000-token request budget](../../crates/symbiotic-model/src/classify.rs),
+[retrieval encoder fixtures with a 100,000-byte allowance](../../crates/symbiotic-model/tests/retrieval_transport.rs),
+and [chat transport fixtures with 65,536-byte request/response allowances and a
+16,000-token Anthropic output default](../../crates/symbiotic-model/tests/anthropic_transport.rs).
+The request default covers sixfold JSON escaping of 100,000 input bytes with
+448,576 bytes of headroom for wrappers and model names. The response default is
+16 times the fixture allowance, leaving 983,040 bytes of headroom for longer text,
+thinking blocks and JSON envelopes. The repository does not specify a universal
+byte-per-token bound or production maxima; deployments needing more must supply
+explicit byte limits based on their provider/model configuration.
+
+`max_input_bytes` still bounds both the typed payload and the complete encoded
+HTTP request, enforced by the shared capped encoder before permit consumption and
+at transmission. The response bound still applies before buffering successful
+HTTP bodies, including chunked bodies. Exceeding either limit returns an error;
+no input or output is truncated. Error bodies are discarded and their HTTP status
+reported. `max_frame_bytes` has no new default and must still fit twice the request
+allowance and the existing fourfold response allowance plus escaped identities
+and the reply envelope. A frame too small for the chosen defaults is refused with
+the existing configuration error; it is never automatically enlarged.
 
 Child-process admission keys and authenticated provider routes use:
 

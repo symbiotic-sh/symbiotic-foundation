@@ -867,6 +867,8 @@ impl JevClassifierProvider {
             max_response_bytes: None,
             served_model: model,
         }
+        .with_request_limit(default_max_request_bytes())
+        .with_response_limit(default_max_response_bytes())
     }
 
     /// Bound the complete encoded System One request before sending.

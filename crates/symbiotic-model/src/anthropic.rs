@@ -2,7 +2,7 @@
 use crate::*;
 
 /// Non-streaming Anthropic Messages adapter. The base URL includes `/v1`.
-/// Requests without a token bound default to 16,000; finite byte limits are required.
+/// Requests without a token bound default to 16,000; shared byte defaults apply.
 #[derive(Clone)]
 pub struct AnthropicChatProvider {
     transport: OpenAiCompatibleChatProvider,
