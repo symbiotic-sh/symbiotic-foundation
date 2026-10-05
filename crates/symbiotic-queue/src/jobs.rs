@@ -119,6 +119,9 @@ pub struct JobSpec {
     pub execution: Execution,
     /// Full waiting copy.
     pub payload: Vec<u8>,
+    /// Opaque signed authority, interpreted only by the execution owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<Vec<u8>>,
     /// Frozen execution limits.
     pub limits: JobLimits,
     /// Limits final-result availability only.
@@ -131,6 +134,8 @@ pub struct JobSpec {
 pub enum JobState {
     /// Waiting for a claim.
     Pending,
+    /// Waiting for a successor signed authority; no claim or charge consumed.
+    AwaitingAdmission,
     /// Leased to a worker.
     Running,
     /// Charge may exist; cannot be claimed blindly.
@@ -154,7 +159,10 @@ pub enum JobState {
 impl JobState {
     /// Whether execution/reconciliation still needs the waiting copy.
     pub fn unfinished(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::Uncertain)
+        matches!(
+            self,
+            Self::Pending | Self::AwaitingAdmission | Self::Running | Self::Uncertain
+        )
     }
     /// Whether a confirmation already won.
     pub fn acked(self) -> bool {
@@ -201,6 +209,9 @@ pub struct JobRecord {
     /// Waiting copy; never removed solely because an unfinished job is old.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Vec<u8>>,
+    /// Current opaque signed authority; absent for embedded jobs and tombstones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<Vec<u8>>,
     /// Frozen ceiling.
     pub max_attempts: u32,
     /// Monotonic claim fence.
@@ -326,7 +337,7 @@ pub struct DiagnosticPage {
 }
 
 /// Cancellation target within the authorized scope.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Selector {
     /// Explicit scoped identities.
     Ids(Vec<JobId>),
@@ -366,6 +377,20 @@ pub enum JobResolution {
 /// Atomic store operations. Runner/recovery and ledger ownership stay outside this module.
 #[derive(Clone, Debug)]
 pub enum JobRequest {
+    /// Trusted execution owner marks an unsent job as requiring renewed authority.
+    AwaitAdmission(JobId),
+    /// Replace authority and resume an unsent job; owner validates the successor.
+    Admit {
+        /// Job within the authorized scope.
+        job: JobId,
+        /// Opaque successor bytes validated by the execution owner.
+        admission: Vec<u8>,
+    },
+    /// Bounded, content-free notices; these are never confirmable completions.
+    AdmissionNotices {
+        /// Maximum number of waiting job notices.
+        limit: usize,
+    },
     /// All-or-none enqueue; joined keys consume no additional capacity.
     Enqueue(Vec<JobSpec>),
     /// Claim one job within handler kinds, given currently available account slots.
@@ -430,6 +455,8 @@ pub enum JobRequest {
     },
     /// Expire at most the configured number of final recovery copies.
     Maintain,
+    /// Content-free scoped status; never loads input, admission or output.
+    Status(JobId),
     /// Authorized internal lookup for runner/reconciliation.
     Get(JobId),
     /// Derived pending count/bytes for backpressure.
@@ -462,7 +489,7 @@ pub enum JobResponse {
 }
 
 /// Visible failures; messages contain static codes or scoped IDs, never content.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobError {
     /// Request crossed tenant/incarnation/queue authorization scope.
     #[error("job scope refused")]
@@ -488,6 +515,9 @@ pub enum JobError {
     /// Invalid configuration, state transition or page bound.
     #[error("invalid job request")]
     InvalidRequest,
+    /// Signed authority elapsed before final claim acceptance; await renewal.
+    #[error("job authority expired")]
+    AuthorityExpired,
     /// Expired or superseded claim.
     #[error("stale job claim")]
     StaleClaim,
@@ -544,6 +574,7 @@ pub fn job_input_bytes(row: &JobRecord) -> Result<usize, JobError> {
     .and_then(|metadata| {
         metadata
             .checked_add(row.payload.as_ref().map_or(0, Vec::len))
+            .and_then(|bytes| bytes.checked_add(row.admission.as_ref().map_or(0, Vec::len)))
             .ok_or(JobError::Storage)
     })
 }

@@ -2,7 +2,7 @@
 
 The [Foundation boundary contract](boundary.md) is authoritative for provider
 principals, grant-revision dispatch ordering, spend ownership and supported modes.
-This page describes the local credential backend and version-3 API implementing
+This page describes the local credential backend and version-4 API implementing
 Foundation-owned spend and ordered caller/provider grant-revision acceptance.
 
 Memory consumes **`symbiotic-egress` 0.2.0** (Rust path `symbiotic_egress`).
@@ -12,9 +12,9 @@ operational database; there is no second provider scheduler or spend owner.
 
 ## Shared schema and Memory integration
 
-The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
-`PROTOCOL_VERSION = 3`. The credential operation also requires
-`InjectProviderCredential.operation_version = 3`.
+The schema is defined in `crates/symbiotic-egress/src/lib.rs` and `jobs_client.rs`.
+`PROTOCOL_VERSION = 4`. The credential operation also requires
+`InjectProviderCredential.operation_version = 4`.
 
 | Current type / API | Meaning |
 | --- | --- |
@@ -34,7 +34,7 @@ The schema is defined once in `crates/symbiotic-egress/src/lib.rs`.
 
 `DurableAttempt` and related wire types are defined in
 [`crates/symbiotic-egress/src/lib.rs`](../../crates/symbiotic-egress/src/lib.rs).
-Use those definitions for current version-3 serialization; this page does not
+Use those definitions for current version-4 serialization; this page does not
 provide a replacement wire schema. `input_digest` hashes the exact typed
 `ProviderPayload` JSON via its `digest()` helper. `input_manifest_digest` binds
 Memory's manifest bytes; Foundation verifies the binding, not the manifest's
@@ -59,10 +59,78 @@ The current `EgressClient` test seam supports unknown-charge results. It re-expo
 the payload construction types; consumers do not import the credential-process
 implementation.
 
-## Same-attempt recovery (v3)
+## Signed model jobs (Memory FQ4)
 
-V3 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version and HMAC domains are 3; the egress registry schema stamp is 5.
+`JobsClient<C>` offers `enqueue`, `admit`, `completions`, `ack`, `cancel` and
+`status` on either `InProcessEgressClient` or `UnixEgressClient`. The corresponding
+wire operations are `EnqueueJobs`, `AdmitJob`, `Completions`, `AckJobs`, `CancelJobs`
+and `JobStatus`. Each carries a `SignedJobsRequest`; the MAC covers the complete
+`JobsRequest { scope, command }` under `symbiotic-egress/v4/jobs\0`. The outer
+operation must match the signed command. Foreign job/token scopes are refused
+before lookup or mutation. Replies use `Reply::Jobs(Result<JobsReply, JobError>)`.
+No claim, heartbeat, checkpoint, worker completion or settlement operation is exposed.
+
+An `EnqueueJob` contains a group, owners, a signed durable attempt and its exact
+`ProviderPayload`. The signed invocation ID is the job key within
+`JobScope { tenant, incarnation, queue }`. The frozen model binding, caller/manifest
+binding and request participate in the payload's conflict digest. Group and
+owners use the canonical job metadata; enqueue replays retain the original metadata.
+Replaying enqueue joins the existing key, including after restart; it never
+refreshes an admission or the route's frozen attempt ceiling. The signed job uses
+that ceiling for reservation; the direct-egress one-send retry setting does not
+reduce it. Each further claim still requires successor authority. `AdmitJob` updates
+only the current signed authority, requiring the same immutable invocation binding
+and increasing attempt ordinal and record sequence. An exact replay is idempotent.
+
+Jobs use the existing model runner, account limiter and spend-ledger connection.
+The account slot is acquired before the IMMEDIATE transaction that rechecks the
+published grant revision and exclusive authority deadline, claims the job, reads
+its waiting payload and reserves accounting. An invalidated admission moves an
+unsent job to `AwaitingAdmission`, consumes no attempt or allowance, and retains
+its input independently of recovery expiry. The shared egress payload preparation strips caller trace metadata and role labels
+and uses the stable scoped invocation key for attribution. Provider secrets are resolved only
+inside the claimed execution. No second scheduler, result copy or spend owner exists.
+Local credential-resolution failures report authentication/configuration failure and
+release the reservation without HTTP. Remote authentication rejection is not trusted
+zero-charge evidence: its accounting and job remain uncertain.
+Cancel before claim finalizes waiting work; cancel after claim arrives with the
+lease heartbeat. Sent version-1 calls finish under their configured timeout.
+
+`Completions { limit, max_bytes, wait_seconds }` long-polls up to
+`io_timeout_seconds`; socket clients must configure a longer exchange timeout.
+The byte bound covers the complete `JobsCompletions` body and must fit within
+`max_frame_bytes` after subtracting the response envelope derived from the shared
+wire serializer. Final deliveries
+precede admission notices. A notice contains an ID/state/code and no delivery
+fence; acknowledging an unfinished job returns `NotFinal`. An individually
+oversized completion returns `CompletionTooLarge` before taking a delivery lease.
+`JobStatus` reads one job's metadata without loading input, admission or output.
+Group summaries and diagnostics are outside this six-operation subset.
+
+`ProcessConfig.jobs` and `.job_runner` use the existing versioned `JobConfig` and
+`RunnerConfig` defaults. Admission bytes count against pending utilization and
+follow the same confirmation, cancellation and erasure deletion rules as input.
+Queue schema 17 adds the current admission column and `AwaitingAdmission` to the
+existing bounded live-row indexes; older formats are refused without migration.
+Workers attach to an authenticated scope on its first job request (also after
+restart). Dropped consumer futures leave Foundation-owned execution running.
+The process state lock remains held until its runners drain. Worker failures
+are reported by subsequent job requests and a failed attachment stays refused.
+Ledger-first recovery preserves `Uncertain` after a kill during dispatch and never
+resends it; final output is retained only by the ledger's existing recovery owner.
+
+The acceptance tests are `jobs_*` in
+`crates/symbiotic-credential-process/tests/egress.rs`: both transports, keyed joins,
+revocation during account waits, successor authority after recovery expiry,
+foreign scopes/MAC tampering, and executable kill/restart without resending.
+`jobs_only_local_credential_failures_are_known_zero_charge` covers local resolution
+versus remote rejection; `admission_bytes_share_maintenance_budget` in the SQLite
+job tests covers admission deletion under the existing maintenance byte budget.
+
+## Same-attempt recovery (v4)
+
+V4 replaces earlier versions without aliases or fallback. Both request and credential-operation
+versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 6 and queue schema is 17.
 Opening a registry with a different stamp fails with `Version`; no migration or reset is
 performed. Operators must reconcile any old live attempts before provisioning fresh state;
 never delete active replay history.
@@ -78,7 +146,7 @@ EgressClient::attempt_status(&self, SignedAttemptId) -> Result<AttemptStatus, Eg
 
 `AttemptId { tenant, incarnation, invocation_id, attempt_ordinal }` is the durable
 identity. Status requests use `Operation::AttemptStatus(SignedAttemptId { attempt_id,
-authentication })`, authenticated over `b"symbiotic-egress/v3/attempt-status\0"` plus
+authentication })`, authenticated over `b"symbiotic-egress/v4/attempt-status\0"` plus
 its typed identity JSON. The reply is `Reply::AttemptStatus(AttemptStatus)`. Knowing an
 identity alone does not authorize lookup; Memory signs it only for its trusted recovery
 path and applies its own caller/output disclosure checks before releasing recovered output.
@@ -104,7 +172,9 @@ requests converge on one permit, and concurrent injections admit at most one han
 | `Expired` | Terminal result recovery deadline elapsed; `Receipt` still returns accounting |
 
 The required signed `DurableAttempt.recovery_expires_at` is an exclusive absolute Unix
-second deadline, greater than `recorded_at` and at most `i64::MAX`. It is immutable
+second deadline, greater than the first attempt's `recorded_at` and at most `i64::MAX`.
+A successor may be recorded after recovery expiry: its authority deadline still
+controls execution, while the original recovery deadline still prevents storing output. It is immutable
 across invocation retries, distinct from authority `expires_at`, and chosen by Memory
 for its recovery window. Terminal results are unavailable at or after that deadline.
 Completion after the deadline persists accounting but never stores recovery output.
@@ -135,20 +205,20 @@ has `kind` / `request`; `Reply` has `reply` / `body`. Rust's `Result` is seriali
 `{"Ok": ...}` or `{"Err": "error_code"}`. For example a refusal is:
 
 ```json
-{"version":3,"result":{"Err":"permit_refused"}}
+{"version":4,"result":{"Err":"permit_refused"}}
 ```
 
 `IssuePermit` requests have the outer form:
 
 ```json
-{"version":3,"operation":{"operation":"issue_permit","body":{"attempt":{},"authentication":"..."}}}
+{"version":4,"operation":{"operation":"issue_permit","body":{"attempt":{},"authentication":"..."}}}
 ```
 
 The empty object above stands for **all** `DurableAttempt` fields, not a valid request.
 Use the shared Rust types, which reject absent required fields.
 `SignedAttempt.authentication` is HMAC-SHA256 over
-`b"symbiotic-egress/v3/attempt\0" || serde_json::to_vec(attempt)`.
-Revision publications use `b"symbiotic-egress/v3/grant-revision\0"` and the `GrantRevision` value.
+`b"symbiotic-egress/v4/attempt\0" || serde_json::to_vec(attempt)`.
+Revision publications use `b"symbiotic-egress/v4/grant-revision\0"` and the `GrantRevision` value.
 The `AdmissionKey` helpers define serialization and constant-time verification.
 
 ## Revocation, replay and unknown charges
@@ -292,7 +362,7 @@ client disconnect cannot terminate the recovery service. No credential is passed
 provider prompt, routine log or raw diagnostic. This local IPC boundary trusts the
 same-user deployment; it is not an OS sandbox against a compromised same-UID process.
 
-`ProcessConfig` version 3 requires `state_dir`, `socket_path`, `admission_key`,
+`ProcessConfig` version 4 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
 Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
 isolation, or explicitly pools execution across routes or tenants. Shared bindings

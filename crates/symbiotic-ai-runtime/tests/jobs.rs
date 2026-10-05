@@ -171,6 +171,7 @@ fn spec(key: &str, p: &Provider) -> JobSpec {
         kind: "chat".into(),
         execution: Execution::Model,
         payload: model_job_payload(&binding(p.clone()), &request()).unwrap(),
+        admission: None,
         limits: JobLimits { max_attempts: 1 },
         recovery_until: None,
     }

@@ -10,7 +10,7 @@ use symbiotic_queue::jobs::*;
 
 type SqlProjection<'a, T> = (&'a str, fn(&Row<'_>) -> rusqlite::Result<T>);
 
-const COLUMNS: &str = "scope, id, key, digest, job_group, owners, kind, execution, state, final_state, payload, max_attempts, generation, lease_until, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes";
+const COLUMNS: &str = "scope, id, key, digest, job_group, owners, kind, execution, state, final_state, payload, max_attempts, generation, lease_until, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes, admission";
 
 fn storage(_: impl std::fmt::Display) -> JobError {
     JobError::Storage
@@ -85,6 +85,7 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
                 Execution::Handler
             },
             payload: None,
+            admission: None,
             max_attempts: 0,
             generation: 0,
             lease_until: None,
@@ -131,6 +132,7 @@ fn read_record(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         delivery_until: read_optional_time(row, 24)?,
         diagnostic: read_optional_json(row, 25)?,
         output_bytes: row.get(26)?,
+        admission: row.get(27)?,
     })
 }
 
@@ -169,17 +171,18 @@ pub(super) fn initialize(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
         delivery_until INTEGER,
         diagnostic TEXT,
         output_bytes INTEGER,
+        admission BLOB,
         PRIMARY KEY(scope, id), UNIQUE(scope, key)
     );
     CREATE INDEX jobs_claim ON jobs(scope, created_at, id)
-        WHERE state IN ('\"Pending\"','\"Running\"','\"Uncertain\"');
+        WHERE state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"');
     CREATE INDEX jobs_delivery ON jobs(scope, finished_at, id)
         WHERE state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"');
     CREATE INDEX jobs_expiry ON jobs(scope, recovery_until, id)
         WHERE result_expired=0 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"');
     CREATE INDEX jobs_unfinished_group ON jobs(scope, job_group, id)
-        WHERE state IN ('\"Pending\"','\"Running\"','\"Uncertain\"');
-    CREATE INDEX jobs_diagnostics ON jobs(scope, job_group, id) WHERE state IN ('\"Failed\"','\"Uncertain\"');
+        WHERE state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"');
+    CREATE INDEX jobs_diagnostics ON jobs(scope, job_group, id) WHERE state IN ('\"Failed\"','\"Uncertain\"','\"AwaitingAdmission\"');
     CREATE TABLE job_owners (
         scope TEXT NOT NULL, owner TEXT NOT NULL, job_id TEXT NOT NULL,
         PRIMARY KEY(scope, owner, job_id)
@@ -205,6 +208,20 @@ pub fn jobs_in_transaction(
     let response = apply_job_request(&mut SqlRows::new(&savepoint), scope, config, now, request)?;
     savepoint.commit().map_err(storage)?;
     Ok(response)
+}
+
+/// Derive whether a scoped kind needs execution or recovery through the unfinished
+/// job index. Jobs awaiting renewed admission do not require an execution owner.
+/// Reads at most one content-free match; work never visits retained final history.
+pub fn jobs_need_execution_in_transaction(
+    tx: &Transaction<'_>,
+    scope: &JobScope,
+    kind: String,
+    now: DateTime<Utc>,
+) -> Result<bool, JobError> {
+    Ok(!SqlRows::new(tx)
+        .select_with(scope, JobQuery::Execution(kind), now, 1, ("1", |_| Ok(())))?
+        .is_empty())
 }
 
 /// Receipt owners affected by deletion, selected before the transition removes
@@ -326,7 +343,7 @@ impl SqlRows<'_> {
         let columns = COLUMNS
             .split(", ")
             .map(|c| match c {
-                "payload" | "output" => "NULL",
+                "payload" | "output" | "admission" => "NULL",
                 _ => c,
             })
             .collect::<Vec<_>>()
@@ -353,7 +370,7 @@ impl SqlRows<'_> {
     fn recovery_bytes(&mut self, id: &JobId) -> Result<usize, JobError> {
         self.conn
             .query_row(
-                "SELECT coalesce(length(CAST(payload AS BLOB)),0) + coalesce(length(CAST(output AS BLOB)),0) + coalesce((SELECT length(CAST(recovery AS BLOB)) FROM spend_receipts WHERE reference=jobs.receipt),0) FROM jobs WHERE scope=?1 AND id=?2",
+                "SELECT coalesce(length(CAST(payload AS BLOB)),0) + coalesce(length(CAST(admission AS BLOB)),0) + coalesce(length(CAST(output AS BLOB)),0) + coalesce((SELECT length(CAST(recovery AS BLOB)) FROM spend_receipts WHERE reference=jobs.receipt),0) FROM jobs WHERE scope=?1 AND id=?2",
                 params![json(&id.scope)?, id.id],
                 |r| r.get(0),
             )
@@ -367,14 +384,14 @@ impl SqlRows<'_> {
         Ok(())
     }
     fn expire(&mut self, id: &JobId) -> Result<(), JobError> {
-        self.conn.execute("UPDATE jobs SET result_expired=1, payload=NULL, output=NULL, output_bytes=0 WHERE scope=?1 AND id=?2", params![json(&id.scope)?, id.id]).map_err(storage)?;
+        self.conn.execute("UPDATE jobs SET result_expired=1, payload=NULL, admission=NULL, output=NULL, output_bytes=0 WHERE scope=?1 AND id=?2", params![json(&id.scope)?, id.id]).map_err(storage)?;
         Ok(())
     }
     fn save(&mut self, row: JobRecord) -> Result<(), JobError> {
         if row.state.acked() {
             // One persistence owner narrows every confirmed write, including
             // future callers of save. Model kind retains the frozen binding for sticky erasure.
-            self.conn.execute("INSERT INTO jobs (scope,id,key,digest,state,final_state,receipt,delivery_generation,kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key,digest=excluded.digest,state=excluded.state,final_state=excluded.final_state,receipt=excluded.receipt,delivery_generation=excluded.delivery_generation,job_group=NULL,owners=NULL,kind=excluded.kind,execution=NULL,payload=NULL,max_attempts=NULL,generation=NULL,lease_until=NULL,cancel_requested=NULL,purged=NULL,output=NULL,origin=NULL,recovery_until=NULL,result_expired=NULL,created_at=NULL,finished_at=NULL,delivery_until=NULL,diagnostic=NULL,output_bytes=NULL",
+            self.conn.execute("INSERT INTO jobs (scope,id,key,digest,state,final_state,receipt,delivery_generation,kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key,digest=excluded.digest,state=excluded.state,final_state=excluded.final_state,receipt=excluded.receipt,delivery_generation=excluded.delivery_generation,job_group=NULL,owners=NULL,kind=excluded.kind,execution=NULL,payload=NULL,admission=NULL,max_attempts=NULL,generation=NULL,lease_until=NULL,cancel_requested=NULL,purged=NULL,output=NULL,origin=NULL,recovery_until=NULL,result_expired=NULL,created_at=NULL,finished_at=NULL,delivery_until=NULL,diagnostic=NULL,output_bytes=NULL",
                 params![json(&row.id.scope)?, row.id.id, row.key, row.digest, json(&row.state)?, optional_json(&row.final_state)?, row.receipt, i64::try_from(row.delivery_generation).map_err(storage)?, (row.execution == Execution::Model).then_some(&row.kind)]).map_err(storage)?;
             self.conn
                 .execute(
@@ -398,7 +415,7 @@ impl SqlRows<'_> {
             millisecond_time(time)?;
         }
         let old = self.get(&row.id)?;
-        self.conn.execute("INSERT INTO jobs (scope, id, key, digest, job_group, owners, kind, execution, state, final_state, payload, max_attempts, generation, lease_until, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key, digest=excluded.digest, job_group=excluded.job_group, owners=excluded.owners, kind=excluded.kind, execution=excluded.execution, state=excluded.state, final_state=excluded.final_state, payload=excluded.payload, max_attempts=excluded.max_attempts, generation=excluded.generation, lease_until=excluded.lease_until, cancel_requested=excluded.cancel_requested, purged=excluded.purged, output=excluded.output, origin=excluded.origin, receipt=excluded.receipt, recovery_until=excluded.recovery_until, result_expired=excluded.result_expired, created_at=excluded.created_at, finished_at=excluded.finished_at, delivery_generation=excluded.delivery_generation, delivery_until=excluded.delivery_until, diagnostic=excluded.diagnostic, output_bytes=excluded.output_bytes",
+        self.conn.execute("INSERT INTO jobs (scope, id, key, digest, job_group, owners, kind, execution, state, final_state, payload, max_attempts, generation, lease_until, cancel_requested, purged, output, origin, receipt, recovery_until, result_expired, created_at, finished_at, delivery_generation, delivery_until, diagnostic, output_bytes, admission) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28) ON CONFLICT(scope,id) DO UPDATE SET key=excluded.key, digest=excluded.digest, job_group=excluded.job_group, owners=excluded.owners, kind=excluded.kind, execution=excluded.execution, state=excluded.state, final_state=excluded.final_state, payload=excluded.payload, max_attempts=excluded.max_attempts, generation=excluded.generation, lease_until=excluded.lease_until, cancel_requested=excluded.cancel_requested, purged=excluded.purged, output=excluded.output, origin=excluded.origin, receipt=excluded.receipt, recovery_until=excluded.recovery_until, result_expired=excluded.result_expired, created_at=excluded.created_at, finished_at=excluded.finished_at, delivery_generation=excluded.delivery_generation, delivery_until=excluded.delivery_until, diagnostic=excluded.diagnostic, output_bytes=excluded.output_bytes, admission=excluded.admission",
             params![
                 json(&row.id.scope)?,
                 &row.id.id,
@@ -427,6 +444,7 @@ impl SqlRows<'_> {
                 row.delivery_until.map(stamp),
                 optional_json(&row.diagnostic)?,
                 i64::try_from(row.output.as_ref().map(encoded_bytes).transpose()?.unwrap_or(0)).map_err(storage)?,
+                &row.admission,
             ]).map_err(storage)?;
         if old.as_ref().is_none_or(|old| old.owners != row.owners) {
             self.conn
@@ -449,11 +467,11 @@ impl SqlRows<'_> {
     fn usage(&mut self, scope: &JobScope) -> Result<PendingUsage, JobError> {
         // The JSON tuple has exactly the same canonical fields as job_input_bytes.
         // CAST to BLOB counts UTF-8 bytes, rather than SQLite's character count.
-        self.conn.query_row("SELECT count(*), coalesce(sum(length(CAST(json_array(json(scope),key,job_group,json(owners),kind,json(execution),max_attempts) AS BLOB))+coalesce(length(payload),0)),0) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')",
+        self.conn.query_row("SELECT count(*), coalesce(sum(length(CAST(json_array(json(scope),key,job_group,json(owners),kind,json(execution),max_attempts) AS BLOB))+coalesce(length(payload),0)+coalesce(length(admission),0)),0) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"')",
             [json(scope)?], |r| Ok(PendingUsage { items: r.get(0)?, bytes: r.get(1)? })).map_err(storage)
     }
     fn live_count(&self, scope: &JobScope) -> Result<usize, JobError> {
-        self.conn.query_row("SELECT (SELECT count(*) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')) + (SELECT count(*) FROM jobs INDEXED BY jobs_delivery WHERE scope=?1 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"'))", [json(scope)?], |r| r.get(0)).map_err(storage)
+        self.conn.query_row("SELECT (SELECT count(*) FROM jobs INDEXED BY jobs_claim WHERE scope=?1 AND state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"')) + (SELECT count(*) FROM jobs INDEXED BY jobs_delivery WHERE scope=?1 AND state IN ('\"Succeeded\"','\"Failed\"','\"Cancelled\"','\"Refused\"','\"Purged\"'))", [json(scope)?], |r| r.get(0)).map_err(storage)
     }
     fn select_with<T>(
         &mut self,
@@ -482,10 +500,15 @@ impl SqlRows<'_> {
         }
         let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
         let (filter, order, index) = match query {
+            JobQuery::Admission => ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state='\"AwaitingAdmission\"'".to_string(), "id", "jobs_claim"),
+            JobQuery::Execution(kind) => {
+                args.push(kind.into());
+                ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state!='\"AwaitingAdmission\"' AND kind=?2".to_string(), "created_at, id", "jobs_claim")
+            }
             JobQuery::Group(group) => {
                 args.push(group.into());
                 (
-                    "job_group=?2 AND state IN ('\"Pending\"','\"Running\"','\"Uncertain\"')"
+                    "job_group=?2 AND state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"')"
                         .to_string(),
                     "id",
                     "jobs_unfinished_group",
@@ -494,14 +517,14 @@ impl SqlRows<'_> {
             JobQuery::Pending { kinds } => {
                 args.push(json(&kinds)?.into());
                 args.push(stamp(now).into());
-                let filter = "state IN ('\"Pending\"','\"Running\"','\"Uncertain\"') AND (state='\"Pending\"' OR (state='\"Running\"' AND execution='\"Handler\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2))".to_string();
+                let filter = "state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND (state='\"Pending\"' OR (state='\"Running\"' AND execution='\"Handler\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2))".to_string();
                 (filter, "created_at, id", "jobs_claim")
             }
             JobQuery::Recovery { kinds, after } => {
                 args.push(json(&kinds)?.into());
                 args.push(stamp(now).into());
                 args.push(after.unwrap_or_default().into());
-                ("state IN ('\"Pending\"','\"Running\"','\"Uncertain\"') AND execution='\"Model\"' AND (state='\"Uncertain\"' OR (state='\"Running\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2)) AND id>?4".to_string(), "id", "jobs_claim")
+                ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND execution='\"Model\"' AND (state='\"Uncertain\"' OR (state='\"Running\"' AND lease_until<=?3)) AND kind IN (SELECT value FROM json_each(?2)) AND id>?4".to_string(), "id", "jobs_claim")
             }
             JobQuery::Final => {
                 args.push(stamp(now).into());
@@ -515,7 +538,7 @@ impl SqlRows<'_> {
                 args.push(group.into());
                 args.push(after.unwrap_or_default().into());
                 (
-                    "job_group=?2 AND state IN ('\"Failed\"','\"Uncertain\"') AND id>?3"
+                    "job_group=?2 AND state IN ('\"Failed\"','\"Uncertain\"','\"AwaitingAdmission\"') AND id>?3"
                         .to_string(),
                     "id",
                     "jobs_diagnostics",
@@ -583,12 +606,17 @@ impl SqliteQueue {
 /// Backend row selection; all operational pages are bounded at the storage read.
 #[derive(Clone, Debug)]
 enum JobQuery {
+    Admission,
+    /// Unfinished work requiring execution or recovery, excluding admission waits.
+    Execution(String),
     /// Unfinished scoped group scan for atomic group cancellation.
     Group(String),
     /// Indexed owner membership, chunked in ascending ID order.
     Owner(String),
     /// Waiting claims within handler kinds, FIFO.
-    Pending { kinds: Vec<String> },
+    Pending {
+        kinds: Vec<String>,
+    },
     /// Expired model claims and unresolved paid attempts, ascending ID.
     Recovery {
         kinds: Vec<String>,
@@ -679,6 +707,7 @@ fn live(row: &JobRecord, generation: u64, now: DateTime<Utc>) -> Result<(), JobE
 
 fn delete_copies(row: &mut JobRecord) {
     row.payload = None;
+    row.admission = None;
     row.output = None;
     row.output_bytes = 0;
 }
@@ -818,6 +847,57 @@ fn apply_job_request(
     deadline(now, config.delivery_lease_seconds)?;
     deadline(now, config.retention_seconds)?;
     match request {
+        JobRequest::AwaitAdmission(job) => {
+            let mut row = get(rows, scope, &job)?;
+            if row.state != JobState::Pending || row.execution != Execution::Model {
+                return Err(JobError::InvalidRequest);
+            }
+            row.state = JobState::AwaitingAdmission;
+            rows.save(row)?;
+            Ok(JobResponse::Done)
+        }
+        JobRequest::Admit { job, admission } => {
+            let mut row = get(rows, scope, &job)?;
+            if !matches!(row.state, JobState::Pending | JobState::AwaitingAdmission)
+                || row.execution != Execution::Model
+                || admission.is_empty()
+            {
+                return Err(JobError::InvalidRequest);
+            }
+            if row.admission.as_deref() == Some(admission.as_slice()) {
+                return Ok(JobResponse::Done);
+            }
+            row.admission = Some(admission);
+            row.state = JobState::Pending;
+            rows.save(row)?;
+            if rows.usage(scope)?.bytes > config.max_pending_bytes {
+                return Err(JobError::QueueFull);
+            }
+            Ok(JobResponse::Done)
+        }
+        JobRequest::AdmissionNotices { limit } => {
+            page(config, limit)?;
+            let notices = rows.select_with(
+                scope,
+                JobQuery::Admission,
+                now,
+                limit,
+                ("scope, id, state, diagnostic", |r| {
+                    Ok(JobDiagnostic {
+                        id: JobId {
+                            scope: read_json(r, 0)?,
+                            id: r.get(1)?,
+                        },
+                        state: read_json(r, 2)?,
+                        code: read_optional_json(r, 3)?,
+                    })
+                }),
+            )?;
+            Ok(JobResponse::Diagnostics(DiagnosticPage {
+                after: notices.last().map(|n| n.id.id.clone()),
+                items: notices,
+            }))
+        }
         JobRequest::Enqueue(specs) => {
             if specs.len() > config.max_batch {
                 return Err(JobError::InvalidRequest);
@@ -858,6 +938,7 @@ fn apply_job_request(
                         state: JobState::Pending,
                         final_state: None,
                         payload: Some(spec.payload),
+                        admission: spec.admission,
                         max_attempts: spec.limits.max_attempts,
                         generation: 0,
                         lease_until: None,
@@ -1109,6 +1190,8 @@ fn apply_job_request(
                     } else if row.generation >= u64::from(row.max_attempts) {
                         row.diagnostic = Some(DiagnosticCode::AttemptBudgetExhausted);
                         finish(&mut row, JobState::Refused, now, config)?;
+                    } else if row.admission.is_some() {
+                        row.state = JobState::AwaitingAdmission;
                     } else {
                         row.state = JobState::Pending;
                     }
@@ -1297,7 +1380,7 @@ fn apply_job_request(
                 if !row.state.unfinished() {
                     continue;
                 }
-                if claimable(&row, now) {
+                if claimable(&row, now) || row.state == JobState::AwaitingAdmission {
                     let state = stopped_state(&row);
                     finish(&mut row, state, now, config)?;
                     delete_copies(&mut row);
@@ -1369,6 +1452,10 @@ fn apply_job_request(
             }
             Ok(JobResponse::Changed(count))
         }
+        JobRequest::Status(id) => {
+            scoped(scope, &id)?;
+            Ok(JobResponse::Job(Some(Box::new(rows.metadata(&id)?))))
+        }
         JobRequest::Get(id) => Ok(JobResponse::Job(Some(Box::new(get(rows, scope, &id)?)))),
         JobRequest::PendingUsage => Ok(JobResponse::Usage(rows.usage(scope)?)),
     }
@@ -1394,6 +1481,7 @@ mod tests {
             kind: "handler".into(),
             execution: Execution::Handler,
             payload: key.as_bytes().to_vec(),
+            admission: None,
             limits: JobLimits { max_attempts: 3 },
             recovery_until: None,
         }
@@ -2066,6 +2154,7 @@ mod tests {
                     JobState::Succeeded
                 };
                 row.payload = None;
+                row.admission = None;
                 row.finished_at = Some(now);
                 row.delivery_generation = 1;
                 row.delivery_until = (i >= retained).then_some(now + chrono::Duration::seconds(30));

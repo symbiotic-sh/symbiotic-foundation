@@ -419,6 +419,11 @@ impl JobRunner {
         }
     }
 
+    /// Whether supervision has finished; await `wait` to collect its result.
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Stop claiming and await running handlers and all worker errors.
     pub async fn shutdown(self) -> Result<(), RunnerError> {
         self.stop.send_replace(true);

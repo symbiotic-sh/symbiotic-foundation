@@ -809,7 +809,7 @@ fn cooldown_active(conn: &Connection, queue_id: &QueueId) -> Result<bool, QueueE
 }
 
 /// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 16;
+pub const QUEUE_SCHEMA_VERSION: u32 = 17;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))

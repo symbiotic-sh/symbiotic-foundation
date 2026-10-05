@@ -8,7 +8,7 @@ pub(crate) struct Registry(Connection);
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 6;
+const REGISTRY_SCHEMA_VERSION: u16 = 7;
 
 // Stored receipt identity/status; accounting is projected from the ledger on reads.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -71,7 +71,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 6 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 7 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -111,15 +111,25 @@ impl Registry {
         if let Some(grant) = self.existing(a)? {
             return Ok(grant);
         }
-        let attempt_digest = digest(a)?;
-        let invocation_key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
-        let grant_key = digest(&(&a.tenant, &a.incarnation))?;
-        let binding = crate::invocation_binding(a)?;
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        Self::check_revision(&tx, a)?;
+        let grant = Self::issue_in(&tx, a, max_attempts)?;
+        tx.commit().map_err(state)?;
+        Ok(grant)
+    }
+
+    fn issue_in(
+        tx: &rusqlite::Transaction<'_>,
+        a: &DurableAttempt,
+        max_attempts: u32,
+    ) -> Result<PermitGrant, EgressError> {
+        let attempt_digest = digest(a)?;
+        let invocation_key = a.attempt_id().invocation_key()?;
+        let grant_key = digest(&(&a.tenant, &a.incarnation))?;
+        let binding = crate::invocation_binding(a)?;
+        Self::check_revision(tx, a)?;
         let previous = tx.query_row(
             "SELECT invocation_binding, ordinal, receipt, record_sequence, consumed, grant_revision, accepted_attempts, expires_at
              FROM egress_permits WHERE invocation_key=?1 ORDER BY ordinal DESC LIMIT 1", [&invocation_key],
@@ -181,7 +191,6 @@ impl Registry {
         let token = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO egress_permits (attempt_digest, invocation_key, invocation_binding, ordinal, token, record_sequence, recovery_expires_at, grant_key, grant_revision, accepted_attempts, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![attempt_digest, invocation_key, binding, a.attempt_ordinal, token, a.record_sequence, a.recovery_expires_at, grant_key, a.grant_revision, accepted_attempts, a.expires_at]).map_err(state)?;
-        tx.commit().map_err(state)?;
         Ok(PermitGrant {
             permit: DispatchPermit {
                 token,
@@ -201,7 +210,10 @@ impl Registry {
         Ok(())
     }
 
-    fn check_revision(conn: &Connection, attempt: &DurableAttempt) -> Result<(), EgressError> {
+    pub(crate) fn check_revision(
+        conn: &Connection,
+        attempt: &DurableAttempt,
+    ) -> Result<(), EgressError> {
         let key = digest(&(&attempt.tenant, &attempt.incarnation))?;
         let current: Option<u64> = conn
             .query_row(
@@ -224,6 +236,56 @@ impl Registry {
         handoff: &AcceptedSpendHandoff,
         max_attempts: u32,
     ) -> Result<DispatchReceipt, EgressError> {
+        let tx = self
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(state)?;
+        let receipt = Self::accept_in(
+            &tx,
+            attempt,
+            permit,
+            &handoff.reservation.reference,
+            max_attempts,
+        )?;
+        if !SqliteSpendLedger::reserve_handoff_in(&tx, handoff).map_err(ledger_error)? {
+            return Err(EgressError::PermitRefused);
+        }
+        tx.commit().map_err(state)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn accept_job_in(
+        tx: &rusqlite::Transaction<'_>,
+        attempt: &DurableAttempt,
+        reference: &SpendReceiptRef,
+        max_attempts: u32,
+    ) -> Result<(), EgressError> {
+        let key = attempt.attempt_id().invocation_key()?;
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT attempt_digest, token FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
+            params![key, attempt.attempt_ordinal], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(state)?;
+        let permit = if let Some((attempt_digest, token)) = existing {
+            DispatchPermit {
+                attempt_digest,
+                token,
+            }
+        } else {
+            Self::issue_in(tx, attempt, max_attempts)?.permit
+        };
+        Self::accept_in(tx, attempt, &permit, reference, max_attempts)?;
+        Ok(())
+    }
+
+    // Both dispatch paths consume this canonical attempt record under the same
+    // writer transaction as their reservation. A failed reservation rolls it back.
+    fn accept_in(
+        tx: &rusqlite::Transaction<'_>,
+        attempt: &DurableAttempt,
+        permit: &DispatchPermit,
+        reference: &SpendReceiptRef,
+        max_attempts: u32,
+    ) -> Result<DispatchReceipt, EgressError> {
         let attempt_digest = digest(attempt)?;
         if attempt_digest != permit.attempt_digest {
             return Err(EgressError::PermitRefused);
@@ -233,15 +295,11 @@ impl Registry {
             status: DispatchStatus::ProviderFailed,
             usage: Default::default(),
             attempt_id: attempt.attempt_id(),
-            reference: handoff.reservation.reference.clone(),
+            reference: reference.clone(),
             spend_state: SpendState::Unknown,
         };
         let json = serde_json::to_string(&StoredReceipt::from(&receipt))
             .map_err(|_| EgressError::StateUnavailable)?;
-        let tx = self
-            .0
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(state)?;
         let (accepted_attempts, superseded): (u32, bool) = tx
             .query_row(
                 "SELECT p.accepted_attempts, EXISTS(
@@ -256,7 +314,7 @@ impl Registry {
             .ok_or(EgressError::PermitRefused)?;
         // The immediate transaction orders current authority with revision publication
         // and the durable replay/reservation acceptance point.
-        Self::check_revision(&tx, attempt)?;
+        Self::check_revision(tx, attempt)?;
         // Issuance permanently supersedes an unconsumed predecessor, even if
         // the clock rolls back. Only the latest row can advance its handoff count.
         if superseded {
@@ -276,10 +334,6 @@ impl Registry {
         if changed != 1 {
             return Err(EgressError::PermitRefused);
         }
-        if !SqliteSpendLedger::reserve_handoff_in(&tx, handoff).map_err(ledger_error)? {
-            return Err(EgressError::PermitRefused);
-        }
-        tx.commit().map_err(state)?;
         Ok(receipt)
     }
 
@@ -326,7 +380,7 @@ impl Registry {
     }
 
     pub(crate) fn existing(&self, a: &DurableAttempt) -> Result<Option<PermitGrant>, EgressError> {
-        let key = digest(&(&a.tenant, &a.incarnation, &a.invocation_id))?;
+        let key = a.attempt_id().invocation_key()?;
         let existing: Option<(String, String)> = self.0.query_row(
             "SELECT attempt_digest, token FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2",
             params![key, a.attempt_ordinal], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -352,7 +406,7 @@ impl Registry {
         id: &AttemptId,
         time: u64,
     ) -> Result<AttemptStatus, EgressError> {
-        let key = digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?;
+        let key = id.invocation_key()?;
         let row = self
             .0
             .query_row(
@@ -482,7 +536,7 @@ impl Registry {
             .0
             .query_row(
                 "SELECT receipt FROM egress_permits WHERE invocation_key=?1 AND ordinal=?2 AND consumed=1",
-                params![digest(&(&id.tenant, &id.incarnation, &id.invocation_id))?, id.attempt_ordinal],
+                params![id.invocation_key()?, id.attempt_ordinal],
                 |row| row.get(0),
             )
             .optional()
@@ -558,7 +612,7 @@ mod tests {
             reservation: SpendReservation {
                 reference: crate::egress_reference(a).unwrap(),
                 account: "test-account".into(),
-                invocation: digest(&(&a.tenant, &a.incarnation, &a.invocation_id)).unwrap(),
+                invocation: a.attempt_id().invocation_key().unwrap(),
                 binding: crate::invocation_binding(a).unwrap(),
                 request_limit: None,
             },
@@ -1335,7 +1389,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 4, 5, 7] {
+        for version in [1, 2, 3, 4, 5, 6, 8] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();

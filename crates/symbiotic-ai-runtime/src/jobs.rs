@@ -24,12 +24,37 @@ fn storage(_: impl std::fmt::Debug) -> ModelError {
 
 /// Final delivery plus the ledger's sole paid recovery answer. The answer is
 /// absent after expiry, confirmation or purge; accounting remains queryable.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelDelivery {
     /// Job metadata and confirmation token.
     pub delivery: Delivery,
     /// Same-invocation answer, with no cache reuse across keys.
     pub output: Option<serde_json::Value>,
+}
+
+/// Optional trusted admission owner for model jobs crossing an authenticated boundary.
+/// Successor and claim checks run inside the same IMMEDIATE transaction as the transition.
+/// Returning false at claim waits for renewed authority without reserving spend.
+pub trait ModelJobAdmission: Send + Sync {
+    /// Validate a signed initial authority before storing a waiting copy.
+    fn enqueue(&self, spec: &JobSpec) -> Result<(), JobError>;
+    /// Validate a successor against the canonical frozen row and previous authority.
+    /// False is an exact replay: leave the current lifecycle unchanged.
+    fn admit(&self, row: &JobRecord, admission: &[u8]) -> Result<bool, JobError>;
+    /// Record signed-attempt acceptance in the claim/reservation transaction.
+    fn accept(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        reservation: &SpendReservation,
+    ) -> Result<(), JobError>;
+    /// Recheck current authority after obtaining the account slot, before claim/reservation.
+    fn claim(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, JobError>;
 }
 
 /// One trusted scoped job API on the runtime's ledger connection.
@@ -39,6 +64,7 @@ pub struct ModelJobs {
     ledger: Arc<spend::SqliteSpendLedger>,
     scope: JobScope,
     config: JobConfig,
+    admission: Option<Arc<dyn ModelJobAdmission>>,
 }
 
 impl Runtime {
@@ -50,6 +76,7 @@ impl Runtime {
             ledger: self.inner.job_ledger.clone().ok_or(JobError::Unavailable)?,
             scope,
             config,
+            admission: None,
         };
         jobs.request_sync(JobRequest::PendingUsage)?;
         Ok(jobs)
@@ -224,6 +251,27 @@ fn job_receipt_reference_in(
 }
 
 impl ModelJobs {
+    /// Derive whether a kind has work requiring execution or ledger recovery.
+    pub async fn needs_execution(&self, kind: String) -> Result<bool, JobError> {
+        let jobs = self.clone();
+        tokio::task::spawn_blocking(move || {
+            jobs.transaction(|tx, now| {
+                symbiotic_queue_sqlite::jobs::jobs_need_execution_in_transaction(
+                    tx,
+                    &jobs.scope,
+                    kind,
+                    now,
+                )
+            })
+        })
+        .await
+        .map_err(|_| JobError::Storage)?
+    }
+    /// Attach the trusted admission owner; signed jobs never retry automatically.
+    pub fn with_admission(mut self, admission: Arc<dyn ModelJobAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     /// D1 invocation key for direct execution/recovery of this scoped job.
     /// The scope and caller key identify one invocation across job attempts.
     pub fn invocation_key(&self, key: &str) -> Result<String, JobError> {
@@ -263,11 +311,14 @@ impl ModelJobs {
         if !matches!(
             request,
             JobRequest::Enqueue(_)
+                | JobRequest::Admit { .. }
+                | JobRequest::AdmissionNotices { .. }
                 | JobRequest::Ack(_)
                 | JobRequest::Cancel(_)
                 | JobRequest::PurgeOwner(_)
                 | JobRequest::Diagnostics { .. }
                 | JobRequest::Maintain
+                | JobRequest::Status(_)
                 | JobRequest::Get(_)
                 | JobRequest::PendingUsage
         ) {
@@ -284,6 +335,11 @@ impl ModelJobs {
                 return Err(JobError::InvalidRequest);
             }
             for spec in specs {
+                if let Some(admission) = &self.admission {
+                    admission.enqueue(spec)?;
+                } else if spec.admission.is_some() {
+                    return Err(JobError::InvalidRequest);
+                }
                 if spec.execution != Execution::Model {
                     return Err(JobError::InvalidRequest);
                 }
@@ -309,6 +365,10 @@ impl ModelJobs {
             return Err(JobError::InvalidRequest);
         }
         self.transaction(|tx, now| {
+            if let JobRequest::Admit { job, admission } = &request {
+                let JobResponse::Job(Some(row)) = self.op(tx, now, JobRequest::Get(job.clone()))? else { return Err(JobError::NotFound) };
+                if !self.admission.as_ref().ok_or(JobError::InvalidRequest)?.admit(&row, admission)? { return Ok(JobResponse::Done); }
+            }
             if let JobRequest::Enqueue(specs) = &request {
                 for spec in specs {
                     let (identity, sharing, _) = input(&spec.payload)?;
@@ -606,6 +666,22 @@ impl model::ModelJob for ClaimOwner {
                 )?;
                 return Ok(None);
             }
+            if let Some(admission) = &self.jobs.admission {
+                let JobResponse::Job(Some(row)) =
+                    self.jobs
+                        .op(tx, now, JobRequest::Get(self.candidate.clone()))?
+                else {
+                    return Err(JobError::NotFound);
+                };
+                if !admission.claim(tx, &row, now)? {
+                    self.jobs.op(tx, now, JobRequest::AwaitAdmission(row.id))?;
+                    return Ok(None);
+                }
+            }
+            if self.jobs.admission.is_some() {
+                tx.execute_batch("SAVEPOINT model_acceptance")
+                    .map_err(|_| JobError::Storage)?;
+            }
             let JobResponse::Job(row) = self.jobs.op(
                 tx,
                 now,
@@ -620,15 +696,36 @@ impl model::ModelJob for ClaimOwner {
             let Some(row) = row else {
                 return Ok(None);
             };
+            // Signed jobs require successor authority for each further claim;
+            // their frozen ceiling is independent of a route's one-send retry policy.
+            let attempt_limit = if self.jobs.admission.is_some() {
+                row.max_attempts
+            } else {
+                row.max_attempts.min(limit)
+            };
             let accepted = spend::SqliteSpendLedger::reserve_with_limit_in(
                 tx,
                 reservation,
-                Some(row.max_attempts.min(limit)),
+                Some(attempt_limit),
                 false,
             )
             .map_err(|error| JobError::Execution(error.code()))?;
             if !accepted {
                 return Err(JobError::Storage);
+            }
+            if let Some(admission) = &self.jobs.admission {
+                match admission.accept(tx, &row, reservation) {
+                    Ok(()) => {}
+                    Err(JobError::AuthorityExpired) => {
+                        tx.execute_batch("ROLLBACK TO model_acceptance; RELEASE model_acceptance")
+                            .map_err(|_| JobError::Storage)?;
+                        self.jobs.op(tx, now, JobRequest::AwaitAdmission(row.id))?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+                tx.execute_batch("RELEASE model_acceptance")
+                    .map_err(|_| JobError::Storage)?;
             }
             Ok(Some(*row))
         });
@@ -636,7 +733,8 @@ impl model::ModelJob for ClaimOwner {
             Ok(result) => result,
             Err(JobError::Execution(
                 code @ (DiagnosticCode::SpendBudgetExhausted
-                | DiagnosticCode::AttemptBudgetExhausted),
+                | DiagnosticCode::AttemptBudgetExhausted
+                | DiagnosticCode::InvocationCompleted),
             )) => {
                 model::ModelJob::refuse(self, code)?;
                 return Ok(None);
@@ -843,6 +941,9 @@ impl model::ModelJob for ClaimOwner {
         Ok(eligible)
     }
     fn can_retry(&self, limit: u32) -> Result<bool, ModelError> {
+        if self.jobs.admission.is_some() {
+            return Ok(false);
+        }
         let claim = self.claim_record()?;
         if claim.generation >= u64::from(claim.max_attempts.min(limit)) {
             return Ok(false);
@@ -970,6 +1071,163 @@ mod review_tests {
     use super::*;
 
     #[tokio::test]
+    async fn final_acceptance_expiry_rolls_back_and_resumes_the_same_runner() {
+        struct Expiring(AtomicBool);
+        impl ModelJobAdmission for Expiring {
+            fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn admit(&self, _: &JobRecord, _: &[u8]) -> Result<bool, JobError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(true)
+            }
+            fn claim(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: chrono::DateTime<Utc>,
+            ) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn accept(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: &SpendReservation,
+            ) -> Result<(), JobError> {
+                if self.0.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(JobError::AuthorityExpired)
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs")
+            .with_admission(Arc::new(Expiring(AtomicBool::new(false))));
+        let binding = ModelBinding::new(model::StaticChatProvider::new("renewed answer"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"))
+            .with_policy(crate::ModelQueueConfig::default());
+        let request = crate::ChatRequest {
+            messages: vec![],
+            max_output_tokens: None,
+            temperature: None,
+            response_format: None,
+            role_binding: None,
+            source: None,
+            metadata: serde_json::Value::Null,
+        };
+        let spec = JobSpec {
+            key: "expiry".into(),
+            kind: "chat".into(),
+            group: None,
+            owners: vec![],
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &request).expect("payload"),
+            admission: Some(b"first".to_vec()),
+            limits: JobLimits { max_attempts: 1 },
+            recovery_until: None,
+        };
+        let JobResponse::Enqueued(items) = jobs
+            .request(JobRequest::Enqueue(vec![spec]))
+            .await
+            .expect("enqueue")
+        else {
+            panic!("enqueued")
+        };
+        let Enqueued::Inserted(id) = &items[0] else {
+            panic!("inserted")
+        };
+        let runner = jobs
+            .start_chat(
+                binding,
+                RunnerConfig {
+                    poll_interval_ms: 1,
+                    ..Default::default()
+                },
+                "chat".into(),
+            )
+            .await
+            .expect("runner");
+        let row = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let JobResponse::Job(Some(row)) = jobs
+                    .request(JobRequest::Get(id.clone()))
+                    .await
+                    .expect("row")
+                else {
+                    panic!("row")
+                };
+                assert!(!runner.is_finished(), "expiry must not stop the worker");
+                if row.state == JobState::AwaitingAdmission {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("await admission");
+        assert_eq!(row.generation, 0);
+        assert!(row.receipt.is_none());
+        assert_eq!(row.admission.as_deref(), Some(b"first".as_slice()));
+        {
+            let conn = jobs.ledger.0.lock().expect("ledger");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM spend_receipts", [], |r| r
+                    .get::<_, usize>(0))
+                    .expect("reservations"),
+                0
+            );
+        }
+        jobs.request(JobRequest::Admit {
+            job: id.clone(),
+            admission: b"renewed".to_vec(),
+        })
+        .await
+        .expect("renewal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let JobResponse::Job(Some(row)) = jobs
+                    .request(JobRequest::Get(id.clone()))
+                    .await
+                    .expect("row")
+                else {
+                    panic!("row")
+                };
+                assert!(!runner.is_finished());
+                if row.state == JobState::Succeeded {
+                    assert_eq!(row.generation, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same worker resumes");
+        runner.shutdown().await.expect("healthy runner");
+    }
+
+    #[tokio::test]
     async fn trial_purge_discovers_receipts_without_reading_saved_answers() {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
@@ -1014,6 +1272,7 @@ mod review_tests {
             kind: "chat".into(),
             execution: Execution::Model,
             payload: model_job_payload(&binding, &request).expect("payload"),
+            admission: None,
             limits: JobLimits { max_attempts: 1 },
             recovery_until: None,
         };
@@ -1076,6 +1335,125 @@ mod review_tests {
     }
 
     #[tokio::test]
+    async fn execution_lookup_ignores_retained_history_and_waiting_admission() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let scope = JobScope {
+            tenant: "tenant".into(),
+            incarnation: "1".into(),
+            queue: "q".into(),
+        };
+        let jobs = runtime
+            .model_jobs(scope.clone(), JobConfig::default())
+            .expect("jobs");
+        let steps = Arc::new(AtomicUsize::new(0));
+        let mut measurements = Vec::new();
+        let mut previous = 0;
+        for retained in [10, 10_000] {
+            {
+                let mut conn = jobs.ledger.0.lock().expect("ledger");
+                let tx = conn.transaction().expect("transaction");
+                for id in previous..retained {
+                    tx.execute(
+                        "INSERT INTO jobs(scope,id,key,digest,kind,state,delivery_generation) VALUES (?1,?2,?2,'digest','chat','\"Accepted\"',1)",
+                        params![serde_json::to_string(&scope).expect("scope"), id.to_string()],
+                    )
+                    .expect("tombstone");
+                }
+                tx.commit().expect("commit");
+                let steps = steps.clone();
+                conn.progress_handler(
+                    1,
+                    Some(move || {
+                        steps.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                );
+            }
+            assert!(!jobs.needs_execution("chat".into()).await.expect("lookup"));
+            jobs.ledger
+                .0
+                .lock()
+                .expect("ledger")
+                .progress_handler(0, None::<fn() -> bool>);
+            measurements.push(steps.swap(0, Ordering::Relaxed));
+            previous = retained;
+        }
+        assert_eq!(
+            measurements[0], measurements[1],
+            "retained history must not affect lookup work: {measurements:?}"
+        );
+        eprintln!("execution lookup VM steps at 10 vs 10,000 tombstones: {measurements:?}");
+
+        // An existence lookup must not decode payloads or other job content.
+        for state in [
+            JobState::AwaitingAdmission,
+            JobState::Pending,
+            JobState::Running,
+            JobState::Uncertain,
+            JobState::Succeeded,
+            JobState::Failed,
+        ] {
+            jobs.ledger
+                .0
+                .lock()
+                .expect("ledger")
+                .execute(
+                    "UPDATE jobs SET state=?1, payload=42 WHERE id='0'",
+                    [serde_json::to_string(&state).expect("state")],
+                )
+                .expect("state");
+            assert_eq!(
+                jobs.needs_execution("chat".into()).await.expect("lookup"),
+                matches!(
+                    state,
+                    JobState::Pending | JobState::Running | JobState::Uncertain
+                ),
+                "{state:?}"
+            );
+        }
+        jobs.ledger
+            .0
+            .lock()
+            .expect("ledger")
+            .execute("UPDATE jobs SET state='\"Pending\"' WHERE id='0'", [])
+            .expect("pending");
+        assert!(
+            !jobs
+                .needs_execution("embedding".into())
+                .await
+                .expect("other kind")
+        );
+        let other = runtime
+            .model_jobs(
+                JobScope {
+                    queue: "other".into(),
+                    ..scope
+                },
+                JobConfig::default(),
+            )
+            .expect("other scope");
+        assert!(
+            !other
+                .needs_execution("chat".into())
+                .await
+                .expect("other scope lookup")
+        );
+    }
+
+    #[tokio::test]
     async fn review_17_claim_retains_only_metadata_for_heartbeats() {
         let dir = tempfile::tempdir().expect("temp directory");
         #[cfg(unix)]
@@ -1109,6 +1487,7 @@ mod review_tests {
             execution: Execution::Model,
             payload: model_job_payload(&binding, &serde_json::json!({"data": "x".repeat(65536)}))
                 .expect("payload"),
+            admission: None,
             limits: JobLimits { max_attempts: 1 },
             recovery_until: None,
         };
@@ -1155,5 +1534,139 @@ mod review_tests {
                 < std::mem::size_of::<JobRecord>()
         );
         assert!(!model::ModelJob::heartbeat(&owner).expect("heartbeat"));
+    }
+
+    #[tokio::test]
+    async fn signed_claims_use_frozen_job_ceiling_across_successor_admissions() {
+        struct Admitted;
+        impl ModelJobAdmission for Admitted {
+            fn accept(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: &SpendReservation,
+            ) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn admit(&self, _: &JobRecord, _: &[u8]) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn claim(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: chrono::DateTime<Utc>,
+            ) -> Result<bool, JobError> {
+                Ok(true)
+            }
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs")
+            .with_admission(Arc::new(Admitted));
+        let binding = ModelBinding::new(model::StaticChatProvider::new("response"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"));
+        let spec = JobSpec {
+            key: "key".into(),
+            group: None,
+            owners: vec![],
+            kind: "chat".into(),
+            execution: Execution::Model,
+            payload: model_job_payload(&binding, &serde_json::json!({"input": "x"}))
+                .expect("payload"),
+            admission: Some(b"first".to_vec()),
+            limits: JobLimits { max_attempts: 3 },
+            recovery_until: None,
+        };
+        let JobResponse::Enqueued(rows) = jobs
+            .request(JobRequest::Enqueue(vec![spec]))
+            .await
+            .expect("enqueue")
+        else {
+            panic!("enqueue response")
+        };
+        let Enqueued::Inserted(id) = &rows[0] else {
+            panic!("inserted")
+        };
+        let (_stop, stop) = watch::channel(false);
+        let owner = ClaimOwner {
+            jobs: jobs.clone(),
+            candidate: id.clone(),
+            claim: Mutex::new(None),
+            heartbeat: Duration::from_millis(10),
+            finished: AtomicBool::new(false),
+            stop,
+        };
+        let mut reservation = SpendReservation {
+            reference: crate::SpendReceiptRef::new("first").expect("reference"),
+            account: "account".into(),
+            invocation: "invocation".into(),
+            binding: "binding".into(),
+            request_limit: None,
+        };
+        assert!(
+            model::ModelJob::claim(&owner, &reservation, 1)
+                .expect("first claim")
+                .is_some()
+        );
+        model::ModelJob::finish(
+            &owner,
+            SpendState::Released,
+            None,
+            None,
+            Some(DiagnosticCode::AuthenticationRejected),
+            true,
+        )
+        .expect("trusted zero charge");
+        let JobResponse::Job(Some(row)) = jobs
+            .request(JobRequest::Get(id.clone()))
+            .await
+            .expect("row")
+        else {
+            panic!("row")
+        };
+        assert_eq!(row.state, JobState::AwaitingAdmission);
+        jobs.request(JobRequest::Admit {
+            job: id.clone(),
+            admission: b"successor".to_vec(),
+        })
+        .await
+        .expect("successor");
+        reservation.reference = crate::SpendReceiptRef::new("second").expect("reference");
+        assert!(
+            model::ModelJob::claim(&owner, &reservation, 1)
+                .expect("successor claim")
+                .is_some()
+        );
+        let receipt = spend::receipt_in(
+            &jobs.ledger.0.lock().expect("ledger"),
+            &reservation.reference,
+        )
+        .expect("receipt")
+        .expect("present");
+        assert_eq!(receipt.attempt_limit, Some(3));
+        assert_eq!(receipt.attempts_used, 2);
     }
 }

@@ -153,6 +153,7 @@ mod tests {
                             tenant: "tenant".into(),
                             incarnation: "incarnation".into(),
                             invocation_id: "i".repeat(4096),
+                            job_queue: None,
                             attempt_ordinal: 1,
                         },
                         reference: symbiotic_egress::SpendReceiptRef::new("reference").unwrap(),
