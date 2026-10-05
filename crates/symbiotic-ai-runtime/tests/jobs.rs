@@ -12,7 +12,7 @@ use symbiotic_ai_runtime::{
     model::{ChatMessage, ModelCapability, ProviderAuthMode, ProviderClass},
     *,
 };
-use symbiotic_core::{ModelIdentity, TraceId};
+use symbiotic_core::{ModelIdentity, QueueItemId, TraceId};
 use symbiotic_queue::{
     jobs::*,
     runner::{JobRunner, RunnerConfig, RunnerError},
@@ -30,6 +30,7 @@ struct Provider {
     known_zero: bool,
     panic: bool,
     usage: UsageTrace,
+    answer_marker: Option<&'static str>,
 }
 impl Provider {
     fn new() -> Self {
@@ -51,6 +52,7 @@ impl Provider {
                 input_tokens: Some(3),
                 ..Default::default()
             },
+            answer_marker: None,
         }
     }
 }
@@ -83,7 +85,7 @@ impl ChatProvider for Provider {
                 symbiotic_core::DiagnosticCode::HttpUnavailable,
             ));
         }
-        Ok(ChatResponse {
+        let mut response = ChatResponse {
             text: "paid answer".into(),
             finish_reason: Some("stop".into()),
             raw_provider_response: None,
@@ -104,7 +106,14 @@ impl ChatProvider for Provider {
                 metadata: serde_json::json!({}),
                 timestamp: chrono::Utc::now(),
             },
-        })
+        };
+        if let Some(marker) = self.answer_marker {
+            response.text = marker.into();
+            response.trace.trace_id = TraceId(marker.into());
+            response.trace.model = ModelIdentity::new(marker, marker, marker);
+            response.trace.queue_item_id = Some(QueueItemId(marker.into()));
+        }
+        Ok(response)
     }
 }
 fn binding(p: Provider) -> ModelBinding<Provider> {
@@ -230,6 +239,130 @@ fn copies(dir: &std::path::Path) -> usize {
             |r| r.get(0),
         )
         .unwrap()
+}
+
+const ANSWER_ID_MARKER: &str = "ProviderAnswerIdentifierMarker97";
+
+fn answer_id_files_contain_marker(dir: &std::path::Path, off: bool) -> bool {
+    let mut found = false;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found |= answer_id_files_contain_marker(&path, off);
+        } else {
+            let contains = std::fs::read(&path)
+                .unwrap()
+                .windows(ANSWER_ID_MARKER.len())
+                .any(|bytes| bytes == ANSWER_ID_MARKER.as_bytes());
+            if off {
+                assert!(
+                    !contains,
+                    "answer identifier persisted in {}",
+                    path.display()
+                );
+            }
+            found |= contains;
+        }
+    }
+    found
+}
+
+async fn assert_answer_recovery_trace_identifiers(job: bool) {
+    for mode in [AnswerRecovery::Off, AnswerRecovery::Retain] {
+        let off = mode == AnswerRecovery::Off;
+        let dir = tempfile::tempdir().unwrap();
+        let trace_path = dir.path().join("traces.jsonl");
+        let r = Runtime::open(RuntimeConfig {
+            state_dir: Some(dir.path().join("state")),
+            trace_sink: Some(Arc::new(
+                symbiotic_trace::JsonlTraceSink::open(&trace_path).unwrap(),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut p = Provider::new();
+        p.answer_marker = Some(ANSWER_ID_MARKER);
+        let configured = binding(p.clone()).with_answer_recovery(mode);
+        let expected_item;
+        if job {
+            let j = jobs(&r, JobConfig::default());
+            let id = enqueue(&j, spec("answer-identifiers", &p)).await;
+            let runner = j
+                .start_chat(
+                    configured,
+                    RunnerConfig {
+                        poll_interval_ms: 5,
+                        ..Default::default()
+                    },
+                    "chat".into(),
+                )
+                .await
+                .unwrap();
+            let completed = wait_state(&j, &id, JobState::Succeeded).await;
+            runner.shutdown().await.unwrap();
+            expected_item = QueueItemId(completed.receipt.unwrap());
+            assert_eq!(completed.result_expired, off);
+            let delivery = j.completions(1, 10000).await.unwrap().remove(0);
+            if off {
+                assert!(delivery.output.is_none());
+            } else {
+                assert_eq!(delivery.output.unwrap()["text"], ANSWER_ID_MARKER);
+            }
+        } else {
+            let executed = r
+                .execute_chat(configured, "answer-identifiers", request())
+                .await
+                .unwrap();
+            assert_eq!(executed.output.text, ANSWER_ID_MARKER);
+            expected_item = executed.output.trace.queue_item_id.unwrap();
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        let traces = symbiotic_trace::JsonlTraceSink::read(&trace_path).unwrap();
+        assert_eq!(traces.len(), 1);
+        let stored = &traces[0];
+        if off {
+            assert_ne!(stored.trace_id.0, ANSWER_ID_MARKER);
+            assert_eq!(stored.model, p.descriptor.identity);
+            assert_eq!(stored.queue_item_id.as_ref(), Some(&expected_item));
+            assert_eq!(stored.usage.input_tokens, Some(3));
+        } else {
+            assert_eq!(stored.trace_id.0, ANSWER_ID_MARKER);
+            assert_eq!(
+                stored.model,
+                ModelIdentity::new(ANSWER_ID_MARKER, ANSWER_ID_MARKER, ANSWER_ID_MARKER)
+            );
+            assert_eq!(
+                stored.queue_item_id,
+                Some(if job {
+                    QueueItemId(ANSWER_ID_MARKER.into())
+                } else {
+                    expected_item
+                })
+            );
+        }
+        // Scan every file while SQLite databases and their WAL files are open.
+        assert!(
+            dir.path()
+                .join("state")
+                .join(format!("{QUEUE_DATABASE}-wal"))
+                .is_file()
+        );
+        assert_eq!(answer_id_files_contain_marker(dir.path(), off), !off);
+        drop(r);
+        let reopened = runtime(&dir.path().join("state"));
+        assert_eq!(answer_id_files_contain_marker(dir.path(), off), !off);
+        drop(reopened);
+    }
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_direct_trace_identifiers() {
+    assert_answer_recovery_trace_identifiers(false).await;
+}
+
+#[tokio::test]
+async fn regression_answer_recovery_job_trace_identifiers() {
+    assert_answer_recovery_trace_identifiers(true).await;
 }
 
 #[tokio::test]

@@ -398,7 +398,12 @@ only its existing `output_received` completion evidence, never the answer or an
 answer hash. Persistent trace/receipt sinks receive numeric usage and operational
 state without response hashes or arbitrary response metadata. Live diagnostics
 remain visible; persistence failures retain the existing conservative accounting
-behavior. The setting is prospective: it does not erase answers previously
+behavior. Stored invocation traces use a fresh Foundation-generated trace ID,
+the model descriptor frozen before dispatch, and the Foundation queue item ID
+or job-attempt receipt ID. Provider-returned trace IDs, model identities and
+queue item IDs stay in memory and never reach persistent sinks under `off`.
+`retain` preserves the existing trace behavior.
+The setting is prospective: it does not erase answers previously
 retained by a route configured with `retain`. An `off` runtime binding refuses direct
 explicit-invocation replay of an earlier retained answer for that same invocation.
 Previously retained job answers remain deliverable through job adoption and
