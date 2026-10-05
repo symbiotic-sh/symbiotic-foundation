@@ -2596,7 +2596,10 @@ mod tests {
             .classify(request(vec![goal_question()]))
             .await
             .unwrap_err();
-        assert!(matches!(err, ModelError::Unavailable(_)), "{err:?}");
+        assert!(
+            matches!(err.primary(), ModelError::Unavailable(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
