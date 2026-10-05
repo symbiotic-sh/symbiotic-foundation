@@ -230,6 +230,13 @@ const REPLY_ENVELOPE_BYTES: usize = 4096;
 /// are invoked. Process-wide settings, OS protection, state availability and
 /// credential availability are checked separately by [`CredentialProcess::open`].
 pub fn validate_routes(routes: &[RouteConfig], max_frame_bytes: u32) -> Result<(), EgressError> {
+    validated_registry(routes, max_frame_bytes).map(|_| ())
+}
+
+fn validated_registry(
+    routes: &[RouteConfig],
+    max_frame_bytes: u32,
+) -> Result<symbiotic_ai_runtime::model::ModelRegistry, EgressError> {
     validate_frame_size(max_frame_bytes)?;
     if routes.is_empty() {
         return Err(EgressError::InvalidRequest);
@@ -241,7 +248,7 @@ pub fn validate_routes(routes: &[RouteConfig], max_frame_bytes: u32) -> Result<(
             return Err(EgressError::InvalidRequest);
         }
     }
-    provider::configured_registry(routes).map(|_| ())
+    provider::configured_registry(routes)
 }
 
 fn validate_frame_size(max_frame_bytes: u32) -> Result<(), EgressError> {
@@ -289,13 +296,13 @@ impl CredentialProcess {
         }
         // Validate every route and shared account policy before touching state.
         // A lock or IO failure must not mask invalid deployment configuration.
-        validate_routes(&config.routes, config.max_frame_bytes)?;
+        let configured_registry =
+            Arc::new(validated_registry(&config.routes, config.max_frame_bytes)?);
         let routes = config
             .routes
             .iter()
             .map(|route| ((route.tenant.clone(), route.route.clone()), route.clone()))
             .collect();
-        let configured_registry = Arc::new(provider::configured_registry(&config.routes)?);
         symbiotic_ai_runtime::model::private_fs::ensure_private_dir(&config.state_dir)
             .map_err(|_| EgressError::StateUnavailable)?;
         let process_lock = lock_process(&config.state_dir)?;
@@ -901,6 +908,53 @@ fn spend_reservation(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_builds_the_validated_registry_once_before_state_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state-is-a-file");
+        std::fs::write(&state_dir, b"untouched").unwrap();
+        let route = serde_json::from_value(serde_json::json!({
+            "tenant": "tenant", "account": "account", "account_sharing_key": null,
+            "max_attempts": 3, "route": "chat", "secret_ref": "", "secret": {"backend": "none"},
+            "destination": "https://example.com/v1", "model": "test-model",
+            "provider": {"kind": "open_ai_chat", "operator": "test"},
+            "allow_loopback_http": false, "max_field_bytes": 1024, "max_output_tokens": 100,
+            "max_in_flight": 4, "requests_per_minute": null, "input_units_per_minute": null,
+            "timeout_seconds": 1
+        }))
+        .unwrap();
+        let config = ProcessConfig {
+            version: PROTOCOL_VERSION,
+            state_dir: state_dir.clone(),
+            socket_path: dir.path().join("egress.sock"),
+            admission_key: SecretSource::Resolver {
+                name: "admission".into(),
+                resolve: Arc::new(|_| panic!("state refusal must precede credential resolution")),
+            },
+            max_secret_bytes: 4096,
+            max_frame_bytes: 8 * symbiotic_ai_runtime::model::DEFAULT_MAX_RESPONSE_BYTES as u32,
+            max_connections: 8,
+            io_timeout_seconds: 2,
+            clock_rollback_warning_tolerance_seconds: 5,
+            jobs: Default::default(),
+            job_runner: Default::default(),
+            routes: vec![route],
+        };
+        provider::REGISTRY_BUILDS.set(0);
+        assert_eq!(
+            validate_routes(&config.routes, config.max_frame_bytes),
+            Ok(())
+        );
+        assert_eq!(provider::REGISTRY_BUILDS.get(), 1);
+        provider::REGISTRY_BUILDS.set(0);
+        assert!(matches!(
+            CredentialProcess::open(config),
+            Err(EgressError::StateUnavailable)
+        ));
+        assert_eq!(provider::REGISTRY_BUILDS.get(), 1);
+        assert_eq!(std::fs::read(state_dir).unwrap(), b"untouched");
+    }
 
     #[test]
     fn dropping_process_lock_releases_it_with_an_inherited_descriptor() {

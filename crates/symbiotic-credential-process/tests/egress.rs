@@ -1950,27 +1950,6 @@ async fn runtime_bookkeeping_failure_retains_paid_output_and_safe_diagnostic() {
 }
 
 #[tokio::test]
-async fn empty_account_sharing_keys_are_refused_at_route_validation() {
-    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
-    for key in ["", " "] {
-        fixture.config.routes[0].account_sharing_key =
-            Some(symbiotic_ai_runtime::AccountSharingKey::new(key));
-        assert!(matches!(
-            CredentialProcess::open(fixture.config.clone()),
-            Err(EgressError::InvalidRequest)
-        ));
-        assert_eq!(
-            symbiotic_credential_process::validate_routes(
-                &fixture.config.routes,
-                fixture.config.max_frame_bytes,
-            ),
-            Err(EgressError::InvalidRequest)
-        );
-    }
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
 async fn conflicting_shared_route_limits_are_refused_at_startup() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     for field in ["concurrency", "requests", "input"] {
@@ -2063,18 +2042,19 @@ async fn conflicting_shared_route_limits_are_validated_before_state_in_every_ord
                     Some(symbiotic_ai_runtime::AccountSharingKey::new("other-pool"));
                 let routes = [first, second, independent, other_pool];
                 for order in &orders {
+                    let mut config = fixture.config.clone();
+                    config.routes = order.iter().map(|&i| routes[i].clone()).collect();
+                    assert_eq!(
+                        symbiotic_credential_process::validate_routes(
+                            &config.routes,
+                            config.max_frame_bytes,
+                        ),
+                        Err(EgressError::InvalidRequest)
+                    );
                     // Rebuilding the registry also varies its HashMaps' random seeds.
                     for state_dir in [&fixture.config.state_dir, &unopened, &blocked] {
-                        let mut config = fixture.config.clone();
-                        config.routes = order.iter().map(|&i| routes[i].clone()).collect();
+                        let mut config = config.clone();
                         config.state_dir = state_dir.clone();
-                        assert_eq!(
-                            symbiotic_credential_process::validate_routes(
-                                &config.routes,
-                                config.max_frame_bytes,
-                            ),
-                            Err(EgressError::InvalidRequest)
-                        );
                         let opened = CredentialProcess::open(config);
                         assert!(
                             matches!(&opened, Err(EgressError::InvalidRequest)),

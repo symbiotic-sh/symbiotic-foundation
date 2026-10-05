@@ -267,6 +267,8 @@ fn route_revision(route: &RouteConfig) -> Result<String, EgressError> {
 pub(crate) fn configured_registry(
     routes: &[RouteConfig],
 ) -> Result<model::ModelRegistry, EgressError> {
+    #[cfg(test)]
+    REGISTRY_BUILDS.set(REGISTRY_BUILDS.get() + 1);
     let mut models = std::collections::HashMap::new();
     let mut accounts = std::collections::HashMap::new();
     let mut bindings = Vec::new();
@@ -335,6 +337,11 @@ pub(crate) fn configured_registry(
         accounts: accounts.into_values().collect(),
     })
     .map_err(|_| EgressError::InvalidRequest)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REGISTRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn queue_policy(route: &RouteConfig) -> ModelQueueConfig {
