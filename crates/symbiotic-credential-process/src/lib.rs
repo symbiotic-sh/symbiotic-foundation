@@ -36,8 +36,10 @@ pub enum RouteProvider {
         /// Provider identity.
         operator: String,
         /// Omitted unless configured; encoded as {"type":"enabled"|"disabled"}.
+        #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<symbiotic_ai_runtime::model::ThinkingMode>,
         /// Omitted unless configured; refused with disabled thinking.
+        #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<ReasoningEffort>,
     },
     /// Anthropic Messages with explicit thinking mode.

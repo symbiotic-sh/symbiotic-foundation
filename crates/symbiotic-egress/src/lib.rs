@@ -421,7 +421,7 @@ where
     serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
-/// Provider completion category; arbitrary provider strings never cross egress.
+/// Direct dispatch completion category; provider strings are normalized here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {

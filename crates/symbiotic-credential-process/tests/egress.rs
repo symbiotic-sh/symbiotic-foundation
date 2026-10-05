@@ -5277,6 +5277,138 @@ async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
 }
 
 #[tokio::test]
+async fn rabbithole_unset_settings_preserve_route_identity_and_job_reattachment() {
+    let fixture = Fixture::new(200, "reattached answer".into(), Duration::ZERO).await;
+    let route = &fixture.config.routes[0];
+    // This is the provider encoding before optional OpenAI settings existed.
+    assert_eq!(
+        serde_json::to_string(&route.provider).unwrap(),
+        r#"{"kind":"open_ai_chat","operator":"test"}"#
+    );
+    let revision = symbiotic_ai_runtime::model::configuration_revision(route).unwrap();
+    for (thinking, reasoning_effort) in [(Some("enabled"), None), (None, Some("low"))] {
+        let mut configured = route.clone();
+        configured.provider = serde_json::from_value(serde_json::json!({
+            "kind": "open_ai_chat", "operator": "test",
+            "thinking": thinking, "reasoning_effort": reasoning_effort
+        }))
+        .unwrap();
+        assert_ne!(
+            symbiotic_ai_runtime::model::configuration_revision(&configured).unwrap(),
+            revision
+        );
+    }
+
+    let client = InProcessEgressClient::new(fixture.process().await);
+    let mut input = queued(&fixture, "reattach");
+    input.admission.attempt.expires_at = unix_seconds();
+    input.admission = AdmissionKey::new(KEY.to_vec())
+        .unwrap()
+        .sign_attempt(input.admission.attempt)
+        .unwrap();
+    let id = enqueue_id(&client, input.clone()).await;
+    wait_job(&client, &id, JobState::AwaitingAdmission).await;
+    drop(client);
+
+    let client = InProcessEgressClient::new(reopen_jobs(&fixture).await);
+    assert_eq!(enqueue_id(&client, input).await, id);
+    let (admission, _) = fixture.job_attempt("reattach", 2, 2);
+    job_call(
+        &client,
+        JobsCommand::AdmitJob {
+            job: id.clone(),
+            admission: Box::new(admission),
+        },
+    )
+    .await
+    .unwrap();
+    wait_job(&client, &id, JobState::Succeeded).await;
+    let new_id = enqueue_id(&client, queued(&fixture, "new-job")).await;
+    wait_job(&client, &new_id, JobState::Succeeded).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rabbithole_jobs_preserve_canonical_completion_shapes() {
+    for classify in [false, true] {
+        let mut fixture = if classify {
+            rabbithole_jev_fixture(None).await
+        } else {
+            Fixture::with_http_response(
+                200,
+                serde_json::json!({"choices":[{"message":{"content":"answer"},
+                    "finish_reason":"content_filter"}],
+                    "usage":{"prompt_tokens":7,"completion_tokens":3}})
+                .to_string(),
+                Duration::ZERO,
+                "0",
+                true,
+                false,
+            )
+            .await
+        };
+        fixture.config.routes[0].provider_request_limit = None;
+        let process = fixture.process().await;
+        let (admission, payload) = if classify {
+            rabbithole_classify_attempt(&fixture)
+        } else {
+            fixture.attempt("direct-shape", 1, 1)
+        };
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange(&process, inject(admission, payload.clone(), granted))
+                .await
+                .unwrap(),
+        );
+        assert!(result.error.is_none());
+        let direct = serde_json::to_value(result.output).unwrap();
+        if classify {
+            assert_eq!(direct.as_object().unwrap().len(), 2); // kind and answers
+        } else {
+            assert_eq!(direct["finish_reason"], "other");
+        }
+
+        let client = InProcessEgressClient::new(process);
+        let mut input = queued(&fixture, "job-shape");
+        input.payload = payload;
+        input.admission.attempt.input_digest = input.payload.digest().unwrap();
+        input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(input.admission.attempt)
+            .unwrap();
+        let id = enqueue_id(&client, input).await;
+        wait_job(&client, &id, JobState::Succeeded).await;
+        let JobsReply::Completions(page) = job_call(
+            &client,
+            JobsCommand::Completions {
+                limit: 1,
+                max_bytes: 65536,
+                wait_seconds: 0,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("completions")
+        };
+        let output = page.items[0].output.as_ref().unwrap();
+        assert!(output["raw_provider_response"].is_null());
+        assert!(output["trace"].is_object());
+        let metadata = output["trace"]["metadata"].as_object().unwrap();
+        assert!(metadata["value"].is_null());
+        assert!(metadata.get("provider").is_none());
+        assert!(metadata["spend_receipt"].is_string());
+        if classify {
+            assert_eq!(output["served_model"], "test-model");
+            assert_eq!(output["answers"], direct["answers"]);
+        } else {
+            assert_eq!(output["finish_reason"], "content_filter");
+            assert_eq!(output["text"], direct["text"]);
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
 async fn rabbithole_deepseek_settings_reach_wire_only_when_configured() {
     for configured in [false, true] {
         let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;

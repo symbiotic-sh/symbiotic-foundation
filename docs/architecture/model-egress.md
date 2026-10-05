@@ -433,23 +433,31 @@ Rabbithole's deployed DeepSeek profile uses enabled thinking and low effort. The
 settings participate in the existing route configuration revision and use the same
 encoder for admission byte checks and HTTP transmission.
 
-Supported chat output includes `finish_reason: Option<FinishReason>`. OpenAI `stop` and
+Direct dispatch `DispatchResult` chat output includes
+`finish_reason: Option<FinishReason>`. OpenAI `stop` and
 Anthropic `end_turn`/`stop_sequence` map to `stop`; OpenAI `length` and Anthropic
 `max_tokens`/`model_context_window_exceeded` map to `length`; other reported values
 map to `other`. An absent provider reason remains absent. Token-limited text remains
 available with its finish reason and accounting receipt, including recovery.
-Arbitrary provider reason strings never cross egress. Anthropic tool, pause and
-refusal outcomes remain visible errors under the existing Messages adapter contract;
-their partial text is never returned as a supported chat answer.
+Arbitrary provider reason strings are excluded from direct dispatch output.
+Anthropic tool, pause and refusal outcomes remain visible errors under the existing
+Messages adapter contract; their partial text is never returned as a supported chat answer.
 
 `ProviderPayload::Classify(ClassifyRequest)` uses the existing Jev System One
 adapter at `POST {destination}/systemone`. The state is a JSON object containing
 application data; questions are typed Noul, Choice or Score values. No arbitrary
 HTTP body or provider options pass through. Question and option vector order is
 the provider presentation order; returned answers preserve question order. The
-route model is also the expected served model. Egress returns only the validated
-`ClassifierAnswer` vector; raw response, provider metadata and local trace labels
-are excluded. Applications own classification meaning and thresholds.
+route model is also the expected served model. Direct dispatch returns only the
+validated `ClassifierAnswer` vector; raw response, provider metadata and local
+trace labels are excluded. Applications own classification meaning and thresholds.
+
+Job completions retain the sanitized canonical runtime response, as described by
+`JobDelivery::output`: chat retains the provider's finish-reason string, and
+classification includes `served_model` and `trace` alongside `answers`. Raw
+provider responses and provider trace metadata are removed; runtime bookkeeping
+remains in the trace. The direct dispatch normalization and answers-only
+guarantees do not apply to job completions.
 
 Classification uses the same signed payload digest, grant revision acceptance,
 exclusive authority deadline, permit consumption, account reservation and recovery
