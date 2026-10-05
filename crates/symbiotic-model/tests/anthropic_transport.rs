@@ -474,3 +474,19 @@ async fn assistant_prefill_is_refused_before_connecting() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[tokio::test]
+async fn regression_anthropic_misses_remain_known_without_cache_reads() {
+    let mut body = answer();
+    body["usage"] = json!({"input_tokens":20,"cache_creation_input_tokens":10});
+    let (url, server) = fixture(200, &body.to_string(), false);
+    let response = symbiotic_model::with_egress_http_observations(
+        provider(&url).with_timeout(1).unwrap().chat(request()),
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(response.trace.usage.input_tokens, Some(30));
+    assert_eq!(response.trace.usage.cache_hit_tokens, None);
+    assert_eq!(response.trace.usage.cache_miss_tokens, Some(30));
+}

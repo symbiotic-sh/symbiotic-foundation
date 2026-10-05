@@ -192,8 +192,19 @@ impl ChatProvider for AnthropicChatProvider {
                     reported_cost_usd: reported_cost_usd(&raw),
                     ..UsageTrace::default()
                 };
-                let (hit, miss) =
-                    prompt_cache_counts(input, usage.cache_read_input_tokens, None, None);
+                let miss = usage
+                    .input_tokens
+                    .map(|uncached| {
+                        uncached
+                            .checked_add(usage.cache_creation_input_tokens.unwrap_or(0))
+                            .ok_or(ModelError::Provider(DiagnosticCode::InvalidResponse))
+                    })
+                    .transpose()?;
+                // Keep omitted cache reads absent while projecting the known miss count.
+                let (hit, _) =
+                    observed_prompt_cache_counts(input, usage.cache_read_input_tokens, None, None)?;
+                trace.usage.cache_hit_tokens = hit;
+                trace.usage.cache_miss_tokens = miss;
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(input, hit, miss),
@@ -205,6 +216,7 @@ impl ChatProvider for AnthropicChatProvider {
                     "cache_miss_tokens": miss,
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                 });
+                provider_usage_identity(&mut trace, &raw);
                 Ok(ChatResponse {
                     text,
                     finish_reason: Some(parsed.stop_reason),

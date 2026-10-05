@@ -96,6 +96,21 @@ pub enum EgressError {
     /// Frame or provider output exceeds configured limits.
     #[error("egress message exceeds configured limit")]
     LimitExceeded,
+    /// Provider throttled the request; its delay is present only when reported.
+    #[error("provider rate limited")]
+    RateLimited {
+        /// Provider Retry-After delay in seconds, with HTTP dates normalized.
+        retry_after_seconds: Option<u64>,
+    },
+    /// Provider request or response read exceeded its configured deadline.
+    #[error("provider request timed out; dispatch charge may be unknown")]
+    Timeout,
+    /// Provider rejected the request or returned an invalid/unsupported response.
+    #[error("provider failed (HTTP status {status:?})")]
+    Provider {
+        /// HTTP status when the failure came from a non-success response.
+        status: Option<u16>,
+    },
     /// Protocol transport failed. A dispatch may already have incurred a charge.
     #[error("egress transport unavailable; dispatch charge may be unknown")]
     Transport,
@@ -463,10 +478,14 @@ pub struct DispatchReceipt {
     pub spend_state: SpendState,
 }
 
-/// Static runtime bookkeeping failures; never contain raw diagnostic text.
+/// Static provider-observation and runtime failures; never contain raw diagnostic text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchDiagnostic {
+    /// Malformed provider identity metadata was omitted from usage; the answer is retained.
+    InvalidUsageIdentity,
+    /// The provider supplied a malformed Retry-After hint; the HTTP class is preserved.
+    InvalidRetryAfter,
     /// The paid response could not be recorded as complete in the runtime queue.
     QueueCompleteFailed,
     /// The runtime could not persist the invocation trace.
@@ -481,7 +500,7 @@ pub enum DispatchDiagnostic {
 pub struct DispatchResult {
     /// Static failure code alongside accounting; absent only on success.
     pub error: Option<EgressError>,
-    /// Runtime side effects that failed without discarding the paid answer or usage.
+    /// Additional provider-observation or runtime failures accompanying this result.
     pub diagnostics: Vec<DispatchDiagnostic>,
     /// False if completion/settlement failed; accounting remains unknown until recovery.
     pub receipt_persisted: bool,

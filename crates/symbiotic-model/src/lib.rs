@@ -57,10 +57,22 @@ mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
     CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission, ModelJob,
-    QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
+    QueueReceipt, QueueReceiptSink, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
+
+/// Key in a response trace's `metadata` listing diagnostics accompanying
+/// a paid answer, as `[{"kind": ..., "error": ...}]`.
+///
+/// Once the provider has answered, the answer is returned and its usage
+/// receipt recorded even when writing the response cache
+/// (`response_cache_write_failed`), the trace (`trace_write_failed`) or the
+/// queue completion (`queue_complete_failed`) fails. The usage receipt's
+/// `metadata` carries the same list. Each side effect failure is also logged as a
+/// `tracing` warning, as are failed cooldown and failure-trace writes of a
+/// failed call, which keeps its own error.
+pub const RUNTIME_DIAGNOSTICS: &str = "runtime_diagnostics";
 
 // Spend receipt and state types are part of the provider contract that
 // protocol clients (symbiotic-egress) use without the queue runtime.
@@ -286,6 +298,17 @@ pub struct RerankResponse {
 /// ```
 #[derive(Clone, Debug, Error)]
 pub enum ModelError {
+    /// HTTP failure with the original class and safe response hints.
+    #[error("{primary}; HTTP status {status}")]
+    Http {
+        /// Original closed failure class.
+        #[source]
+        primary: Box<ModelError>,
+        /// Provider HTTP status; no response body is retained.
+        status: u16,
+        /// Retry-After delay in seconds, including HTTP-date normalization.
+        retry_after_seconds: Option<u64>,
+    },
     #[error("provider unavailable: {0}")]
     Unavailable(symbiotic_core::DiagnosticCode),
     #[error("provider auth failed: {0}")]
@@ -331,7 +354,28 @@ impl ModelError {
             Self::Queue(code) => *code,
             Self::Cache(code) => *code,
             Self::Unsupported(_) => DiagnosticCode::InvalidConfiguration,
-            Self::Diagnostics { primary, .. } => primary.code(),
+            Self::Diagnostics { primary, .. } | Self::Http { primary, .. } => primary.code(),
+        }
+    }
+
+    /// Original class beneath HTTP hints and secondary bookkeeping diagnostics.
+    pub fn primary(&self) -> &Self {
+        match self {
+            Self::Http { primary, .. } | Self::Diagnostics { primary, .. } => primary.primary(),
+            _ => self,
+        }
+    }
+
+    /// Provider status and retry hint, preserved beneath bookkeeping diagnostics.
+    pub fn http_details(&self) -> Option<(u16, Option<u64>)> {
+        match self {
+            Self::Http {
+                status,
+                retry_after_seconds,
+                ..
+            } => Some((*status, *retry_after_seconds)),
+            Self::Diagnostics { primary, .. } => primary.http_details(),
+            _ => None,
         }
     }
 
@@ -343,7 +387,6 @@ impl ModelError {
         }
     }
 
-    #[cfg(feature = "queue")]
     fn with_diagnostics(self, diagnostics: impl IntoIterator<Item = DiagnosticCode>) -> Self {
         let mut diagnostics = diagnostics.into_iter().peekable();
         if diagnostics.peek().is_none() {
@@ -1478,6 +1521,11 @@ fn note_side_effect<Res: TraceCarrier>(
 ) {
     warn_side_effect(queue_id, kind, error);
     let mut trace = response.trace().clone();
+    note_trace_diagnostic(&mut trace, kind, error);
+    response.set_trace(trace);
+}
+
+fn note_trace_diagnostic(trace: &mut ModelInvocationTrace, kind: &str, error: DiagnosticCode) {
     if !trace.metadata.is_object() {
         let original = std::mem::take(&mut trace.metadata);
         trace.metadata = if original.is_null() {
@@ -1491,7 +1539,6 @@ fn note_side_effect<Res: TraceCarrier>(
         Some(Value::Array(list)) => list.push(entry),
         _ => trace.metadata[RUNTIME_DIAGNOSTICS] = serde_json::json!([entry]),
     }
-    response.set_trace(trace);
 }
 
 // The arguments are the queue execution boundary: one queued call.
@@ -2939,14 +2986,15 @@ impl TraceCarrier for RerankResponse {
 #[cfg(feature = "queue")]
 fn is_transient(err: &ModelError) -> bool {
     matches!(
-        err,
+        err.primary(),
         ModelError::Unavailable(_) | ModelError::RateLimited(_) | ModelError::Timeout(_)
     )
 }
 
 #[cfg(feature = "queue")]
 fn is_retryable(err: &ModelError, config: &ModelQueueConfig) -> bool {
-    is_transient(err) || (config.retry_provider_errors && matches!(err, ModelError::Provider(_)))
+    is_transient(err)
+        || (config.retry_provider_errors && matches!(err.primary(), ModelError::Provider(_)))
 }
 
 /// Backoff before jitter: the base delay doubling per attempt up to 32x,
@@ -3012,7 +3060,7 @@ fn retry_jitter_seconds(
     if max_jitter_seconds == 0 {
         return Ok(0);
     }
-    let err_kind = match err {
+    let err_kind = match err.primary() {
         ModelError::RateLimited(_) => "rate_limited",
         ModelError::Unavailable(_) => "unavailable",
         ModelError::Timeout(_) => "timeout",
@@ -3074,7 +3122,9 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 #[cfg(feature = "queue")]
 fn error_class(err: &ModelError) -> FailureClass {
     match err {
-        ModelError::Diagnostics { primary, .. } => error_class(primary),
+        ModelError::Diagnostics { primary, .. } | ModelError::Http { primary, .. } => {
+            error_class(primary)
+        }
         ModelError::Unavailable(_) => FailureClass::Unavailable,
         ModelError::Auth(_) => FailureClass::Auth,
         ModelError::RateLimited(_) => FailureClass::RateLimited,
@@ -3309,6 +3359,7 @@ fn exhausted_request_error(
     last_error: &ModelError,
 ) -> ModelError {
     match last_error {
+        ModelError::Http { .. } => last_error.clone(),
         ModelError::Diagnostics { primary, secondary } => {
             exhausted_request_error(_queue_id, _item, _config, primary)
                 .with_diagnostics(secondary.iter().copied())
@@ -3594,7 +3645,7 @@ async fn note_model_cooldown(
     err: &ModelError,
     retry_delay_ms: u64,
 ) -> Result<(), ModelError> {
-    let multiplier = match err {
+    let multiplier = match err.primary() {
         ModelError::RateLimited(_) => 4,
         ModelError::Unavailable(_) => 2,
         ModelError::Timeout(_) => 1,
@@ -3962,8 +4013,32 @@ pub fn prompt_cache_counts(
     miss: Option<u64>,
     nested_hit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
+    normalize_prompt_cache_counts(total, hit, miss, nested_hit).unwrap_or_default()
+}
+
+fn observed_prompt_cache_counts(
+    total: Option<u64>,
+    hit: Option<u64>,
+    miss: Option<u64>,
+    nested_hit: Option<u64>,
+) -> Result<(Option<u64>, Option<u64>), ModelError> {
+    let counts = normalize_prompt_cache_counts(total, hit, miss, nested_hit);
+    if egress_observations_enabled() {
+        counts
+    } else {
+        Ok(counts.unwrap_or_default())
+    }
+}
+
+fn normalize_prompt_cache_counts(
+    total: Option<u64>,
+    hit: Option<u64>,
+    miss: Option<u64>,
+    nested_hit: Option<u64>,
+) -> Result<(Option<u64>, Option<u64>), ModelError> {
+    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
     if hit.zip(nested_hit).is_some_and(|(a, b)| a != b) {
-        return (None, None);
+        return Err(invalid());
     }
     let hit = hit.or(nested_hit).or_else(|| {
         total
@@ -3981,9 +4056,9 @@ pub fn prompt_cache_counts(
             .zip(hit.zip(miss))
             .is_some_and(|(total, (hit, miss))| hit.checked_add(miss) != Some(total))
     {
-        return (None, None);
+        return Err(invalid());
     }
-    (hit, miss)
+    Ok((hit, miss))
 }
 
 fn reported_cost_usd(raw: &Value) -> Option<String> {
@@ -4068,16 +4143,19 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     media_units: None,
                     cost_micro_usd: None,
                     reported_cost_usd: reported_cost_usd(&raw),
+                    ..UsageTrace::default()
                 };
                 let nested_hit = usage
                     .prompt_tokens_details
                     .and_then(|details| details.cached_tokens);
-                let (hit, miss) = prompt_cache_counts(
+                let (hit, miss) = observed_prompt_cache_counts(
                     usage.prompt_tokens,
                     usage.prompt_cache_hit_tokens,
                     usage.prompt_cache_miss_tokens,
                     nested_hit,
-                );
+                )?;
+                trace.usage.cache_hit_tokens = hit;
+                trace.usage.cache_miss_tokens = miss;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -4093,6 +4171,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                         "nested_hit": nested_hit,
                     },
                 });
+                provider_usage_identity(&mut trace, &raw);
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
@@ -4431,9 +4510,11 @@ async fn bounded_response_bytes(
         ));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        ModelError::Unavailable(symbiotic_core::DiagnosticCode::ProviderResponseReadFailed)
-    })? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| http_transport_error(error, DiagnosticCode::ProviderResponseReadFailed))?
+    {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(ModelError::Provider(
                 symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded,
@@ -4442,6 +4523,17 @@ async fn bounded_response_bytes(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+tokio::task_local! {
+    static EGRESS_HTTP_OBSERVATIONS: ();
+}
+
+/// Include safe HTTP observations in failures during credential-owned egress.
+/// Ordinary adapter calls retain their original top-level error variants.
+/// The scope lasts only for this future and does not propagate to spawned tasks.
+pub async fn with_egress_http_observations<F: std::future::Future>(future: F) -> F::Output {
+    EGRESS_HTTP_OBSERVATIONS.scope((), future).await
 }
 
 /// Bounded HTTP decoding. Credential policy belongs exclusively to the final
@@ -4454,15 +4546,32 @@ async fn provider_response_json(
     let response = builder
         .send()
         .await
-        .map_err(|_err| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))?;
+        .map_err(|error| http_transport_error(error, DiagnosticCode::HttpUnavailable))?;
     let status = response.status();
-    if status.is_redirection() {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderRedirectRefused,
-        ));
-    }
     if !status.is_success() {
-        return Err(status_error(status.as_u16()));
+        let primary = if status.is_redirection() {
+            ModelError::Provider(DiagnosticCode::ProviderRedirectRefused)
+        } else {
+            status_error(status.as_u16())
+        };
+        if !egress_observations_enabled() {
+            return Err(primary);
+        }
+        let retry = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|header| parse_retry_after(header, Utc::now()))
+            .transpose();
+        let (retry_after_seconds, hint_error) = match retry {
+            Ok(delay) => (delay, None),
+            Err(invalid) => (None, Some(invalid.code())),
+        };
+        return Err(ModelError::Http {
+            primary: Box::new(primary),
+            status: status.as_u16(),
+            retry_after_seconds,
+        }
+        .with_diagnostics(hint_error));
     }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
     let text = String::from_utf8(bytes).map_err(|_| {
@@ -4471,6 +4580,71 @@ async fn provider_response_json(
     let raw: Value = serde_json::from_str(&text)
         .map_err(|_err| invalid_json(DiagnosticCode::InvalidResponse))?;
     Ok((raw, text))
+}
+
+fn egress_observations_enabled() -> bool {
+    EGRESS_HTTP_OBSERVATIONS.try_with(|_| ()).is_ok()
+}
+
+fn http_transport_error(error: reqwest::Error, direct_code: DiagnosticCode) -> ModelError {
+    if !egress_observations_enabled() {
+        ModelError::Unavailable(direct_code)
+    } else if error.is_timeout() {
+        ModelError::Timeout(DiagnosticCode::HttpTimeout)
+    } else {
+        ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
+    }
+}
+
+fn parse_retry_after(
+    header: &reqwest::header::HeaderValue,
+    now: chrono::DateTime<Utc>,
+) -> Result<u64, ModelError> {
+    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
+    let text = header.to_str().map_err(|_| invalid())?;
+    if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
+        return text.parse().map_err(|_| invalid());
+    }
+    let deadline: chrono::DateTime<Utc> = httpdate::parse_http_date(text)
+        .map_err(|_| invalid())?
+        .into();
+    Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
+}
+
+fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
+    if !egress_observations_enabled() {
+        trace.usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+        trace.usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
+        trace.usage.created = raw.get("created").and_then(Value::as_i64);
+        return;
+    }
+    let mut invalid = false;
+    let mut identity = |field: &str| {
+        raw.get(field).and_then(|value| {
+            let token = value.as_str().filter(|text| {
+                (1..=128).contains(&text.len())
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+            });
+            invalid |= token.is_none();
+            token.map(str::to_owned)
+        })
+    };
+    trace.usage.response_id = identity("id");
+    trace.usage.served_model = identity("model");
+    trace.usage.created = raw.get("created").and_then(|value| {
+        let seconds = value.as_i64().filter(|seconds| *seconds >= 0);
+        invalid |= seconds.is_none();
+        seconds
+    });
+    if invalid {
+        note_trace_diagnostic(
+            trace,
+            "invalid_usage_identity",
+            DiagnosticCode::InvalidResponse,
+        );
+    }
 }
 
 fn status_error(status: u16) -> ModelError {
@@ -5938,3 +6112,233 @@ mod tests {
 
 #[cfg(test)]
 mod credential_transport_tests;
+
+#[cfg(test)]
+mod egress_http_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn usage_identity_drops_invalid_fields_and_preserves_valid_fields() {
+        let new_trace = || {
+            success_trace(
+                &StaticChatProvider::new("OK").descriptor,
+                None,
+                None,
+                String::new(),
+                None,
+            )
+        };
+        with_egress_http_observations(async {
+            for raw in [
+                serde_json::json!({"id":null}),
+                serde_json::json!({"id":123}),
+                serde_json::json!({"id":""}),
+                serde_json::json!({"id":"private\nanswer"}),
+                serde_json::json!({"model":false}),
+                serde_json::json!({"model":"private answer"}),
+                serde_json::json!({"id":"a".repeat(129)}),
+                serde_json::json!({"model":"a".repeat(129)}),
+                serde_json::json!({"id":"é"}),
+                serde_json::json!({"created":-1}),
+                serde_json::json!({"created":null}),
+                serde_json::json!({"created":1.5}),
+                serde_json::json!({"created":u64::MAX}),
+            ] {
+                let mut trace = new_trace();
+                provider_usage_identity(&mut trace, &raw);
+                assert!(trace.usage.response_id.is_none());
+                assert!(trace.usage.served_model.is_none());
+                assert!(trace.usage.created.is_none());
+                assert_eq!(
+                    trace.metadata[RUNTIME_DIAGNOSTICS][0]["error"],
+                    "invalid_response"
+                );
+            }
+            for (id, model) in [
+                ("msg_0123456789abcdef", "claude-sonnet-4-20250514"),
+                ("7c971547-8bcc-4a91-8e10-00466eef5216", "deepseek-chat"),
+                ("namespace/response:123", "namespace/model:version"),
+                (&"a".repeat(128), &"m".repeat(128)),
+            ] {
+                let mut trace = new_trace();
+                provider_usage_identity(
+                    &mut trace,
+                    &serde_json::json!({"id":id,"model":model,"created":0}),
+                );
+                assert_eq!(trace.usage.response_id.as_deref(), Some(id));
+                assert_eq!(trace.usage.served_model.as_deref(), Some(model));
+                assert_eq!(trace.usage.created, Some(0));
+                assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+            }
+            let mut trace = new_trace();
+            provider_usage_identity(&mut trace, &serde_json::json!({}));
+            assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+        })
+        .await;
+    }
+
+    #[test]
+    fn rabbithole_retry_after_is_typed_and_survives_diagnostics() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:27:00 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (value, seconds) in [
+            ("7", 7),
+            ("Wed, 21 Oct 2015 07:28:00 GMT", 60),
+            ("Wednesday, 21-Oct-15 07:28:00 GMT", 60),
+            ("Wed Oct 21 07:28:00 2015", 60),
+            ("Wed, 21 Oct 2015 07:26:00 GMT", 0),
+        ] {
+            assert_eq!(
+                parse_retry_after(&reqwest::header::HeaderValue::from_str(value).unwrap(), now)
+                    .unwrap(),
+                seconds
+            );
+        }
+        for invalid in ["", "later", "-1", "18446744073709551616"] {
+            assert!(
+                parse_retry_after(
+                    &reqwest::header::HeaderValue::from_str(invalid).unwrap(),
+                    now
+                )
+                .is_err()
+            );
+        }
+        let error = ModelError::Http {
+            primary: Box::new(ModelError::RateLimited(DiagnosticCode::HttpRateLimited)),
+            status: 429,
+            retry_after_seconds: Some(7),
+        };
+        assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+        assert_eq!(error.http_details(), Some((429, Some(7))));
+        #[cfg(feature = "queue")]
+        {
+            assert!(is_transient(&error));
+            assert_eq!(error_class(&error), FailureClass::RateLimited);
+            let decorated = error.with_diagnostics([DiagnosticCode::StorageFailure]);
+            assert_eq!(decorated.http_details(), Some((429, Some(7))));
+        }
+    }
+
+    #[tokio::test]
+    async fn rabbithole_retry_after_absence_and_invalid_hints_remain_visible() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for hint in ["", "Retry-After: 7\r\n", "Retry-After: invalid\r\n"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 1];
+                    stream.read_exact(&mut buffer).await.unwrap();
+                    stream.write_all(format!("HTTP/1.1 429 Limited\r\n{hint}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                });
+                let error = with_egress_http_observations(provider_response_json(http_client(Some(1)).unwrap().get(url), Some(1024), ModelError::Unavailable)).await.unwrap_err();
+                server.await.unwrap();
+                if hint.contains("invalid") {
+                    assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+                    assert_eq!(error.diagnostics(), &[DiagnosticCode::InvalidResponse]);
+                    assert_eq!(error.http_details(), Some((429, None)));
+                } else {
+                    assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+                    assert_eq!(error.http_details(), Some((429, if hint.is_empty() {None} else {Some(7)})));
+                }
+            }
+        }).await.expect("retry hint fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_direct_and_egress_transport_errors_keep_their_contracts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for scoped in [false, true] {
+                for phase in ["send", "read", "truncated"] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut buffer = [0; 1];
+                        stream.read_exact(&mut buffer).await.unwrap();
+                        if phase != "send" {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                        if phase != "truncated" {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    let client = http_client_builder()
+                        .timeout(std::time::Duration::from_millis(100))
+                        .build()
+                        .unwrap();
+                    let call = provider_response_json(
+                        client.get(url),
+                        Some(1024),
+                        ModelError::Unavailable,
+                    );
+                    let error = if scoped {
+                        with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .unwrap_err();
+                    server.abort();
+                    let expected = if scoped && phase != "truncated" {
+                        ModelError::Timeout(DiagnosticCode::HttpTimeout)
+                    } else if !scoped && phase != "send" {
+                        ModelError::Unavailable(DiagnosticCode::ProviderResponseReadFailed)
+                    } else {
+                        ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
+                    };
+                    assert_eq!(
+                        std::mem::discriminant(&error),
+                        std::mem::discriminant(&expected),
+                        "scoped={scoped}, phase={phase}: {error:?}"
+                    );
+                    assert_eq!(error.code(), expected.code());
+                }
+            }
+        })
+        .await
+        .expect("transport fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn rabbithole_send_and_body_read_timeouts_keep_their_class() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            for headers_first in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 1];
+                    stream.read_exact(&mut buffer).await.unwrap();
+                    if headers_first {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let client = http_client(Some(1)).unwrap();
+                let result = with_egress_http_observations(provider_response_json(
+                    client.get(url),
+                    Some(1024),
+                    ModelError::Unavailable,
+                ))
+                .await;
+                server.abort();
+                assert!(
+                    matches!(result, Err(ModelError::Timeout(_))),
+                    "headers_first={headers_first}: {result:?}"
+                );
+            }
+        })
+        .await
+        .expect("two one-second transport timeouts must finish within four seconds");
+    }
+}

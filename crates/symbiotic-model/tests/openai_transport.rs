@@ -159,31 +159,23 @@ async fn disabled_thinking_and_nullable_content_keep_identity() {
 }
 
 #[test]
-fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(4), Some(6), Some(5)),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(4), Some(7), None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, Some(11), None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, Some(6), None),
-        (Some(4), Some(6))
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), None, None, None),
-        (None, None)
-    );
-    assert_eq!(
-        prompt_cache_counts(Some(10), Some(0), None, None),
-        (Some(0), Some(10))
-    );
+fn cache_counts_return_unknown_for_conflicts_and_derive_only_numeric_evidence() {
+    for (total, hit, miss, nested) in [
+        (Some(10), Some(4), Some(6), Some(5)),
+        (Some(10), Some(4), Some(7), None),
+        (Some(10), None, Some(11), None),
+        (Some(10), Some(11), None, None),
+        (Some(u64::MAX), Some(u64::MAX), Some(1), None),
+    ] {
+        assert_eq!(prompt_cache_counts(total, hit, miss, nested), (None, None));
+    }
+    for (hit, miss, expected) in [
+        (None, Some(6), (Some(4), Some(6))),
+        (None, None, (None, None)),
+        (Some(0), None, (Some(0), Some(10))),
+    ] {
+        assert_eq!(prompt_cache_counts(Some(10), hit, miss, None), expected);
+    }
 }
 
 #[tokio::test]
@@ -385,4 +377,86 @@ fn local_hash_embeddings_have_no_http_destination() {
     let provider = HashEmbeddingProvider::new(3);
     assert_eq!(provider.descriptor().provider_class, ProviderClass::Local);
     assert!(provider.descriptor().metadata.get("endpoint").is_none());
+}
+
+async fn assert_invalid_id_preserves_answer(id: String) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (url, server) = fixture(serde_json::json!({
+            "id":id, "model":"served-model", "created":0,
+            "choices":[{"message":{"content":"OK"}}]
+        }));
+        let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+            .with_timeout(1)
+            .unwrap();
+        let response = symbiotic_model::with_egress_http_observations(provider.chat(request()))
+            .await
+            .expect("invalid identity must preserve the paid answer");
+        server.join().unwrap();
+        assert_eq!(response.text, "OK");
+        assert_eq!(response.trace.usage.response_id, None);
+        assert_eq!(
+            response.trace.usage.served_model.as_deref(),
+            Some("served-model")
+        );
+        assert_eq!(
+            response.trace.metadata["runtime_diagnostics"][0]["kind"],
+            "invalid_usage_identity"
+        );
+    })
+    .await
+    .expect("identity fixture must finish within three seconds");
+}
+
+#[tokio::test]
+async fn regression_request_phrase_id_is_dropped_without_rejecting_answer() {
+    assert_invalid_id_preserves_answer("synthetic evidence".into()).await;
+}
+
+#[tokio::test]
+async fn regression_129_byte_id_is_dropped_without_rejecting_answer() {
+    assert_invalid_id_preserves_answer("a".repeat(129)).await;
+}
+
+#[tokio::test]
+async fn regression_strict_usage_refusal_is_scoped_to_egress() {
+    for malformed in [
+        serde_json::json!({"id":null}),
+        serde_json::json!({"usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":7}}),
+    ] {
+        for scoped in [false, true] {
+            let mut body = malformed.clone();
+            body["choices"] = serde_json::json!([{"message":{"content":"OK"}}]);
+            let (url, server) = fixture(body);
+            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                .with_timeout(1)
+                .unwrap();
+            let call = provider.chat(request());
+            let result = if scoped {
+                symbiotic_model::with_egress_http_observations(call).await
+            } else {
+                call.await
+            };
+            server.join().unwrap();
+            if scoped && malformed.get("usage").is_some() {
+                assert!(matches!(
+                    result,
+                    Err(symbiotic_model::ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::InvalidResponse
+                    ))
+                ));
+            } else {
+                let response = result.expect("direct calls retain successful answers");
+                assert_eq!(response.text, "OK");
+                assert_eq!(response.trace.usage.response_id, None);
+                assert_eq!(response.trace.usage.cache_hit_tokens, None);
+                assert_eq!(response.trace.usage.cache_miss_tokens, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn regression_public_cache_counts_remain_tuple_returning() {
+    let (hit, miss) = prompt_cache_counts(Some(10), Some(4), None, None);
+    assert_eq!((hit, miss), (Some(4), Some(6)));
 }

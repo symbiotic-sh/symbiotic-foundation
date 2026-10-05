@@ -224,7 +224,18 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
     if secret.is_empty() {
         return result;
     }
-    let mut response = result?;
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some((status, retry)) = error.http_details() {
+                check_response(
+                    &serde_json::json!({"status":status,"retry_after_seconds":retry}),
+                    secret,
+                )?;
+            }
+            return Err(error);
+        }
+    };
     let value = serde_json::to_value(&response).map_err(|_| {
         crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidResponse)
     })?;
@@ -268,6 +279,35 @@ mod tests {
         assert!(check_response(&value, "123400000").is_ok());
         let value: serde_json::Value = serde_json::from_str("123400000").unwrap();
         assert!(check_response(&value, "1.234e8").is_ok());
+    }
+
+    #[test]
+    fn regression_numeric_error_hints_cannot_echo_credentials() {
+        for wrapped in [false, true] {
+            let error = crate::ModelError::Http {
+                primary: Box::new(crate::ModelError::RateLimited(
+                    symbiotic_core::DiagnosticCode::HttpRateLimited,
+                )),
+                status: 429,
+                retry_after_seconds: Some(123456789),
+            };
+            let error = if wrapped {
+                crate::ModelError::Diagnostics {
+                    primary: Box::new(error),
+                    secondary: vec![symbiotic_core::DiagnosticCode::StorageFailure],
+                }
+            } else {
+                error
+            };
+            let boundary = CredentialBoundary::new("123456789".into());
+            let result = credential_boundary::<serde_json::Value>(Err(error), &boundary);
+            assert!(matches!(
+                result,
+                Err(crate::ModelError::Provider(
+                    symbiotic_core::DiagnosticCode::CredentialBearingProviderResponseRefused
+                ))
+            ));
+        }
     }
 
     #[test]

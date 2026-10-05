@@ -301,10 +301,32 @@ A received success with measured usage reports `SpendState::Settled` and availab
 input/output/reasoning/media/cost fields. Missing usage remains `None`; it is never
 invented. `UsageTrace.reported_cost_usd` preserves validated provider-reported USD cost
 as an exact decimal string, including sub-micro-dollar precision, in immediate receipts
-and recovered results. It is separate from integer `cost_micro_usd`; the process neither
+and recovered results. The same typed `UsageTrace` carries optional
+`cache_hit_tokens`, `cache_miss_tokens`, `response_id`, `served_model` and `created`
+(provider Unix seconds). OpenAI-compatible prompt counters include DeepSeek's
+cache split and nested OpenAI cached-token counts. Anthropic input totals include
+uncached input, cache reads and cache writes; misses include uncached input and
+cache writes. Jev classification carries its response identity and reported cache
+counts through the same usage owner. Missing fields stay absent; timestamps are
+never synthesized. Response identity survives recovery even without token counts,
+while spend remains unknown without measured usage. The complete credential
+boundary checks these fields before any runtime or ledger write; reasoning text,
+prompts, answers, raw responses and credentials are excluded from usage.
+No new persistent store is introduced: immediate replies and recovery derive
+usage from the existing canonical spend receipt.
+`reported_cost_usd` is separate from integer `cost_micro_usd`; the process neither
 rounds it nor estimates prices, and does not establish a monetary ceiling.
-Every failed dispatch returns a static credential-free `error` alongside
-its receipt (`None` on success). Credential-loading and setup/queue failures before
+Every failed dispatch returns a closed, credential-free `error` alongside
+its receipt (`None` on success). Provider failures keep `rate_limited` with an
+optional `retry_after_seconds`, `timeout`, `provider` with an optional HTTP
+`status`, or `transport`. Provider HTTP status and Retry-After survive runtime
+attempt exhaustion and secondary bookkeeping diagnostics. HTTP-date Retry-After
+values become a nonnegative delay relative to receipt time; malformed hints fail
+visibly rather than being ignored. Send and response-body read timeouts share the
+same timeout classification. Provider error bodies and raw header strings never
+leave the transport. These classes are observations, not permission to retry:
+unknown spend still requires reconciliation before another admitted attempt.
+Credential-loading and setup/queue failures before
 transport handoff report `SpendState::Released` and release that reservation for a
 subsequent admitted attempt, while the attempt-count limit still applies. Once the
 raw transport starts, failures conservatively retain the unknown reservation.
@@ -554,3 +576,11 @@ limits, file protection, unsupported secret backend refusal and real executable 
 are not a live-provider qualification or physical power-loss certification. The tests cover this backend's revision ordering and ledger accounting; Memory must
 implement the trusted publication integration and its data authorization checks.
 Memory input-authorization and guarded-commit verification belongs to Memory.
+
+The `rabbithole_usage_metadata_round_trips_in_process_and_recovery`,
+`rabbithole_classification_usage_metadata_survives_projection`,
+`rabbithole_response_identity_without_token_usage_recovers`, and
+`rabbithole_failure_classes_round_trip_in_process_and_recovery` tests cover safe
+usage and typed failure recovery through the in-process client. The shared HTTP
+unit tests cover numeric/date retry hints and send/body-read timeouts. All new
+network regressions have explicit deadlines; they do not qualify live providers.

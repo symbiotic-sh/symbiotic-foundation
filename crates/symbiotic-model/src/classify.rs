@@ -1148,6 +1148,24 @@ impl ClassifierProvider for JevClassifierProvider {
                 trace.usage.input_tokens = usage("input_tokens");
                 trace.usage.output_tokens = usage("output_tokens");
                 trace.usage.reported_cost_usd = reported_cost_usd(&raw);
+                let cache_counter = |field: &str| {
+                    raw.pointer(&format!("/usage/{field}"))
+                        .map(|value| match value.as_u64() {
+                            Some(count) => Ok(Some(count)),
+                            None if !egress_observations_enabled() => Ok(None),
+                            None => Err(ModelError::Provider(DiagnosticCode::InvalidResponse)),
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                };
+                let (hit, miss) = observed_prompt_cache_counts(
+                    trace.usage.input_tokens,
+                    cache_counter("cache_hit_tokens")?,
+                    cache_counter("cache_miss_tokens")?,
+                    None,
+                )?;
+                trace.usage.cache_hit_tokens = hit;
+                trace.usage.cache_miss_tokens = miss;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -1155,6 +1173,7 @@ impl ClassifierProvider for JevClassifierProvider {
                         "reported_cost_usd": trace.usage.reported_cost_usd,
                     },
                 });
+                provider_usage_identity(&mut trace, &raw);
                 Ok(ClassifyResponse {
                     answers,
                     served_model,
@@ -2496,7 +2515,7 @@ mod tests {
                 .await
                 .unwrap_err();
             if status == 429 {
-                assert!(matches!(error, ModelError::RateLimited(_)));
+                assert!(matches!(error.primary(), ModelError::RateLimited(_)));
             } else {
                 assert!(matches!(
                     error,
@@ -2549,7 +2568,7 @@ mod tests {
                 .classify(request(vec![goal_question()]))
                 .await
                 .unwrap_err();
-            let got = match err {
+            let got = match err.primary() {
                 ModelError::Timeout(_) => "timeout",
                 ModelError::RateLimited(_) => "rate_limited",
                 ModelError::Unavailable(_) => "unavailable",
@@ -2691,6 +2710,67 @@ mod tests {
         let json: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json.as_object().unwrap().len(), 3);
         assert!(json.get("source").is_none() && json.get("metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn regression_jev_supplied_invalid_cache_counters_are_visible_in_egress() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for field in ["cache_hit_tokens", "cache_miss_tokens"] {
+                for invalid in [
+                    serde_json::json!("invalid"),
+                    serde_json::json!(null),
+                    serde_json::json!(-1),
+                    serde_json::json!(1.5),
+                    serde_json::json!(true),
+                ] {
+                    let mut body = jev_body(JEV_DEFAULT_MODEL);
+                    body["usage"][field] = invalid;
+                    let server = mock_http(vec![ok(body)]);
+                    let result = with_egress_http_observations(
+                        jev_at(&server).classify(request(vec![goal_question(), route_question()])),
+                    )
+                    .await;
+                    assert!(
+                        matches!(
+                            result,
+                            Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
+                        ),
+                        "{field}: {result:?}"
+                    );
+                }
+            }
+            let server = mock_http(vec![ok(jev_body(JEV_DEFAULT_MODEL))]);
+            let response = with_egress_http_observations(
+                jev_at(&server).classify(request(vec![goal_question(), route_question()])),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.trace.usage.cache_hit_tokens, None);
+            assert_eq!(response.trace.usage.cache_miss_tokens, None);
+        })
+        .await
+        .expect("cache counter fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_jev_served_model_matching_local_description_is_accepted() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let server = mock_http(vec![ok(jev_body(JEV_DEFAULT_MODEL))]);
+            let mut req = request(vec![goal_question(), route_question()]);
+            req.state_description = Some(JEV_DEFAULT_MODEL.into());
+            req.state
+                .insert("message".into(), serde_json::json!(JEV_DEFAULT_MODEL));
+            let response = with_egress_http_observations(jev_at(&server).classify(req))
+                .await
+                .expect("local content must not screen usage identity");
+            assert_eq!(response.served_model, JEV_DEFAULT_MODEL);
+            assert_eq!(
+                response.trace.usage.served_model.as_deref(),
+                Some(JEV_DEFAULT_MODEL)
+            );
+        })
+        .await
+        .expect("identity fixture must finish within three seconds");
     }
 
     #[test]

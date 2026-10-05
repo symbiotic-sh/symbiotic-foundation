@@ -565,6 +565,7 @@ impl CredentialProcess {
                         output = Some(answer);
                     }
                     Err(failure) => {
+                        diagnostics = failure.diagnostics;
                         error = Some(failure.code);
                         if !failure.may_have_dispatched {
                             receipt.spend_state = SpendState::Released;

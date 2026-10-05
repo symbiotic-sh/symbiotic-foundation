@@ -358,11 +358,11 @@ impl Registry {
         if changed != 1 {
             return Err(EgressError::StateUnavailable);
         }
-        let usage = if symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage) {
-            Some(result.receipt.usage.clone())
-        } else {
-            None
-        };
+        // Response identity is still recoverable when token usage is absent.
+        // Settlement remains governed by measured usage, independently of metadata.
+        let usage = (result.output.is_some()
+            || symbiotic_ai_runtime::model::has_measured_usage(&result.receipt.usage))
+        .then(|| result.receipt.usage.clone());
         SqliteSpendLedger::finish_in(
             &tx,
             &result.receipt.reference,
