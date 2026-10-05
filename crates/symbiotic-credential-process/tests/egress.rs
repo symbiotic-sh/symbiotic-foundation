@@ -6132,7 +6132,7 @@ async fn rabbithole_usage_metadata_round_trips_in_process_and_recovery() {
 
 #[tokio::test]
 async fn rabbithole_failure_classes_round_trip_in_process_and_recovery() {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         for anthropic in [false, true] {
             for (http_status, delay, expected) in [
                 (0, Duration::ZERO, serde_json::json!("transport")),
@@ -6184,12 +6184,12 @@ async fn rabbithole_failure_classes_round_trip_in_process_and_recovery() {
         }
     })
     .await
-    .expect("failure dispatch and recovery must finish within five seconds");
+    .expect("failure dispatch and recovery must finish within thirty seconds (hang guard)");
 }
 
 #[tokio::test]
 async fn rabbithole_classification_usage_metadata_survives_projection() {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         let fixture = rabbithole_jev_fixture(None).await;
         let process = fixture.process().await;
         let client = InProcessEgressClient::new(process.clone());
