@@ -379,38 +379,42 @@ fn local_hash_embeddings_have_no_http_destination() {
     assert!(provider.descriptor().metadata.get("endpoint").is_none());
 }
 
+async fn assert_invalid_id_preserves_answer(id: String) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (url, server) = fixture(serde_json::json!({
+            "id":id, "model":"served-model", "created":0,
+            "choices":[{"message":{"content":"OK"}}]
+        }));
+        let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+            .with_timeout(1)
+            .unwrap();
+        let response = symbiotic_model::with_egress_http_observations(provider.chat(request()))
+            .await
+            .expect("invalid identity must preserve the paid answer");
+        server.join().unwrap();
+        assert_eq!(response.text, "OK");
+        assert_eq!(response.trace.usage.response_id, None);
+        assert_eq!(
+            response.trace.usage.served_model.as_deref(),
+            Some("served-model")
+        );
+        assert_eq!(
+            response.trace.metadata["runtime_diagnostics"][0]["kind"],
+            "invalid_usage_identity"
+        );
+    })
+    .await
+    .expect("identity fixture must finish within three seconds");
+}
+
 #[tokio::test]
-async fn regression_ascii_request_and_answer_echoes_are_not_usage_identities() {
-    for field in ["id", "model"] {
-        for (request_text, echo) in [
-            ("PRIVATE_REQUEST", "PRIVATE_REQUEST"),
-            ("PRIVATE_REQUEST", "PRIVATE_ANSWER"),
-            ("PRIVATE_ANSWER", "PRIVATE_ANSWER"),
-        ] {
-            let mut body = serde_json::json!({
-                "id":"fixture-id", "model":"served-model",
-                "choices":[{"message":{"content":"PRIVATE_ANSWER"}}]
-            });
-            body[field] = serde_json::json!(echo);
-            let (url, server) = fixture(body);
-            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
-                .with_timeout(1)
-                .unwrap();
-            let mut req = request();
-            req.messages[0].content = request_text.into();
-            let result = symbiotic_model::with_egress_http_observations(provider.chat(req)).await;
-            server.join().unwrap();
-            assert!(
-                matches!(
-                    result,
-                    Err(symbiotic_model::ModelError::Provider(
-                        symbiotic_core::DiagnosticCode::InvalidResponse
-                    ))
-                ),
-                "{field}={echo}: {result:?}"
-            );
-        }
-    }
+async fn regression_request_phrase_id_is_dropped_without_rejecting_answer() {
+    assert_invalid_id_preserves_answer("synthetic evidence".into()).await;
+}
+
+#[tokio::test]
+async fn regression_129_byte_id_is_dropped_without_rejecting_answer() {
+    assert_invalid_id_preserves_answer("a".repeat(129)).await;
 }
 
 #[tokio::test]
@@ -433,7 +437,7 @@ async fn regression_strict_usage_refusal_is_scoped_to_egress() {
                 call.await
             };
             server.join().unwrap();
-            if scoped {
+            if scoped && malformed.get("usage").is_some() {
                 assert!(matches!(
                     result,
                     Err(symbiotic_model::ModelError::Provider(

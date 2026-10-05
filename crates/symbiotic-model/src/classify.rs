@@ -1148,12 +1148,6 @@ impl ClassifierProvider for JevClassifierProvider {
                 trace.usage.input_tokens = usage("input_tokens");
                 trace.usage.output_tokens = usage("output_tokens");
                 trace.usage.reported_cost_usd = reported_cost_usd(&raw);
-                provider_usage_identity(
-                    &mut trace.usage,
-                    &raw,
-                    &serde_json::json!({"state": request.state, "questions": request.questions,
-                        "state_description": request.state_description, "answers": answers}),
-                )?;
                 let cache_counter = |field: &str| {
                     raw.pointer(&format!("/usage/{field}"))
                         .map(|value| match value.as_u64() {
@@ -1179,6 +1173,7 @@ impl ClassifierProvider for JevClassifierProvider {
                         "reported_cost_usd": trace.usage.reported_cost_usd,
                     },
                 });
+                provider_usage_identity(&mut trace, &raw);
                 Ok(ClassifyResponse {
                     answers,
                     served_model,
@@ -2758,27 +2753,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regression_jev_ascii_echoes_are_not_usage_identities() {
+    async fn regression_jev_served_model_matching_local_description_is_accepted() {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            for echo in ["PRIVATE_REQUEST", "quick"] {
-                let mut body = jev_body(JEV_DEFAULT_MODEL);
-                body["id"] = serde_json::json!(format!("prefix_{echo}_suffix"));
-                let server = mock_http(vec![ok(body)]);
-                let mut req = request(vec![goal_question(), route_question()]);
-                req.state
-                    .insert("message".into(), serde_json::json!("PRIVATE_REQUEST"));
-                let result = with_egress_http_observations(jev_at(&server).classify(req)).await;
-                assert!(
-                    matches!(
-                        result,
-                        Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
-                    ),
-                    "{echo}: {result:?}"
-                );
-            }
+            let server = mock_http(vec![ok(jev_body(JEV_DEFAULT_MODEL))]);
+            let mut req = request(vec![goal_question(), route_question()]);
+            req.state_description = Some(JEV_DEFAULT_MODEL.into());
+            req.state
+                .insert("message".into(), serde_json::json!(JEV_DEFAULT_MODEL));
+            let response = with_egress_http_observations(jev_at(&server).classify(req))
+                .await
+                .expect("local content must not screen usage identity");
+            assert_eq!(response.served_model, JEV_DEFAULT_MODEL);
+            assert_eq!(
+                response.trace.usage.served_model.as_deref(),
+                Some(JEV_DEFAULT_MODEL)
+            );
         })
         .await
-        .expect("identity fixtures must finish within three seconds");
+        .expect("identity fixture must finish within three seconds");
     }
 
     #[test]

@@ -205,14 +205,6 @@ impl ChatProvider for AnthropicChatProvider {
                     observed_prompt_cache_counts(input, usage.cache_read_input_tokens, None, None)?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
-                provider_usage_identity(
-                    &mut trace.usage,
-                    &raw,
-                    &serde_json::json!({
-                        "request": request.messages.iter().map(|message| &message.content).collect::<Vec<_>>(),
-                        "answer": text,
-                    }),
-                )?;
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(input, hit, miss),
@@ -224,6 +216,7 @@ impl ChatProvider for AnthropicChatProvider {
                     "cache_miss_tokens": miss,
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                 });
+                provider_usage_identity(&mut trace, &raw);
                 Ok(ChatResponse {
                     text,
                     finish_reason: Some(parsed.stop_reason),

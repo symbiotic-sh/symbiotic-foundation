@@ -59,7 +59,7 @@ impl<P: ChatProvider> ChatProvider for Dispatched<P> {
         self.started.store(true, Ordering::SeqCst);
         let mut response =
             self.outcome(model::with_egress_http_observations(self.inner.chat(request)).await)?;
-        response.trace.metadata = serde_json::Value::Null;
+        retain_diagnostics(&mut response.trace);
         Ok(response)
     }
 }
@@ -69,7 +69,7 @@ impl<P: ClassifierProvider> ClassifierProvider for Dispatched<P> {
         self.started.store(true, Ordering::SeqCst);
         let mut response =
             self.outcome(model::with_egress_http_observations(self.inner.classify(request)).await)?;
-        response.trace.metadata = serde_json::Value::Null;
+        retain_diagnostics(&mut response.trace);
         Ok(response)
     }
 }
@@ -79,7 +79,7 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Dispatched<P> {
         self.started.store(true, Ordering::SeqCst);
         let mut response =
             self.outcome(model::with_egress_http_observations(self.inner.embed(request)).await)?;
-        response.trace.metadata = serde_json::Value::Null;
+        retain_diagnostics(&mut response.trace);
         Ok(response)
     }
 }
@@ -89,9 +89,14 @@ impl<P: RerankProvider> RerankProvider for Dispatched<P> {
         self.started.store(true, Ordering::SeqCst);
         let mut response =
             self.outcome(model::with_egress_http_observations(self.inner.rerank(request)).await)?;
-        response.trace.metadata = serde_json::Value::Null;
+        retain_diagnostics(&mut response.trace);
         Ok(response)
     }
+}
+
+fn retain_diagnostics(trace: &mut ModelInvocationTrace) {
+    trace.metadata =
+        serde_json::json!({RUNTIME_DIAGNOSTICS: trace.metadata[RUNTIME_DIAGNOSTICS].take()});
 }
 
 // Once the raw adapter starts, retain the reservation unless it establishes
@@ -407,6 +412,7 @@ fn completed(
     if let Some(entries) = trace.metadata[RUNTIME_DIAGNOSTICS].as_array() {
         for entry in entries {
             let diagnostic = match entry["kind"].as_str() {
+                Some("invalid_usage_identity") => DispatchDiagnostic::InvalidUsageIdentity,
                 Some("queue_complete_failed") => DispatchDiagnostic::QueueCompleteFailed,
                 Some("trace_write_failed") => DispatchDiagnostic::TraceWriteFailed,
                 Some("response_cache_write_failed") => DispatchDiagnostic::ResponseCacheWriteFailed,

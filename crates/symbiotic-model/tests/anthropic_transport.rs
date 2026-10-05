@@ -490,29 +490,3 @@ async fn regression_anthropic_misses_remain_known_without_cache_reads() {
     assert_eq!(response.trace.usage.cache_hit_tokens, None);
     assert_eq!(response.trace.usage.cache_miss_tokens, Some(30));
 }
-
-#[tokio::test]
-async fn regression_anthropic_ascii_echoes_are_not_usage_identities() {
-    for field in ["id", "model"] {
-        for echo in ["PRIVATE_REQUEST", "PRIVATE_ANSWER"] {
-            let mut body = answer();
-            body[field] = json!(format!("prefix_{echo}_suffix"));
-            body["content"] = json!([{"type":"text", "text":"PRIVATE_ANSWER"}]);
-            let (url, server) = fixture(200, &body.to_string(), false);
-            let mut req = request();
-            req.messages[1].content = "PRIVATE_REQUEST".into();
-            let result = symbiotic_model::with_egress_http_observations(
-                provider(&url).with_timeout(1).unwrap().chat(req),
-            )
-            .await;
-            server.join().unwrap();
-            assert!(
-                matches!(
-                    result,
-                    Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
-                ),
-                "{field}={echo}: {result:?}"
-            );
-        }
-    }
-}

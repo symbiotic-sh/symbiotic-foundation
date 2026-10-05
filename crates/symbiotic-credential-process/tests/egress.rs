@@ -6247,12 +6247,13 @@ async fn rabbithole_response_identity_without_token_usage_recovers() {
 }
 
 #[tokio::test]
-async fn regression_egress_rejects_malformed_usage_identity() {
+async fn regression_egress_drops_malformed_usage_identity_and_recovers_diagnostic() {
     tokio::time::timeout(Duration::from_secs(5), async {
         for anthropic in [false, true] {
             for (field, value) in [
                 ("id", serde_json::json!("answer\nprivate text")),
                 ("id", serde_json::json!({})),
+                ("id", serde_json::json!("a".repeat(129))),
                 ("model", serde_json::json!("answer with spaces")),
                 ("created", serde_json::json!("invalid")),
                 ("created", serde_json::json!(-1)),
@@ -6269,11 +6270,12 @@ async fn regression_egress_rejects_malformed_usage_identity() {
                 let (admission, payload) = fixture.attempt("invalid-identity",1,1);
                 let granted = permit(&process,&admission).await;
                 let result = dispatched(exchange(&process, inject(admission.clone(),payload,granted)).await.unwrap());
-                assert_eq!(result.error, Some(EgressError::Provider {status:None}), "{field}, anthropic={anthropic}");
-                assert!(result.output.is_none());
-                assert_eq!(result.receipt.usage.response_id,None);
-                let AttemptStatus::Failed {result:recovered} = status(&process,&admission).await else {panic!("missing failure")};
-                assert_eq!(recovered.error,result.error);
+                assert_eq!(result.error, None, "{field}, anthropic={anthropic}");
+                assert!(matches!(&result.output, Some(ProviderOutput::Chat {text, ..}) if text == "answer"));
+                assert_eq!(serde_json::to_value(&result.receipt.usage).unwrap()[match field {"id" => "response_id", "model" => "served_model", _ => "created"}], serde_json::Value::Null);
+                assert_eq!(serde_json::to_value(&result.diagnostics).unwrap(), serde_json::json!(["invalid_usage_identity"]));
+                let AttemptStatus::Completed {result:recovered} = status(&process,&admission).await else {panic!("missing answer")};
+                assert_eq!(recovered.diagnostics,result.diagnostics);
             }
         }
     }).await.expect("identity fixtures must finish within five seconds");

@@ -482,6 +482,8 @@ pub struct DispatchReceipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchDiagnostic {
+    /// Malformed provider identity metadata was omitted from usage; the answer is retained.
+    InvalidUsageIdentity,
     /// The provider supplied a malformed Retry-After hint; the HTTP class is preserved.
     InvalidRetryAfter,
     /// The paid response could not be recorded as complete in the runtime queue.

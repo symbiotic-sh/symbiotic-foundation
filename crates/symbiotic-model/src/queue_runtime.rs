@@ -85,18 +85,6 @@ impl ModelAdmission {
     }
 }
 
-/// Key in a response trace's `metadata` listing side effects that failed
-/// while the call's outcome stood, as `[{"kind": ..., "error": ...}]`.
-///
-/// Once the provider has answered, the answer is returned and its usage
-/// receipt recorded even when writing the response cache
-/// (`response_cache_write_failed`), the trace (`trace_write_failed`) or the
-/// queue completion (`queue_complete_failed`) fails. The usage receipt's
-/// `metadata` carries the same list. Each failure is also logged as a
-/// `tracing` warning, as are failed cooldown and failure-trace writes of a
-/// failed call, which keeps its own error.
-pub const RUNTIME_DIAGNOSTICS: &str = "runtime_diagnostics";
-
 /// What happened to one queued call at one step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -57,10 +57,22 @@ mod queue_runtime;
 #[cfg(feature = "queue")]
 pub use queue_runtime::{
     CacheEntry, CachedResponse, DirResponseCache, InMemoryReceiptSink, ModelAdmission, ModelJob,
-    QueueReceipt, QueueReceiptSink, RUNTIME_DIAGNOSTICS, ReceiptStatus, ResponseCache,
+    QueueReceipt, QueueReceiptSink, ReceiptStatus, ResponseCache,
 };
 #[cfg(feature = "queue")]
 use queue_runtime::{QueueRuntime, queue_runtime_builders};
+
+/// Key in a response trace's `metadata` listing diagnostics accompanying
+/// a paid answer, as `[{"kind": ..., "error": ...}]`.
+///
+/// Once the provider has answered, the answer is returned and its usage
+/// receipt recorded even when writing the response cache
+/// (`response_cache_write_failed`), the trace (`trace_write_failed`) or the
+/// queue completion (`queue_complete_failed`) fails. The usage receipt's
+/// `metadata` carries the same list. Each side effect failure is also logged as a
+/// `tracing` warning, as are failed cooldown and failure-trace writes of a
+/// failed call, which keeps its own error.
+pub const RUNTIME_DIAGNOSTICS: &str = "runtime_diagnostics";
 
 // Spend receipt and state types are part of the provider contract that
 // protocol clients (symbiotic-egress) use without the queue runtime.
@@ -1509,6 +1521,11 @@ fn note_side_effect<Res: TraceCarrier>(
 ) {
     warn_side_effect(queue_id, kind, error);
     let mut trace = response.trace().clone();
+    note_trace_diagnostic(&mut trace, kind, error);
+    response.set_trace(trace);
+}
+
+fn note_trace_diagnostic(trace: &mut ModelInvocationTrace, kind: &str, error: DiagnosticCode) {
     if !trace.metadata.is_object() {
         let original = std::mem::take(&mut trace.metadata);
         trace.metadata = if original.is_null() {
@@ -1522,7 +1539,6 @@ fn note_side_effect<Res: TraceCarrier>(
         Some(Value::Array(list)) => list.push(entry),
         _ => trace.metadata[RUNTIME_DIAGNOSTICS] = serde_json::json!([entry]),
     }
-    response.set_trace(trace);
 }
 
 // The arguments are the queue execution boundary: one queued call.
@@ -4140,14 +4156,6 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 )?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
-                provider_usage_identity(
-                    &mut trace.usage,
-                    &raw,
-                    &serde_json::json!({
-                        "request": request.messages.iter().map(|message| &message.content).collect::<Vec<_>>(),
-                        "answer": content,
-                    }),
-                )?;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -4163,6 +4171,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                         "nested_hit": nested_hit,
                     },
                 });
+                provider_usage_identity(&mut trace, &raw);
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
@@ -4602,61 +4611,40 @@ fn parse_retry_after(
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
 }
 
-fn provider_usage_identity(
-    usage: &mut UsageTrace,
-    raw: &Value,
-    content: &Value,
-) -> Result<(), ModelError> {
+fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
     if !egress_observations_enabled() {
-        usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
-        usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
-        usage.created = raw.get("created").and_then(Value::as_i64);
-        return Ok(());
+        trace.usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+        trace.usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
+        trace.usage.created = raw.get("created").and_then(Value::as_i64);
+        return;
     }
-    fn echoes_content(identity: &str, content: &Value) -> bool {
-        match content {
-            Value::String(text) => !text.is_empty() && identity.contains(text.as_str()),
-            Value::Array(values) => values.iter().any(|value| echoes_content(identity, value)),
-            Value::Object(values) => values.values().any(|value| echoes_content(identity, value)),
-            _ => false,
-        }
-    }
-    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
-    let identity = |field: &str| -> Result<Option<String>, ModelError> {
-        raw.get(field)
-            .map(|value| {
-                let text = value.as_str().ok_or_else(invalid)?;
-                // Provider IDs and model names are ASCII tokens, not free-form text.
-                // Model names also permit namespace and version separators.
-                if text.is_empty()
-                    || echoes_content(text, content)
-                    || !text.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric()
-                            || b"-_.".contains(&byte)
-                            || (field == "model" && b"/:".contains(&byte))
-                    })
-                {
-                    return Err(invalid());
-                }
-                Ok(text.to_owned())
-            })
-            .transpose()
-    };
-    let response_id = identity("id")?;
-    let served_model = identity("model")?;
-    let created = raw
-        .get("created")
-        .map(|value| {
-            value
-                .as_i64()
-                .filter(|seconds| *seconds >= 0)
-                .ok_or_else(invalid)
+    let mut invalid = false;
+    let mut identity = |field: &str| {
+        raw.get(field).and_then(|value| {
+            let token = value.as_str().filter(|text| {
+                (1..=128).contains(&text.len())
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+            });
+            invalid |= token.is_none();
+            token.map(str::to_owned)
         })
-        .transpose()?;
-    usage.response_id = response_id;
-    usage.served_model = served_model;
-    usage.created = created;
-    Ok(())
+    };
+    trace.usage.response_id = identity("id");
+    trace.usage.served_model = identity("model");
+    trace.usage.created = raw.get("created").and_then(|value| {
+        let seconds = value.as_i64().filter(|seconds| *seconds >= 0);
+        invalid |= seconds.is_none();
+        seconds
+    });
+    if invalid {
+        note_trace_diagnostic(
+            trace,
+            "invalid_usage_identity",
+            DiagnosticCode::InvalidResponse,
+        );
+    }
 }
 
 fn status_error(status: u16) -> ModelError {
@@ -6130,7 +6118,16 @@ mod egress_http_tests {
     use super::*;
 
     #[tokio::test]
-    async fn usage_identity_validates_tokens_and_supplied_types_before_projection() {
+    async fn usage_identity_drops_invalid_fields_and_preserves_valid_fields() {
+        let new_trace = || {
+            success_trace(
+                &StaticChatProvider::new("OK").descriptor,
+                None,
+                None,
+                String::new(),
+                None,
+            )
+        };
         with_egress_http_observations(async {
             for raw in [
                 serde_json::json!({"id":null}),
@@ -6139,40 +6136,43 @@ mod egress_http_tests {
                 serde_json::json!({"id":"private\nanswer"}),
                 serde_json::json!({"model":false}),
                 serde_json::json!({"model":"private answer"}),
+                serde_json::json!({"id":"a".repeat(129)}),
+                serde_json::json!({"model":"a".repeat(129)}),
+                serde_json::json!({"id":"é"}),
+                serde_json::json!({"created":-1}),
                 serde_json::json!({"created":null}),
                 serde_json::json!({"created":1.5}),
                 serde_json::json!({"created":u64::MAX}),
             ] {
-                let mut usage = UsageTrace::default();
-                assert!(matches!(
-                    provider_usage_identity(&mut usage, &raw, &Value::Null),
-                    Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
-                ));
-                assert!(usage.response_id.is_none());
-                assert!(usage.served_model.is_none());
-                assert!(usage.created.is_none());
+                let mut trace = new_trace();
+                provider_usage_identity(&mut trace, &raw);
+                assert!(trace.usage.response_id.is_none());
+                assert!(trace.usage.served_model.is_none());
+                assert!(trace.usage.created.is_none());
+                assert_eq!(
+                    trace.metadata[RUNTIME_DIAGNOSTICS][0]["error"],
+                    "invalid_response"
+                );
             }
             for (id, model) in [
                 ("msg_0123456789abcdef", "claude-sonnet-4-20250514"),
                 ("7c971547-8bcc-4a91-8e10-00466eef5216", "deepseek-chat"),
-                ("chatcmpl-123", "namespace/model:version"),
+                ("namespace/response:123", "namespace/model:version"),
+                (&"a".repeat(128), &"m".repeat(128)),
             ] {
-                let mut usage = UsageTrace::default();
+                let mut trace = new_trace();
                 provider_usage_identity(
-                    &mut usage,
+                    &mut trace,
                     &serde_json::json!({"id":id,"model":model,"created":0}),
-                    &Value::Null,
-                )
-                .unwrap();
-                assert_eq!(usage.response_id.as_deref(), Some(id));
-                assert_eq!(usage.served_model.as_deref(), Some(model));
-                assert_eq!(usage.created, Some(0));
+                );
+                assert_eq!(trace.usage.response_id.as_deref(), Some(id));
+                assert_eq!(trace.usage.served_model.as_deref(), Some(model));
+                assert_eq!(trace.usage.created, Some(0));
+                assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
             }
-            let mut absent = UsageTrace::default();
-            provider_usage_identity(&mut absent, &serde_json::json!({}), &Value::Null).unwrap();
-            assert!(absent.response_id.is_none());
-            assert!(absent.served_model.is_none());
-            assert!(absent.created.is_none());
+            let mut trace = new_trace();
+            provider_usage_identity(&mut trace, &serde_json::json!({}));
+            assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
         })
         .await;
     }
