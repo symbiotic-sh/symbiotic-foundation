@@ -60,7 +60,7 @@ pub enum EgressError {
     InvalidRequest,
     /// Configured identity and response bounds cannot fit in the reply frame.
     #[error(
-        "max_frame_bytes must fit the reply envelope plus max_field_bytes identity bounds and max_response_bytes response bound"
+        "max_frame_bytes must be at least 4124 and at least 4096 + 24 * max_field_bytes + 4 * max_response_bytes"
     )]
     InvalidFrameConfiguration,
     /// App secret callbacks cannot be configured for a child process.
