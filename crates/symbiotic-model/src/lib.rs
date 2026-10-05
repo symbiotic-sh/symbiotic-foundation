@@ -298,6 +298,9 @@ pub struct RerankResponse {
 /// ```
 #[derive(Clone, Debug, Error)]
 pub enum ModelError {
+    /// Transport evidence that this attempt failed before sending a request.
+    #[error(transparent)]
+    HttpNotSent(HttpNotSentError),
     /// HTTP failure with the original class and safe response hints.
     #[error("{primary}; HTTP status {status}")]
     Http {
@@ -340,10 +343,21 @@ pub enum ModelError {
     },
 }
 
+/// Evidence created only by Foundation's HTTP send boundary for a non-timeout
+/// connect-phase failure (DNS, connection establishment or TLS setup).
+/// The private field prevents callers from constructing evidence from a class.
+#[derive(Clone, Debug, Error)]
+#[error("{primary}")]
+pub struct HttpNotSentError {
+    #[source]
+    primary: Box<ModelError>,
+}
+
 impl ModelError {
     /// Static diagnostic used by logs and durable queue failure records.
     pub const fn code(&self) -> DiagnosticCode {
         match self {
+            Self::HttpNotSent(evidence) => evidence.primary.code(),
             Self::Unavailable(code) => *code,
             Self::Auth(code) => *code,
             Self::RateLimited(code) => *code,
@@ -358,9 +372,10 @@ impl ModelError {
         }
     }
 
-    /// Original class beneath HTTP hints and secondary bookkeeping diagnostics.
+    /// Original class beneath transport evidence, HTTP hints and bookkeeping diagnostics.
     pub fn primary(&self) -> &Self {
         match self {
+            Self::HttpNotSent(evidence) => evidence.primary.primary(),
             Self::Http { primary, .. } | Self::Diagnostics { primary, .. } => primary.primary(),
             _ => self,
         }
@@ -384,6 +399,14 @@ impl ModelError {
         match self {
             Self::Diagnostics { secondary, .. } => secondary,
             _ => &[],
+        }
+    }
+
+    fn failure_charge(&self) -> FailureCharge {
+        match self {
+            Self::HttpNotSent(_) => FailureCharge::KnownZero,
+            Self::Diagnostics { primary, .. } => primary.failure_charge(),
+            _ => FailureCharge::Unknown,
         }
     }
 
@@ -426,9 +449,10 @@ pub trait ModelProvider: Send + Sync {
     {
         Ok(self.clone())
     }
+    /// Read per-attempt evidence from the shared HTTP transport by default.
     /// Override only with evidence that the failed attempt incurred no charge.
-    fn failure_charge(&self, _error: &ModelError) -> FailureCharge {
-        FailureCharge::Unknown
+    fn failure_charge(&self, error: &ModelError) -> FailureCharge {
+        error.failure_charge()
     }
     /// Refuse unsupported or unbounded transport configuration before execution.
     fn validate_configuration(&self) -> Result<(), ModelError> {
@@ -3122,6 +3146,7 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 #[cfg(feature = "queue")]
 fn error_class(err: &ModelError) -> FailureClass {
     match err {
+        ModelError::HttpNotSent(evidence) => error_class(&evidence.primary),
         ModelError::Diagnostics { primary, .. } | ModelError::Http { primary, .. } => {
             error_class(primary)
         }
@@ -3359,7 +3384,7 @@ fn exhausted_request_error(
     last_error: &ModelError,
 ) -> ModelError {
     match last_error {
-        ModelError::Http { .. } => last_error.clone(),
+        ModelError::Http { .. } | ModelError::HttpNotSent(_) => last_error.clone(),
         ModelError::Diagnostics { primary, secondary } => {
             exhausted_request_error(_queue_id, _item, _config, primary)
                 .with_diagnostics(secondary.iter().copied())
@@ -4530,7 +4555,8 @@ tokio::task_local! {
 }
 
 /// Include safe HTTP observations in failures during credential-owned egress.
-/// Ordinary adapter calls retain their original top-level error variants.
+/// Ordinary adapter calls omit status/timeout observations; unsent-request
+/// evidence is attached by the send boundary in either mode.
 /// The scope lasts only for this future and does not propagate to spawned tasks.
 pub async fn with_egress_http_observations<F: std::future::Future>(future: F) -> F::Output {
     EGRESS_HTTP_OBSERVATIONS.scope((), future).await
@@ -4543,10 +4569,7 @@ async fn provider_response_json(
     max_bytes: Option<usize>,
     invalid_json: fn(DiagnosticCode) -> ModelError,
 ) -> Result<(Value, String), ModelError> {
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| http_transport_error(error, DiagnosticCode::HttpUnavailable))?;
+    let response = builder.send().await.map_err(http_send_error)?;
     let status = response.status();
     if !status.is_success() {
         let primary = if status.is_redirection() {
@@ -4584,6 +4607,21 @@ async fn provider_response_json(
 
 fn egress_observations_enabled() -> bool {
     EGRESS_HTTP_OBSERVATIONS.try_with(|_| ()).is_ok()
+}
+
+// Only send failures can prove that no request bytes were sent. Body-read
+// failures never enter this evidence path, and timeouts remain uncertain even
+// when reqwest also labels them as connect-phase errors.
+fn http_send_error(error: reqwest::Error) -> ModelError {
+    let not_sent = error.is_connect() && !error.is_timeout();
+    let primary = http_transport_error(error, DiagnosticCode::HttpUnavailable);
+    if not_sent {
+        ModelError::HttpNotSent(HttpNotSentError {
+            primary: Box::new(primary),
+        })
+    } else {
+        primary
+    }
 }
 
 fn http_transport_error(error: reqwest::Error, direct_code: DiagnosticCode) -> ModelError {
@@ -6118,6 +6156,125 @@ mod egress_http_tests {
     use super::*;
 
     #[tokio::test]
+    async fn regression_http_connect_failure_has_per_call_zero_charge_evidence() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener);
+            let provider = JevClassifierProvider::new("op", "model", &endpoint, "")
+                .with_timeout(1)
+                .unwrap();
+            let request = ClassifyRequest::new(
+                serde_json::Map::new(),
+                vec![ClassifierQuestion::noul("answer", "yes?", None, None)],
+            );
+            for scoped in [false, true] {
+                let call = provider.classify(request.clone());
+                let error = if scoped {
+                    with_egress_http_observations(call).await
+                } else {
+                    call.await
+                }
+                .unwrap_err();
+                assert!(matches!(error.primary(), ModelError::Unavailable(_)));
+                assert_eq!(provider.failure_charge(&error), FailureCharge::KnownZero);
+                let decorated = error.with_diagnostics([DiagnosticCode::StorageFailure]);
+                assert_eq!(
+                    provider.failure_charge(&decorated),
+                    FailureCharge::KnownZero
+                );
+                assert_eq!(
+                    provider
+                        .failure_charge(&ModelError::Unavailable(DiagnosticCode::HttpUnavailable)),
+                    FailureCharge::Unknown
+                );
+            }
+        })
+        .await
+        .expect("refused connections must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_http_tls_setup_failure_is_zero_but_connect_timeout_is_unknown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for stall in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("https://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut byte = [0; 1];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    if stall {
+                        std::future::pending::<()>().await;
+                    } else {
+                        stream.write_all(b"invalid TLS handshake").await.unwrap();
+                    }
+                });
+                let client = http_client_builder()
+                    .connect_timeout(std::time::Duration::from_millis(100))
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build()
+                    .unwrap();
+                let transport_error = client.get(endpoint).send().await.unwrap_err();
+                assert!(transport_error.is_connect());
+                assert_eq!(transport_error.is_timeout(), stall);
+                let error =
+                    with_egress_http_observations(async { http_send_error(transport_error) }).await;
+                server.abort();
+                assert_eq!(
+                    StaticChatProvider::new("unused").failure_charge(&error),
+                    if stall {
+                        FailureCharge::Unknown
+                    } else {
+                        FailureCharge::KnownZero
+                    }
+                );
+                if stall {
+                    assert!(matches!(error.primary(), ModelError::Timeout(_)));
+                }
+            }
+        })
+        .await
+        .expect("TLS setup fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_http_status_failure_has_unknown_charge() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut byte = [0; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 500 Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let error = with_egress_http_observations(provider_response_json(
+                http_client(Some(1)).unwrap().get(endpoint),
+                Some(1024),
+                ModelError::Unavailable,
+            ))
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error.http_details(), Some((500, None)));
+            assert_eq!(
+                StaticChatProvider::new("unused").failure_charge(&error),
+                FailureCharge::Unknown
+            );
+        })
+        .await
+        .expect("HTTP status fixture must finish within three seconds");
+    }
+
+    #[tokio::test]
     async fn usage_identity_drops_invalid_fields_and_preserves_valid_fields() {
         let new_trace = || {
             success_trace(
@@ -6252,20 +6409,20 @@ mod egress_http_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             for scoped in [false, true] {
-                for phase in ["send", "read", "truncated"] {
+                for phase in ["send", "closed", "read", "truncated"] {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let url = format!("http://{}", listener.local_addr().unwrap());
                     let server = tokio::spawn(async move {
                         let (mut stream, _) = listener.accept().await.unwrap();
                         let mut buffer = [0; 1];
                         stream.read_exact(&mut buffer).await.unwrap();
-                        if phase != "send" {
+                        if phase != "send" && phase != "closed" {
                             stream
                                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
                                 .await
                                 .unwrap();
                         }
-                        if phase != "truncated" {
+                        if phase != "truncated" && phase != "closed" {
                             std::future::pending::<()>().await;
                         }
                     });
@@ -6285,9 +6442,13 @@ mod egress_http_tests {
                     }
                     .unwrap_err();
                     server.abort();
-                    let expected = if scoped && phase != "truncated" {
+                    assert_eq!(
+                        StaticChatProvider::new("unused").failure_charge(&error),
+                        FailureCharge::Unknown
+                    );
+                    let expected = if scoped && matches!(phase, "send" | "read") {
                         ModelError::Timeout(DiagnosticCode::HttpTimeout)
-                    } else if !scoped && phase != "send" {
+                    } else if !scoped && matches!(phase, "read" | "truncated") {
                         ModelError::Unavailable(DiagnosticCode::ProviderResponseReadFailed)
                     } else {
                         ModelError::Unavailable(DiagnosticCode::HttpUnavailable)

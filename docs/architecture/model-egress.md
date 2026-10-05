@@ -328,8 +328,21 @@ leave the transport. These classes are observations, not permission to retry:
 unknown spend still requires reconciliation before another admitted attempt.
 Credential-loading and setup/queue failures before
 transport handoff report `SpendState::Released` and release that reservation for a
-subsequent admitted attempt, while the attempt-count limit still applies. Once the
-raw transport starts, failures conservatively retain the unknown reservation.
+subsequent admitted attempt, while the attempt-count limit still applies. The shared
+HTTP send boundary also records per-failed-call evidence in an opaque
+`ModelError::HttpNotSent` error when reqwest reports a non-timeout connect-phase
+failure (DNS, connection establishment or TLS setup), before any HTTP request
+bytes are written. The shared `ModelProvider::failure_charge` default reads this
+evidence, including beneath bookkeeping diagnostics, for every HTTP adapter
+(including Jev); the error class alone never supplies it. Egress releases that
+reservation and allows a new admitted attempt with an advancing ordinal, within
+`max_attempts` and the existing provider cooldown rules.
+HTTP error statuses (including 429 and 5xx), all timeouts (including connect
+and TLS setup timeouts), failures after connection setup, and response-body read
+errors retain `FailureCharge::Unknown` and the unknown spend reservation. This
+repository holds no provider billing documentation supporting status exceptions.
+Evidence lives only in the failed call's error; released accounting and retry
+admission use the existing canonical spend ledger and attempt records.
 Admission checks only the latest attempt using the invocation/ordinal index. For a
 consumed predecessor, its receipt's canonical ledger state must be Released;
 an unconsumed predecessor follows the revocation rule above. Success is terminal,
@@ -582,5 +595,15 @@ The `rabbithole_usage_metadata_round_trips_in_process_and_recovery`,
 `rabbithole_response_identity_without_token_usage_recovers`, and
 `rabbithole_failure_classes_round_trip_in_process_and_recovery` tests cover safe
 usage and typed failure recovery through the in-process client. The shared HTTP
-unit tests cover numeric/date retry hints and send/body-read timeouts. All new
-network regressions have explicit deadlines; they do not qualify live providers.
+unit tests cover numeric/date retry hints and send/body-read timeouts.
+`regression_http_connect_failure_has_per_call_zero_charge_evidence` covers a
+refused connection, error-local evidence and preservation through diagnostics;
+`regression_http_tls_setup_failure_is_zero_but_connect_timeout_is_unknown`
+covers TLS setup failure and timeout; `regression_http_status_failure_has_unknown_charge`
+and `regression_direct_and_egress_transport_errors_keep_their_contracts` cover
+HTTP 500 and send/body-read failures retaining unknown charge.
+`regression_http_connect_failure_releases_spend_and_allows_bounded_retry`
+covers in-process chat/Jev reservation release, recovered accounting, advancing
+retry dispatches and refusal at the configured attempt limit. Its fixture expires
+the existing durable cooldown between retries to avoid waiting for production jitter. All new network regressions
+have explicit deadlines; they do not qualify live providers.

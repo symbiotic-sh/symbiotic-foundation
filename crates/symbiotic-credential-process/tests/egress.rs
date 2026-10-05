@@ -1692,6 +1692,91 @@ async fn embeddings_share_attempt_binding_and_credential_boundary() {
 }
 
 #[tokio::test]
+async fn regression_http_connect_failure_releases_spend_and_allows_bounded_retry() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for classifier in [false, true] {
+            let mut fixture = if classifier {
+                rabbithole_jev_fixture(None).await
+            } else {
+                Fixture::new(200, "unused".into(), Duration::ZERO).await
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            fixture.config.routes[0].destination =
+                format!("http://{}/v1", listener.local_addr().unwrap());
+            drop(listener);
+            fixture.config.routes[0].provider_request_limit = Some(1);
+            fixture.config.routes[0].timeout_seconds = 1;
+            let process = fixture.process().await;
+            let (first, payload) = if classifier {
+                rabbithole_classify_attempt(&fixture)
+            } else {
+                fixture.attempt("connect-failure", 1, 1)
+            };
+            for ordinal in 1..=fixture.config.routes[0].max_attempts {
+                let mut attempt = first.attempt.clone();
+                attempt.attempt_ordinal = ordinal;
+                attempt.record_sequence = u64::from(ordinal);
+                let admission = AdmissionKey::new(KEY.to_vec())
+                    .unwrap()
+                    .sign_attempt(attempt)
+                    .unwrap();
+                let granted = permit(&process, &admission).await;
+                let result = dispatched(
+                    exchange(
+                        &process,
+                        inject(admission.clone(), payload.clone(), granted),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+                assert_eq!(result.error, Some(EgressError::Transport));
+                assert_eq!(result.receipt.spend_state, SpendState::Released);
+                assert!(result.receipt_persisted);
+                assert_eq!(ledger_totals(&fixture), (0, u64::from(ordinal)));
+                let AttemptStatus::Failed { result: recovered } =
+                    status(&process, &admission).await
+                else {
+                    panic!("refused connection must remain a visible failed attempt");
+                };
+                assert_eq!(recovered.receipt.spend_state, SpendState::Released);
+                // Simulate expiry of the existing durable provider cooldown so
+                // this accounting regression need not wait for production jitter.
+                let db = rusqlite::Connection::open(
+                    fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
+                .unwrap();
+                assert_eq!(
+                    db.execute(
+                        "UPDATE queue_cooldowns SET cooldown_until = ?1",
+                        [(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()]
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            let mut fourth = first.attempt;
+            fourth.attempt_ordinal = 4;
+            fourth.record_sequence = 4;
+            let fourth = AdmissionKey::new(KEY.to_vec())
+                .unwrap()
+                .sign_attempt(fourth)
+                .unwrap();
+            assert!(matches!(
+                exchange(&process, Operation::IssuePermit(fourth.into())).await,
+                Err(EgressError::BudgetRefused)
+            ));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        }
+    })
+    .await
+    .expect("connect failure retries must finish within five seconds");
+}
+
+#[tokio::test]
 async fn known_zero_charge_releases_reservation_for_next_attempt() {
     let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
     let process = fixture.process().await;
