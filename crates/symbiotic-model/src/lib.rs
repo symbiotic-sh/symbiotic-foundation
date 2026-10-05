@@ -947,7 +947,7 @@ impl CallReceipts {
             usage: trace.map(|trace| self.answer_recovery.stored_usage(trace.usage.clone())),
             cache: trace.map(|trace| trace.cache.clone()),
             metadata: trace.map_or(Value::Null, |trace| {
-                self.answer_recovery.stored_trace(trace).metadata
+                self.answer_recovery.stored_metadata(&trace.metadata)
             }),
             error,
             queue_wait_ms: timing.queue_wait_ms,
@@ -1041,15 +1041,34 @@ impl AnswerRecovery {
     }
 
     #[cfg(feature = "queue")]
-    fn stored_trace(self, trace: &ModelInvocationTrace) -> ModelInvocationTrace {
+    fn stored_metadata(self, metadata: &Value) -> Value {
+        if self == Self::Off {
+            Value::Null
+        } else {
+            metadata.clone()
+        }
+    }
+
+    #[cfg(feature = "queue")]
+    fn stored_trace(
+        self,
+        trace: &ModelInvocationTrace,
+        model: &ModelIdentity,
+        queue_item_id: Option<&QueueItemId>,
+    ) -> ModelInvocationTrace {
         let mut trace = trace.clone();
         if self == Self::Off {
+            // Only the descriptor frozen before dispatch and Foundation's execution
+            // identifiers may reach a sink; response trace identifiers are untrusted.
+            trace.trace_id = TraceId::new();
+            trace.model = model.clone();
+            trace.queue_item_id = queue_item_id.cloned();
             trace.usage = self.stored_usage(trace.usage);
             trace.response_hash = None;
             trace.source = None;
             trace.role_binding = None;
             trace.audit_refs.clear();
-            trace.metadata = Value::Null;
+            trace.metadata = self.stored_metadata(&trace.metadata);
         }
         trace
     }
@@ -1459,15 +1478,22 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
     /// Cache a successful attempt's response, then trace it. The provider
     /// has answered and been paid, so neither write can fail the call: a
     /// failure is noted on the response ([`note_side_effect`]).
-    async fn record_success<Res>(self: &Arc<Self>, response: Res) -> Res
+    async fn record_success<Res>(
+        self: &Arc<Self>,
+        response: Res,
+        queue_item_id: &QueueItemId,
+    ) -> Res
     where
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
     {
-        self.record_success_diagnostic(response).await.0
+        self.record_success_diagnostic(response, queue_item_id)
+            .await
+            .0
     }
     async fn record_success_diagnostic<Res>(
         self: &Arc<Self>,
         response: Res,
+        queue_item_id: &QueueItemId,
     ) -> (Res, Option<DiagnosticCode>)
     where
         Res: Serialize + TraceCarrier + Clone + Send + Sync + 'static,
@@ -1476,12 +1502,6 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             .answer_recovery
             .usage_diagnostic(&response.trace().usage);
         let mut response = response;
-        if self.answer_recovery == AnswerRecovery::Off {
-            let mut trace = response.trace().clone();
-            trace.trace_id = TraceId::new();
-            trace.model = self.descriptor.identity.clone();
-            response.set_trace(trace);
-        }
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
             let shared = Arc::new(response);
@@ -1509,7 +1529,11 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
         }
         if let Some(trace_sink) = &self.trace_sink
             && let Err(err) = trace_sink
-                .record_model_invocation(self.answer_recovery.stored_trace(response.trace()))
+                .record_model_invocation(self.answer_recovery.stored_trace(
+                    response.trace(),
+                    &self.descriptor.identity,
+                    Some(queue_item_id),
+                ))
                 .await
         {
             diagnostic = Some(err.code());
@@ -1544,7 +1568,11 @@ impl<Req> QueuedCall<Req> {
         response.set_trace(trace.clone());
         if let Some(trace_sink) = &self.trace_sink
             && let Err(err) = trace_sink
-                .record_model_invocation(self.answer_recovery.stored_trace(&trace))
+                .record_model_invocation(self.answer_recovery.stored_trace(
+                    &trace,
+                    &self.descriptor.identity,
+                    trace.queue_item_id.as_ref(),
+                ))
                 .await
         {
             note_side_effect(
@@ -2604,7 +2632,7 @@ where
     }
     let outcome = match result {
         Ok(response) => {
-            let (response, diagnostic) = this.record_success_diagnostic(response).await;
+            let (response, diagnostic) = this.record_success_diagnostic(response, &item_id).await;
             this.receipts
                 .record_attempt(
                     ReceiptStatus::Succeeded,
@@ -2888,7 +2916,7 @@ where
                     return Settled::Failed { err, failed };
                 }
             }
-            let response = this.record_success(response).await;
+            let response = this.record_success(response, &item.item_id).await;
             let completed = queue.complete(&item.item_id, worker_id).await;
             Settled::Succeeded {
                 response,
