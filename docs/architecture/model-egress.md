@@ -147,11 +147,27 @@ start separate budgets. No request or answer content enters the budget table.
 `renewal_seconds: null` never renews, including across restart. A positive
 interval renews after that many seconds since the last failure completion or
 uncertain admission; clock rollback cannot renew early. Zero gives each call a
-fresh budget. A successfully recorded response deletes the key. Local credential
-failures and durably recorded trusted pre-send failures do not consume allowance.
-HTTP failures keep their
+fresh budget. A successfully recorded response accepted by caller validation
+(if supplied) deletes the key. Local credential failures and durably recorded
+trusted pre-send failures do not consume allowance. HTTP failures keep their
 existing unknown-charge accounting and count against this shared allowance;
 the budget introduces no retry inside an invocation.
+
+Thread-mode direct callers can attach
+`InProcessEgressClient::with_answer_validation` before dispatch. Its synchronous,
+prompt callback receives the normalized `ProviderOutput` and returns whether the
+final answer is valid. Foundation invokes it on its owned dispatch task after
+provider execution and before committing egress completion, while still holding
+the configured budget lock. Returning `false` reports
+`EgressError::Provider { status: None }` with `ProviderFailed` receipt status and
+no output. Rejection keeps the debit and updates the failure renewal timestamp
+exactly like a failed send; measured usage still settles spend, and missing usage
+keeps spend unknown with content-free output-received evidence. Under
+`answer_recovery: "off"`, no rejected answer is persisted. A dropped caller future
+does not cancel validation or completion; a crash before completion keeps the
+debit. Callers without this callback, socket dispatches, signed jobs, and
+unconfigured or zero-renewal budget behavior remain unchanged. No wire operation
+or persistent structure is added.
 
 After single-use permit consumption and credential resolution, an exhausted
 key returns `DispatchResult.error = RequestBudgetExhausted` (wire code
@@ -180,8 +196,13 @@ identical HTTP-400 classifier calls, restart, fresh-per-call renewal, separate
 inputs and rotated credentials, two HTTP-401 sends, concurrent exhaustion,
 positive renewal, success clearing, omission/validation, and no request,
 answer or credential content in state under `off`. The
-`regression_request_budget_durable_*` tests cover admission-write refusal,
-completion-write failure after rejection or success, and crash/restart after a
+`regression_request_budget_answer_*` tests cover three sends for six rejected
+HTTP-200 final answers (including token-limit termination), restart partway through
+allowance consumption, rejection followed by acceptance, completion-time renewal,
+measured and missing usage, and unchanged unconfigured/fresh-per-call dispatch.
+The `regression_request_budget_durable_*` tests cover admission-write refusal,
+completion-write failure after provider failure, caller rejection or success,
+and crash/restart after a
 send followed by a different invocation with identical input. The registry test
 `request_budget_pre_send_undo_restores_only_unexpired_consumption` covers renewal
 timestamp restoration and expiry.
