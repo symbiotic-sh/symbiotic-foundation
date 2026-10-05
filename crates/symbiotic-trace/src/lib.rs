@@ -40,6 +40,21 @@ pub struct CacheTrace {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UsageTrace {
+    /// Provider-reported prompt tokens served from its cache.
+    #[serde(default)]
+    pub cache_hit_tokens: Option<u64>,
+    /// Prompt tokens not served from the provider cache, including cache writes.
+    #[serde(default)]
+    pub cache_miss_tokens: Option<u64>,
+    /// Provider response identifier, checked by the credential boundary.
+    #[serde(default)]
+    pub response_id: Option<String>,
+    /// Provider-reported served model, checked by the credential boundary.
+    #[serde(default)]
+    pub served_model: Option<String>,
+    /// Provider-reported creation time in Unix seconds; never synthesized.
+    #[serde(default)]
+    pub created: Option<i64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
@@ -405,6 +420,7 @@ mod tests {
                 media_units: None,
                 cost_micro_usd: Some(42),
                 reported_cost_usd: Some("0.000042123456789".into()),
+                ..UsageTrace::default()
             },
             timing: TimingTrace {
                 queued_ms: Some(1),

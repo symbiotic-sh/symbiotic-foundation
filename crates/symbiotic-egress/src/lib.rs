@@ -96,6 +96,21 @@ pub enum EgressError {
     /// Frame or provider output exceeds configured limits.
     #[error("egress message exceeds configured limit")]
     LimitExceeded,
+    /// Provider throttled the request; its delay is present only when reported.
+    #[error("provider rate limited")]
+    RateLimited {
+        /// Provider Retry-After delay in seconds, with HTTP dates normalized.
+        retry_after_seconds: Option<u64>,
+    },
+    /// Provider request or response read exceeded its configured deadline.
+    #[error("provider request timed out; dispatch charge may be unknown")]
+    Timeout,
+    /// Provider rejected the request or returned an invalid/unsupported response.
+    #[error("provider failed (HTTP status {status:?})")]
+    Provider {
+        /// HTTP status when the failure came from a non-success response.
+        status: Option<u16>,
+    },
     /// Protocol transport failed. A dispatch may already have incurred a charge.
     #[error("egress transport unavailable; dispatch charge may be unknown")]
     Transport,

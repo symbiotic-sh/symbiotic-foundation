@@ -83,7 +83,7 @@ async fn gemini_single_and_batch_results_cross_the_complete_credential_boundary(
             assert!(head.to_ascii_lowercase().contains("x-goog-api-key:"));
             let error = result.unwrap_err();
             assert!(!error.to_string().contains(key), "credential escaped final result");
-            if status == 401 { assert!(matches!(error, ModelError::Auth(_))); }
+            if status == 401 { assert!(matches!(error.primary(), ModelError::Auth(_))); }
         }
         let body = r#"{"embedding":{"values":[0.5]},"embeddings":[{"values":[0.5]},{"values":[0.5]}],"ignored":"private raw detail"}"#;
         let (endpoint, server) =
@@ -131,7 +131,7 @@ async fn gemini_redirects_and_hidden_http_retries_never_send_a_second_request() 
             .unwrap_err();
         server.join().unwrap();
         assert!(matches!(
-            error,
+            error.primary(),
             ModelError::Provider(_) | ModelError::Unavailable(_)
         ));
         for listener in [origin, target] {

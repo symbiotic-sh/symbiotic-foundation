@@ -286,6 +286,17 @@ pub struct RerankResponse {
 /// ```
 #[derive(Clone, Debug, Error)]
 pub enum ModelError {
+    /// HTTP failure with the original class and safe response hints.
+    #[error("{primary}; HTTP status {status}")]
+    Http {
+        /// Original closed failure class.
+        #[source]
+        primary: Box<ModelError>,
+        /// Provider HTTP status; no response body is retained.
+        status: u16,
+        /// Retry-After delay in seconds, including HTTP-date normalization.
+        retry_after_seconds: Option<u64>,
+    },
     #[error("provider unavailable: {0}")]
     Unavailable(symbiotic_core::DiagnosticCode),
     #[error("provider auth failed: {0}")]
@@ -331,7 +342,28 @@ impl ModelError {
             Self::Queue(code) => *code,
             Self::Cache(code) => *code,
             Self::Unsupported(_) => DiagnosticCode::InvalidConfiguration,
-            Self::Diagnostics { primary, .. } => primary.code(),
+            Self::Diagnostics { primary, .. } | Self::Http { primary, .. } => primary.code(),
+        }
+    }
+
+    /// Original class beneath HTTP hints and secondary bookkeeping diagnostics.
+    pub fn primary(&self) -> &Self {
+        match self {
+            Self::Http { primary, .. } | Self::Diagnostics { primary, .. } => primary.primary(),
+            _ => self,
+        }
+    }
+
+    /// Provider status and retry hint, preserved beneath bookkeeping diagnostics.
+    pub fn http_details(&self) -> Option<(u16, Option<u64>)> {
+        match self {
+            Self::Http {
+                status,
+                retry_after_seconds,
+                ..
+            } => Some((*status, *retry_after_seconds)),
+            Self::Diagnostics { primary, .. } => primary.http_details(),
+            _ => None,
         }
     }
 
@@ -2939,14 +2971,15 @@ impl TraceCarrier for RerankResponse {
 #[cfg(feature = "queue")]
 fn is_transient(err: &ModelError) -> bool {
     matches!(
-        err,
+        err.primary(),
         ModelError::Unavailable(_) | ModelError::RateLimited(_) | ModelError::Timeout(_)
     )
 }
 
 #[cfg(feature = "queue")]
 fn is_retryable(err: &ModelError, config: &ModelQueueConfig) -> bool {
-    is_transient(err) || (config.retry_provider_errors && matches!(err, ModelError::Provider(_)))
+    is_transient(err)
+        || (config.retry_provider_errors && matches!(err.primary(), ModelError::Provider(_)))
 }
 
 /// Backoff before jitter: the base delay doubling per attempt up to 32x,
@@ -3012,7 +3045,7 @@ fn retry_jitter_seconds(
     if max_jitter_seconds == 0 {
         return Ok(0);
     }
-    let err_kind = match err {
+    let err_kind = match err.primary() {
         ModelError::RateLimited(_) => "rate_limited",
         ModelError::Unavailable(_) => "unavailable",
         ModelError::Timeout(_) => "timeout",
@@ -3074,7 +3107,9 @@ fn item_max_attempts(config: &ModelQueueConfig) -> u32 {
 #[cfg(feature = "queue")]
 fn error_class(err: &ModelError) -> FailureClass {
     match err {
-        ModelError::Diagnostics { primary, .. } => error_class(primary),
+        ModelError::Diagnostics { primary, .. } | ModelError::Http { primary, .. } => {
+            error_class(primary)
+        }
         ModelError::Unavailable(_) => FailureClass::Unavailable,
         ModelError::Auth(_) => FailureClass::Auth,
         ModelError::RateLimited(_) => FailureClass::RateLimited,
@@ -3309,6 +3344,7 @@ fn exhausted_request_error(
     last_error: &ModelError,
 ) -> ModelError {
     match last_error {
+        ModelError::Http { .. } => last_error.clone(),
         ModelError::Diagnostics { primary, secondary } => {
             exhausted_request_error(_queue_id, _item, _config, primary)
                 .with_diagnostics(secondary.iter().copied())
@@ -3594,7 +3630,7 @@ async fn note_model_cooldown(
     err: &ModelError,
     retry_delay_ms: u64,
 ) -> Result<(), ModelError> {
-    let multiplier = match err {
+    let multiplier = match err.primary() {
         ModelError::RateLimited(_) => 4,
         ModelError::Unavailable(_) => 2,
         ModelError::Timeout(_) => 1,
@@ -4068,6 +4104,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     media_units: None,
                     cost_micro_usd: None,
                     reported_cost_usd: reported_cost_usd(&raw),
+                    ..UsageTrace::default()
                 };
                 let nested_hit = usage
                     .prompt_tokens_details
@@ -4078,6 +4115,9 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     usage.prompt_cache_miss_tokens,
                     nested_hit,
                 );
+                trace.usage.cache_hit_tokens = hit;
+                trace.usage.cache_miss_tokens = miss;
+                provider_usage_identity(&mut trace.usage, &raw);
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -4431,9 +4471,7 @@ async fn bounded_response_bytes(
         ));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        ModelError::Unavailable(symbiotic_core::DiagnosticCode::ProviderResponseReadFailed)
-    })? {
+    while let Some(chunk) = response.chunk().await.map_err(http_transport_error)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(ModelError::Provider(
                 symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded,
@@ -4451,18 +4489,29 @@ async fn provider_response_json(
     max_bytes: Option<usize>,
     invalid_json: fn(DiagnosticCode) -> ModelError,
 ) -> Result<(Value, String), ModelError> {
-    let response = builder
-        .send()
-        .await
-        .map_err(|_err| ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable))?;
+    let response = builder.send().await.map_err(http_transport_error)?;
     let status = response.status();
-    if status.is_redirection() {
-        return Err(ModelError::Provider(
-            symbiotic_core::DiagnosticCode::ProviderRedirectRefused,
-        ));
-    }
     if !status.is_success() {
-        return Err(status_error(status.as_u16()));
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|header| parse_retry_after(header, Utc::now()))
+            .transpose()
+            .map_err(|primary| ModelError::Http {
+                primary: Box::new(primary),
+                status: status.as_u16(),
+                retry_after_seconds: None,
+            })?;
+        let primary = if status.is_redirection() {
+            ModelError::Provider(DiagnosticCode::ProviderRedirectRefused)
+        } else {
+            status_error(status.as_u16())
+        };
+        return Err(ModelError::Http {
+            primary: Box::new(primary),
+            status: status.as_u16(),
+            retry_after_seconds,
+        });
     }
     let bytes = bounded_response_bytes(response, max_bytes).await?;
     let text = String::from_utf8(bytes).map_err(|_| {
@@ -4471,6 +4520,33 @@ async fn provider_response_json(
     let raw: Value = serde_json::from_str(&text)
         .map_err(|_err| invalid_json(DiagnosticCode::InvalidResponse))?;
     Ok((raw, text))
+}
+
+fn http_transport_error(error: reqwest::Error) -> ModelError {
+    if error.is_timeout() {
+        ModelError::Timeout(DiagnosticCode::HttpTimeout)
+    } else {
+        ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
+    }
+}
+
+fn parse_retry_after(
+    header: &reqwest::header::HeaderValue,
+    now: chrono::DateTime<Utc>,
+) -> Result<u64, ModelError> {
+    let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
+    let text = header.to_str().map_err(|_| invalid())?;
+    if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
+        return text.parse().map_err(|_| invalid());
+    }
+    let deadline = chrono::DateTime::parse_from_rfc2822(text).map_err(|_| invalid())?;
+    Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
+}
+
+fn provider_usage_identity(usage: &mut UsageTrace, raw: &Value) {
+    usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+    usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
+    usage.created = raw.get("created").and_then(Value::as_i64);
 }
 
 fn status_error(status: u16) -> ModelError {
@@ -5938,3 +6014,109 @@ mod tests {
 
 #[cfg(test)]
 mod credential_transport_tests;
+
+#[cfg(test)]
+mod egress_http_tests {
+    use super::*;
+
+    #[test]
+    fn rabbithole_retry_after_is_typed_and_survives_diagnostics() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:27:00 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (value, seconds) in [
+            ("7", 7),
+            ("Wed, 21 Oct 2015 07:28:00 GMT", 60),
+            ("Wed, 21 Oct 2015 07:26:00 GMT", 0),
+        ] {
+            assert_eq!(
+                parse_retry_after(&reqwest::header::HeaderValue::from_str(value).unwrap(), now)
+                    .unwrap(),
+                seconds
+            );
+        }
+        for invalid in ["", "later", "-1", "18446744073709551616"] {
+            assert!(
+                parse_retry_after(
+                    &reqwest::header::HeaderValue::from_str(invalid).unwrap(),
+                    now
+                )
+                .is_err()
+            );
+        }
+        let error = ModelError::Http {
+            primary: Box::new(ModelError::RateLimited(DiagnosticCode::HttpRateLimited)),
+            status: 429,
+            retry_after_seconds: Some(7),
+        };
+        assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+        assert_eq!(error.http_details(), Some((429, Some(7))));
+        #[cfg(feature = "queue")]
+        {
+            assert!(is_transient(&error));
+            assert_eq!(error_class(&error), FailureClass::RateLimited);
+            let decorated = error.with_diagnostics([DiagnosticCode::StorageFailure]);
+            assert_eq!(decorated.http_details(), Some((429, Some(7))));
+        }
+    }
+
+    #[tokio::test]
+    async fn rabbithole_retry_after_absence_and_invalid_hints_remain_visible() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for hint in ["", "Retry-After: 7\r\n", "Retry-After: invalid\r\n"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 1];
+                    stream.read_exact(&mut buffer).await.unwrap();
+                    stream.write_all(format!("HTTP/1.1 429 Limited\r\n{hint}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                });
+                let error = provider_response_json(http_client(Some(1)).unwrap().get(url), Some(1024), ModelError::Unavailable).await.unwrap_err();
+                server.await.unwrap();
+                if hint.contains("invalid") {
+                    assert!(matches!(error.primary(), ModelError::Provider(DiagnosticCode::InvalidResponse)));
+                    assert_eq!(error.http_details(), Some((429, None)));
+                } else {
+                    assert!(matches!(error.primary(), ModelError::RateLimited(_)));
+                    assert_eq!(error.http_details(), Some((429, if hint.is_empty() {None} else {Some(7)})));
+                }
+            }
+        }).await.expect("retry hint fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn rabbithole_send_and_body_read_timeouts_keep_their_class() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            for headers_first in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 1];
+                    stream.read_exact(&mut buffer).await.unwrap();
+                    if headers_first {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let client = http_client(Some(1)).unwrap();
+                let result =
+                    provider_response_json(client.get(url), Some(1024), ModelError::Unavailable)
+                        .await;
+                server.abort();
+                assert!(
+                    matches!(result, Err(ModelError::Timeout(_))),
+                    "headers_first={headers_first}: {result:?}"
+                );
+            }
+        })
+        .await
+        .expect("two one-second transport timeouts must finish within four seconds");
+    }
+}

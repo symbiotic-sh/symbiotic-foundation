@@ -28,7 +28,7 @@ struct Dispatched<P> {
 impl<P: ModelProvider> Dispatched<P> {
     fn outcome<T>(&self, result: Result<T, ModelError>) -> Result<T, ModelError> {
         if result.as_ref().err().is_some_and(|error| {
-            !matches!(error, ModelError::Timeout(_))
+            !matches!(error.primary(), ModelError::Timeout(_))
                 && self.inner.failure_charge(error) == model::FailureCharge::KnownZero
         }) {
             self.started.store(false, Ordering::SeqCst);
@@ -204,7 +204,17 @@ pub(crate) fn route_settings(
 
 fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
     ExecuteError {
-        code: match error {
+        code: match error.primary() {
+            ModelError::RateLimited(_) => EgressError::RateLimited {
+                retry_after_seconds: error.http_details().and_then(|(_, retry)| retry),
+            },
+            ModelError::Timeout(_) => EgressError::Timeout,
+            _ if error.http_details().is_some() => EgressError::Provider {
+                status: error.http_details().map(|(status, _)| status),
+            },
+            ModelError::Provider(_) | ModelError::Auth(_) | ModelError::BudgetExhausted(_) => {
+                EgressError::Provider { status: None }
+            }
             ModelError::Queue(_) => EgressError::StateUnavailable,
             ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
             _ => EgressError::Transport,

@@ -1148,6 +1148,15 @@ impl ClassifierProvider for JevClassifierProvider {
                 trace.usage.input_tokens = usage("input_tokens");
                 trace.usage.output_tokens = usage("output_tokens");
                 trace.usage.reported_cost_usd = reported_cost_usd(&raw);
+                provider_usage_identity(&mut trace.usage, &raw);
+                let (hit, miss) = prompt_cache_counts(
+                    trace.usage.input_tokens,
+                    usage("cache_hit_tokens"),
+                    usage("cache_miss_tokens"),
+                    None,
+                );
+                trace.usage.cache_hit_tokens = hit;
+                trace.usage.cache_miss_tokens = miss;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -2496,7 +2505,7 @@ mod tests {
                 .await
                 .unwrap_err();
             if status == 429 {
-                assert!(matches!(error, ModelError::RateLimited(_)));
+                assert!(matches!(error.primary(), ModelError::RateLimited(_)));
             } else {
                 assert!(matches!(
                     error,
@@ -2549,7 +2558,7 @@ mod tests {
                 .classify(request(vec![goal_question()]))
                 .await
                 .unwrap_err();
-            let got = match err {
+            let got = match err.primary() {
                 ModelError::Timeout(_) => "timeout",
                 ModelError::RateLimited(_) => "rate_limited",
                 ModelError::Unavailable(_) => "unavailable",
