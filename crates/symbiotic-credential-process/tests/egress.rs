@@ -6387,39 +6387,106 @@ async fn rabbithole_response_identity_without_token_usage_recovers() {
     }).await.expect("identity-only recovery must finish within five seconds");
 }
 
+// Each fixture reports completion through its task; the timeout only detects a hung fixture.
+// No elapsed-time limit covers the cumulative setup and durable writes of the whole matrix.
+async fn identity_fixture_completion(
+    completion: tokio::task::JoinHandle<()>,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(30), completion)
+        .await?
+        .expect("identity fixture task panicked");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn regression_identity_fixture_completion_outlives_old_deadline() {
+    let started = tokio::time::Instant::now();
+    let completion = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    });
+    identity_fixture_completion(completion).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(6));
+}
+
+#[tokio::test(start_paused = true)]
+async fn regression_identity_fixture_completion_reports_hang() {
+    let started = tokio::time::Instant::now();
+    let completion = tokio::spawn(std::future::pending::<()>());
+    assert!(identity_fixture_completion(completion).await.is_err());
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+}
+
 #[tokio::test]
 async fn regression_egress_drops_malformed_usage_identity_and_recovers_diagnostic() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        for anthropic in [false, true] {
-            for (field, value) in [
-                ("id", serde_json::json!("answer\nprivate text")),
-                ("id", serde_json::json!({})),
-                ("id", serde_json::json!("a".repeat(129))),
-                ("model", serde_json::json!("answer with spaces")),
-                ("created", serde_json::json!("invalid")),
-                ("created", serde_json::json!(-1)),
-            ] {
+    for anthropic in [false, true] {
+        for (field, value) in [
+            ("id", serde_json::json!("answer\nprivate text")),
+            ("id", serde_json::json!({})),
+            ("id", serde_json::json!("a".repeat(129))),
+            ("model", serde_json::json!("answer with spaces")),
+            ("created", serde_json::json!("invalid")),
+            ("created", serde_json::json!(-1)),
+        ] {
+            let completion = tokio::spawn(async move {
                 let mut body = if anthropic {
                     serde_json::json!({"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn"})
                 } else {
                     serde_json::json!({"choices":[{"message":{"content":"answer"}}]})
                 };
                 body[field] = value;
-                let mut fixture = Fixture::with_http_response(200, body.to_string(), Duration::ZERO, "0", true, false).await;
-                if anthropic { fixture.config.routes[0].provider = RouteProvider::AnthropicChat {operator:"test".into(),thinking:None}; }
+                let mut fixture = Fixture::with_http_response(
+                    200,
+                    body.to_string(),
+                    Duration::ZERO,
+                    "0",
+                    true,
+                    false,
+                )
+                .await;
+                if anthropic {
+                    fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+                        operator: "test".into(),
+                        thinking: None,
+                    };
+                }
                 let process = fixture.process().await;
-                let (admission, payload) = fixture.attempt("invalid-identity",1,1);
-                let granted = permit(&process,&admission).await;
-                let result = dispatched(exchange(&process, inject(admission.clone(),payload,granted)).await.unwrap());
+                let (admission, payload) = fixture.attempt("invalid-identity", 1, 1);
+                let granted = permit(&process, &admission).await;
+                let result = dispatched(
+                    exchange(&process, inject(admission.clone(), payload, granted))
+                        .await
+                        .unwrap(),
+                );
                 assert_eq!(result.error, None, "{field}, anthropic={anthropic}");
-                assert!(matches!(&result.output, Some(ProviderOutput::Chat {text, ..}) if text == "answer"));
-                assert_eq!(serde_json::to_value(&result.receipt.usage).unwrap()[match field {"id" => "response_id", "model" => "served_model", _ => "created"}], serde_json::Value::Null);
-                assert_eq!(serde_json::to_value(&result.diagnostics).unwrap(), serde_json::json!(["invalid_usage_identity"]));
-                let AttemptStatus::Completed {result:recovered} = status(&process,&admission).await else {panic!("missing answer")};
-                assert_eq!(recovered.diagnostics,result.diagnostics);
-            }
+                assert!(
+                    matches!(&result.output, Some(ProviderOutput::Chat {text, ..}) if text == "answer")
+                );
+                assert_eq!(
+                    serde_json::to_value(&result.receipt.usage).unwrap()[match field {
+                        "id" => "response_id",
+                        "model" => "served_model",
+                        _ => "created",
+                    }],
+                    serde_json::Value::Null
+                );
+                assert_eq!(
+                    serde_json::to_value(&result.diagnostics).unwrap(),
+                    serde_json::json!(["invalid_usage_identity"])
+                );
+                let AttemptStatus::Completed { result: recovered } =
+                    status(&process, &admission).await
+                else {
+                    panic!("missing answer")
+                };
+                assert_eq!(recovered.diagnostics, result.diagnostics);
+            });
+            identity_fixture_completion(completion)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("identity fixture hung: {field}, anthropic={anthropic}")
+                });
         }
-    }).await.expect("identity fixtures must finish within five seconds");
+    }
 }
 
 #[tokio::test]

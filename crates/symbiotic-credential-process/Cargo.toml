@@ -32,3 +32,4 @@ zeroize = "1"
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
