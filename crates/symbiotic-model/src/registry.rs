@@ -75,13 +75,41 @@ pub struct PricingProvenance {
     /// Date of the tariff observation in YYYY-MM-DD format.
     pub date: String,
 }
+/// Default hard encoded request-body limit: 1 MiB per provider call.
+/// Repository basis: retrieval transport fixtures allow 100,000 input bytes;
+/// Jev permits 64,000 request tokens and the example registry declares an 8,192
+/// token context. Sixfold JSON escaping of 100,000 bytes leaves 448,576 bytes
+/// for wrappers/model names. This is a provisional setting, not provider capacity.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Default hard HTTP response-body limit: 1 MiB per provider call.
+/// Repository basis: chat/registry transport fixtures configure 65,536 bytes and
+/// Anthropic defaults to 16,000 output tokens. This is 16 times that response
+/// allowance, leaving 983,040 bytes for longer text, thinking and JSON envelopes.
+/// It is a provisional setting, not a token-to-byte or provider capacity guarantee.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Serde default shared by route configuration and HTTP adapters.
+pub fn default_max_request_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BYTES
+}
+
+/// Serde default shared by route configuration and HTTP adapters.
+pub fn default_max_response_bytes() -> usize {
+    DEFAULT_MAX_RESPONSE_BYTES
+}
+
 /// Hard encoded request and HTTP response limits, in bytes, per binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderLimits {
-    /// Maximum encoded HTTP request body bytes; required and nonzero.
+    /// Maximum encoded HTTP request body bytes; defaults to [`DEFAULT_MAX_REQUEST_BYTES`].
+    /// Explicit zero is refused by registry validation.
+    #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
-    /// Maximum buffered HTTP response body bytes, including errors.
+    /// Maximum buffered success body bytes; defaults to [`DEFAULT_MAX_RESPONSE_BYTES`].
+    /// Explicit zero is refused; HTTP error bodies are discarded.
+    #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
     /// Required nonzero output ceiling for chat; unsupported for other adapters.
     pub max_output_tokens: Option<u32>,

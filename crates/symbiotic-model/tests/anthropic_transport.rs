@@ -212,9 +212,8 @@ async fn request_limits_and_unsupported_options_refuse_before_connecting() {
     );
 }
 #[tokio::test]
-async fn byte_limits_are_required_and_endpoint_credentials_refused() {
+async fn zero_byte_limits_and_endpoint_credentials_are_refused() {
     for p in [
-        AnthropicChatProvider::new("f", "m", "http://127.0.0.1:9", KEY),
         provider("http://127.0.0.1:9").with_request_limit(0),
         provider("http://127.0.0.1:9").with_response_limit(0),
         provider("http://user:password@127.0.0.1:9"),

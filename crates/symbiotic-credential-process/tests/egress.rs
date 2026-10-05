@@ -8,6 +8,7 @@ use std::{
     },
     time::Duration,
 };
+use symbiotic_ai_runtime::model::{DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES};
 use symbiotic_credential_process::{
     CredentialProcess, InProcessEgressClient, ProcessConfig, RouteConfig, RouteProvider,
     secrets::{SecretSource, initialize_resolver_panic_hook},
@@ -5978,4 +5979,74 @@ async fn rabbithole_classification_jobs_reuse_runner_and_strip_raw_response() {
     assert!(!output.to_string().contains("private-provider-debug"));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
+#[tokio::test]
+async fn route_byte_defaults_and_overrides_work_in_process() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "default answer".into(), Duration::ZERO).await;
+        let mut config = serde_json::to_value(&fixture.config).unwrap();
+        // Keep the existing frame boundary: fourfold response plus identities/envelope.
+        config["max_frame_bytes"] = serde_json::json!(8 * DEFAULT_MAX_RESPONSE_BYTES);
+        for omitted in [
+            vec!["max_input_bytes"],
+            vec!["max_response_bytes"],
+            vec!["max_input_bytes", "max_response_bytes"],
+        ] {
+            let mut value = config.clone();
+            let route = value["routes"][0].as_object_mut().unwrap();
+            for field in &omitted {
+                route.remove(*field);
+            }
+            let parsed: ProcessConfig =
+                serde_json::from_value(value).expect("route limits may be omitted");
+            assert_eq!(
+                parsed.routes[0].max_input_bytes,
+                if omitted.contains(&"max_input_bytes") {
+                    DEFAULT_MAX_REQUEST_BYTES
+                } else {
+                    32768
+                }
+            );
+            assert_eq!(
+                parsed.routes[0].max_response_bytes,
+                if omitted.contains(&"max_response_bytes") {
+                    DEFAULT_MAX_RESPONSE_BYTES
+                } else {
+                    32768
+                }
+            );
+        }
+        for field in ["max_input_bytes", "max_response_bytes"] {
+            config["routes"][0].as_object_mut().unwrap().remove(field);
+        }
+        fixture.config = serde_json::from_value(config).unwrap();
+        for field in ["max_input_bytes", "max_response_bytes"] {
+            let mut zero = serde_json::to_value(&fixture.config).unwrap();
+            zero["routes"][0][field] = serde_json::json!(0);
+            let invalid = serde_json::from_value(zero).unwrap();
+            assert!(matches!(
+                CredentialProcess::open(invalid),
+                Err(EgressError::InvalidRequest)
+            ));
+            assert!(
+                !fixture.config.state_dir.exists(),
+                "invalid limits must fail before state creation"
+            );
+        }
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process.clone());
+        let (admission, payload) = fixture.attempt("default-byte-limits", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let result = dispatched(
+            exchange_client(&client, inject(admission, payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert!(matches!(result.output,
+            Some(ProviderOutput::Chat { text, .. }) if text == "default answer"));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("default-limit in-process dispatch must finish within five seconds");
 }

@@ -1,7 +1,9 @@
 //! Registry invariants; these fixtures configure no real provider credentials.
 use serde_json::{Value, json};
 use symbiotic_core::{ProviderPrincipalId, TenantId};
-use symbiotic_model::{ModelQueueConfig, ModelRegistry};
+use symbiotic_model::{
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES, ModelQueueConfig, ModelRegistry,
+};
 
 fn config() -> Value {
     let mut config: Value =
@@ -187,5 +189,38 @@ fn anthropic_registration_requires_chat_limits_and_refuses_unsupported_settings(
         let mut invalid = config.clone();
         *invalid.pointer_mut(path).unwrap() = value;
         assert!(load(&invalid).is_err(), "{path}");
+    }
+}
+
+#[test]
+fn omitted_byte_limits_use_defaults_and_explicit_values_win() {
+    for omitted in [
+        vec!["max_request_bytes"],
+        vec!["max_response_bytes"],
+        vec!["max_request_bytes", "max_response_bytes"],
+    ] {
+        let mut config = config();
+        let limits = config["bindings"][0]["limits"].as_object_mut().unwrap();
+        for field in &omitted {
+            limits.remove(*field);
+        }
+        let registry = load(&config).expect("omitted byte limits must use Foundation defaults");
+        let limits = &registry.config().bindings[0].limits;
+        assert_eq!(
+            limits.max_request_bytes,
+            if omitted.contains(&"max_request_bytes") {
+                DEFAULT_MAX_REQUEST_BYTES
+            } else {
+                65536
+            }
+        );
+        assert_eq!(
+            limits.max_response_bytes,
+            if omitted.contains(&"max_response_bytes") {
+                DEFAULT_MAX_RESPONSE_BYTES
+            } else {
+                65536
+            }
+        );
     }
 }
