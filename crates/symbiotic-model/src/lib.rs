@@ -3996,6 +3996,29 @@ pub fn prompt_cache_counts(
     hit: Option<u64>,
     miss: Option<u64>,
     nested_hit: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    normalize_prompt_cache_counts(total, hit, miss, nested_hit).unwrap_or_default()
+}
+
+fn observed_prompt_cache_counts(
+    total: Option<u64>,
+    hit: Option<u64>,
+    miss: Option<u64>,
+    nested_hit: Option<u64>,
+) -> Result<(Option<u64>, Option<u64>), ModelError> {
+    let counts = normalize_prompt_cache_counts(total, hit, miss, nested_hit);
+    if egress_observations_enabled() {
+        counts
+    } else {
+        Ok(counts.unwrap_or_default())
+    }
+}
+
+fn normalize_prompt_cache_counts(
+    total: Option<u64>,
+    hit: Option<u64>,
+    miss: Option<u64>,
+    nested_hit: Option<u64>,
 ) -> Result<(Option<u64>, Option<u64>), ModelError> {
     let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
     if hit.zip(nested_hit).is_some_and(|(a, b)| a != b) {
@@ -4109,7 +4132,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 let nested_hit = usage
                     .prompt_tokens_details
                     .and_then(|details| details.cached_tokens);
-                let (hit, miss) = prompt_cache_counts(
+                let (hit, miss) = observed_prompt_cache_counts(
                     usage.prompt_tokens,
                     usage.prompt_cache_hit_tokens,
                     usage.prompt_cache_miss_tokens,
@@ -4117,7 +4140,14 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 )?;
                 trace.usage.cache_hit_tokens = hit;
                 trace.usage.cache_miss_tokens = miss;
-                provider_usage_identity(&mut trace.usage, &raw)?;
+                provider_usage_identity(
+                    &mut trace.usage,
+                    &raw,
+                    &serde_json::json!({
+                        "request": request.messages.iter().map(|message| &message.content).collect::<Vec<_>>(),
+                        "answer": content,
+                    }),
+                )?;
                 trace.metadata = serde_json::json!({
                     "provider": {
                         "response_id": raw.get("id").and_then(Value::as_str),
@@ -4471,7 +4501,11 @@ async fn bounded_response_bytes(
         ));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(http_transport_error)? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| http_transport_error(error, DiagnosticCode::ProviderResponseReadFailed))?
+    {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(ModelError::Provider(
                 symbiotic_core::DiagnosticCode::ProviderResponseLimitExceeded,
@@ -4500,7 +4534,10 @@ async fn provider_response_json(
     max_bytes: Option<usize>,
     invalid_json: fn(DiagnosticCode) -> ModelError,
 ) -> Result<(Value, String), ModelError> {
-    let response = builder.send().await.map_err(http_transport_error)?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| http_transport_error(error, DiagnosticCode::HttpUnavailable))?;
     let status = response.status();
     if !status.is_success() {
         let primary = if status.is_redirection() {
@@ -4508,7 +4545,7 @@ async fn provider_response_json(
         } else {
             status_error(status.as_u16())
         };
-        if EGRESS_HTTP_OBSERVATIONS.try_with(|_| ()).is_err() {
+        if !egress_observations_enabled() {
             return Err(primary);
         }
         let retry = response
@@ -4536,8 +4573,14 @@ async fn provider_response_json(
     Ok((raw, text))
 }
 
-fn http_transport_error(error: reqwest::Error) -> ModelError {
-    if error.is_timeout() {
+fn egress_observations_enabled() -> bool {
+    EGRESS_HTTP_OBSERVATIONS.try_with(|_| ()).is_ok()
+}
+
+fn http_transport_error(error: reqwest::Error, direct_code: DiagnosticCode) -> ModelError {
+    if !egress_observations_enabled() {
+        ModelError::Unavailable(direct_code)
+    } else if error.is_timeout() {
         ModelError::Timeout(DiagnosticCode::HttpTimeout)
     } else {
         ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
@@ -4559,7 +4602,25 @@ fn parse_retry_after(
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
 }
 
-fn provider_usage_identity(usage: &mut UsageTrace, raw: &Value) -> Result<(), ModelError> {
+fn provider_usage_identity(
+    usage: &mut UsageTrace,
+    raw: &Value,
+    content: &Value,
+) -> Result<(), ModelError> {
+    if !egress_observations_enabled() {
+        usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+        usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
+        usage.created = raw.get("created").and_then(Value::as_i64);
+        return Ok(());
+    }
+    fn echoes_content(identity: &str, content: &Value) -> bool {
+        match content {
+            Value::String(text) => !text.is_empty() && identity.contains(text.as_str()),
+            Value::Array(values) => values.iter().any(|value| echoes_content(identity, value)),
+            Value::Object(values) => values.values().any(|value| echoes_content(identity, value)),
+            _ => false,
+        }
+    }
     let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
     let identity = |field: &str| -> Result<Option<String>, ModelError> {
         raw.get(field)
@@ -4568,6 +4629,7 @@ fn provider_usage_identity(usage: &mut UsageTrace, raw: &Value) -> Result<(), Mo
                 // Provider IDs and model names are ASCII tokens, not free-form text.
                 // Model names also permit namespace and version separators.
                 if text.is_empty()
+                    || echoes_content(text, content)
                     || !text.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric()
                             || b"-_.".contains(&byte)
@@ -6067,48 +6129,52 @@ mod credential_transport_tests;
 mod egress_http_tests {
     use super::*;
 
-    #[test]
-    fn usage_identity_validates_tokens_and_supplied_types_before_projection() {
-        for raw in [
-            serde_json::json!({"id":null}),
-            serde_json::json!({"id":123}),
-            serde_json::json!({"id":""}),
-            serde_json::json!({"id":"private\nanswer"}),
-            serde_json::json!({"model":false}),
-            serde_json::json!({"model":"private answer"}),
-            serde_json::json!({"created":null}),
-            serde_json::json!({"created":1.5}),
-            serde_json::json!({"created":u64::MAX}),
-        ] {
-            let mut usage = UsageTrace::default();
-            assert!(matches!(
-                provider_usage_identity(&mut usage, &raw),
-                Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
-            ));
-            assert!(usage.response_id.is_none());
-            assert!(usage.served_model.is_none());
-            assert!(usage.created.is_none());
-        }
-        for (id, model) in [
-            ("msg_0123456789abcdef", "claude-sonnet-4-20250514"),
-            ("7c971547-8bcc-4a91-8e10-00466eef5216", "deepseek-chat"),
-            ("chatcmpl-123", "namespace/model:version"),
-        ] {
-            let mut usage = UsageTrace::default();
-            provider_usage_identity(
-                &mut usage,
-                &serde_json::json!({"id":id,"model":model,"created":0}),
-            )
-            .unwrap();
-            assert_eq!(usage.response_id.as_deref(), Some(id));
-            assert_eq!(usage.served_model.as_deref(), Some(model));
-            assert_eq!(usage.created, Some(0));
-        }
-        let mut absent = UsageTrace::default();
-        provider_usage_identity(&mut absent, &serde_json::json!({})).unwrap();
-        assert!(absent.response_id.is_none());
-        assert!(absent.served_model.is_none());
-        assert!(absent.created.is_none());
+    #[tokio::test]
+    async fn usage_identity_validates_tokens_and_supplied_types_before_projection() {
+        with_egress_http_observations(async {
+            for raw in [
+                serde_json::json!({"id":null}),
+                serde_json::json!({"id":123}),
+                serde_json::json!({"id":""}),
+                serde_json::json!({"id":"private\nanswer"}),
+                serde_json::json!({"model":false}),
+                serde_json::json!({"model":"private answer"}),
+                serde_json::json!({"created":null}),
+                serde_json::json!({"created":1.5}),
+                serde_json::json!({"created":u64::MAX}),
+            ] {
+                let mut usage = UsageTrace::default();
+                assert!(matches!(
+                    provider_usage_identity(&mut usage, &raw, &Value::Null),
+                    Err(ModelError::Provider(DiagnosticCode::InvalidResponse))
+                ));
+                assert!(usage.response_id.is_none());
+                assert!(usage.served_model.is_none());
+                assert!(usage.created.is_none());
+            }
+            for (id, model) in [
+                ("msg_0123456789abcdef", "claude-sonnet-4-20250514"),
+                ("7c971547-8bcc-4a91-8e10-00466eef5216", "deepseek-chat"),
+                ("chatcmpl-123", "namespace/model:version"),
+            ] {
+                let mut usage = UsageTrace::default();
+                provider_usage_identity(
+                    &mut usage,
+                    &serde_json::json!({"id":id,"model":model,"created":0}),
+                    &Value::Null,
+                )
+                .unwrap();
+                assert_eq!(usage.response_id.as_deref(), Some(id));
+                assert_eq!(usage.served_model.as_deref(), Some(model));
+                assert_eq!(usage.created, Some(0));
+            }
+            let mut absent = UsageTrace::default();
+            provider_usage_identity(&mut absent, &serde_json::json!({}), &Value::Null).unwrap();
+            assert!(absent.response_id.is_none());
+            assert!(absent.served_model.is_none());
+            assert!(absent.created.is_none());
+        })
+        .await;
     }
 
     #[test]
@@ -6182,6 +6248,64 @@ mod egress_http_tests {
     }
 
     #[tokio::test]
+    async fn regression_direct_and_egress_transport_errors_keep_their_contracts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for scoped in [false, true] {
+                for phase in ["send", "read", "truncated"] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut buffer = [0; 1];
+                        stream.read_exact(&mut buffer).await.unwrap();
+                        if phase != "send" {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                        if phase != "truncated" {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    let client = http_client_builder()
+                        .timeout(std::time::Duration::from_millis(100))
+                        .build()
+                        .unwrap();
+                    let call = provider_response_json(
+                        client.get(url),
+                        Some(1024),
+                        ModelError::Unavailable,
+                    );
+                    let error = if scoped {
+                        with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .unwrap_err();
+                    server.abort();
+                    let expected = if scoped && phase != "truncated" {
+                        ModelError::Timeout(DiagnosticCode::HttpTimeout)
+                    } else if !scoped && phase != "send" {
+                        ModelError::Unavailable(DiagnosticCode::ProviderResponseReadFailed)
+                    } else {
+                        ModelError::Unavailable(DiagnosticCode::HttpUnavailable)
+                    };
+                    assert_eq!(
+                        std::mem::discriminant(&error),
+                        std::mem::discriminant(&expected),
+                        "scoped={scoped}, phase={phase}: {error:?}"
+                    );
+                    assert_eq!(error.code(), expected.code());
+                }
+            }
+        })
+        .await
+        .expect("transport fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
     async fn rabbithole_send_and_body_read_timeouts_keep_their_class() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
@@ -6201,9 +6325,12 @@ mod egress_http_tests {
                     std::future::pending::<()>().await;
                 });
                 let client = http_client(Some(1)).unwrap();
-                let result =
-                    provider_response_json(client.get(url), Some(1024), ModelError::Unavailable)
-                        .await;
+                let result = with_egress_http_observations(provider_response_json(
+                    client.get(url),
+                    Some(1024),
+                    ModelError::Unavailable,
+                ))
+                .await;
                 server.abort();
                 assert!(
                     matches!(result, Err(ModelError::Timeout(_))),

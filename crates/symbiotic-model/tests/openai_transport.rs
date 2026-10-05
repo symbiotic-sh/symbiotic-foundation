@@ -159,7 +159,7 @@ async fn disabled_thinking_and_nullable_content_keep_identity() {
 }
 
 #[test]
-fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
+fn cache_counts_return_unknown_for_conflicts_and_derive_only_numeric_evidence() {
     for (total, hit, miss, nested) in [
         (Some(10), Some(4), Some(6), Some(5)),
         (Some(10), Some(4), Some(7), None),
@@ -167,22 +167,14 @@ fn cache_counts_reject_conflicts_and_derive_only_numeric_evidence() {
         (Some(10), Some(11), None, None),
         (Some(u64::MAX), Some(u64::MAX), Some(1), None),
     ] {
-        assert!(matches!(
-            prompt_cache_counts(total, hit, miss, nested),
-            Err(symbiotic_model::ModelError::Provider(
-                symbiotic_core::DiagnosticCode::InvalidResponse
-            ))
-        ));
+        assert_eq!(prompt_cache_counts(total, hit, miss, nested), (None, None));
     }
     for (hit, miss, expected) in [
         (None, Some(6), (Some(4), Some(6))),
         (None, None, (None, None)),
         (Some(0), None, (Some(0), Some(10))),
     ] {
-        assert_eq!(
-            prompt_cache_counts(Some(10), hit, miss, None).unwrap(),
-            expected
-        );
+        assert_eq!(prompt_cache_counts(Some(10), hit, miss, None), expected);
     }
 }
 
@@ -385,4 +377,82 @@ fn local_hash_embeddings_have_no_http_destination() {
     let provider = HashEmbeddingProvider::new(3);
     assert_eq!(provider.descriptor().provider_class, ProviderClass::Local);
     assert!(provider.descriptor().metadata.get("endpoint").is_none());
+}
+
+#[tokio::test]
+async fn regression_ascii_request_and_answer_echoes_are_not_usage_identities() {
+    for field in ["id", "model"] {
+        for (request_text, echo) in [
+            ("PRIVATE_REQUEST", "PRIVATE_REQUEST"),
+            ("PRIVATE_REQUEST", "PRIVATE_ANSWER"),
+            ("PRIVATE_ANSWER", "PRIVATE_ANSWER"),
+        ] {
+            let mut body = serde_json::json!({
+                "id":"fixture-id", "model":"served-model",
+                "choices":[{"message":{"content":"PRIVATE_ANSWER"}}]
+            });
+            body[field] = serde_json::json!(echo);
+            let (url, server) = fixture(body);
+            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                .with_timeout(1)
+                .unwrap();
+            let mut req = request();
+            req.messages[0].content = request_text.into();
+            let result = symbiotic_model::with_egress_http_observations(provider.chat(req)).await;
+            server.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(symbiotic_model::ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::InvalidResponse
+                    ))
+                ),
+                "{field}={echo}: {result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn regression_strict_usage_refusal_is_scoped_to_egress() {
+    for malformed in [
+        serde_json::json!({"id":null}),
+        serde_json::json!({"usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":7}}),
+    ] {
+        for scoped in [false, true] {
+            let mut body = malformed.clone();
+            body["choices"] = serde_json::json!([{"message":{"content":"OK"}}]);
+            let (url, server) = fixture(body);
+            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                .with_timeout(1)
+                .unwrap();
+            let call = provider.chat(request());
+            let result = if scoped {
+                symbiotic_model::with_egress_http_observations(call).await
+            } else {
+                call.await
+            };
+            server.join().unwrap();
+            if scoped {
+                assert!(matches!(
+                    result,
+                    Err(symbiotic_model::ModelError::Provider(
+                        symbiotic_core::DiagnosticCode::InvalidResponse
+                    ))
+                ));
+            } else {
+                let response = result.expect("direct calls retain successful answers");
+                assert_eq!(response.text, "OK");
+                assert_eq!(response.trace.usage.response_id, None);
+                assert_eq!(response.trace.usage.cache_hit_tokens, None);
+                assert_eq!(response.trace.usage.cache_miss_tokens, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn regression_public_cache_counts_remain_tuple_returning() {
+    let (hit, miss) = prompt_cache_counts(Some(10), Some(4), None, None);
+    assert_eq!((hit, miss), (Some(4), Some(6)));
 }
