@@ -6966,6 +6966,190 @@ fn assert_request_budget_refused(result: &DispatchResult) {
 }
 
 #[tokio::test]
+async fn regression_request_budget_durable_completion_failure_keeps_allowance_consumed() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (status_code, pre_send_failure) in [(400, false), (200, false), (400, true)] {
+            for restart in [false, true] {
+                let mut fixture = Fixture::new(status_code, "answer".into(), Duration::ZERO).await;
+                configure_request_budget(&mut fixture, 1, None);
+                if pre_send_failure {
+                    // A trusted pre-send failure must keep its debit if the
+                    // transaction that would undo it cannot commit.
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    fixture.config.routes[0].destination =
+                        format!("http://{}/v1", listener.local_addr().unwrap());
+                    drop(listener);
+                }
+                let mut process = fixture.process().await;
+                let conn = rusqlite::Connection::open(
+                    fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
+                .unwrap();
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_completion BEFORE UPDATE OF finished ON egress_permits
+                     BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;",
+                )
+                .unwrap();
+                let result =
+                    request_budget_call(&fixture, &process, "unfinished", false, false).await;
+                assert!(!result.receipt_persisted);
+                assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+                assert_eq!(result.output.is_some(), status_code == 200);
+                conn.execute_batch("DROP TRIGGER reject_completion")
+                    .unwrap();
+                if restart {
+                    drop(process);
+                    process = fixture.process().await;
+                }
+                assert_request_budget_refused(
+                    &request_budget_call(&fixture, &process, "different-invocation", false, false)
+                        .await,
+                );
+                assert_eq!(
+                    fixture.calls.load(Ordering::SeqCst),
+                    usize::from(!pre_send_failure)
+                );
+            }
+        }
+    })
+    .await
+    .expect("bounded completion-failure budget regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_durable_admission_write_failure_refuses_before_http() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for existing_budget in [false, true] {
+            let mut fixture = Fixture::new(400, "rejected".into(), Duration::ZERO).await;
+            configure_request_budget(&mut fixture, 2, None);
+            let process = fixture.process().await;
+            if existing_budget {
+                let result = request_budget_call(&fixture, &process, "first", false, false).await;
+                assert!(matches!(
+                    result.error,
+                    Some(EgressError::Provider { status: Some(400) })
+                ));
+            }
+            let conn = rusqlite::Connection::open(
+                fixture
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            let operation = if existing_budget { "UPDATE" } else { "INSERT" };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER reject_admission BEFORE {operation} ON egress_request_failures
+                 BEGIN SELECT RAISE(ABORT, 'synthetic admission failure'); END;",
+            ))
+            .unwrap();
+            let result = request_budget_call(&fixture, &process, "refused", false, false).await;
+            assert_eq!(result.error, Some(EgressError::StateUnavailable));
+            assert_eq!(result.receipt.spend_state, SpendState::Released);
+            assert!(result.receipt_persisted);
+            assert_eq!(
+                fixture.calls.load(Ordering::SeqCst),
+                usize::from(existing_budget)
+            );
+        }
+    })
+    .await
+    .expect("bounded admission-write budget regression");
+}
+
+#[tokio::test]
+async fn regression_request_budget_durable_crash_after_send_blocks_different_invocation() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut fixture = Fixture::with_response_gate(
+            400,
+            "rejected".into(),
+            Duration::ZERO,
+            "null",
+            false,
+            false,
+            Some(response_gate.clone()),
+        )
+        .await;
+        configure_request_budget(&mut fixture, 1, None);
+        fixture.config.routes[0].timeout_seconds = 5;
+        let config = fixture.dir.path().join("config.json");
+        std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut child = Child(
+            std::process::Command::new(credential_process())
+                .arg(config)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let client = socket::UnixEgressClient {
+            path: fixture.config.socket_path.clone(),
+            max_frame_bytes: fixture.config.max_frame_bytes,
+            timeout: Duration::from_secs(2),
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none());
+                match exchange_client(&client, publish_revision(1)).await {
+                    Ok(Reply::GrantRevisionPublished) => break,
+                    Err(EgressError::Transport) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("startup failed: {error:?}"),
+                    Ok(_) => panic!("unexpected startup reply"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (admission, payload) = fixture.attempt("crashed", 1, 1);
+        let Reply::Permit(grant) =
+            exchange_client(&client, Operation::IssuePermit(admission.clone().into()))
+                .await
+                .unwrap()
+        else {
+            panic!("permit")
+        };
+        let peer =
+            send_without_reading(&client, inject(admission.clone(), payload, grant.permit)).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider must observe the send before the crash");
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        drop(peer);
+        response_gate.add_permits(1);
+        let process = fixture.process().await;
+        let AttemptStatus::Dispatched { receipt } = status(&process, &admission).await else {
+            panic!("crashed attempt must remain uncertain")
+        };
+        assert_eq!(receipt.spend_state, SpendState::Unknown);
+        assert_request_budget_refused(
+            &request_budget_call(&fixture, &process, "after-crash", false, false).await,
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded crash/restart budget regression");
+}
+
+#[tokio::test]
 async fn regression_request_budget_failed_sends_survive_restart_without_content() {
     tokio::time::timeout(Duration::from_secs(15), async {
         for restart in [false, true] {

@@ -137,7 +137,7 @@ existing route revisions stay unchanged. A configured budget participates in
 the route revision. This implements the 2026-10-05 revised SO-0 shared failure
 budget decision; signed jobs keep their existing per-job allowance.
 
-Direct egress counts failed sends across invocations under a digest of
+Direct egress counts failed and uncertain sends across invocations under a digest of
 `(tenant, route, credential fingerprint, signed input_digest)`. The fingerprint
 uses the shared model credential helper; keyless routes use its absent value.
 The signed digest covers the exact typed payload before Foundation replaces
@@ -145,10 +145,11 @@ trace metadata/source labels. Credential rotation and different input digests
 start separate budgets. No request or answer content enters the budget table.
 
 `renewal_seconds: null` never renews, including across restart. A positive
-interval renews after that many seconds since the last failed send; clock
-rollback cannot renew early. Zero gives each call a fresh budget. A successful
-response deletes the key. Local credential/setup failures and trusted
-pre-send failures do not count as failed sends. HTTP failures keep their
+interval renews after that many seconds since the last failure completion or
+uncertain admission; clock rollback cannot renew early. Zero gives each call a
+fresh budget. A successfully recorded response deletes the key. Local credential
+failures and durably recorded trusted pre-send failures do not consume allowance.
+HTTP failures keep their
 existing unknown-charge accounting and count against this shared allowance;
 the budget introduces no retry inside an invocation.
 
@@ -157,25 +158,33 @@ key returns `DispatchResult.error = RequestBudgetExhausted` (wire code
 `request_budget_exhausted`), no output, and a released spend receipt: no HTTP
 send or spend. With retained recovery the typed failure is recoverable; with
 `answer_recovery: "off"` only the existing completion/receipt evidence persists.
-The permit stays consumed. Budget lookup failure refuses execution visibly.
+The permit stays consumed. Budget admission failure refuses execution visibly.
 
 The existing process state lock excludes other processes. One in-memory async
-lock serializes configured budget dispatches from lookup through completion,
+lock serializes configured budget dispatches from admission through completion,
 including unrelated budget keys; unconfigured dispatches retain their existing
 concurrency. Failure counts and last-failure Unix seconds live in the single
 `egress_request_failures` table in the existing SQLite operational database.
-Budget updates commit atomically with egress completion and spend bookkeeping.
-A failed completion write reports `receipt_persisted: false` and retains unknown
-spend; a process crash before completion likewise preserves the existing
-uncertain attempt and does not record a completed failure count. Neither case
-authorizes resending that uncertain attempt inside its invocation.
+Admission checks renewal and commits one debit before provider execution; a failed
+write prevents execution. Admission timestamps uncertain sends; a recorded failed
+send updates the renewal timestamp at completion. Completion commits success
+clearing or a trusted pre-send debit undo atomically with egress completion and
+spend bookkeeping. Undo restores the previous renewal timestamp. A failed completion
+write reports `receipt_persisted: false` and retains unknown spend and the debit;
+a process crash before completion likewise preserves the debit. Both prevent a
+different invocation with identical input from bypassing the shared allowance.
 
 Evidence: the `regression_request_budget_*` tests in
 `crates/symbiotic-credential-process/tests/egress.rs` cover three sends for six
 identical HTTP-400 classifier calls, restart, fresh-per-call renewal, separate
 inputs and rotated credentials, two HTTP-401 sends, concurrent exhaustion,
 positive renewal, success clearing, omission/validation, and no request,
-answer or credential content in state under `off`.
+answer or credential content in state under `off`. The
+`regression_request_budget_durable_*` tests cover admission-write refusal,
+completion-write failure after rejection or success, and crash/restart after a
+send followed by a different invocation with identical input. The registry test
+`request_budget_pre_send_undo_restores_only_unexpired_consumption` covers renewal
+timestamp restoration and expiry.
 
 ## Same-attempt recovery (v4)
 

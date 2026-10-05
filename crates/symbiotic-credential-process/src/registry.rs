@@ -7,6 +7,14 @@ use uuid::Uuid;
 
 pub(crate) struct Registry(Connection);
 
+/// A committed debit held under the budget dispatch lock through completion.
+/// Previous state is needed only to undo a durably recorded trusted pre-send failure.
+/// Dropping this token leaves the debit consumed.
+pub(crate) struct RequestBudgetAdmission {
+    key: String,
+    previous: Option<(u32, u64)>,
+}
+
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
 const REGISTRY_SCHEMA_VERSION: u16 = 8;
@@ -355,43 +363,58 @@ impl Registry {
         Ok(receipt)
     }
 
-    /// Check while holding the process's budget dispatch lock until finish commits.
-    pub(crate) fn check_request_budget(
+    /// Commit one debit before execution while holding the budget dispatch lock
+    /// until finish commits. Restart or a failed completion keeps that debit.
+    pub(crate) fn admit_request_budget(
         &mut self,
-        key: &str,
+        key: String,
         policy: &RequestBudget,
-    ) -> Result<(), EgressError> {
-        let row: Option<(u32, u64)> = self.0.query_row(
+    ) -> Result<RequestBudgetAdmission, EgressError> {
+        let tx = self
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(state)?;
+        let current_time = now()?;
+        let previous: Option<(u32, u64)> = tx.query_row(
             "SELECT failed_sends, last_failure FROM egress_request_failures WHERE request_key=?1",
-            [key], |row| Ok((row.get(0)?, row.get(1)?)),
+            [&key], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(state)?;
-        if let Some((failures, last_failure)) = row {
-            let current_time = now()?;
-            let renewed = policy.renewal_seconds.is_some_and(|seconds| {
+        let previous = previous.filter(|&(_, last_failure)| {
+            !policy.renewal_seconds.is_some_and(|seconds| {
                 // Zero renews every call, even after clock rollback. Positive
                 // intervals cannot renew early when the clock moves backwards.
                 seconds == 0
                     || current_time >= last_failure && current_time - last_failure >= seconds
-            });
-            if renewed {
-                self.0
-                    .execute(
-                        "DELETE FROM egress_request_failures WHERE request_key=?1",
-                        [key],
-                    )
-                    .map_err(state)?;
-            } else if failures >= policy.attempts {
-                return Err(EgressError::RequestBudgetExhausted);
-            }
+            })
+        });
+        let failures = previous.map_or(0, |(failures, _)| failures);
+        if failures >= policy.attempts {
+            return Err(EgressError::RequestBudgetExhausted);
         }
-        Ok(())
+        let changed = tx
+            .execute(
+                "INSERT INTO egress_request_failures(request_key, failed_sends, last_failure)
+             VALUES (?1, ?2, ?3) ON CONFLICT(request_key) DO UPDATE SET
+             failed_sends=excluded.failed_sends, last_failure=excluded.last_failure",
+                params![
+                    key,
+                    failures + 1,
+                    previous.map_or(current_time, |(_, time)| time.max(current_time))
+                ],
+            )
+            .map_err(state)?;
+        if changed != 1 {
+            return Err(EgressError::StateUnavailable);
+        }
+        tx.commit().map_err(state)?;
+        Ok(RequestBudgetAdmission { key, previous })
     }
 
     pub(crate) fn finish(
         &mut self,
         mode: AnswerRecovery,
         result: &DispatchResult,
-        request_budget_key: Option<&str>,
+        request_budget: Option<&RequestBudgetAdmission>,
     ) -> Result<(), EgressError> {
         let stored_receipt = serde_json::to_value(StoredReceipt::from(&result.receipt))
             .map_err(|_| EgressError::StateUnavailable)?;
@@ -444,19 +467,38 @@ impl Registry {
                 .map(|_| serde_json::json!({"output_received": true})),
         )
         .map_err(ledger_error)?;
-        if let Some(key) = request_budget_key {
+        if let Some(budget) = request_budget {
             if result.output.is_some() {
                 tx.execute(
                     "DELETE FROM egress_request_failures WHERE request_key=?1",
-                    [key],
+                    [&budget.key],
                 )
                 .map_err(state)?;
+            } else if result.receipt.spend_state == SpendState::Released {
+                // Only trusted pre-send failures release spend. Restore the
+                // allowance and renewal time that existed before this debit;
+                // an expired cohort stays expired rather than being resurrected.
+                if let Some((failures, last_failure)) = budget.previous {
+                    tx.execute(
+                        "UPDATE egress_request_failures SET failed_sends=?2, last_failure=?3
+                         WHERE request_key=?1",
+                        params![budget.key, failures, last_failure],
+                    )
+                    .map_err(state)?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM egress_request_failures WHERE request_key=?1",
+                        [&budget.key],
+                    )
+                    .map_err(state)?;
+                }
             } else {
+                // Admission already consumed the allowance. A recorded failure
+                // starts renewal at completion; uncertain attempts keep admission time.
                 tx.execute(
-                    "INSERT INTO egress_request_failures(request_key, failed_sends, last_failure)
-                     VALUES (?1, 1, ?2) ON CONFLICT(request_key) DO UPDATE SET
-                     failed_sends=failed_sends+1, last_failure=excluded.last_failure",
-                    params![key, now()?],
+                    "UPDATE egress_request_failures SET last_failure=MAX(last_failure, ?2)
+                     WHERE request_key=?1",
+                    params![budget.key, now()?],
                 )
                 .map_err(state)?;
             }
@@ -755,6 +797,79 @@ mod tests {
             "grant_revision": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn request_budget_pre_send_undo_restores_only_unexpired_consumption() {
+        let clock = TestClock::new(1000);
+        for renewal in [None, Some(60), Some(0)] {
+            for last_failure in [900, 990, 1100] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut registry = open(&dir.path().join("registry.sqlite"));
+                registry
+                    .0
+                    .execute(
+                        "INSERT INTO egress_request_failures VALUES ('request', 2, ?1)",
+                        [last_failure],
+                    )
+                    .unwrap();
+                let policy = RequestBudget {
+                    attempts: 3,
+                    renewal_seconds: renewal,
+                };
+                let admission = registry
+                    .admit_request_budget("request".into(), &policy)
+                    .unwrap();
+                let renewed = renewal.is_some_and(|seconds| {
+                    seconds == 0 || 1000 >= last_failure && 1000 - last_failure >= seconds
+                });
+                let debited: (u32, u64) = registry
+                    .0
+                    .query_row(
+                        "SELECT failed_sends, last_failure FROM egress_request_failures",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    debited,
+                    if renewed {
+                        (1, 1000)
+                    } else {
+                        (3, last_failure.max(1000))
+                    }
+                );
+                let a = attempt();
+                let permit = registry.issue(&a, 1).unwrap().permit;
+                let mut receipt = registry.consume(&a, &permit, &reservation(&a), 1).unwrap();
+                receipt.spend_state = SpendState::Released;
+                clock.set(1010);
+                registry
+                    .finish(
+                        AnswerRecovery::Off,
+                        &DispatchResult {
+                            receipt,
+                            output: None,
+                            error: Some(EgressError::Transport),
+                            diagnostics: Vec::new(),
+                            receipt_persisted: true,
+                        },
+                        Some(&admission),
+                    )
+                    .unwrap();
+                let remaining: Option<(u32, u64)> = registry
+                    .0
+                    .query_row(
+                        "SELECT failed_sends, last_failure FROM egress_request_failures",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .unwrap();
+                assert_eq!(remaining, (!renewed).then_some((2, last_failure)));
+                clock.set(1000);
+            }
+        }
     }
 
     #[test]

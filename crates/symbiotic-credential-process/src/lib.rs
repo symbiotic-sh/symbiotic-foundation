@@ -110,14 +110,14 @@ fn answer_recovery_is_default(mode: &AnswerRecovery) -> bool {
     *mode == AnswerRecovery::default()
 }
 
-/// Failed-send allowance shared by identical direct-egress requests.
+/// Allowance shared by identical direct-egress requests after failed or uncertain sends.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestBudget {
-    /// Maximum failed sends per tenant/route, credential fingerprint and input digest.
+    /// Maximum failed or uncertain sends per tenant/route, credential fingerprint and input digest.
     pub attempts: u32,
-    /// Renew after this many seconds since the last failure; None never renews.
-    /// Zero gives every call a fresh budget.
+    /// Renew after this many seconds since failure completion or an uncertain admission.
+    /// None never renews. Zero gives every call a fresh budget.
     pub renewal_seconds: Option<u64>,
 }
 
@@ -615,7 +615,7 @@ impl CredentialProcess {
         let mut output = None;
         let mut error = None;
         let mut diagnostics = Vec::new();
-        let mut completed_budget_key = None;
+        let mut budget_admission = None;
         match secret {
             Ok(Ok(secret)) => {
                 let budget_key = route
@@ -632,18 +632,20 @@ impl CredentialProcess {
                         .map_err(|_| EgressError::StateUnavailable)
                     })
                     .transpose();
-                let budget_key = budget_key.and_then(|key| {
-                    if let (Some(key), Some(policy)) = (&key, &route.request_budget) {
-                        self.inner
-                            .registry
-                            .lock()
-                            .map_err(|_| EgressError::StateUnavailable)?
-                            .check_request_budget(key, policy)?;
-                    }
-                    Ok(key)
+                let admission = budget_key.and_then(|key| {
+                    key.zip(route.request_budget.as_ref())
+                        .map(|(key, policy)| {
+                            self.inner
+                                .registry
+                                .lock()
+                                .map_err(|_| EgressError::StateUnavailable)?
+                                .admit_request_budget(key, policy)
+                        })
+                        .transpose()
                 });
-                let execution = match &budget_key {
-                    Ok(_) => {
+                let execution = match admission {
+                    Ok(admission) => {
+                        budget_admission = admission;
                         provider::execute(
                             &self.inner.runtime,
                             &route,
@@ -653,11 +655,10 @@ impl CredentialProcess {
                         )
                         .await
                     }
-                    Err(code) => Err((*code).into()),
+                    Err(code) => Err(code.into()),
                 };
                 match execution {
                     Ok((answer, usage, runtime_diagnostics)) => {
-                        completed_budget_key = budget_key.ok().flatten();
                         diagnostics = runtime_diagnostics;
                         receipt.status = DispatchStatus::Succeeded;
                         receipt.usage = usage;
@@ -671,8 +672,6 @@ impl CredentialProcess {
                         error = Some(failure.code);
                         if !failure.may_have_dispatched {
                             receipt.spend_state = SpendState::Released;
-                        } else {
-                            completed_budget_key = budget_key.ok().flatten();
                         }
                     }
                 }
@@ -694,11 +693,7 @@ impl CredentialProcess {
         };
         result.receipt_persisted = self.inner.registry.lock().is_ok_and(|mut registry| {
             registry
-                .finish(
-                    route.answer_recovery,
-                    &result,
-                    completed_budget_key.as_deref(),
-                )
+                .finish(route.answer_recovery, &result, budget_admission.as_ref())
                 .is_ok()
         });
         if !result.receipt_persisted {
