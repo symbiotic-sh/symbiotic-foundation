@@ -3407,6 +3407,8 @@ async fn assert_answer_recovery_off_privacy(
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut response = self.inner.chat(request).await?;
             if self.provider_fields {
+                response.trace.trace_id = TraceId(MARKER.into());
+                response.trace.model = ModelIdentity::new(MARKER, MARKER, MARKER);
                 response.trace.source = Some(MARKER.into());
                 response.trace.role_binding = Some(MARKER.into());
                 response.trace.audit_refs = vec![MARKER.into()];
@@ -3585,6 +3587,14 @@ async fn assert_answer_recovery_off_privacy(
                     symbiotic_core::DiagnosticCode::InvocationCompleted
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                assert!(
+                    !std::fs::read_to_string(dir.path().join("traces.jsonl"))
+                        .unwrap()
+                        .contains(MARKER)
+                );
+                for stored in trace.records() {
+                    assert_eq!(stored.model, provider.descriptor().identity);
+                }
                 assert!(
                     !serde_json::to_string(&trace.records())
                         .unwrap()

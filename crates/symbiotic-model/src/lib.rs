@@ -1476,6 +1476,12 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
             .answer_recovery
             .usage_diagnostic(&response.trace().usage);
         let mut response = response;
+        if self.answer_recovery == AnswerRecovery::Off {
+            let mut trace = response.trace().clone();
+            trace.trace_id = TraceId::new();
+            trace.model = self.descriptor.identity.clone();
+            response.set_trace(trace);
+        }
         if let Some(cache) = self.cache.clone() {
             let call = self.clone();
             let shared = Arc::new(response);
