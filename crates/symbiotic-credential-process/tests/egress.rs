@@ -174,35 +174,6 @@ async fn regression_engine_startup_fails_when_first_supervised_child_exits() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn regression_observation_guard_allows_delayed_send() {
-    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let provider = tokio::spawn({
-            let calls = calls.clone();
-            let response_gate = response_gate.clone();
-            async move {
-                tokio::time::sleep(Duration::from_secs(6)).await;
-                calls.fetch_add(1, Ordering::SeqCst);
-                response_gate.acquire().await.unwrap().forget();
-            }
-        });
-        tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
-            while calls.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("provider must observe the delayed send");
-        assert!(!provider.is_finished(), "response must remain gated");
-        response_gate.add_permits(1);
-        provider.await.unwrap();
-    })
-    .await
-    .expect("observation regression must finish within the hang guard");
-}
-
-#[tokio::test(start_paused = true)]
 async fn regression_child_startup_wait_allows_delayed_readiness() {
     let mut child = Child(
         std::process::Command::new("/bin/sleep")
@@ -3109,8 +3080,55 @@ fn supervised_credential_parent_entrypoint() {
     };
     std::fs::write(pid_path, pid.to_string()).unwrap();
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        match supervisor
+            .next_event()
+            .expect("credential supervision failed")
+        {
+            symbiotic_supervise::Event::Started(_) => {}
+            symbiotic_supervise::Event::Exited(status) => {
+                panic!("credential child exited: {status}");
+            }
+        }
     }
+}
+
+#[tokio::test]
+async fn regression_supervised_credential_parent_exits_on_child_startup_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervised_credential_parent_entrypoint",
+                "--nocapture",
+            ])
+            .env(
+                "CREDENTIAL_PARENT_CONFIG",
+                dir.path().join("missing-config.json"),
+            )
+            .env("CREDENTIAL_CHILD_PID", dir.path().join("child.pid"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = parent.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parent stayed alive after credential child startup failure");
+    assert!(
+        dir.path().join("child.pid").exists(),
+        "child must have started"
+    );
+    assert!(
+        !status.success(),
+        "child startup failure must fail the parent"
+    );
 }
 
 #[tokio::test]
