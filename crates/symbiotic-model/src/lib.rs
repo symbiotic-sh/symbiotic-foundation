@@ -4258,7 +4258,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 .await?;
                 let parsed: OpenAiChatWireResponse =
                     serde_json::from_value(raw.clone()).map_err(|_err| {
-                        ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure)
+                        ModelError::Unavailable(symbiotic_core::DiagnosticCode::InvalidResponse)
                     })?;
                 let choice = parsed.choices.into_iter().next().ok_or({
                     ModelError::Provider(

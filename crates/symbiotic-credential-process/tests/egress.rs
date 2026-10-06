@@ -6551,25 +6551,32 @@ async fn regression_egress_classification_rejects_cache_contradictions() {
 
 #[tokio::test]
 async fn regression_invalid_provider_json_preserves_charge_and_budget_openai() {
-    invalid_provider_json_preserves_charge_and_budget(false).await;
+    invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
 }
 
 #[tokio::test]
 async fn regression_invalid_provider_json_preserves_charge_and_budget_anthropic() {
-    invalid_provider_json_preserves_charge_and_budget(true).await;
+    invalid_provider_json_preserves_charge_and_budget(true, "invalid JSON").await;
 }
 
-async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool) {
+#[tokio::test]
+async fn regression_wrong_shape_matches_unparsable_send_count_openai() {
+    let wrong_shape = invalid_provider_json_preserves_charge_and_budget(false, "{}").await;
+    let unparsable = invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
+    assert_eq!(wrong_shape, unparsable);
+}
+
+#[tokio::test]
+async fn regression_wrong_shape_matches_unparsable_send_count_anthropic() {
+    let wrong_shape = invalid_provider_json_preserves_charge_and_budget(true, "{}").await;
+    let unparsable = invalid_provider_json_preserves_charge_and_budget(true, "invalid JSON").await;
+    assert_eq!(wrong_shape, unparsable);
+}
+
+async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool, body: &str) -> usize {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut fixture = Fixture::with_http_response(
-            200,
-            "invalid JSON".into(),
-            Duration::ZERO,
-            "0",
-            true,
-            false,
-        )
-        .await;
+        let mut fixture =
+            Fixture::with_http_response(200, body.into(), Duration::ZERO, "0", true, false).await;
         if anthropic {
             fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
                 operator: "test".into(),
@@ -6594,6 +6601,7 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool) {
                 })
                 .await;
             if call < 3 {
+                assert_eq!(result.error, Some(EgressError::InvalidProviderJson));
                 assert_eq!(result.receipt.spend_state, SpendState::Unknown);
                 assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
                 assert!(result.receipt_persisted && result.output.is_none());
@@ -6635,7 +6643,7 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool) {
             .unwrap();
         assert_eq!(
             count, 3,
-            "malformed JSON consumes exactly one failed-send debit"
+            "invalid provider answers consume exactly one failed-send debit"
         );
         drop(process);
         let process = fixture.process().await;
@@ -6657,9 +6665,10 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool) {
             assert!(!wire.contains("invalid JSON"));
             assert!(!wire.contains(SECRET));
         }
+        fixture.calls.load(Ordering::SeqCst)
     })
     .await
-    .expect("invalid JSON fixtures must finish within five seconds");
+    .expect("invalid provider answer fixtures must finish within five seconds")
 }
 
 #[tokio::test]

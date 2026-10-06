@@ -141,7 +141,7 @@ impl ChatProvider for AnthropicChatProvider {
                 )
                 .await?;
                 let parsed: MessagesResponse = serde_json::from_value(raw.clone())
-                    .map_err(|_| ModelError::Provider(DiagnosticCode::InvalidResponse))?;
+                    .map_err(|_| ModelError::Unavailable(DiagnosticCode::InvalidResponse))?;
                 // Unsupported tool/pause/refusal outcomes cannot become a partial answer.
                 if !matches!(
                     parsed.stop_reason.as_str(),
