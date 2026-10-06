@@ -408,6 +408,80 @@ async fn assert_invalid_id_preserves_answer(id: String) {
 }
 
 #[tokio::test]
+async fn regression_reasoning_echoes_are_not_usage_identities() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for reasoning_field in [
+            "reasoning_content",
+            "reasoning",
+            "reasoning_details",
+            "thinking",
+        ] {
+            for identity_field in ["id", "model"] {
+                for echo in [false, true] {
+                    let mut body = serde_json::json!({
+                        "id":"fixture-id", "model":"served-model",
+                        "choices":[{"message":{"content":"OK"}}]
+                    });
+                    body["choices"][0]["message"][reasoning_field] = if reasoning_field
+                        == "reasoning_details"
+                    {
+                        serde_json::json!([{"type":"reasoning.text","text":"PRIVATE_REASONING"}])
+                    } else {
+                        serde_json::json!("PRIVATE_REASONING")
+                    };
+                    if echo {
+                        body[identity_field] = serde_json::json!("PRIVATE_REASONING");
+                    }
+                    let (url, server) = fixture(body);
+                    let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                        .with_timeout(1)
+                        .unwrap();
+                    let response =
+                        symbiotic_model::with_egress_http_observations(provider.chat(request()))
+                            .await
+                            .expect("identity screening must preserve the paid answer");
+                    server.join().unwrap();
+                    assert_eq!(response.text, "OK");
+                    let identity = if identity_field == "id" {
+                        &response.trace.usage.response_id
+                    } else {
+                        &response.trace.usage.served_model
+                    };
+                    assert_eq!(
+                        identity.is_none(),
+                        echo,
+                        "{reasoning_field}/{identity_field}"
+                    );
+                    if !echo {
+                        assert_eq!(
+                            identity.as_deref(),
+                            Some(if identity_field == "id" {
+                                "fixture-id"
+                            } else {
+                                "served-model"
+                            })
+                        );
+                    }
+                    assert!(
+                        !response
+                            .trace
+                            .metadata
+                            .to_string()
+                            .contains("PRIVATE_REASONING")
+                    );
+                    assert_eq!(
+                        response.trace.metadata.get("runtime_diagnostics").is_some(),
+                        echo
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("reasoning identity fixtures must finish within three seconds");
+}
+
+#[tokio::test]
 async fn regression_request_phrase_id_is_dropped_without_rejecting_answer() {
     assert_invalid_id_preserves_answer("synthetic evidence".into()).await;
 }

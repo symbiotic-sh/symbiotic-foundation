@@ -395,6 +395,11 @@ never synthesized. Response identity survives recovery even without token counts
 while spend remains unknown without measured usage. The complete credential
 boundary checks these fields before any runtime or ledger write; reasoning text,
 prompts, answers, raw responses and credentials are excluded from usage.
+For OpenAI-compatible and Anthropic egress calls, `response_id` and `served_model`
+are screened against every string in response choices and content blocks, including
+nested reasoning, thinking, signatures and redacted thinking data. An identity
+that occurs in those strings is omitted from both typed usage and provider trace
+metadata, with an `invalid_usage_identity` diagnostic; the paid answer is preserved.
 No new persistent store is introduced: immediate replies and recovery derive
 usage from the existing canonical spend receipt.
 `reported_cost_usd` is separate from integer `cost_micro_usd`; the process neither
