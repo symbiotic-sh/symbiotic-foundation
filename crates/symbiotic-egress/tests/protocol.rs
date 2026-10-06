@@ -1,6 +1,18 @@
 use symbiotic_egress::*;
 
 #[test]
+fn response_size_diagnostic_round_trips_without_response_bytes() {
+    let started = std::time::Instant::now();
+    let json = r#"["max_response_bytes_exceeded"]"#;
+    let diagnostics: Vec<DispatchDiagnostic> = serde_json::from_str(json).unwrap();
+    assert_eq!(serde_json::to_string(&diagnostics).unwrap(), json);
+    eprintln!(
+        "response size diagnostic: static wire round trip, elapsed={:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn invalid_provider_json_round_trips_as_a_distinct_v4_wire_error() {
     let json = r#"{"version":4,"result":{"Err":"invalid_provider_json"}}"#;
     let response: Response = serde_json::from_str(json).unwrap();

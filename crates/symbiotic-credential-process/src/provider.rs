@@ -235,16 +235,17 @@ fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
             _ => EgressError::Transport,
         },
         may_have_dispatched: started.load(Ordering::SeqCst),
-        diagnostics: error
-            .diagnostics()
-            .iter()
-            .filter_map(|code| match code {
-                model::DiagnosticCode::InvalidResponse => {
-                    Some(DispatchDiagnostic::InvalidRetryAfter)
-                }
-                _ => None,
-            })
-            .collect(),
+        diagnostics: matches!(
+            error.primary(),
+            ModelError::Provider(model::DiagnosticCode::ProviderResponseLimitExceeded)
+        )
+        .then_some(DispatchDiagnostic::MaxResponseBytesExceeded)
+        .into_iter()
+        .chain(error.diagnostics().iter().filter_map(|code| match code {
+            model::DiagnosticCode::InvalidResponse => Some(DispatchDiagnostic::InvalidRetryAfter),
+            _ => None,
+        }))
+        .collect(),
     }
 }
 
@@ -798,6 +799,38 @@ mod tests {
             assert!(actual.may_have_dispatched);
             assert!(actual.diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn response_size_refusal_preserves_bound_diagnostic_and_charge() {
+        let started_at = std::time::Instant::now();
+        let provider = OpenAiCompatibleChatProvider::new("test", "test", "http://localhost", "");
+        let started = AtomicBool::new(true);
+        for wrapped in [false, true] {
+            let mut error =
+                ModelError::Provider(model::DiagnosticCode::ProviderResponseLimitExceeded);
+            if wrapped {
+                error = ModelError::Diagnostics {
+                    primary: Box::new(error),
+                    secondary: vec![model::DiagnosticCode::StorageFailure],
+                };
+            }
+            assert_eq!(
+                provider.failure_charge(&error),
+                model::FailureCharge::Unknown
+            );
+            let actual = execute_error(error, &started);
+            assert_eq!(actual.code, EgressError::Provider { status: None });
+            assert!(actual.may_have_dispatched);
+            assert_eq!(
+                serde_json::to_value(actual.diagnostics).unwrap(),
+                serde_json::json!(["max_response_bytes_exceeded"])
+            );
+        }
+        eprintln!(
+            "response size refusal: direct+wrapped, unknown charge, static bound diagnostic, elapsed={:?}",
+            started_at.elapsed()
+        );
     }
 
     #[tokio::test]

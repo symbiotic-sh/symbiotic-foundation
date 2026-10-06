@@ -415,6 +415,21 @@ This preserves `ModelError::Unavailable(InvalidResponse)` separately from status
 `provider` failures. The malformed body contributes no diagnostics or provider text. This
 failure retains unknown charge and the existing request failure budget debit;
 no parsed answer reaches caller answer validation.
+A successful HTTP response refused for exceeding the route's `max_response_bytes`
+bound keeps `EgressError::Provider { status: None }` and adds
+`DispatchDiagnostic::MaxResponseBytesExceeded` (wire diagnostic
+`max_response_bytes_exceeded`). The shared response reader identifies refusals
+both from Content-Length and while reading a body without a known length. This
+static diagnostic carries no provider body or response bytes and survives runtime
+bookkeeping diagnostics. Dispatch evidence remains `may_have_dispatched = true`,
+spend remains unknown, and each failed send debits the request failure budget
+exactly once. No parsed answer reaches caller answer validation, so no additional
+answer-validation debit occurs. The embedding batch and budget regressions in
+[`embedding_route.rs`](../../crates/symbiotic-credential-process/tests/embedding_route.rs)
+cover the default-bound refusal, three sends before budget exhaustion, and zero
+validator calls; the projection regression in
+[`provider.rs`](../../crates/symbiotic-credential-process/src/provider.rs)
+covers dispatch evidence beneath bookkeeping diagnostics.
 Credential-loading and setup/queue failures before
 transport handoff report `SpendState::Released` and release that reservation for a
 subsequent admitted attempt, while the attempt-count limit still applies. The shared
@@ -623,7 +638,8 @@ with adapter `open_ai_embedding`, operator `openrouter`, dimensions 1024 and
 measures **2,729,388 response bytes**. It needs raised bounds: the test accepts
 `max_response_bytes: 8388608` (8 MiB) and `max_frame_bytes: 37748736` (36 MiB),
 with `max_field_bytes: 1024`; the default response limit returns
-`EgressError::Provider { status: None }`. These are sufficient bounds for the
+`EgressError::Provider { status: None }` with the `max_response_bytes_exceeded`
+diagnostic. These are sufficient bounds for the
 synthetic fixture, not a measured live-provider maximum.
 
 These are **provisional configured hard limits per provider call**, not measured
