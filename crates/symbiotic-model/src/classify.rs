@@ -1159,7 +1159,9 @@ impl ClassifierProvider for JevClassifierProvider {
                         "reported_cost_usd": trace.usage.reported_cost_usd,
                     },
                 });
-                provider_usage_identity(&mut trace, &raw);
+                provider_usage_identity(&mut trace, &raw, |identity| {
+                    jev_request_contains_identity(&request, identity)
+                });
                 Ok(ClassifyResponse {
                     answers,
                     served_model,
@@ -1201,6 +1203,44 @@ pub fn jev_classify_body(
         Some(body) => Ok(body),
         None => wire::encode(&wire_request, None),
     }
+}
+
+// Inspect only text sent by JevWireRequest, excluding its model and type labels.
+// Local metadata and state_description are not provider-visible on this path.
+fn jev_request_contains_identity(request: &ClassifyRequest, identity: &str) -> bool {
+    fn value_contains(value: &Value, identity: &str) -> bool {
+        match value {
+            Value::String(text) => text.contains(identity),
+            Value::Array(values) => values.iter().any(|value| value_contains(value, identity)),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key.contains(identity) || value_contains(value, identity)),
+            _ => false,
+        }
+    }
+    request
+        .state
+        .iter()
+        .any(|(key, value)| key.contains(identity) || value_contains(value, identity))
+        || request.questions.iter().any(|question| {
+            question.id.contains(identity)
+                || question.instructions.contains(identity)
+                || match &question.kind {
+                    QuestionKind::Noul {
+                        when_true,
+                        when_false,
+                    } => when_true
+                        .iter()
+                        .chain(when_false.iter())
+                        .any(|text| text.contains(identity)),
+                    QuestionKind::Choice { options } => options.iter().any(|option| {
+                        option.id.contains(identity) || option.criterion.contains(identity)
+                    }),
+                    QuestionKind::Score { levels } => {
+                        levels.iter().any(|text| text.contains(identity))
+                    }
+                }
+        })
 }
 
 // Questions and Choice options are JSON maps whose order is the presentation
@@ -2804,13 +2844,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regression_jev_request_echoes_are_not_usage_identities() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for location in [
+                "state", "instructions", "true", "false", "choice", "score", "local",
+            ] {
+                let mut req = request(vec![goal_question(), route_question()]);
+                match location {
+                    "state" => {
+                        req.state.insert(
+                            "message".into(),
+                            serde_json::json!({"type":["prefix PRIVATE_PROMPT suffix"]}),
+                        );
+                    }
+                    "instructions" => {
+                        req.questions[0].instructions = "prefix PRIVATE_PROMPT suffix".into();
+                    }
+                    "true" | "false" => req.questions[0].kind = QuestionKind::Noul {
+                        when_true: (location == "true").then(|| "PRIVATE_PROMPT".into()),
+                        when_false: (location == "false").then(|| "PRIVATE_PROMPT".into()),
+                    },
+                    "choice" => {
+                        if let QuestionKind::Choice { options } = &mut req.questions[1].kind {
+                            options[0].criterion = "PRIVATE_PROMPT".into();
+                        }
+                    }
+                    "score" => req.questions.push(ClassifierQuestion::score(
+                        "score",
+                        "Rate it",
+                        ["PRIVATE_PROMPT", "high"],
+                    )),
+                    "local" => {
+                        req.state_description = Some("PRIVATE_PROMPT".into());
+                        req.metadata = serde_json::json!({"text":"PRIVATE_PROMPT"});
+                    }
+                    _ => unreachable!(),
+                }
+                let mut body = jev_body(JEV_DEFAULT_MODEL);
+                body["id"] = serde_json::json!("PRIVATE_PROMPT");
+                if location == "score" {
+                    body["answers"]["score"] = serde_json::json!({"type":"score", "score":0.0, "probabilities":{"0":1.0,"1":0.0}});
+                }
+                let server = mock_http(vec![ok(body)]);
+                let response = with_egress_http_observations(
+                    jev_at(&server).with_timeout(1).unwrap().classify(req),
+                )
+                .await
+                .expect("screening preserves classification");
+                let expected = (location == "local").then_some("PRIVATE_PROMPT");
+                assert_eq!(
+                    response.trace.usage.response_id.as_deref(),
+                    expected,
+                    "{location}"
+                );
+                assert_eq!(
+                    response.trace.metadata["provider"]
+                        .get("response_id")
+                        .and_then(Value::as_str),
+                    expected
+                );
+                assert_eq!(
+                    response.trace.usage.served_model.as_deref(),
+                    Some(JEV_DEFAULT_MODEL)
+                );
+                assert_eq!(response.noul("goal"), Some(0.12));
+                assert_eq!(response.trace.usage.input_tokens, Some(612));
+            }
+        })
+        .await
+        .expect("classifier identity fixtures must finish within three seconds");
+    }
+
+    #[tokio::test]
     async fn regression_jev_served_model_matching_local_description_is_accepted() {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let server = mock_http(vec![ok(jev_body(JEV_DEFAULT_MODEL))]);
             let mut req = request(vec![goal_question(), route_question()]);
             req.state_description = Some(JEV_DEFAULT_MODEL.into());
-            req.state
-                .insert("message".into(), serde_json::json!(JEV_DEFAULT_MODEL));
             let response = with_egress_http_observations(jev_at(&server).classify(req))
                 .await
                 .expect("local content must not screen usage identity");
@@ -2818,6 +2928,30 @@ mod tests {
             assert_eq!(
                 response.trace.usage.served_model.as_deref(),
                 Some(JEV_DEFAULT_MODEL)
+            );
+        })
+        .await
+        .expect("identity fixture must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_jev_served_model_matching_request_state_is_omitted() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let server = mock_http(vec![ok(jev_body(JEV_DEFAULT_MODEL))]);
+            let mut req = request(vec![goal_question(), route_question()]);
+            req.state
+                .insert("message".into(), serde_json::json!(JEV_DEFAULT_MODEL));
+            let response = with_egress_http_observations(
+                jev_at(&server).with_timeout(1).unwrap().classify(req),
+            )
+            .await
+            .expect("screening preserves classification");
+            assert_eq!(response.served_model, JEV_DEFAULT_MODEL);
+            assert!(response.trace.usage.served_model.is_none());
+            assert!(
+                response.trace.metadata["provider"]
+                    .get("served_model")
+                    .is_none()
             );
         })
         .await

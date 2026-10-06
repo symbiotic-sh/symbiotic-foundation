@@ -4359,7 +4359,12 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                         "nested_hit": nested_hit,
                     },
                 });
-                provider_usage_identity(&mut trace, &raw);
+                provider_usage_identity(&mut trace, &raw, |identity| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains(identity))
+                });
                 trace.cache = CacheTrace {
                     response_cache: CacheStatus::Miss,
                     prompt_cache: prompt_cache_status(usage.prompt_tokens, hit, miss),
@@ -4812,7 +4817,11 @@ fn parse_retry_after(
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
 }
 
-fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
+fn provider_usage_identity(
+    trace: &mut ModelInvocationTrace,
+    raw: &Value,
+    request_contains_identity: impl Fn(&str) -> bool,
+) {
     fn contains_identity(value: &Value, identity: &str, payload: bool) -> bool {
         match value {
             Value::String(text) => payload && text.contains(identity),
@@ -4853,6 +4862,8 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
                     && text
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+                    // Borrow provider-visible request text; do not copy or retain it in usage.
+                    && !request_contains_identity(text)
                     // Screen payloads in every choice/block, independently of HTTP observations.
                     && !["choices", "content"].iter().any(|field| {
                         raw.get(field)
@@ -6544,7 +6555,7 @@ mod egress_http_tests {
                         trace.metadata = serde_json::json!({"provider": {
                             "response_id": raw["id"], "served_model": raw["model"]
                         }});
-                        provider_usage_identity(&mut trace, &raw);
+                        provider_usage_identity(&mut trace, &raw, |_| false);
                         let identity = if identity_field == "id" {
                             &trace.usage.response_id
                         } else {
@@ -6589,7 +6600,7 @@ mod egress_http_tests {
             trace.metadata = serde_json::json!({"provider": {
                 "response_id": raw["id"], "served_model": raw["model"]
             }});
-            provider_usage_identity(&mut trace, &raw);
+            provider_usage_identity(&mut trace, &raw, |_| false);
             assert!(trace.usage.response_id.is_none());
             assert!(trace.usage.served_model.is_none());
             assert!(!trace.metadata.to_string().contains("PRIVATE_REASONING"));
@@ -6614,7 +6625,7 @@ mod egress_http_tests {
                     let mut trace = success_trace(
                         &StaticChatProvider::new("OK").descriptor, None, None, String::new(), Some("OK"),
                     );
-                    provider_usage_identity(&mut trace, &raw);
+                    provider_usage_identity(&mut trace, &raw, |_| false);
                     assert!(trace.usage.response_id.is_none(), "{identity}");
                     assert!(trace.usage.served_model.is_none(), "{identity}");
                 }
@@ -6648,7 +6659,7 @@ mod egress_http_tests {
                     String::new(),
                     Some("OK"),
                 );
-                provider_usage_identity(&mut trace, &raw);
+                provider_usage_identity(&mut trace, &raw, |_| false);
                 assert_eq!(trace.usage.response_id.as_deref(), Some(label));
                 assert_eq!(trace.usage.served_model.as_deref(), Some(label));
                 assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
@@ -6690,7 +6701,7 @@ mod egress_http_tests {
             trace.metadata = serde_json::json!({"provider": {
                 "response_id": raw["id"], "served_model": raw["model"]
             }});
-            provider_usage_identity(&mut trace, &raw);
+            provider_usage_identity(&mut trace, &raw, |_| false);
             assert_eq!(trace.usage.response_id.as_deref(), Some("chatcmpl-4abc"));
             assert_eq!(trace.usage.served_model.as_deref(), Some("gpt-4.1"));
             assert_eq!(trace.metadata["provider"]["response_id"], "chatcmpl-4abc");
@@ -6700,7 +6711,7 @@ mod egress_http_tests {
             // The identity-in-payload comparison still rejects exact echoes.
             raw["id"] = serde_json::json!("4");
             raw["model"] = serde_json::json!("4");
-            provider_usage_identity(&mut trace, &raw);
+            provider_usage_identity(&mut trace, &raw, |_| false);
             assert!(trace.usage.response_id.is_none());
             assert!(trace.usage.served_model.is_none());
             assert!(trace.metadata["provider"].get("response_id").is_none());
@@ -6740,7 +6751,7 @@ mod egress_http_tests {
                 serde_json::json!({"created":u64::MAX}),
             ] {
                 let mut trace = new_trace();
-                provider_usage_identity(&mut trace, &raw);
+                provider_usage_identity(&mut trace, &raw, |_| false);
                 assert!(trace.usage.response_id.is_none());
                 assert!(trace.usage.served_model.is_none());
                 assert!(trace.usage.created.is_none());
@@ -6759,6 +6770,7 @@ mod egress_http_tests {
                 provider_usage_identity(
                     &mut trace,
                     &serde_json::json!({"id":id,"model":model,"created":0}),
+                    |_| false,
                 );
                 assert_eq!(trace.usage.response_id.as_deref(), Some(id));
                 assert_eq!(trace.usage.served_model.as_deref(), Some(model));
@@ -6766,7 +6778,7 @@ mod egress_http_tests {
                 assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
             }
             let mut trace = new_trace();
-            provider_usage_identity(&mut trace, &serde_json::json!({}));
+            provider_usage_identity(&mut trace, &serde_json::json!({}), |_| false);
             assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
         })
         .await;

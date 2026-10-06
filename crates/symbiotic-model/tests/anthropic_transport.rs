@@ -591,3 +591,81 @@ async fn regression_anthropic_misses_remain_known_without_cache_reads() {
     assert_eq!(response.trace.usage.cache_hit_tokens, None);
     assert_eq!(response.trace.usage.cache_miss_tokens, Some(30));
 }
+
+#[tokio::test]
+async fn regression_request_echoes_are_not_usage_identities() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for role in ["system", "user", "assistant"] {
+            for scoped in [false, true] {
+                for (identity, content, echo) in [
+                    ("PRIVATE_PROMPT", "PRIVATE_PROMPT", true),
+                    ("PROMPT", "prefix PRIVATE_PROMPT suffix", true),
+                    ("fixture-id", "PRIVATE_PROMPT", false),
+                    (role, "PRIVATE_PROMPT", false),
+                    ("chatcmpl-4abc", "4", false),
+                ] {
+                    let mut req = request();
+                    req.messages = vec![ChatMessage {
+                        role: role.into(),
+                        content: content.into(),
+                    }];
+                    // Anthropic requires a final user turn after system/assistant text.
+                    if role != "user" {
+                        req.messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: "next".into(),
+                        });
+                    }
+                    // Local metadata is not sent and must not screen valid identities.
+                    req.metadata = serde_json::json!({"local": identity});
+                    let body = serde_json::json!({"id":identity,"model":identity,"stop_reason":"end_turn","content":[{"type":"text","text":"OK"},{"type":"thinking","thinking":"unrelated reasoning","signature":"sig"}],"usage":{"input_tokens":7,"output_tokens":2}});
+                    let (url, server) = fixture(200, &body.to_string(), false);
+                    let provider = AnthropicChatProvider::new("fixture", "requested-model", url, "")
+                        .with_timeout(1)
+                        .unwrap();
+                    let call = provider.chat(req);
+                    let response = if scoped {
+                        symbiotic_model::with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .expect("request screening must preserve the paid answer");
+                    let (_, wire) = server.join().unwrap();
+                    assert!(wire.to_string().contains(content));
+                    assert_eq!(response.text, "OK");
+                    assert_eq!(response.trace.usage.input_tokens, Some(7));
+                    assert_eq!(response.trace.usage.output_tokens, Some(2));
+                    assert_eq!(
+                        response.trace.usage.response_id.as_deref(),
+                        (!echo).then_some(identity),
+                        "{role}/{identity}"
+                    );
+                    assert_eq!(
+                        response.trace.usage.served_model.as_deref(),
+                        (!echo).then_some(identity),
+                        "{role}/{identity}"
+                    );
+                    for field in ["response_id", "served_model"] {
+                        assert_eq!(
+                            response.trace.metadata["provider"]
+                                .get(field)
+                                .and_then(serde_json::Value::as_str),
+                            (!echo).then_some(identity)
+                        );
+                    }
+                    assert_eq!(
+                        response.trace.metadata.get("runtime_diagnostics").is_some(),
+                        echo
+                    );
+                    assert!(
+                        !serde_json::to_string(&response.trace)
+                            .unwrap()
+                            .contains("PRIVATE_PROMPT")
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("request identity fixtures must finish within five seconds");
+}
