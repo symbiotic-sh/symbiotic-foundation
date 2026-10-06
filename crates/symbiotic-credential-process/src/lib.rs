@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 pub use symbiotic_ai_runtime::AnswerRecovery;
 use symbiotic_ai_runtime::{Runtime, RuntimeConfig};
@@ -275,15 +275,72 @@ fn validate_frame_size(max_frame_bytes: u32) -> Result<(), EgressError> {
     Ok(())
 }
 
+#[derive(Default)]
+struct RequestBudgetDispatch(Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+
+struct RequestBudgetGate<'a> {
+    owner: &'a RequestBudgetDispatch,
+    key: String,
+    gate: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<'a> RequestBudgetGate<'a> {
+    async fn lock_owned(self) -> Result<(tokio::sync::OwnedMutexGuard<()>, Self), EgressError> {
+        let gate = self.gate.as_ref().ok_or(EgressError::StateUnavailable)?;
+        let guard = gate.clone().lock_owned().await;
+        // Drop the owned mutex guard before the registration, so retirement sees
+        // every holder and waiter leave, including cancellation while waiting.
+        Ok((guard, self))
+    }
+}
+
+impl Drop for RequestBudgetGate<'_> {
+    fn drop(&mut self) {
+        // Poison still refuses subsequent lookup. Cleanup alone can recover the
+        // map: it cannot admit work or alter durable budget accounting.
+        let mut gates = self
+            .owner
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Release our reference under the lookup mutex; concurrent departures
+        // must not both observe another reference and leave an idle entry.
+        drop(self.gate.take());
+        if gates
+            .get(&self.key)
+            .is_some_and(|gate| gate.strong_count() == 0)
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
+impl RequestBudgetDispatch {
+    fn gate(&self, key: &str) -> Result<RequestBudgetGate<'_>, EgressError> {
+        let mut gates = self.0.lock().map_err(|_| EgressError::StateUnavailable)?;
+        let entry = gates.entry(key.to_owned()).or_default();
+        let gate = entry.upgrade().unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            *entry = Arc::downgrade(&gate);
+            gate
+        });
+        Ok(RequestBudgetGate {
+            owner: self,
+            key: key.to_owned(),
+            gate: Some(gate),
+        })
+    }
+}
+
 struct Inner {
     config: ProcessConfig,
     key: AdmissionKey,
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
-    // Hold from budget lookup through durable completion. The process state lock
-    // excludes other processes; this lock prevents simultaneous sends overspending
-    // a request key without another durable in-flight owner.
-    request_budget_dispatch: tokio::sync::Mutex<()>,
+    // One gate per request-budget key, held from admission through durable
+    // completion so snapshot undo and success clearing cannot race another debit.
+    // The final holder/waiter retires only its key under the lookup mutex.
+    request_budget_dispatch: RequestBudgetDispatch,
     runtime: Runtime,
     job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
     _process_lock: Arc<ProcessLock>,
@@ -344,7 +401,7 @@ impl CredentialProcess {
                 key,
                 routes,
                 registry: Mutex::new(registry),
-                request_budget_dispatch: tokio::sync::Mutex::new(()),
+                request_budget_dispatch: RequestBudgetDispatch::default(),
                 runtime,
                 job_runners: tokio::sync::Mutex::new(HashMap::new()),
                 _process_lock: Arc::new(process_lock),
@@ -621,11 +678,8 @@ impl CredentialProcess {
         input_digest: String,
         answer_validator: Option<AnswerValidator>,
     ) -> DispatchResult {
-        let _budget_guard = if route.request_budget.is_some() {
-            Some(self.inner.request_budget_dispatch.lock().await)
-        } else {
-            None
-        };
+        // Resolve first: the credential fingerprint is part of the budget key.
+        let mut _budget_guard = None;
         let source = route.secret.clone();
         let max = self.inner.config.max_secret_bytes;
         let secret = tokio::task::spawn_blocking(move || match source {
@@ -653,17 +707,22 @@ impl CredentialProcess {
                         .map_err(|_| EgressError::StateUnavailable)
                     })
                     .transpose();
-                let admission = budget_key.and_then(|key| {
-                    key.zip(route.request_budget.as_ref())
-                        .map(|(key, policy)| {
-                            self.inner
-                                .registry
-                                .lock()
-                                .map_err(|_| EgressError::StateUnavailable)?
-                                .admit_request_budget(key, policy)
-                        })
-                        .transpose()
-                });
+                let admission = async {
+                    let Some((key, policy)) = budget_key?.zip(route.request_budget.as_ref()) else {
+                        return Ok(None);
+                    };
+                    let gate = self.inner.request_budget_dispatch.gate(&key)?;
+                    // Never await a key or account while holding the map/registry
+                    // mutex. Retain this key's guard until finish commits or fails.
+                    _budget_guard = Some(gate.lock_owned().await?);
+                    self.inner
+                        .registry
+                        .lock()
+                        .map_err(|_| EgressError::StateUnavailable)?
+                        .admit_request_budget(key, policy)
+                        .map(Some)
+                }
+                .await;
                 let execution = match admission {
                     Ok(admission) => {
                         budget_admission = admission;
@@ -1008,6 +1067,74 @@ fn spend_reservation(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_budget_gates_retire_only_the_final_departing_key() {
+        let gates = RequestBudgetDispatch::default();
+        let unrelated: Vec<_> = (0..128)
+            .map(|key| gates.gate(&format!("unrelated-{key}")).unwrap())
+            .collect();
+        let first = gates.gate("retiring").unwrap();
+        let last = gates.gate("retiring").unwrap();
+        drop(first);
+        assert_eq!(gates.0.lock().unwrap().len(), 129);
+        drop(last);
+        assert_eq!(
+            gates.0.lock().unwrap().len(),
+            128,
+            "the final departure retires its key without another admission"
+        );
+        drop(unrelated);
+        assert!(gates.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_budget_gates_keep_same_key_waiters_together_and_allow_other_keys() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let gates = RequestBudgetDispatch::default();
+            let first = gates.gate("same").unwrap().lock_owned().await.unwrap();
+            let waiter = gates.gate("same").unwrap().lock_owned();
+            tokio::pin!(waiter);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let other = gates.gate("other").unwrap().lock_owned().await.unwrap();
+            let same = gates.gate("same").unwrap();
+            assert!(Arc::ptr_eq(
+                same.gate.as_ref().unwrap(),
+                gates.gate("same").unwrap().gate.as_ref().unwrap(),
+            ));
+            drop(first);
+            let held = waiter.await.unwrap();
+            drop(same);
+            // The held guard and registration retain the gate during lookups.
+            let later = gates.gate("same").unwrap();
+            assert!(later.gate.as_ref().unwrap().try_lock().is_err());
+            drop(later);
+            drop(held);
+            drop(other);
+            assert!(gates.0.lock().unwrap().is_empty(), "idle keys retire");
+
+            let first = gates.gate("cancelled").unwrap().lock_owned().await.unwrap();
+            let mut waiter = Box::pin(gates.gate("cancelled").unwrap().lock_owned());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(first);
+            assert_eq!(gates.0.lock().unwrap().len(), 1, "waiter retains its key");
+            drop(waiter);
+            assert!(
+                gates.0.lock().unwrap().is_empty(),
+                "cancelled waiter retires"
+            );
+        })
+        .await
+        .expect("bounded request budget gate regression");
+    }
 
     #[test]
     fn startup_builds_the_validated_registry_once_before_state_access() {
