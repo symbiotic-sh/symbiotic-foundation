@@ -5514,6 +5514,7 @@ mod tests {
             "timing-{}",
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         );
+        let rate_state = ModelRateState::default();
         let provider = QueuedChatProvider::new(
             SlowCountingChat {
                 // Reproduce a slow first request and a provider call above the old 500 ms bound.
@@ -5540,18 +5541,75 @@ mod tests {
                 ..ModelQueueConfig::default()
             },
         )
+        .with_rate_state(rate_state.clone())
         .with_spend_ledger(test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
-        tokio::time::timeout(Duration::from_secs(60), async {
+        let observed_throttle_wait = tokio::time::timeout(Duration::from_secs(60), async {
             provider.chat(chat_request("first")).await.unwrap();
-            provider.chat(chat_request("second")).await.unwrap();
+
+            // Keep the second request waiting for rate budget until this test
+            // replenishes it, independently of how long the first call took.
+            let budget_checked_at = {
+                let mut buckets = rate_state.buckets.lock().unwrap();
+                assert_eq!(buckets.len(), 1);
+                let bucket = buckets.values_mut().next().unwrap();
+                bucket.tokens = 0.0;
+                bucket.rate_per_second = 0.001; // Cannot refill within the hang guard.
+                bucket.updated_at = Instant::now();
+                bucket.updated_at
+            };
+            let mut second = std::pin::pin!(provider.chat(chat_request("second")));
+            loop {
+                assert!(
+                    futures::poll!(&mut second).is_pending(),
+                    "second call must wait for budget"
+                );
+                let checked = rate_state
+                    .buckets
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .updated_at
+                    != budget_checked_at;
+                if checked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            // The budget check has happened and no grant is available. Observe
+            // only the interval we control, excluding enqueue and provider work.
+            // Leave the future parked in this rate sleep until replenishment,
+            // so even a slow observer cannot include work between wait slices.
+            let observed_at = Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let observed = {
+                let mut buckets = rate_state.buckets.lock().unwrap();
+                let observed = observed_at.elapsed();
+                let bucket = buckets.values_mut().next().unwrap();
+                bucket.tokens = bucket.capacity;
+                observed
+            };
+            second.await.unwrap();
+            observed
         })
         .await
         .expect("queued chat calls must finish within the hang guard");
 
         let records = trace_sink.records();
         assert_eq!(records.len(), 2);
+        assert!(observed_throttle_wait.as_millis() > 0);
+        assert!(
+            records[1]
+                .timing
+                .throttle_wait_ms
+                .expect("throttle wait is recorded")
+                >= observed_throttle_wait.as_millis() as u64,
+            "controlled budget wait must be attributed to throttle time: {:?}; observed {observed_throttle_wait:?}",
+            records[1].timing
+        );
         for record in &records {
             let timing = &record.timing;
             let queued = timing.queued_ms.expect("queued time is recorded");
