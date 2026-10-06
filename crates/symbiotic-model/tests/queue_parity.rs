@@ -3559,6 +3559,109 @@ struct TrialJob {
     recovered: Arc<tokio::sync::Notify>,
     finished: std::sync::atomic::AtomicBool,
 }
+
+struct AdmissionJob {
+    payload: Vec<u8>,
+    admitting: std::sync::atomic::AtomicBool,
+    renewed: (Mutex<bool>, std::sync::Condvar),
+    finished: std::sync::atomic::AtomicBool,
+}
+impl symbiotic_model::ModelJob for AdmissionJob {
+    fn recover(&self, _: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
+        Ok(false)
+    }
+    fn claim(
+        &self,
+        _: &symbiotic_model::SpendReservation,
+        _: u32,
+    ) -> Result<Option<Vec<u8>>, ModelError> {
+        Ok(Some(self.payload.clone()))
+    }
+    fn admit_request(&self, _: Option<String>) -> Result<(), ModelError> {
+        self.admitting.store(true, Ordering::SeqCst);
+        let (renewed, _) = self
+            .renewed
+            .1
+            .wait_timeout_while(
+                self.renewed.0.lock().unwrap(),
+                Duration::from_secs(1),
+                |renewed| !*renewed,
+            )
+            .unwrap();
+        if *renewed {
+            Ok(())
+        } else {
+            Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::QueueFailure,
+            ))
+        }
+    }
+    fn heartbeat(&self) -> Result<bool, ModelError> {
+        if self.admitting.load(Ordering::SeqCst) {
+            *self.renewed.0.lock().unwrap() = true;
+            self.renewed.1.notify_one();
+        }
+        Ok(false)
+    }
+    fn finish(
+        &self,
+        state: symbiotic_model::SpendState,
+        _: Option<UsageTrace>,
+        _: Option<Value>,
+        failure: Option<symbiotic_core::DiagnosticCode>,
+        _: bool,
+    ) -> Result<(), ModelError> {
+        assert_eq!(state, symbiotic_model::SpendState::Settled);
+        assert!(failure.is_none());
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn release(&self) -> Result<(), ModelError> {
+        panic!("live admission must proceed")
+    }
+    fn refuse(&self, _: symbiotic_core::DiagnosticCode) -> Result<(), ModelError> {
+        panic!("valid request")
+    }
+    fn eligible(&self) -> Result<bool, ModelError> {
+        Ok(true)
+    }
+    fn can_retry(&self, _: u32) -> Result<bool, ModelError> {
+        Ok(false)
+    }
+    fn attempt(&self) -> Result<u32, ModelError> {
+        Ok(1)
+    }
+    fn heartbeat_interval(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+}
+
+#[tokio::test]
+async fn request_admission_renews_job_lease_before_transport() {
+    let raw = Loopback::new(unique_identity());
+    let input = request("renew during admission");
+    let job = Arc::new(AdmissionJob {
+        payload: serde_json::to_vec(&input).unwrap(),
+        admitting: std::sync::atomic::AtomicBool::new(false),
+        renewed: (Mutex::new(false), std::sync::Condvar::new()),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    });
+    let provider = queued(raw.clone(), Arc::new(MemoryQueue::new()), config())
+        .with_admission(ModelAdmission::new())
+        .with_binding_identity(symbiotic_core::BindingIdentity::new(
+            "tenant", "provider", "1", "account",
+        ))
+        .with_invocation("admission-heartbeat".into())
+        .with_job_owner(job.clone());
+    tokio::time::timeout(Duration::from_secs(2), provider.chat(input))
+        .await
+        .expect("bounded admission")
+        .expect("renewed admission sends");
+    assert!(*job.renewed.0.lock().unwrap());
+    assert!(job.finished.load(Ordering::SeqCst));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+}
+
 impl symbiotic_model::ModelJob for TrialJob {
     fn recover(&self, _: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
         Ok(false)

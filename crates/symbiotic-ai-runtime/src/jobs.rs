@@ -48,6 +48,21 @@ pub trait ModelJobAdmission: Send + Sync {
         row: &JobRecord,
         reservation: &SpendReservation,
     ) -> Result<(), JobError>;
+    /// Bind the resolved credential's request identity before transport, preserving
+    /// the existing per-job allowance. Runs in the canonical writer transaction.
+    fn before_send(
+        &self,
+        _tx: &Transaction<'_>,
+        _row: &JobRecord,
+        _credential_fingerprint: Option<String>,
+    ) -> Result<(), JobError> {
+        Ok(())
+    }
+    /// Retire a request binding in the canonical job completion transaction,
+    /// including completed attempts whose charge remains unknown.
+    fn finish(&self, _tx: &Transaction<'_>, _row: &JobRecord) -> Result<(), JobError> {
+        Ok(())
+    }
     /// Recheck current authority after obtaining the account slot, before claim/reservation.
     fn claim(
         &self,
@@ -767,6 +782,41 @@ impl model::ModelJob for ClaimOwner {
         }
         Ok(payload)
     }
+    fn admit_request(&self, credential_fingerprint: Option<String>) -> Result<(), ModelError> {
+        let Some(admission) = &self.jobs.admission else {
+            return Ok(());
+        };
+        let claim = self.claim_record()?;
+        self.jobs
+            .transaction(|tx, now| {
+                // Recovery can preserve the generation while clearing the lease.
+                // Renew and check cancellation atomically with request binding.
+                match self.jobs.op(
+                    tx,
+                    now,
+                    JobRequest::Heartbeat {
+                        job: claim.id.clone(),
+                        generation: claim.generation,
+                    },
+                )? {
+                    JobResponse::Heartbeat(false) => {}
+                    JobResponse::Heartbeat(true) => {
+                        return Err(JobError::Execution(DiagnosticCode::InvocationCompleted));
+                    }
+                    _ => return Err(JobError::InvalidRequest),
+                }
+                let JobResponse::Job(Some(row)) =
+                    self.jobs.op(tx, now, JobRequest::Get(claim.id.clone()))?
+                else {
+                    return Err(JobError::NotFound);
+                };
+                admission.before_send(tx, &row, credential_fingerprint)
+            })
+            .map_err(|error| match error {
+                JobError::Execution(code) => ModelError::InvalidRequest(code),
+                other => storage(other),
+            })
+    }
     fn heartbeat(&self) -> Result<bool, ModelError> {
         let (job, generation) = {
             let claim = self.claim.lock().map_err(storage)?;
@@ -842,6 +892,9 @@ impl model::ModelJob for ClaimOwner {
                 .map_err(|_| JobError::Storage)?;
                 spend::SqliteSpendLedger::finish_in(tx, &reference, state, usage, evidence)
                     .map_err(|_| JobError::Storage)?;
+                if let Some(admission) = &self.jobs.admission {
+                    admission.finish(tx, &current)?;
+                }
                 if output.is_none() && current.cancel_requested && !current.purged {
                     self.jobs.op(
                         tx,
@@ -1081,6 +1134,210 @@ model_runner!(
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_admission_rejects_invalidated_claims_before_binding() {
+        struct Admitted(std::sync::atomic::AtomicUsize);
+        impl ModelJobAdmission for Admitted {
+            fn enqueue(&self, _: &JobSpec) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn admit(&self, _: &JobRecord, _: &[u8]) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn claim(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: chrono::DateTime<Utc>,
+            ) -> Result<bool, JobError> {
+                Ok(true)
+            }
+            fn accept(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: &SpendReservation,
+            ) -> Result<(), JobError> {
+                Ok(())
+            }
+            fn before_send(
+                &self,
+                _: &Transaction<'_>,
+                _: &JobRecord,
+                _: Option<String>,
+            ) -> Result<(), JobError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("permissions");
+        }
+        let runtime = Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().into()),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let admission = Arc::new(Admitted(std::sync::atomic::AtomicUsize::new(0)));
+        let jobs = runtime
+            .model_jobs(
+                JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "1".into(),
+                    queue: "q".into(),
+                },
+                JobConfig::default(),
+            )
+            .expect("jobs")
+            .with_admission(admission.clone());
+        let binding = ModelBinding::new(model::StaticChatProvider::new("response"))
+            .with_identity(crate::BindingIdentity::new("tenant", "p", "1", "a"));
+        for case in [
+            "live",
+            "expired",
+            "recovered",
+            "reconciled",
+            "cancelled",
+            "purged",
+        ] {
+            let spec = JobSpec {
+                key: case.into(),
+                group: None,
+                owners: vec![case.into()],
+                kind: "chat".into(),
+                execution: Execution::Model,
+                payload: model_job_payload(&binding, &serde_json::json!({"input": case}))
+                    .expect("payload"),
+                admission: Some(b"signed".to_vec()),
+                limits: JobLimits { max_attempts: 3 },
+                recovery_until: None,
+            };
+            let JobResponse::Enqueued(rows) = jobs
+                .request(JobRequest::Enqueue(vec![spec]))
+                .await
+                .expect("enqueue")
+            else {
+                panic!("enqueued")
+            };
+            let Enqueued::Inserted(id) = &rows[0] else {
+                panic!("inserted")
+            };
+            let (_stop, stop) = watch::channel(false);
+            let owner = ClaimOwner {
+                answer_recovery: crate::AnswerRecovery::default(),
+                jobs: jobs.clone(),
+                candidate: id.clone(),
+                claim: Mutex::new(None),
+                heartbeat: Duration::from_millis(10),
+                finished: AtomicBool::new(false),
+                stop,
+            };
+            let reservation = SpendReservation {
+                reference: crate::SpendReceiptRef::new(case).expect("reference"),
+                account: "account".into(),
+                invocation: case.into(),
+                binding: "binding".into(),
+                request_limit: None,
+            };
+            assert!(
+                model::ModelJob::claim(&owner, &reservation, 3)
+                    .expect("claim")
+                    .is_some()
+            );
+            if matches!(case, "expired" | "recovered" | "reconciled") {
+                jobs.transaction(|tx, now| {
+                    // Expire without a wall-clock wait; recovery still uses the real owner.
+                    tx.execute(
+                        "UPDATE jobs SET lease_until=?1 WHERE id=?2",
+                        params![
+                            (now - chrono::Duration::seconds(1)).timestamp_millis(),
+                            id.id
+                        ],
+                    )
+                    .map_err(|_| JobError::Storage)?;
+                    Ok(())
+                })
+                .expect("expire");
+            }
+            if matches!(case, "recovered" | "reconciled") {
+                jobs.recover("chat".into()).await.expect("recover");
+                let JobResponse::Job(Some(row)) = jobs
+                    .request(JobRequest::Get(id.clone()))
+                    .await
+                    .expect("recovered row")
+                else {
+                    panic!("row")
+                };
+                assert_eq!(row.state, JobState::Uncertain);
+                assert_eq!(
+                    row.generation,
+                    owner.claim_record().expect("claim").generation
+                );
+                assert!(row.lease_until.is_none());
+            }
+            if case == "reconciled" {
+                jobs.transaction(|tx, _| {
+                    spend::SqliteSpendLedger::finish_in(
+                        tx,
+                        &reservation.reference,
+                        SpendState::Released,
+                        None,
+                        None,
+                    )
+                    .map_err(|_| JobError::Storage)
+                })
+                .expect("reconcile zero charge");
+            }
+            if case == "cancelled" {
+                jobs.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
+                    .await
+                    .expect("cancel");
+            }
+            if case == "purged" {
+                jobs.request(JobRequest::PurgeOwner(case.into()))
+                    .await
+                    .expect("purge");
+            }
+            let bound_before = admission.0.load(Ordering::SeqCst);
+            let result = model::ModelJob::admit_request(&owner, None);
+            if case == "live" {
+                result.expect("live claim admitted");
+                assert_eq!(admission.0.load(Ordering::SeqCst), bound_before + 1);
+            } else {
+                let error = result.expect_err(case);
+                assert_eq!(
+                    error.code(),
+                    if matches!(case, "cancelled" | "purged") {
+                        DiagnosticCode::InvocationCompleted
+                    } else {
+                        DiagnosticCode::SpendLedgerUnavailable
+                    },
+                    "{case}"
+                );
+                assert_eq!(admission.0.load(Ordering::SeqCst), bound_before, "{case}");
+            }
+            let receipt = spend::receipt_in(
+                &jobs.ledger.0.lock().expect("ledger"),
+                &reservation.reference,
+            )
+            .expect("receipt")
+            .expect("present");
+            assert_eq!(
+                receipt.state,
+                if case == "reconciled" {
+                    SpendState::Released
+                } else {
+                    SpendState::Unknown
+                },
+                "{case}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn final_acceptance_expiry_rolls_back_and_resumes_the_same_runner() {

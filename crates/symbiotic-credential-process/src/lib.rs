@@ -693,34 +693,24 @@ impl CredentialProcess {
         let mut budget_admission = None;
         match secret {
             Ok(Ok(secret)) => {
-                let budget_key = route
-                    .request_budget
-                    .as_ref()
-                    .map(|_| {
-                        symbiotic_ai_runtime::model::configuration_revision(&(
-                            &route.tenant,
-                            &route.route,
-                            symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
-                            &input_digest,
-                        ))
-                        .map(|digest| digest.0)
-                        .map_err(|_| EgressError::StateUnavailable)
-                    })
-                    .transpose();
+                let request_key = request_key(
+                    &route,
+                    &input_digest,
+                    symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
+                );
                 let admission = async {
-                    let Some((key, policy)) = budget_key?.zip(route.request_budget.as_ref()) else {
-                        return Ok(None);
-                    };
-                    let gate = self.inner.request_budget_dispatch.gate(&key)?;
-                    // Never await a key or account while holding the map/registry
-                    // mutex. Retain this key's guard until finish commits or fails.
-                    _budget_guard = Some(gate.lock_owned().await?);
+                    let key = request_key?;
+                    if route.request_budget.is_some() {
+                        let gate = self.inner.request_budget_dispatch.gate(&key)?;
+                        // Never await a key or account while holding the map/registry
+                        // mutex. Retain this key's guard until finish commits or fails.
+                        _budget_guard = Some(gate.lock_owned().await?);
+                    }
                     self.inner
                         .registry
                         .lock()
                         .map_err(|_| EgressError::StateUnavailable)?
-                        .admit_request_budget(key, policy)
-                        .map(Some)
+                        .admit_request(&receipt.attempt_digest, key, route.request_budget.as_ref())
                 }
                 .await;
                 let execution = match admission {
@@ -1040,6 +1030,21 @@ fn egress_reference(
 ) -> Result<symbiotic_ai_runtime::SpendReceiptRef, EgressError> {
     symbiotic_ai_runtime::SpendReceiptRef::new(format!("egress:{}", digest(a)?))
         .map_err(|_| EgressError::LimitExceeded)
+}
+
+fn request_key(
+    route: &RouteConfig,
+    input_digest: &str,
+    credential_fingerprint: Option<String>,
+) -> Result<String, EgressError> {
+    symbiotic_ai_runtime::model::configuration_revision(&(
+        &route.tenant,
+        &route.route,
+        credential_fingerprint,
+        input_digest,
+    ))
+    .map(|digest| digest.0)
+    .map_err(|_| EgressError::StateUnavailable)
 }
 
 fn spend_reservation(

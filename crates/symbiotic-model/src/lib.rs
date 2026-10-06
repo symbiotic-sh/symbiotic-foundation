@@ -2521,11 +2521,25 @@ where
         if let Some(rate) = rate {
             rate.charge()?;
         }
-        Ok::<_, ModelError>(provider)
+        let fingerprint = provider.credential_fingerprint();
+        let owner = job.clone();
+        let admission = run_blocking(move || owner.admit_request(fingerprint)).await;
+        Ok::<_, ModelError>((provider, admission))
     })
     .await;
     let provider = match prepared {
-        Ok(provider) => provider,
+        Ok((provider, Ok(()))) => provider,
+        Ok((_, Err(error))) => {
+            // Admission precedes every transport future, so its refusal is known
+            // zero charge and remains visible in the canonical job result.
+            let owner = job.clone();
+            let failure = error.code();
+            run_blocking(move || {
+                owner.finish(SpendState::Released, None, None, Some(failure), false)
+            })
+            .await?;
+            return Err(error);
+        }
         Err(error) => {
             let owner = job.clone();
             let failure = error.code();
@@ -2718,7 +2732,7 @@ fn combine_attempt_errors<T>(
     })))
 }
 
-// One renewal owner covers both receipt preparation and dispatched transport.
+// One renewal owner covers preparation, request admission and dispatched transport.
 // Before dispatch, cancellation or renewal failure releases the reservation;
 // after dispatch, accounting must finish before a renewal error reaches the caller.
 #[cfg(feature = "queue")]
