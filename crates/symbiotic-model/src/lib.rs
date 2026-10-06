@@ -4769,16 +4769,27 @@ fn parse_retry_after(
 }
 
 fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
-    fn contains_identity(value: &Value, identity: &str, payload: bool) -> bool {
+    fn contains_identity(value: &Value, identity: &str, payload: bool, reasoning: bool) -> bool {
         match value {
             Value::String(text) => {
                 payload
-                    && (text.contains(identity) || (!text.is_empty() && identity.contains(text)))
+                    && (text.contains(identity)
+                        || (reasoning && !text.is_empty() && identity.contains(text)))
             }
             Value::Array(values) => values
                 .iter()
-                .any(|value| contains_identity(value, identity, payload)),
+                .any(|value| contains_identity(value, identity, payload, reasoning)),
             Value::Object(values) => values.iter().any(|(field, value)| {
+                let reasoning = reasoning
+                    || matches!(
+                        field.as_str(),
+                        "reasoning_content"
+                            | "reasoning"
+                            | "reasoning_details"
+                            | "thinking"
+                            | "signature"
+                            | "data"
+                    );
                 // Protocol labels describe payloads; they are not answer or reasoning text.
                 !matches!(
                     field.as_str(),
@@ -4787,18 +4798,9 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
                     value,
                     identity,
                     payload
-                        || matches!(
-                            field.as_str(),
-                            "content"
-                                | "text"
-                                | "refusal"
-                                | "reasoning_content"
-                                | "reasoning"
-                                | "reasoning_details"
-                                | "thinking"
-                                | "signature"
-                                | "data"
-                        ),
+                        || reasoning
+                        || matches!(field.as_str(), "content" | "text" | "refusal"),
+                    reasoning,
                 )
             }),
             _ => false,
@@ -4815,7 +4817,9 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
                     // Screen payloads in every choice/block, independently of HTTP observations.
                     && !["choices", "content"].iter().any(|field| {
                         raw.get(field)
-                            .is_some_and(|value| contains_identity(value, text, *field == "content"))
+                            .is_some_and(|value| {
+                                contains_identity(value, text, *field == "content", false)
+                            })
                     })
             });
             invalid |= token.is_none();
@@ -6612,6 +6616,54 @@ mod egress_http_tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn regression_payload_boundary_preserves_short_answer_identities() {
+        for payload in [
+            serde_json::json!({"choices":[{"message":{"content":"4",
+                "reasoning_content":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":[{"text":"4"}],
+                "reasoning_details":[{"text":"PRIVATE_REASONING"}]}}]}),
+            serde_json::json!({"choices":[{"message":{"refusal":"4",
+                "reasoning":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"content":[{"type":"text","text":"4"},
+                {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"},
+                {"type":"redacted_thinking","data":"REDACTED_REASONING"}]}),
+        ] {
+            let mut raw = payload;
+            raw["id"] = serde_json::json!("chatcmpl-4abc");
+            raw["model"] = serde_json::json!("gpt-4.1");
+            let mut trace = success_trace(
+                &StaticChatProvider::new("4").descriptor,
+                None,
+                None,
+                String::new(),
+                Some("4"),
+            );
+            trace.metadata = serde_json::json!({"provider": {
+                "response_id": raw["id"], "served_model": raw["model"]
+            }});
+            provider_usage_identity(&mut trace, &raw);
+            assert_eq!(trace.usage.response_id.as_deref(), Some("chatcmpl-4abc"));
+            assert_eq!(trace.usage.served_model.as_deref(), Some("gpt-4.1"));
+            assert_eq!(trace.metadata["provider"]["response_id"], "chatcmpl-4abc");
+            assert_eq!(trace.metadata["provider"]["served_model"], "gpt-4.1");
+            assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+
+            // The existing identity-in-answer comparison still rejects exact echoes.
+            raw["id"] = serde_json::json!("4");
+            raw["model"] = serde_json::json!("4");
+            provider_usage_identity(&mut trace, &raw);
+            assert!(trace.usage.response_id.is_none());
+            assert!(trace.usage.served_model.is_none());
+            assert!(trace.metadata["provider"].get("response_id").is_none());
+            assert!(trace.metadata["provider"].get("served_model").is_none());
+            assert_eq!(
+                trace.metadata[RUNTIME_DIAGNOSTICS][0]["kind"],
+                "invalid_usage_identity"
+            );
+        }
     }
 
     #[tokio::test]

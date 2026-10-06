@@ -399,10 +399,12 @@ For all OpenAI-compatible and Anthropic calls, independently of HTTP observation
 scope, `response_id` and `served_model` are screened against answer and reasoning
 payload values in response choices and content blocks, including nested reasoning,
 thinking, signatures and redacted thinking data. Protocol discriminators such as
-roles, block types and finish reasons are excluded. An identity that occurs in a
-payload string, or contains a complete nonempty payload string, is omitted from
-both typed usage and provider trace metadata, with an `invalid_usage_identity`
-diagnostic; the paid answer is preserved.
+roles, block types and finish reasons are excluded. An identity that occurs in an
+answer or reasoning payload string, or contains a complete nonempty reasoning
+payload string, is omitted from both typed usage and provider trace metadata,
+with an `invalid_usage_identity` diagnostic; the paid answer is preserved.
+An identity containing a short final answer remains valid unless it otherwise
+fails screening.
 No new persistent store is introduced: immediate replies and recovery derive
 usage from the existing canonical spend receipt.
 `reported_cost_usd` is separate from integer `cost_micro_usd`; the process neither
