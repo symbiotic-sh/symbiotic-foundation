@@ -114,6 +114,9 @@ pub enum EgressError {
         /// HTTP status when the failure came from a non-success response.
         status: Option<u16>,
     },
+    /// A successful HTTP response was not valid JSON; dispatch charge may be unknown.
+    #[error("provider response is not valid JSON; dispatch charge may be unknown")]
+    InvalidProviderJson,
     /// Protocol transport failed. A dispatch may already have incurred a charge.
     #[error("egress transport unavailable; dispatch charge may be unknown")]
     Transport,

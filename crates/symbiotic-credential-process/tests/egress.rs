@@ -6550,39 +6550,112 @@ async fn regression_egress_classification_rejects_cache_contradictions() {
 }
 
 #[tokio::test]
-async fn regression_egress_invalid_chat_json_is_provider_failure() {
+async fn regression_invalid_provider_json_preserves_charge_and_budget_openai() {
+    invalid_provider_json_preserves_charge_and_budget(false).await;
+}
+
+#[tokio::test]
+async fn regression_invalid_provider_json_preserves_charge_and_budget_anthropic() {
+    invalid_provider_json_preserves_charge_and_budget(true).await;
+}
+
+async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        for anthropic in [false, true] {
-            let mut fixture = Fixture::with_http_response(
-                200,
-                "invalid JSON".into(),
-                Duration::ZERO,
-                "0",
-                true,
-                false,
-            )
-            .await;
-            if anthropic {
-                fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
-                    operator: "test".into(),
-                    thinking: None,
-                };
-            }
-            let process = fixture.process().await;
-            let (admission, payload) = fixture.attempt("invalid-json", 1, 1);
-            let granted = permit(&process, &admission).await;
-            let result = dispatched(
-                exchange(&process, inject(admission.clone(), payload, granted))
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(result.error, Some(EgressError::Provider { status: None }));
-            drop(process);
-            let process = fixture.process().await;
-            let AttemptStatus::Failed { result } = status(&process, &admission).await else {
-                panic!("missing failure")
+        let mut fixture = Fixture::with_http_response(
+            200,
+            "invalid JSON".into(),
+            Duration::ZERO,
+            "0",
+            true,
+            false,
+        )
+        .await;
+        if anthropic {
+            fixture.config.routes[0].provider = RouteProvider::AnthropicChat {
+                operator: "test".into(),
+                thinking: None,
             };
-            assert_eq!(result.error, Some(EgressError::Provider { status: None }));
+        }
+        configure_request_budget(&mut fixture, 3, None);
+        let mut process = fixture.process().await;
+        let validations = Arc::new(AtomicUsize::new(0));
+        let mut failures = Vec::new();
+        for call in 0..6 {
+            if call == 2 {
+                drop(process);
+                process = fixture.process().await;
+            }
+            let observed = validations.clone();
+            let invocation = format!("invalid-json-{call}");
+            let result =
+                validated_request_budget_call(&fixture, &process, &invocation, move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    false
+                })
+                .await;
+            if call < 3 {
+                assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+                assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+                assert!(result.receipt_persisted && result.output.is_none());
+                assert!(result.diagnostics.is_empty());
+                let (admission, _) = fixture.attempt(&invocation, 1, 1);
+                let AttemptStatus::Failed { result: recovered } =
+                    status(&process, &admission).await
+                else {
+                    panic!("missing failure");
+                };
+                assert_eq!(
+                    serde_json::to_value(&recovered).unwrap(),
+                    serde_json::to_value(&result).unwrap()
+                );
+                failures.push(result);
+            } else {
+                assert_request_budget_refused(&result);
+            }
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            validations.load(Ordering::SeqCst),
+            0,
+            "no parsed answer to validate"
+        );
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let count: u32 = conn
+            .query_row(
+                "SELECT failed_sends FROM egress_request_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "malformed JSON consumes exactly one failed-send debit"
+        );
+        drop(process);
+        let process = fixture.process().await;
+        for (call, result) in failures.iter().enumerate() {
+            let (admission, _) = fixture.attempt(&format!("invalid-json-{call}"), 1, 1);
+            let AttemptStatus::Failed { result: recovered } = status(&process, &admission).await
+            else {
+                panic!("missing failure after restart");
+            };
+            assert_eq!(
+                serde_json::to_value(&recovered).unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(result.error).unwrap(),
+                serde_json::json!("invalid_provider_json")
+            );
+            let wire = serde_json::to_string(&recovered).unwrap();
+            assert!(!wire.contains("invalid JSON"));
+            assert!(!wire.contains(SECRET));
         }
     })
     .await

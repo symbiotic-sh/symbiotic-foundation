@@ -224,10 +224,12 @@ fn execute_error(error: ModelError, started: &AtomicBool) -> ExecuteError {
             _ if error.http_details().is_some() => EgressError::Provider {
                 status: error.http_details().map(|(status, _)| status),
             },
-            ModelError::Unavailable(model::DiagnosticCode::InvalidResponse)
-            | ModelError::Provider(_)
-            | ModelError::Auth(_)
-            | ModelError::BudgetExhausted(_) => EgressError::Provider { status: None },
+            ModelError::Unavailable(model::DiagnosticCode::InvalidResponse) => {
+                EgressError::InvalidProviderJson
+            }
+            ModelError::Provider(_) | ModelError::Auth(_) | ModelError::BudgetExhausted(_) => {
+                EgressError::Provider { status: None }
+            }
             ModelError::Queue(_) => EgressError::StateUnavailable,
             ModelError::InvalidRequest(_) => EgressError::InvalidRequest,
             _ => EgressError::Transport,
@@ -758,6 +760,43 @@ mod tests {
                 model::FailureCharge::KnownZero
             );
             assert_eq!(provider.started.load(Ordering::SeqCst), started_after);
+        }
+    }
+
+    #[test]
+    fn malformed_json_keeps_its_class_without_broadening_provider_failures() {
+        let provider = OpenAiCompatibleChatProvider::new("test", "test", "http://localhost", "");
+        let started = AtomicBool::new(true);
+        for (error, expected) in [
+            (
+                ModelError::Unavailable(model::DiagnosticCode::InvalidResponse),
+                serde_json::json!("invalid_provider_json"),
+            ),
+            (
+                ModelError::Provider(model::DiagnosticCode::InvalidResponse),
+                serde_json::json!({"provider": {"status": null}}),
+            ),
+            (
+                ModelError::Provider(model::DiagnosticCode::ProviderResponseIsNotValidUtf8),
+                serde_json::json!({"provider": {"status": null}}),
+            ),
+            (
+                ModelError::Auth(model::DiagnosticCode::InvalidConfiguration),
+                serde_json::json!({"provider": {"status": null}}),
+            ),
+            (
+                ModelError::BudgetExhausted(model::DiagnosticCode::AttemptBudgetExhausted),
+                serde_json::json!({"provider": {"status": null}}),
+            ),
+        ] {
+            assert_eq!(
+                provider.failure_charge(&error),
+                model::FailureCharge::Unknown
+            );
+            let actual = execute_error(error, &started);
+            assert_eq!(serde_json::to_value(actual.code).unwrap(), expected);
+            assert!(actual.may_have_dispatched);
+            assert!(actual.diagnostics.is_empty());
         }
     }
 
