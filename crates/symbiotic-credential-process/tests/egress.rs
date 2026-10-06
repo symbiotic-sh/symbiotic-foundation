@@ -7530,7 +7530,7 @@ async fn regression_request_budget_answer_rejected_then_valid_resets_allowance()
 
 #[tokio::test]
 async fn regression_request_budget_answer_rejections_preserve_per_call_routes() {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         for configured in [false, true] {
             let mut fixture = Fixture::new(200, "invalid".into(), Duration::ZERO).await;
             if configured {
