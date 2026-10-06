@@ -123,7 +123,10 @@ fn built_in_clients_ignore_ambient_proxies() {
                             .classify(classify_request())
                             .await
                             .unwrap();
-                    assert_eq!(response.trace.metadata["provider"]["response_id"], "direct");
+                    assert_eq!(
+                        response.trace.metadata["provider"]["response_id"],
+                        "response-direct"
+                    );
                 } else {
                     let mut provider = OpenAiCompatibleChatProvider::new(
                         "fixture",
@@ -146,8 +149,9 @@ fn built_in_clients_ignore_ambient_proxies() {
     for adapter in ["configured", "raw_chat", "raw_classifier"] {
         let stop = Arc::new(AtomicBool::new(false));
         let body = |id| {
+            // The response id must not repeat the answer text, or identity screening drops it.
             serde_json::to_vec(&serde_json::json!({
-                "id": id, "model": "fixture",
+                "id": format!("response-{id}"), "model": "fixture",
                 "choices": [{"message": {"content": id}}],
                 "answers": {"goal": {"type": "noul", "noul": 0.25}}
             }))
