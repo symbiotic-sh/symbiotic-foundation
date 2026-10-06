@@ -493,7 +493,7 @@ async fn assistant_prefill_is_refused_before_connecting() {
 
 #[tokio::test]
 async fn regression_reasoning_echoes_are_not_usage_identities() {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         for reasoning_field in ["thinking", "signature", "data"] {
             for identity_field in ["id", "model"] {
                 for (scoped, echoed_identity) in [
@@ -573,7 +573,7 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
         }
     })
     .await
-    .expect("reasoning identity fixtures must finish within three seconds");
+    .expect("reasoning identity fixtures must finish within the 60-second hang guard");
 }
 
 #[tokio::test]

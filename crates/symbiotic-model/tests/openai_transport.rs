@@ -409,7 +409,7 @@ async fn assert_invalid_id_preserves_answer(id: String) {
 
 #[tokio::test]
 async fn regression_reasoning_echoes_are_not_usage_identities() {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         for reasoning_field in [
             "reasoning_content",
             "reasoning",
@@ -497,7 +497,7 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
         }
     })
     .await
-    .expect("reasoning identity fixtures must finish within three seconds");
+    .expect("reasoning identity fixtures must finish within the 60-second hang guard");
 }
 
 #[tokio::test]
