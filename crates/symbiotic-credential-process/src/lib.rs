@@ -876,10 +876,10 @@ fn validate_route(route: &RouteConfig, max_frame: u32) -> Result<(), EgressError
 }
 
 fn validate_payload(route: &RouteConfig, payload: &ProviderPayload) -> Result<(), EgressError> {
-    let bytes = serde_json::to_vec(payload).map_err(|_| EgressError::InvalidRequest)?;
-    if bytes.len() > route.max_input_bytes {
-        return Err(EgressError::LimitExceeded);
-    }
+    // Route validation bounds this limit by half the u32-sized frame limit.
+    let max_bytes =
+        u32::try_from(route.max_input_bytes).map_err(|_| EgressError::InvalidRequest)?;
+    encode_frame(payload, max_bytes)?;
     match (&route.provider, payload) {
         (RouteProvider::JevClassifier { .. }, ProviderPayload::Classify(request)) => {
             symbiotic_ai_runtime::model::wire::jev_classify_body(
@@ -1206,5 +1206,83 @@ mod tests {
             lock_process(dir.path()),
             Err(EgressError::StateUnavailable)
         ));
+    }
+}
+
+#[cfg(test)]
+#[path = "../../test-support/request_allocations.rs"]
+mod request_allocations;
+
+#[cfg(test)]
+mod request_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn request_encoding_typed_payload_stops_at_byte_limit() {
+        let mut route = RouteConfig {
+            tenant: "tenant".into(),
+            account: "account".into(),
+            account_sharing_key: None,
+            provider_request_limit: None,
+            max_attempts: 1,
+            request_budget: None,
+            answer_recovery: AnswerRecovery::default(),
+            route: "chat".into(),
+            secret_ref: String::new(),
+            secret: SecretSource::None,
+            destination: "http://127.0.0.1".into(),
+            model: "model".into(),
+            provider: RouteProvider::OpenAiChat {
+                operator: "test".into(),
+                thinking: None,
+                reasoning_effort: None,
+            },
+            allow_loopback_http: true,
+            max_input_bytes: 1024,
+            max_response_bytes: 1024,
+            max_field_bytes: 128,
+            max_output_tokens: 10,
+            max_in_flight: 1,
+            requests_per_minute: None,
+            input_units_per_minute: None,
+            timeout_seconds: 1,
+        };
+        let mut payload = ProviderPayload::Chat(ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hello\n\"é".into(),
+            }],
+            max_output_tokens: Some(10),
+            temperature: None,
+            response_format: None,
+            role_binding: None,
+            source: None,
+            metadata: serde_json::Value::Null,
+        });
+        let before = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(encode_frame(&payload, before.len() as u32).unwrap(), before);
+        route.max_input_bytes = before.len();
+        assert_eq!(validate_payload(&route, &payload), Ok(()));
+        route.max_input_bytes -= 1;
+        assert_eq!(
+            validate_payload(&route, &payload),
+            Err(EgressError::LimitExceeded)
+        );
+        route.max_input_bytes = 1024;
+        if let ProviderPayload::Chat(request) = &mut payload {
+            request.messages[0].content = "x".repeat(128 * 1024);
+        }
+        let (result, allocated) =
+            request_allocations::allocated(|| validate_payload(&route, &payload));
+        assert_eq!(result, Err(EgressError::LimitExceeded));
+        eprintln!(
+            "typed payload rejected: {allocated} allocated bytes, cap {}",
+            route.max_input_bytes
+        );
+        assert!(
+            allocated <= 8 * route.max_input_bytes,
+            "allocated {allocated} bytes for a {}-byte cap",
+            route.max_input_bytes
+        );
     }
 }

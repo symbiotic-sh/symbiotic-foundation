@@ -6,22 +6,31 @@ use serde::Serialize;
 use serde_json::Value;
 use std::io::{self, Write};
 
-struct CappedBody {
-    bytes: Vec<u8>,
+#[cfg(test)]
+thread_local! {
+    static SERIALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CappedWriter<W> {
+    output: W,
+    written: usize,
     max_bytes: usize,
 }
 
-impl Write for CappedBody {
+impl<W: Write> Write for CappedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.max_bytes - self.bytes.len() {
+        if bytes.len() > self.max_bytes - self.written {
             return Err(io::Error::other("provider request limit exceeded"));
         }
-        self.bytes.extend_from_slice(bytes);
+        self.output.write_all(bytes)?;
+        #[cfg(test)]
+        SERIALIZED_BYTES.with(|count| count.set(count.get() + bytes.len()));
+        self.written += bytes.len();
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.output.flush()
     }
 }
 
@@ -29,14 +38,28 @@ pub(crate) fn encode(
     value: &impl Serialize,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
-    let mut body = CappedBody {
-        bytes: Vec::new(),
+    let mut body = CappedWriter {
+        output: Vec::new(),
+        written: 0,
         max_bytes: max_bytes.unwrap_or(usize::MAX),
     };
     serde_json::to_writer(&mut body, value).map_err(|_| {
         ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded)
     })?;
-    Ok(body.bytes)
+    Ok(body.output)
+}
+
+/// Count encoded JSON bytes without buffering, refusing to exceed `max_bytes`.
+pub(crate) fn encoded_len(value: &impl Serialize, max_bytes: usize) -> Result<usize, ModelError> {
+    let mut counter = CappedWriter {
+        output: io::sink(),
+        written: 0,
+        max_bytes,
+    };
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded)
+    })?;
+    Ok(counter.written)
 }
 
 #[derive(Serialize)]
@@ -48,12 +71,18 @@ struct OpenAiChatWireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<Value>,
+    response_format: Option<ResponseFormat<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     stream: bool,
+}
+
+#[derive(Serialize)]
+struct ResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
 }
 
 /// Encode the complete OpenAI-compatible HTTP body, refusing to buffer more than
@@ -75,7 +104,7 @@ pub fn openai_chat_body(
             response_format: request
                 .response_format
                 .as_deref()
-                .map(|format| serde_json::json!({ "type": format })),
+                .map(|kind| ResponseFormat { kind }),
             thinking: thinking.map(|mode| serde_json::json!({ "type": mode })),
             reasoning_effort,
             stream: false,
@@ -93,17 +122,40 @@ struct GeminiEmbedWireRequest<'a> {
 
 #[derive(Serialize)]
 struct GeminiBatchEmbedWireRequest<'a> {
-    requests: Vec<GeminiEmbedWireRequest<'a>>,
+    requests: GeminiRequests<'a>,
 }
 
 #[derive(Serialize)]
 struct GeminiContent<'a> {
-    parts: Vec<GeminiPart<'a>>,
+    parts: [GeminiPart<'a>; 1],
 }
 
 #[derive(Serialize)]
 struct GeminiPart<'a> {
     text: &'a str,
+}
+
+struct GeminiRequests<'a> {
+    model: &'a str,
+    dimensions: usize,
+    inputs: &'a [String],
+}
+
+impl Serialize for GeminiRequests<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.inputs.len()))?;
+        for input in self.inputs {
+            seq.serialize_element(&GeminiEmbedWireRequest {
+                model: self.model,
+                content: GeminiContent {
+                    parts: [GeminiPart { text: input }],
+                },
+                output_dimensionality: self.dimensions,
+            })?;
+        }
+        seq.end()
+    }
 }
 
 /// Refuse request options the installed Gemini adapter does not implement.
@@ -141,7 +193,7 @@ pub fn gemini_embedding_body(
     let wire_request = |input| GeminiEmbedWireRequest {
         model: &model,
         content: GeminiContent {
-            parts: vec![GeminiPart { text: input }],
+            parts: [GeminiPart { text: input }],
         },
         output_dimensionality: dimensions,
     };
@@ -150,11 +202,11 @@ pub fn gemini_embedding_body(
     } else {
         encode(
             &GeminiBatchEmbedWireRequest {
-                requests: request
-                    .inputs
-                    .iter()
-                    .map(|input| wire_request(input.as_str()))
-                    .collect(),
+                requests: GeminiRequests {
+                    model: &model,
+                    dimensions,
+                    inputs: &request.inputs,
+                },
             },
             max_bytes,
         )
@@ -227,6 +279,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_encoding_jev_preflight_stays_within_token_budgets_and_body_cap() {
+        let state_request = crate::ClassifyRequest::new(
+            serde_json::from_value(serde_json::json!({"text": "x".repeat(16_384)})).unwrap(),
+            vec![crate::ClassifierQuestion::noul("q", "", None, None)],
+        );
+        let questions_request = crate::ClassifyRequest::new(
+            serde_json::Map::new(),
+            (0..1000)
+                .map(|id| crate::ClassifierQuestion::noul(id.to_string(), "", None, None))
+                .collect(),
+        );
+        for (trigger, request) in [("state", state_request), ("questions", questions_request)] {
+            assert!(jev_classify_body("jev", &request, None).is_ok());
+            SERIALIZED_BYTES.with(|count| count.set(0));
+            let error = jev_classify_body("jev", &request, Some(1024)).unwrap_err();
+            let serialized = SERIALIZED_BYTES.with(|count| count.get());
+            assert_eq!(
+                error.code(),
+                symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded
+            );
+            eprintln!("Jev {trigger} rejected: {serialized} serialized bytes, cap 1024");
+            // The fixed token budgets precede the byte cap to preserve diagnostics.
+            // Count successful writes across preflight and capped body encoding.
+            // Internal string escape scans are outside the capped-writer contract.
+            let preflight_budget = 63_488;
+            assert!(
+                serialized <= preflight_budget + 1024,
+                "serialized {serialized} bytes"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_wire_refuses_unsupported_task_and_conflicting_dimensions() {
         let mut request = EmbeddingRequest {
             inputs: vec!["synthetic".into()],
@@ -276,19 +361,44 @@ mod tests {
     }
 
     #[test]
+    fn request_encoding_counter_stops_serializing_at_the_cap() {
+        use serde::ser::SerializeSeq;
+        use std::cell::Cell;
+
+        struct Items(Cell<usize>);
+        impl Serialize for Items {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(4096))?;
+                for _ in 0..4096 {
+                    self.0.set(self.0.get() + 1);
+                    seq.serialize_element("x")?;
+                }
+                seq.end()
+            }
+        }
+        let items = Items(Cell::new(0));
+        assert!(encoded_len(&items, 32).is_err());
+        assert_eq!(items.0.get(), 9);
+        assert_eq!(encoded_len(&["x", "y"], 9).unwrap(), 9);
+        assert!(encoded_len(&["x", "y"], 8).is_err());
+    }
+
+    #[test]
     fn capped_writer_never_buffers_beyond_limit() {
-        let mut writer = CappedBody {
-            bytes: Vec::new(),
+        let mut writer = CappedWriter {
+            output: Vec::new(),
+            written: 0,
             max_bytes: 4,
         };
         writer.write_all(b"1234").unwrap();
         assert!(writer.write_all(b"5").is_err());
-        assert_eq!(writer.bytes, b"1234");
-        let mut writer = CappedBody {
-            bytes: Vec::new(),
+        assert_eq!(writer.output, b"1234");
+        let mut writer = CappedWriter {
+            output: Vec::new(),
+            written: 0,
             max_bytes: 4,
         };
         assert!(writer.write_all(b"12345").is_err());
-        assert!(writer.bytes.is_empty());
+        assert!(writer.output.is_empty());
     }
 }

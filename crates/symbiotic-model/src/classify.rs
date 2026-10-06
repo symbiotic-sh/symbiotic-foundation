@@ -948,34 +948,20 @@ impl JevClassifierProvider {
                 ));
             }
         }
-        let tokens = |bytes: usize| bytes as u64;
-        let state = tokens(Value::Object(request.state.clone()).to_string().len());
-        let mut longest = 0;
+        let invalid =
+            |_| ModelError::InvalidRequest(symbiotic_core::DiagnosticCode::InvalidConfiguration);
+        let pair_budget = JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS - JEV_TEMPLATE_RESERVE_TOKENS;
+        let total_budget = JEV_MAX_REQUEST_TOKENS - JEV_TEMPLATE_RESERVE_TOKENS;
+        // Jev's conservative token estimate is one token per encoded byte. Count
+        // borrowed JSON with the same writer as encoding, stopping at either token bound.
+        let state =
+            wire::encoded_len(&request.state, pair_budget as usize).map_err(invalid)? as u64;
         let mut all = 0;
         for question in &request.questions {
-            let question = tokens(
-                serde_json::to_vec(&WireQuestion(question))
-                    .map_err(|_err| {
-                        ModelError::InvalidRequest(
-                            symbiotic_core::DiagnosticCode::InvalidConfiguration,
-                        )
-                    })?
-                    .len(),
-            );
-            longest = longest.max(question);
+            let remaining = (pair_budget - state).min(total_budget - state - all);
+            let question = wire::encoded_len(&WireQuestion(question), remaining as usize)
+                .map_err(invalid)? as u64;
             all += question;
-        }
-        let pair = JEV_TEMPLATE_RESERVE_TOKENS + state + longest;
-        if pair > JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS {
-            return Err(ModelError::InvalidRequest(
-                symbiotic_core::DiagnosticCode::InvalidConfiguration,
-            ));
-        }
-        let total = JEV_TEMPLATE_RESERVE_TOKENS + state + all;
-        if total > JEV_MAX_REQUEST_TOKENS {
-            return Err(ModelError::InvalidRequest(
-                symbiotic_core::DiagnosticCode::InvalidConfiguration,
-            ));
         }
         Ok(())
     }
@@ -1195,16 +1181,26 @@ pub fn jev_classify_body(
     request: &ClassifyRequest,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
-    request.validate()?;
+    // Empty questions keep their shape diagnostic. Allocation-free count checks
+    // and bounded token counting preserve provider-limit diagnostic precedence.
+    if request.questions.is_empty() {
+        request.validate()?;
+    }
     JevClassifierProvider::check_limits(request)?;
-    wire::encode(
-        &JevWireRequest {
-            model,
-            state: &request.state,
-            questions: &request.questions,
-        },
-        max_bytes,
-    )
+    let wire_request = JevWireRequest {
+        model,
+        state: &request.state,
+        questions: &request.questions,
+    };
+    // Cap body buffering before uniqueness allocation and reuse the admitted body.
+    let body = max_bytes
+        .map(|max| wire::encode(&wire_request, Some(max)))
+        .transpose()?;
+    request.validate()?;
+    match body {
+        Some(body) => Ok(body),
+        None => wire::encode(&wire_request, None),
+    }
 }
 
 // Questions and Choice options are JSON maps whose order is the presentation
@@ -2599,6 +2595,58 @@ mod tests {
         assert!(
             matches!(err.primary(), ModelError::Unavailable(_)),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn request_encoding_jev_token_bounds_keep_the_exact_pair_and_total_limits() {
+        let mut req = request(vec![goal_question()]);
+        let question_bytes = serde_json::to_vec(&WireQuestion(&req.questions[0]))
+            .unwrap()
+            .len();
+        let empty_state_bytes = serde_json::to_vec(&serde_json::json!({"message": ""}))
+            .unwrap()
+            .len();
+        let state_chars = JEV_MAX_STATE_AND_LONGEST_QUESTION_TOKENS as usize
+            - JEV_TEMPLATE_RESERVE_TOKENS as usize
+            - question_bytes
+            - empty_state_bytes;
+        req.state
+            .insert("message".into(), Value::String("x".repeat(state_chars)));
+        assert!(JevClassifierProvider::check_limits(&req).is_ok());
+        req.state
+            .insert("message".into(), Value::String("x".repeat(state_chars + 1)));
+        assert_eq!(
+            JevClassifierProvider::check_limits(&req)
+                .unwrap_err()
+                .code(),
+            DiagnosticCode::InvalidConfiguration
+        );
+
+        let mut req = ClassifyRequest::new(
+            serde_json::Map::new(),
+            (0..3)
+                .map(|i| ClassifierQuestion::noul(format!("q{i}"), "", None, None))
+                .collect(),
+        );
+        let overhead = 2 + 3 * serde_json::to_vec(&WireQuestion(&req.questions[0]))
+            .unwrap()
+            .len();
+        let chars =
+            JEV_MAX_REQUEST_TOKENS as usize - JEV_TEMPLATE_RESERVE_TOKENS as usize - overhead;
+        for question in &mut req.questions {
+            question.instructions = "x".repeat(chars / 3);
+        }
+        req.questions[0]
+            .instructions
+            .push_str(&"x".repeat(chars % 3));
+        assert!(JevClassifierProvider::check_limits(&req).is_ok());
+        req.questions[0].instructions.push('x');
+        assert_eq!(
+            JevClassifierProvider::check_limits(&req)
+                .unwrap_err()
+                .code(),
+            DiagnosticCode::InvalidConfiguration
         );
     }
 
