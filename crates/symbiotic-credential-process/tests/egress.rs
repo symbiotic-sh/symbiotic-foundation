@@ -3111,7 +3111,7 @@ async fn regression_supervised_credential_parent_exits_on_child_startup_failure(
             .spawn()
             .unwrap(),
     );
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
+    let status = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         loop {
             if let Some(status) = parent.0.try_wait().unwrap() {
                 break status;
