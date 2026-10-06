@@ -289,21 +289,37 @@ async fn status_mapping_discards_error_bodies_and_refuses_redirects() {
 #[tokio::test]
 async fn malformed_refusal_and_unsupported_blocks_fail_visibly() {
     let mut cases = vec![
-        json!({}),
-        json!({"content":[],"stop_reason":"refusal"}),
-        json!({"content":[{"type":"text"}],"stop_reason":"end_turn"}),
-        json!({"content":[{"type":"tool_use","id":"x"}],"stop_reason":"tool_use"}),
+        (json!({}), true),
+        (json!({"content":[],"stop_reason":"refusal"}), false),
+        (
+            json!({"content":[{"type":"text"}],"stop_reason":"end_turn"}),
+            true,
+        ),
+        (
+            json!({"content":[{"type":"tool_use","id":"x"}],"stop_reason":"tool_use"}),
+            true,
+        ),
     ];
     let mut overflow = answer();
     overflow["usage"]["input_tokens"] = json!(u64::MAX);
-    cases.push(overflow);
-    for body in cases {
+    cases.push((overflow, false));
+    for (body, wrong_shape) in cases {
         let (url, server) = fixture(200, &body.to_string(), false);
-        assert!(matches!(
-            provider(&url).chat(request()).await,
-            Err(ModelError::Provider(_))
-        ));
+        let error = provider(&url)
+            .with_timeout(1)
+            .unwrap()
+            .chat(request())
+            .await
+            .unwrap_err();
         server.join().unwrap();
+        if wrong_shape {
+            assert!(matches!(
+                error,
+                ModelError::Unavailable(DiagnosticCode::InvalidResponse)
+            ));
+        } else {
+            assert!(matches!(error, ModelError::Provider(_)));
+        }
     }
     let (url, server) = fixture(200, "invalid JSON", false);
     assert!(matches!(

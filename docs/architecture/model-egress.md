@@ -409,10 +409,10 @@ visibly rather than being ignored. Send and response-body read timeouts share th
 same timeout classification. Provider error bodies and raw header strings never
 leave the transport. These classes are observations, not permission to retry:
 unknown spend still requires reconciliation before another admitted attempt.
-`EgressError::InvalidProviderJson` (wire code `invalid_provider_json`) identifies
-a successful HTTP response whose body is not valid JSON, preserving
-`ModelError::Unavailable(InvalidResponse)` separately from status-less `provider`
-failures. The malformed body contributes no diagnostics or provider text. This
+`EgressError::InvalidProviderJson` (wire code `invalid_provider_json`):
+A successful HTTP response was not a valid provider answer: not JSON, or not the expected shape.
+This preserves `ModelError::Unavailable(InvalidResponse)` separately from status-less
+`provider` failures. The malformed body contributes no diagnostics or provider text. This
 failure retains unknown charge and the existing request failure budget debit;
 no parsed answer reaches caller answer validation.
 Credential-loading and setup/queue failures before

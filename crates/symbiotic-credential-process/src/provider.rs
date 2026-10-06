@@ -800,6 +800,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn regression_chat_response_shape_classification() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for (anthropic, body, expected, code) in [
+                (false, r#"{"choices":[]}"#, EgressError::Provider { status: None }, model::DiagnosticCode::OpenaiCompatibleResponseHadNoChoices),
+                (false, "{}", EgressError::InvalidProviderJson, model::DiagnosticCode::InvalidResponse),
+                (false, r#"{"choices":null}"#, EgressError::InvalidProviderJson, model::DiagnosticCode::InvalidResponse),
+                (true, "{}", EgressError::InvalidProviderJson, model::DiagnosticCode::InvalidResponse),
+                (true, r#"{"content":[{"type":"text"}],"stop_reason":"end_turn"}"#, EgressError::InvalidProviderJson, model::DiagnosticCode::InvalidResponse),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 1];
+                    stream.read_exact(&mut buffer).await.unwrap();
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                let request = ChatRequest {
+                    messages: vec![model::ChatMessage { role: "user".into(), content: "synthetic evidence".into() }],
+                    response_format: None,
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    role_binding: None,
+                    source: None,
+                    metadata: serde_json::Value::Null,
+                };
+                let started = Arc::new(AtomicBool::new(false));
+                let error = if anthropic {
+                    Dispatched { inner: AnthropicChatProvider::new("test", "test", url, "").with_timeout(1).unwrap(), started: started.clone() }.chat(request).await.unwrap_err()
+                } else {
+                    Dispatched { inner: OpenAiCompatibleChatProvider::new("test", "test", url, "").with_timeout(1).unwrap(), started: started.clone() }.chat(request).await.unwrap_err()
+                };
+                server.await.unwrap();
+                assert_eq!(error.code(), code, "anthropic={anthropic}, body={body}");
+                let actual = execute_error(error, &started);
+                assert_eq!(actual.code, expected);
+                assert!(actual.may_have_dispatched);
+                assert!(actual.diagnostics.is_empty());
+            }
+        }).await.expect("chat shape fixtures must finish within three seconds");
+    }
+
     struct FailingTrace;
     #[async_trait]
     impl symbiotic_trace::TraceSink for FailingTrace {
