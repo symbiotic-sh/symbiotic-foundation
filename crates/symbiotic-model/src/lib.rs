@@ -1676,7 +1676,14 @@ where
     P: ModelProvider + Clone + Send + Sync + 'static,
     Req: Clone + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
     Req: BudgetedModelRequest,
-    Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
+    Res: secrets::CredentialResponse
+        + Clone
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + TraceCarrier
+        + Send
+        + Sync
+        + 'static,
     F: FnOnce(P, Req) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
 {
@@ -2095,7 +2102,14 @@ async fn run_attempt<P, Req, Res, F, Fut>(
 where
     P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: secrets::CredentialResponse
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Clone
+        + TraceCarrier
+        + Send
+        + Sync
+        + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -2360,7 +2374,7 @@ enum Settled<Res> {
 #[cfg(feature = "queue")]
 async fn dispatch_model<
     P: ModelProvider,
-    T: Serialize + for<'de> Deserialize<'de> + TraceCarrier,
+    T: secrets::CredentialResponse + Serialize + for<'de> Deserialize<'de> + TraceCarrier,
 >(
     queue: &QueueId,
     config: &ModelQueueConfig,
@@ -2372,6 +2386,8 @@ async fn dispatch_model<
         provider,
         within_timeout(queue, config.request_timeout_seconds, call).await,
     )?;
+    // Direct keyless adapters return raw JSON; runtime bookkeeping never retains it.
+    response.discard_raw();
     if let Some(error) = answer_recovery.usage_diagnostic(&response.trace().usage) {
         note_side_effect(&mut response, queue, "invalid_reported_cost", error);
     }
@@ -2395,7 +2411,14 @@ where
         + Sync
         + 'static
         + BudgetedModelRequest,
-    Res: Clone + Serialize + for<'de> Deserialize<'de> + TraceCarrier + Send + Sync + 'static,
+    Res: secrets::CredentialResponse
+        + Clone
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + TraceCarrier
+        + Send
+        + Sync
+        + 'static,
     F: FnOnce(P, Req) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<Res, ModelError>> + Send + 'static,
 {
@@ -2764,7 +2787,14 @@ async fn settle<P, Req, Res, F, Fut>(
 where
     P: ModelProvider + Clone,
     Req: Clone + Send + Sync + 'static,
-    Res: Serialize + for<'de> Deserialize<'de> + Clone + TraceCarrier + Send + Sync + 'static,
+    Res: secrets::CredentialResponse
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Clone
+        + TraceCarrier
+        + Send
+        + Sync
+        + 'static,
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
@@ -4783,11 +4813,37 @@ fn parse_retry_after(
 }
 
 fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
-    if !egress_observations_enabled() {
-        trace.usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
-        trace.usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
-        trace.usage.created = raw.get("created").and_then(Value::as_i64);
-        return;
+    fn contains_identity(value: &Value, identity: &str, payload: bool) -> bool {
+        match value {
+            Value::String(text) => payload && text.contains(identity),
+            Value::Array(values) => values
+                .iter()
+                .any(|value| contains_identity(value, identity, payload)),
+            Value::Object(values) => values.iter().any(|(field, value)| {
+                // Protocol labels describe payloads; they are not answer or reasoning text.
+                !matches!(
+                    field.as_str(),
+                    "type" | "role" | "finish_reason" | "stop_reason"
+                ) && contains_identity(
+                    value,
+                    identity,
+                    payload
+                        || matches!(
+                            field.as_str(),
+                            "content"
+                                | "text"
+                                | "refusal"
+                                | "reasoning_content"
+                                | "reasoning"
+                                | "reasoning_details"
+                                | "thinking"
+                                | "signature"
+                                | "data"
+                        ),
+                )
+            }),
+            _ => false,
+        }
     }
     let mut invalid = false;
     let mut identity = |field: &str| {
@@ -4797,6 +4853,13 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
                     && text
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+                    // Screen payloads in every choice/block, independently of HTTP observations.
+                    && !["choices", "content"].iter().any(|field| {
+                        raw.get(field)
+                            .is_some_and(|value| {
+                                contains_identity(value, text, *field == "content")
+                            })
+                    })
             });
             invalid |= token.is_none();
             token.map(str::to_owned)
@@ -4809,6 +4872,22 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
         invalid |= seconds.is_none();
         seconds
     });
+    // Usage receipts also carry trace metadata; rejected identities must not
+    // survive in the provider's duplicate presentation of those fields.
+    if let Some(provider) = trace
+        .metadata
+        .get_mut("provider")
+        .and_then(Value::as_object_mut)
+    {
+        for (field, present) in [
+            ("response_id", trace.usage.response_id.is_some()),
+            ("served_model", trace.usage.served_model.is_some()),
+        ] {
+            if !present {
+                provider.remove(field);
+            }
+        }
+    }
     if invalid {
         note_trace_diagnostic(
             trace,
@@ -6405,6 +6484,232 @@ mod egress_http_tests {
         })
         .await
         .expect("HTTP status fixture must finish within three seconds");
+    }
+
+    #[tokio::test]
+    async fn regression_openai_reasoning_echoes_are_not_usage_identities() {
+        assert_reasoning_echoes_are_not_usage_identities(&[
+            serde_json::json!({"choices":[{"message":{
+                "content":"OK", "reasoning_content":"PRIVATE_REASONING"
+            }}]}),
+            serde_json::json!({"choices":[{"message":{
+                "content":"OK", "reasoning":"PRIVATE_REASONING"
+            }}]}),
+            serde_json::json!({"choices":[{"message":{
+                "content":"OK", "reasoning_details":[{"text":"PRIVATE_REASONING"}]
+            }}]}),
+            serde_json::json!({"choices":[{"message":{
+                "content":"OK", "thinking":"PRIVATE_REASONING"
+            }}]}),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn regression_anthropic_reasoning_echoes_are_not_usage_identities() {
+        assert_reasoning_echoes_are_not_usage_identities(&[
+            serde_json::json!({"content":[
+                {"type":"text","text":"OK"},
+                {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"}
+            ]}),
+            serde_json::json!({"content":[
+                {"type":"text","text":"OK"},
+                {"type":"thinking","thinking":"private","signature":"PRIVATE_REASONING"}
+            ]}),
+            serde_json::json!({"content":[
+                {"type":"text","text":"OK"},
+                {"type":"redacted_thinking","data":"PRIVATE_REASONING"}
+            ]}),
+        ])
+        .await;
+    }
+
+    async fn assert_reasoning_echoes_are_not_usage_identities(responses: &[Value]) {
+        with_egress_http_observations(async {
+            for mut raw in responses.iter().cloned() {
+                for identity_field in ["id", "model"] {
+                    for echo in [false, true] {
+                        raw["id"] = serde_json::json!("fixture-id");
+                        raw["model"] = serde_json::json!("served-model");
+                        if echo {
+                            raw[identity_field] = serde_json::json!("PRIVATE_REASONING");
+                        }
+                        let mut trace = success_trace(
+                            &StaticChatProvider::new("OK").descriptor,
+                            None,
+                            None,
+                            String::new(),
+                            Some("OK"),
+                        );
+                        trace.metadata = serde_json::json!({"provider": {
+                            "response_id": raw["id"], "served_model": raw["model"]
+                        }});
+                        provider_usage_identity(&mut trace, &raw);
+                        let identity = if identity_field == "id" {
+                            &trace.usage.response_id
+                        } else {
+                            &trace.usage.served_model
+                        };
+                        assert_eq!(identity.is_none(), echo, "{identity_field}: {raw}");
+                        if !echo {
+                            assert_eq!(
+                                identity.as_deref(),
+                                Some(if identity_field == "id" {
+                                    "fixture-id"
+                                } else {
+                                    "served-model"
+                                })
+                            );
+                        }
+                        assert_eq!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_some(), echo);
+                        assert!(!trace.metadata.to_string().contains("PRIVATE_REASONING"));
+                    }
+                }
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn regression_payload_boundary_screens_unscoped_reasoning_and_metadata() {
+        assert!(!egress_observations_enabled());
+        for raw in [
+            serde_json::json!({"id":"PRIVATE_REASONING", "model":"PRIVATE_REASONING",
+                "choices":[{"message":{"content":"OK","reasoning":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"id":"PRIVATE_REASONING", "model":"PRIVATE_REASONING",
+                "content":[{"type":"thinking","thinking":"PRIVATE_REASONING"}]}),
+        ] {
+            let mut trace = success_trace(
+                &StaticChatProvider::new("OK").descriptor,
+                None,
+                None,
+                String::new(),
+                Some("OK"),
+            );
+            trace.metadata = serde_json::json!({"provider": {
+                "response_id": raw["id"], "served_model": raw["model"]
+            }});
+            provider_usage_identity(&mut trace, &raw);
+            assert!(trace.usage.response_id.is_none());
+            assert!(trace.usage.served_model.is_none());
+            assert!(!trace.metadata.to_string().contains("PRIVATE_REASONING"));
+            assert_eq!(
+                trace.metadata[RUNTIME_DIAGNOSTICS][0]["kind"],
+                "invalid_usage_identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_payload_boundary_screens_identity_occurrences_in_reasoning() {
+        with_egress_http_observations(async {
+            for identity in ["chatcmpl-PRIVATE_REASONING", "PRIVATE_REASONING-suffix", "REASONING"] {
+                for payload in [
+                    serde_json::json!({"choices":[{"message":{"content":"OK","reasoning_content":format!("prefix {identity} suffix")}}]}),
+                    serde_json::json!({"content":[{"type":"thinking","thinking":format!("prefix {identity} suffix")}]}),
+                ] {
+                    let mut raw = payload;
+                    raw["id"] = serde_json::json!(identity);
+                    raw["model"] = serde_json::json!(identity);
+                    let mut trace = success_trace(
+                        &StaticChatProvider::new("OK").descriptor, None, None, String::new(), Some("OK"),
+                    );
+                    provider_usage_identity(&mut trace, &raw);
+                    assert!(trace.usage.response_id.is_none(), "{identity}");
+                    assert!(trace.usage.served_model.is_none(), "{identity}");
+                }
+            }
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn regression_payload_boundary_preserves_protocol_label_identities() {
+        with_egress_http_observations(async {
+            for label in [
+                "assistant",
+                "stop",
+                "text",
+                "thinking",
+                "reasoning.text",
+                "end_turn",
+            ] {
+                let raw = serde_json::json!({"id":label,"model":label,
+                    "choices":[{"message":{"role":"assistant","content":"OK","reasoning_content":"",
+                        "reasoning_details":[{"type":"reasoning.text","text":"PRIVATE_REASONING"}]},
+                        "finish_reason":"stop"}],
+                    "stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"OK"},
+                        {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"}]
+                });
+                let mut trace = success_trace(
+                    &StaticChatProvider::new("OK").descriptor,
+                    None,
+                    None,
+                    String::new(),
+                    Some("OK"),
+                );
+                provider_usage_identity(&mut trace, &raw);
+                assert_eq!(trace.usage.response_id.as_deref(), Some(label));
+                assert_eq!(trace.usage.served_model.as_deref(), Some(label));
+                assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn regression_payload_boundary_preserves_short_payload_identities() {
+        for payload in [
+            serde_json::json!({"choices":[{"message":{"content":"OK","reasoning_content":"4"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"OK","reasoning":"4"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"OK","reasoning_details":[{"text":"4"}]}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"OK","thinking":"4"}}]}),
+            serde_json::json!({"content":[{"type":"text","text":"OK"},{"type":"thinking","thinking":"4"}]}),
+            serde_json::json!({"content":[{"type":"text","text":"OK"},{"type":"thinking","signature":"4"}]}),
+            serde_json::json!({"content":[{"type":"text","text":"OK"},{"type":"redacted_thinking","data":"4"}]}),
+            serde_json::json!({"choices":[{"message":{"content":"4",
+                "reasoning_content":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":[{"text":"4"}],
+                "reasoning_details":[{"text":"PRIVATE_REASONING"}]}}]}),
+            serde_json::json!({"choices":[{"message":{"refusal":"4",
+                "reasoning":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"content":[{"type":"text","text":"4"},
+                {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"},
+                {"type":"redacted_thinking","data":"REDACTED_REASONING"}]}),
+        ] {
+            let mut raw = payload;
+            raw["id"] = serde_json::json!("chatcmpl-4abc");
+            raw["model"] = serde_json::json!("gpt-4.1");
+            let mut trace = success_trace(
+                &StaticChatProvider::new("4").descriptor,
+                None,
+                None,
+                String::new(),
+                Some("4"),
+            );
+            trace.metadata = serde_json::json!({"provider": {
+                "response_id": raw["id"], "served_model": raw["model"]
+            }});
+            provider_usage_identity(&mut trace, &raw);
+            assert_eq!(trace.usage.response_id.as_deref(), Some("chatcmpl-4abc"));
+            assert_eq!(trace.usage.served_model.as_deref(), Some("gpt-4.1"));
+            assert_eq!(trace.metadata["provider"]["response_id"], "chatcmpl-4abc");
+            assert_eq!(trace.metadata["provider"]["served_model"], "gpt-4.1");
+            assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+
+            // The identity-in-payload comparison still rejects exact echoes.
+            raw["id"] = serde_json::json!("4");
+            raw["model"] = serde_json::json!("4");
+            provider_usage_identity(&mut trace, &raw);
+            assert!(trace.usage.response_id.is_none());
+            assert!(trace.usage.served_model.is_none());
+            assert!(trace.metadata["provider"].get("response_id").is_none());
+            assert!(trace.metadata["provider"].get("served_model").is_none());
+            assert_eq!(
+                trace.metadata[RUNTIME_DIAGNOSTICS][0]["kind"],
+                "invalid_usage_identity"
+            );
+        }
     }
 
     #[tokio::test]

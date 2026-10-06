@@ -492,6 +492,91 @@ async fn assistant_prefill_is_refused_before_connecting() {
 }
 
 #[tokio::test]
+async fn regression_reasoning_echoes_are_not_usage_identities() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for reasoning_field in ["thinking", "signature", "data"] {
+            for identity_field in ["id", "model"] {
+                for (scoped, echoed_identity) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some("PRIVATE_REASONING")),
+                    (true, Some("PRIVATE_REASONING")),
+                    (false, Some("chatcmpl-PRIVATE_REASONING")),
+                    (true, Some("chatcmpl-PRIVATE_REASONING")),
+                    (false, Some("PRIVATE_REASONING-suffix")),
+                    (true, Some("PRIVATE_REASONING-suffix")),
+                ] {
+                    let echo = echoed_identity.is_some();
+                    let mut body = answer();
+                    body["content"][1]["text"] = json!("OK");
+                    body["content"][3]["text"] = json!("");
+                    let block = if reasoning_field == "data" { 2 } else { 0 };
+                    body["content"][block][reasoning_field] = json!(format!(
+                        "prefix {} suffix",
+                        echoed_identity.unwrap_or("PRIVATE_REASONING")
+                    ));
+                    if let Some(identity) = echoed_identity {
+                        body[identity_field] = json!(identity);
+                    }
+                    let (url, server) = fixture(200, &body.to_string(), false);
+                    let provider = AnthropicChatProvider::new("fixture", "fixture-model", &url, "")
+                        .with_timeout(1)
+                        .unwrap();
+                    let call = provider.chat(request());
+                    let response = if scoped {
+                        symbiotic_model::with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .expect("identity screening must preserve the paid answer");
+                    server.join().unwrap();
+                    assert_eq!(response.text, "OK");
+                    assert!(response.raw_provider_response.is_some());
+                    assert!(
+                        !serde_json::to_string(&response.trace)
+                            .unwrap()
+                            .contains("PRIVATE_REASONING")
+                    );
+                    let identity = if identity_field == "id" {
+                        &response.trace.usage.response_id
+                    } else {
+                        &response.trace.usage.served_model
+                    };
+                    assert_eq!(
+                        identity.is_none(),
+                        echo,
+                        "{reasoning_field}/{identity_field}"
+                    );
+                    if !echo {
+                        assert_eq!(
+                            identity.as_deref(),
+                            Some(if identity_field == "id" {
+                                "fixture-id"
+                            } else {
+                                "served-model"
+                            })
+                        );
+                    }
+                    assert!(
+                        !response
+                            .trace
+                            .metadata
+                            .to_string()
+                            .contains("PRIVATE_REASONING")
+                    );
+                    assert_eq!(
+                        response.trace.metadata.get("runtime_diagnostics").is_some(),
+                        echo
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("reasoning identity fixtures must finish within the 60-second hang guard");
+}
+
+#[tokio::test]
 async fn regression_anthropic_misses_remain_known_without_cache_reads() {
     let mut body = answer();
     body["usage"] = json!({"input_tokens":20,"cache_creation_input_tokens":10});

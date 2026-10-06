@@ -181,7 +181,7 @@ pub(crate) fn composed_result<T: serde::Serialize + serde::de::DeserializeOwned>
     })
 }
 
-/// Responses crossing the credential boundary must surrender raw provider JSON.
+/// Adapter responses support raw disposal after credential inspection or runtime dispatch.
 pub(crate) trait CredentialResponse: serde::Serialize {
     fn discard_raw(&mut self);
 }
@@ -216,6 +216,7 @@ credential_response!(
 /// typed decoding and answer validation, and before runtime bookkeeping.
 /// Inspect raw JSON and the final typed value together; never export raw JSON
 /// or provider-controlled error text from a credential-bearing call.
+/// Keyless direct calls retain their explicit raw response return value.
 pub(crate) fn credential_boundary<T: CredentialResponse>(
     result: Result<T, crate::ModelError>,
     boundary: &CredentialBoundary,
@@ -247,6 +248,34 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regression_keyless_credential_boundary_preserves_raw_results() {
+        let boundary = CredentialBoundary::new(String::new().into());
+        let response = credential_boundary(
+            Ok(serde_json::json!({"text":"OK", "raw_provider_response":{
+                "choices":[{"message":{"reasoning_content":"PRIVATE_REASONING"}}]
+            }})),
+            &boundary,
+        )
+        .unwrap();
+        assert_eq!(response["text"], "OK");
+        assert_eq!(
+            response["raw_provider_response"]["choices"][0]["message"]["reasoning_content"],
+            "PRIVATE_REASONING"
+        );
+        assert!(matches!(
+            credential_boundary::<serde_json::Value>(
+                Err(crate::ModelError::Timeout(
+                    symbiotic_core::DiagnosticCode::HttpTimeout
+                )),
+                &boundary,
+            ),
+            Err(crate::ModelError::Timeout(
+                symbiotic_core::DiagnosticCode::HttpTimeout
+            ))
+        ));
+    }
+
     #[test]
     fn rejects_every_declared_credential_encoding() {
         let secret = "key-\"/\n+?=é";

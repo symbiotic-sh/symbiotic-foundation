@@ -6997,8 +6997,14 @@ async fn regression_answer_recovery_direct_never_writes_answers_or_usage_text() 
                 assert_eq!(receipt.usage.input_tokens, Some(7));
                 assert_eq!(receipt.usage.output_tokens, Some(3));
                 assert_eq!(receipt.usage.reported_cost_usd.as_deref(), Some("0.001"));
-                assert_eq!(receipt.usage.response_id.is_none(), off);
-                assert_eq!(receipt.usage.served_model.is_none(), off);
+                // The chat fixture's id and model repeat its reasoning_content, so they are never
+                // stored as usage identity, with or without answer recovery (#93).
+                let echoes_reasoning = !classify;
+                assert_eq!(receipt.usage.response_id.is_none(), off || echoes_reasoning);
+                assert_eq!(
+                    receipt.usage.served_model.is_none(),
+                    off || echoes_reasoning
+                );
                 assert_eq!(
                     state_has_bytes(&fixture.config.state_dir, ANSWER_RECOVERY_MARKER),
                     !off

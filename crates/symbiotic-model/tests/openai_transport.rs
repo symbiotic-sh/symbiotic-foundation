@@ -408,6 +408,99 @@ async fn assert_invalid_id_preserves_answer(id: String) {
 }
 
 #[tokio::test]
+async fn regression_reasoning_echoes_are_not_usage_identities() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for reasoning_field in [
+            "reasoning_content",
+            "reasoning",
+            "reasoning_details",
+            "thinking",
+        ] {
+            for identity_field in ["id", "model"] {
+                for (scoped, echoed_identity) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some("PRIVATE_REASONING")),
+                    (true, Some("PRIVATE_REASONING")),
+                    (false, Some("chatcmpl-PRIVATE_REASONING")),
+                    (true, Some("chatcmpl-PRIVATE_REASONING")),
+                    (false, Some("PRIVATE_REASONING-suffix")),
+                    (true, Some("PRIVATE_REASONING-suffix")),
+                ] {
+                    let echo = echoed_identity.is_some();
+                    let mut body = serde_json::json!({
+                        "id":"fixture-id", "model":"served-model",
+                        "choices":[{"message":{"content":"OK"}}]
+                    });
+                    body["choices"][0]["message"][reasoning_field] = if reasoning_field
+                        == "reasoning_details"
+                    {
+                        serde_json::json!([{"type":"reasoning.text","text":format!("prefix {} suffix", echoed_identity.unwrap_or("PRIVATE_REASONING"))}])
+                    } else {
+                        serde_json::json!(format!("prefix {} suffix", echoed_identity.unwrap_or("PRIVATE_REASONING")))
+                    };
+                    if let Some(identity) = echoed_identity {
+                        body[identity_field] = serde_json::json!(identity);
+                    }
+                    let (url, server) = fixture(body);
+                    let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                        .with_timeout(1)
+                        .unwrap();
+                    let call = provider.chat(request());
+                    let response = if scoped {
+                        symbiotic_model::with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .expect("identity screening must preserve the paid answer");
+                    server.join().unwrap();
+                    assert_eq!(response.text, "OK");
+                    assert!(response.raw_provider_response.is_some());
+                    assert!(
+                        !serde_json::to_string(&response.trace)
+                            .unwrap()
+                            .contains("PRIVATE_REASONING")
+                    );
+                    let identity = if identity_field == "id" {
+                        &response.trace.usage.response_id
+                    } else {
+                        &response.trace.usage.served_model
+                    };
+                    assert_eq!(
+                        identity.is_none(),
+                        echo,
+                        "{reasoning_field}/{identity_field}"
+                    );
+                    if !echo {
+                        assert_eq!(
+                            identity.as_deref(),
+                            Some(if identity_field == "id" {
+                                "fixture-id"
+                            } else {
+                                "served-model"
+                            })
+                        );
+                    }
+                    assert!(
+                        !response
+                            .trace
+                            .metadata
+                            .to_string()
+                            .contains("PRIVATE_REASONING")
+                    );
+                    assert_eq!(
+                        response.trace.metadata.get("runtime_diagnostics").is_some(),
+                        echo
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("reasoning identity fixtures must finish within the 60-second hang guard");
+}
+
+#[tokio::test]
 async fn regression_request_phrase_id_is_dropped_without_rejecting_answer() {
     assert_invalid_id_preserves_answer("synthetic evidence".into()).await;
 }
@@ -459,4 +552,80 @@ async fn regression_strict_usage_refusal_is_scoped_to_egress() {
 fn regression_public_cache_counts_remain_tuple_returning() {
     let (hit, miss) = prompt_cache_counts(Some(10), Some(4), None, None);
     assert_eq!((hit, miss), (Some(4), Some(6)));
+}
+
+#[tokio::test]
+async fn regression_short_reasoning_preserves_ordinary_usage_identities() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for scoped in [false, true] {
+            let (url, server) = fixture(serde_json::json!({
+                "id":"chatcmpl-4abc", "model":"gpt-4.1",
+                "choices":[{"message":{"content":"OK","reasoning_content":"4"}}]
+            }));
+            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                .with_timeout(1)
+                .unwrap();
+            let call = provider.chat(request());
+            let response = if scoped {
+                symbiotic_model::with_egress_http_observations(call).await
+            } else {
+                call.await
+            }
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(response.text, "OK");
+            assert_eq!(
+                response.trace.usage.response_id.as_deref(),
+                Some("chatcmpl-4abc")
+            );
+            assert_eq!(
+                response.trace.usage.served_model.as_deref(),
+                Some("gpt-4.1")
+            );
+            assert_eq!(
+                response.trace.metadata["provider"]["response_id"],
+                "chatcmpl-4abc"
+            );
+            assert_eq!(
+                response.trace.metadata["provider"]["served_model"],
+                "gpt-4.1"
+            );
+            assert!(response.trace.metadata.get("runtime_diagnostics").is_none());
+        }
+    })
+    .await
+    .expect("short reasoning fixtures must finish within three seconds");
+}
+
+#[tokio::test]
+async fn regression_keyless_direct_adapter_returns_raw_reasoning() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for composed in [false, true] {
+            let body = serde_json::json!({
+                "id":"fixture-id", "model":"served-model",
+                "choices":[{"message":{"content":"OK","reasoning_content":"PRIVATE_REASONING"}}]
+            });
+            let (url, server) = fixture(body.clone());
+            let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
+                .with_timeout(1)
+                .unwrap();
+            let response = if composed {
+                let provider: std::sync::Arc<dyn ChatProvider> = std::sync::Arc::new(provider);
+                provider.chat(request()).await
+            } else {
+                provider.chat(request()).await
+            }
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(response.text, "OK");
+            assert_eq!(response.raw_provider_response, Some(body));
+            assert!(
+                !serde_json::to_string(&response.trace)
+                    .unwrap()
+                    .contains("PRIVATE_REASONING")
+            );
+        }
+    })
+    .await
+    .expect("keyless direct fixtures must finish within three seconds");
 }
