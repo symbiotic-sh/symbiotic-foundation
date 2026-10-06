@@ -489,6 +489,9 @@ pub struct DispatchReceipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchDiagnostic {
+    /// The successful HTTP response exceeded the route's `max_response_bytes` bound.
+    /// No provider body or response bytes are included; dispatch charge may be unknown.
+    MaxResponseBytesExceeded,
     /// Malformed provider identity metadata was omitted from usage; the answer is retained.
     InvalidUsageIdentity,
     /// The provider supplied a malformed Retry-After hint; the HTTP class is preserved.

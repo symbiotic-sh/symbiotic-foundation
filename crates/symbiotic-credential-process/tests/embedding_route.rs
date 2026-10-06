@@ -294,6 +294,8 @@ async fn full_batch_requires_larger_response_and_frame_bounds_and_preserves_inpu
         let client = fixture.client().await;
         let refused = fixture.send(&client, "default-bound").await;
         assert_eq!(refused.error, Some(EgressError::Provider { status: None }));
+        assert_eq!(serde_json::to_value(&refused.diagnostics).unwrap(),
+            serde_json::json!(["max_response_bytes_exceeded"]));
         assert!(refused.output.is_none());
         assert_eq!(refused.receipt.spend_state, SpendState::Unknown);
         assert!(refused.receipt_persisted);
@@ -320,7 +322,7 @@ async fn full_batch_requires_larger_response_and_frame_bounds_and_preserves_inpu
             }
         }
         fixture.assert_sends(1);
-        eprintln!("full batch: response_bytes={measured}, default=Provider {{ status: None }}, raised=accepted, sends=1+1, elapsed={:?}", started.elapsed());
+        eprintln!("full batch: response_bytes={measured}, default=max_response_bytes_exceeded, raised=accepted, sends=1+1, elapsed={:?}", started.elapsed());
     }).await.expect("batch size and ordering regression must finish within five seconds");
 }
 
@@ -354,34 +356,44 @@ async fn rate_limited_batch_preserves_retry_after_without_a_second_send() {
 async fn identical_batch_budget_refuses_after_three_failed_sends() {
     let started = Instant::now();
     tokio::time::timeout(DEADLINE, async {
-        // A 400 proves failed-send accounting without the 429 Retry-After cooldown.
-        let mut fixture = Fixture::new(400, "{}".into()).await;
-        fixture.config.routes[0].request_budget = Some(RequestBudget {
-            attempts: 3,
-            renewal_seconds: None,
-        });
-        let client = fixture.client().await;
-        for send in 1..=3 {
-            let result = fixture.send(&client, &format!("failed-{send}")).await;
-            assert_eq!(
-                result.error,
-                Some(EgressError::Provider { status: Some(400) })
-            );
+        // Both a provider rejection and a response-size refusal debit exactly once.
+        for (status, body, diagnostics) in [
+            (400, "{}".into(), serde_json::json!([])),
+            (200, shuffled_response(), serde_json::json!(["max_response_bytes_exceeded"])),
+        ] {
+            let mut fixture = Fixture::new(status, body).await;
+            fixture.config.routes[0].request_budget = Some(RequestBudget {
+                attempts: 3,
+                renewal_seconds: None,
+            });
+            let validations = Arc::new(AtomicUsize::new(0));
+            let observed = validations.clone();
+            let client = fixture.client().await.with_answer_validation(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                false
+            });
+            for send in 1..=3 {
+                let result = fixture.send(&client, &format!("failed-{send}")).await;
+                assert_eq!(result.error, Some(EgressError::Provider {
+                    status: (status != 200).then_some(status),
+                }));
+                assert_eq!(serde_json::to_value(&result.diagnostics).unwrap(), diagnostics);
+                assert!(result.output.is_none());
+                assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+                assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
+                assert!(result.receipt_persisted);
+                fixture.assert_sends(send);
+            }
+            let result = fixture.send(&client, "budget-refused").await;
+            assert_eq!(result.error, Some(EgressError::RequestBudgetExhausted));
             assert!(result.output.is_none());
-            assert_eq!(result.receipt.spend_state, SpendState::Unknown);
+            assert_eq!(result.receipt.spend_state, SpendState::Released);
             assert!(result.receipt_persisted);
-            fixture.assert_sends(send);
+            assert!(result.diagnostics.is_empty());
+            assert_eq!(validations.load(Ordering::SeqCst), 0);
+            fixture.assert_sends(3);
+            eprintln!("identical batch: status={status}, failed_sends=3, fourth=RequestBudgetExhausted, validations=0, sends=3, elapsed={:?}", started.elapsed());
         }
-        let result = fixture.send(&client, "budget-refused").await;
-        assert_eq!(result.error, Some(EgressError::RequestBudgetExhausted));
-        assert!(result.output.is_none());
-        assert_eq!(result.receipt.spend_state, SpendState::Released);
-        assert!(result.receipt_persisted);
-        fixture.assert_sends(3);
-        eprintln!(
-            "identical batch: failed_sends=3, fourth=RequestBudgetExhausted, sends=3, elapsed={:?}",
-            started.elapsed()
-        );
     })
     .await
     .expect("request-budget regression must finish within five seconds");
