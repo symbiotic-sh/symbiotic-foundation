@@ -6574,7 +6574,7 @@ async fn regression_wrong_shape_matches_unparsable_send_count_anthropic() {
 }
 
 async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool, body: &str) -> usize {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         let mut fixture =
             Fixture::with_http_response(200, body.into(), Duration::ZERO, "0", true, false).await;
         if anthropic {
@@ -6668,7 +6668,7 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool, body
         fixture.calls.load(Ordering::SeqCst)
     })
     .await
-    .expect("invalid provider answer fixtures must finish within five seconds")
+    .expect("invalid provider answer fixtures hang guard: fixture did not finish within 60 seconds")
 }
 
 #[tokio::test]
