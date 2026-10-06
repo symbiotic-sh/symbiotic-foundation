@@ -15,8 +15,9 @@ Normalized traces retain numeric usage, provider response ID, served model,
 creation time, and provider-reported decimal USD cost when present. Requested
 model identity stays separate. Missing cache counters are not a cache miss;
 contradictory counters remain unknown. Hidden reasoning text never enters trace
-metadata. The shared adapter-result boundary discards raw provider JSON before
-runtime bookkeeping, including for keyless calls.
+metadata. Raw responses remain an explicit return value, not a trace sink.
+The shared runtime-result boundary discards raw provider JSON before bookkeeping
+and persistence, including for keyless calls.
 
 Memory keeps its public chat trait and builders, plus its established reasoning
 return field. Its usage record gains optional provider metadata with serde defaults.

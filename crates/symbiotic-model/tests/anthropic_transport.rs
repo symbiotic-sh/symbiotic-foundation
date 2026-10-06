@@ -511,7 +511,10 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
                     body["content"][1]["text"] = json!("OK");
                     body["content"][3]["text"] = json!("");
                     let block = if reasoning_field == "data" { 2 } else { 0 };
-                    body["content"][block][reasoning_field] = json!("PRIVATE_REASONING");
+                    body["content"][block][reasoning_field] = json!(format!(
+                        "prefix {} suffix",
+                        echoed_identity.unwrap_or("PRIVATE_REASONING")
+                    ));
                     if let Some(identity) = echoed_identity {
                         body[identity_field] = json!(identity);
                     }
@@ -528,9 +531,9 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
                     .expect("identity screening must preserve the paid answer");
                     server.join().unwrap();
                     assert_eq!(response.text, "OK");
-                    assert!(response.raw_provider_response.is_none());
+                    assert!(response.raw_provider_response.is_some());
                     assert!(
-                        !serde_json::to_string(&response)
+                        !serde_json::to_string(&response.trace)
                             .unwrap()
                             .contains("PRIVATE_REASONING")
                     );

@@ -79,6 +79,7 @@ struct Loopback {
     uncertain_failures: bool,
     completion_gate: Option<Arc<tokio::sync::Notify>>,
     credential: Option<Arc<symbiotic_model::OpenAiCompatibleChatProvider>>,
+    raw_response: Option<Value>,
 }
 
 impl Loopback {
@@ -100,6 +101,7 @@ impl Loopback {
             uncertain_failures: false,
             completion_gate: None,
             credential: None,
+            raw_response: None,
         }
     }
 
@@ -186,7 +188,7 @@ impl ChatProvider for Loopback {
                 metadata: json!({"provider": {"response_id": "loopback-1"}}),
                 timestamp: Utc::now(),
             },
-            raw_provider_response: None,
+            raw_provider_response: self.raw_response.clone(),
         })
     }
 }
@@ -3796,4 +3798,54 @@ async fn close_storage_failures_preserve_provider_error(backend: &str, queue: Ar
             assert_eq!(raw.calls.load(Ordering::SeqCst), 1, "{backend}: {fault}");
         }
     }
+}
+
+#[tokio::test]
+async fn regression_keyless_runtime_discards_raw_before_cache_and_recovery() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for explicit in [false, true] {
+            let mut raw = Loopback::new(unique_identity());
+            raw.raw_response = Some(json!({"reasoning_content":"PRIVATE_REASONING"}));
+            let cache = Arc::new(TextKeyedCache::default());
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let spend = test_spend::ledger();
+            let mut provider = queued(raw.clone(), Arc::new(MemoryQueue::new()), config())
+                .with_spend_ledger(spend.clone(), None)
+                .with_response_cache(cache.clone())
+                .with_receipt_sink(receipts.clone())
+                .with_binding_identity(symbiotic_core::BindingIdentity::new(
+                    "tenant", "provider", "1", "account",
+                ));
+            if explicit {
+                provider = provider.with_invocation("raw-disposal".into());
+            }
+            let response = provider.chat(request("OK")).await.unwrap();
+            assert_eq!(response.text, "OK");
+            assert!(response.raw_provider_response.is_none());
+            let saved = if explicit {
+                let reference = receipts
+                    .receipts()
+                    .into_iter()
+                    .find_map(|r| r.spend_receipt)
+                    .unwrap();
+                spend
+                    .receipt(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .recovery
+                    .unwrap()
+            } else {
+                cache.entries.lock().unwrap().get("OK").cloned().unwrap()
+            };
+            assert_eq!(saved["text"], "OK");
+            assert!(saved["raw_provider_response"].is_null());
+            assert!(!saved.to_string().contains("PRIVATE_REASONING"));
+            let replay = provider.chat(request("OK")).await.unwrap();
+            assert_eq!(replay.text, "OK");
+            assert!(replay.raw_provider_response.is_none());
+            assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+        }
+    })
+    .await
+    .expect("runtime raw disposal must finish within three seconds");
 }
