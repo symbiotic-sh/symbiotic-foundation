@@ -10,7 +10,7 @@ use symbiotic_ai_runtime::{
     ChatProvider, ChatRequest, ConfiguredProvider, InMemoryReceiptSink, ModelError,
     ModelQueueConfig, Runtime, RuntimeConfig, model,
 };
-use symbiotic_core::{ProviderPrincipalId, TenantId};
+use symbiotic_core::{DiagnosticCode, ProviderPrincipalId, TenantId};
 use symbiotic_trace::InMemoryTraceSink;
 
 const KEY: &str = "synthetic-credential-echo-9271";
@@ -316,7 +316,20 @@ async fn final_validation_and_typed_decoding_errors_cannot_reach_bookkeeping() {
             configured(&url, &state.path().join("state"), classifier, key).await;
         let error = call(&provider).await.unwrap_err();
         server.join().unwrap();
-        assert!(matches!(error, ModelError::Provider(_)), "{error:?}");
+        if classifier {
+            assert!(
+                matches!(error, ModelError::Provider(DiagnosticCode::ProviderFailure)),
+                "{error:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    ModelError::Unavailable(DiagnosticCode::InvalidResponse)
+                ),
+                "{error:?}"
+            );
+        }
         for text in [
             error.to_string(),
             serde_json::to_string(&receipts.receipts()).unwrap(),
