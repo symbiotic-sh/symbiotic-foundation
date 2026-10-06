@@ -1707,6 +1707,9 @@ where
         &runtime.binding_identity,
         provider.credential_fingerprint(),
     ))?;
+    // Rebuild responses cached before request-text identity screening. Keep
+    // this format version out of queue deduplication and paid attempt identity.
+    let cache_scope = hash_json(&("request-screened-usage/v1", &provider_identity))?;
     // Credential generations partition queue/cache state, not charge recovery.
     let attempt_binding =
         hash_json(&(kind, &descriptor, &runtime.binding_identity, &request_hash))?;
@@ -1768,7 +1771,7 @@ where
         capability,
         kind: kind.to_string(),
         binding_identity: runtime.binding_identity.clone(),
-        cache_scope: Some(provider_identity),
+        cache_scope: Some(cache_scope),
         cache,
         trace_sink: runtime.trace_sink.clone(),
         request,
@@ -5664,6 +5667,123 @@ mod tests {
         );
 
         second.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "queue")]
+    #[tokio::test]
+    async fn regression_prescreening_cache_misses_and_clean_rebuild_is_reusable() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = DirResponseCache::new(dir.path().to_path_buf());
+            let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let raw = SlowCountingChat::new(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                calls.clone(),
+            );
+            let request = chat_request("PRIVATE_PROMPT");
+            let request_hash = hash_json(&request).unwrap();
+            let request_value = serde_json::to_value(&request).unwrap();
+            let mut descriptor = raw.descriptor().clone();
+            let binding: Option<symbiotic_core::BindingIdentity> = None;
+            descriptor.metadata = serde_json::json!({
+                "configuration": descriptor.metadata,
+                "binding": binding,
+            });
+            // Pin the scope used before provider identities were screened against requests.
+            let old_scope =
+                hash_json(&(&descriptor, &binding, raw.credential_fingerprint())).unwrap();
+            let mut old_trace = success_trace(
+                raw.descriptor(),
+                None,
+                None,
+                request_hash.clone(),
+                Some("old answer"),
+            );
+            old_trace.usage.response_id = Some("PRIVATE_PROMPT".into());
+            old_trace.metadata = serde_json::json!({
+                "result_scope": old_scope,
+                "provider": {"response_id": "PRIVATE_PROMPT"},
+            });
+            cache
+                .store(
+                    &CacheEntry {
+                        kind: "chat",
+                        scope: Some(&old_scope),
+                        request_hash: &request_hash,
+                        request: &request_value,
+                    },
+                    &serde_json::to_value(ChatResponse {
+                        text: "old answer".into(),
+                        finish_reason: Some("stop".into()),
+                        trace: old_trace,
+                        raw_provider_response: None,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let traces = Arc::new(InMemoryTraceSink::default());
+            let receipts = Arc::new(InMemoryReceiptSink::default());
+            let spend = test_spend::ledger();
+            let install = || {
+                QueuedChatProvider::new(
+                    raw.clone(),
+                    queue.clone(),
+                    "worker",
+                    ModelQueueConfig {
+                        request_timeout_seconds: Some(1),
+                        response_cache_dir: Some(dir.path().to_path_buf()),
+                        ..ModelQueueConfig::default()
+                    },
+                )
+                .with_spend_ledger(spend.clone(), None)
+                .with_trace_sink(traces.clone())
+                .with_receipt_sink(receipts.clone())
+            };
+            let rebuilt = install().chat(request.clone()).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "old cache must miss");
+            assert_eq!(rebuilt.trace.cache.response_cache, CacheStatus::Miss);
+            assert_ne!(rebuilt.trace.metadata["result_scope"], old_scope);
+            assert_eq!(rebuilt.text, "PRIVATE_PROMPT");
+
+            // Cache format changes must not reset queue deduplication or spend attribution.
+            let attempt_binding =
+                hash_json(&("chat", &descriptor, &binding, &request_hash)).unwrap();
+            let item = queue
+                .get_item(rebuilt.trace.queue_item_id.as_ref().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                item.idempotency_key,
+                Some(format!(
+                    "{}:{old_scope}:{request_hash}:{}",
+                    descriptor.queue_id().0,
+                    hash_json(&attempt_binding).unwrap(),
+                )),
+            );
+            // Reopen the wrapper with the same configuration, as after a restart.
+            let reused = install().chat(request).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "clean cache must hit");
+            assert_eq!(reused.trace.cache.response_cache, CacheStatus::Hit);
+            assert_eq!(reused.text, rebuilt.text);
+            assert_eq!(traces.records().len(), 2);
+            for trace in traces.records() {
+                assert_eq!(trace.usage.response_id, None);
+                assert!(trace.metadata.pointer("/provider/response_id").is_none());
+            }
+            let receipts = receipts.receipts();
+            assert!(receipts.iter().any(|r| r.status == ReceiptStatus::CacheHit));
+            for receipt in receipts {
+                if let Some(usage) = receipt.usage {
+                    assert_eq!(usage.response_id, None);
+                }
+                assert!(receipt.metadata.pointer("/provider/response_id").is_none());
+            }
+        })
+        .await
+        .expect("old-cache rebuild and reuse must finish within three seconds");
     }
 
     #[cfg(feature = "queue")]
