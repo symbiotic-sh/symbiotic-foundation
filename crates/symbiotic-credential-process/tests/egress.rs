@@ -83,6 +83,142 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
     }
 }
 
+struct Child(std::process::Child);
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+const OBSERVATION_HANG_GUARD: Duration = Duration::from_secs(60);
+
+async fn wait_for_startup<T, F>(mut check_alive: impl FnMut(), mut probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Result<T, EgressError>>,
+{
+    // The socket path can appear before the server accepts requests.
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+        loop {
+            check_alive();
+            match probe().await {
+                Ok(reply) => break reply,
+                Err(EgressError::Transport) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("child startup failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("child did not accept requests within the startup hang guard")
+}
+
+async fn wait_for_child_startup<T, F>(child: &mut Child, probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Result<T, EgressError>>,
+{
+    wait_for_startup(
+        || {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before accepting requests"
+            );
+        },
+        probe,
+    )
+    .await
+}
+
+async fn wait_for_engine_startup(pid: u32, ready_path: &std::path::Path) {
+    wait_for_startup(
+        || {
+            // SAFETY: signal 0 only checks the first child, which the supervisor reaps.
+            assert_eq!(
+                unsafe { libc::kill(pid as i32, 0) },
+                0,
+                "engine exited before readiness: {}",
+                std::io::Error::last_os_error()
+            );
+        },
+        || async {
+            if ready_path.exists() {
+                Ok(())
+            } else {
+                Err(EgressError::Transport)
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "engine exited before readiness")]
+async fn regression_engine_startup_fails_when_first_supervised_child_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = symbiotic_supervise::Supervisor::start(
+        || std::process::Command::new("/usr/bin/true"),
+        symbiotic_supervise::Policy {
+            max_restarts: 0,
+            ..supervision_policy()
+        },
+    )
+    .unwrap();
+    let symbiotic_supervise::Event::Started(pid) = supervisor.next_event().unwrap() else {
+        panic!("missing first engine");
+    };
+    assert!(matches!(
+        supervisor.next_event().unwrap(),
+        symbiotic_supervise::Event::Exited(_)
+    ));
+    // Reaping the first child must fail startup before the paused clock advances.
+    wait_for_engine_startup(pid, &dir.path().join("engine.ready")).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn regression_child_startup_wait_allows_delayed_readiness() {
+    let mut child = Child(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    let started = tokio::time::Instant::now();
+    let reply = wait_for_child_startup(&mut child, || async {
+        if started.elapsed() < Duration::from_secs(4) {
+            Err(EgressError::Transport)
+        } else {
+            Ok(Reply::GrantRevisionPublished)
+        }
+    })
+    .await;
+    assert!(matches!(reply, Reply::GrantRevisionPublished));
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "child exited before accepting requests")]
+async fn regression_child_startup_wait_fails_before_probing_exited_child() {
+    let mut child = Child(std::process::Command::new("/usr/bin/true").spawn().unwrap());
+    assert!(child.0.wait().unwrap().success());
+    wait_for_child_startup::<(), _>(&mut child, || async {
+        panic!("an exited child must be detected before any readiness probe");
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "child did not accept requests within the startup hang guard")]
+async fn regression_child_startup_wait_bounds_unready_child() {
+    let mut child = Child(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_child_startup(&mut child, || async {
+        Err::<(), _>(EgressError::Transport)
+    })
+    .await;
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: ProcessConfig,
@@ -1461,32 +1597,12 @@ async fn executable_dispatch(
     numeric_cost: Option<&'static str>,
     clock_case: Option<(u64, u64, bool)>,
 ) -> String {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     async fn ready_status(
         child: &mut Child,
         client: &socket::UnixEgressClient,
         signed_id: &SignedAttemptId,
     ) -> AttemptStatus {
-        // The socket path can appear before the server is accepting.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                assert!(child.0.try_wait().unwrap().is_none());
-                match client.attempt_status(signed_id.clone()).await {
-                    Ok(status) => break status,
-                    Err(EgressError::Transport) => {}
-                    Err(error) => panic!("startup status failed: {error:?}"),
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap()
+        wait_for_child_startup(child, || client.attempt_status(signed_id.clone())).await
     }
     let mut fixture = Fixture::with_cost(
         200,
@@ -1578,7 +1694,7 @@ async fn executable_dispatch(
     // before dropping it, so this proves loss after commit rather than before accept.
     let lost_permit_reply =
         send_without_reading(&client, Operation::IssuePermit(admission.clone().into())).await;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         loop {
             if matches!(
                 client.attempt_status(signed_id.clone()).await.unwrap(),
@@ -1608,7 +1724,7 @@ async fn executable_dispatch(
     // Lose the completion reply as well. No second injection is needed to settle.
     let lost_completion_reply =
         send_without_reading(&client, inject(admission, payload, granted.permit)).await;
-    let result = tokio::time::timeout(Duration::from_secs(3), async {
+    let result = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         loop {
             if let AttemptStatus::Completed { result } =
                 client.attempt_status(signed_id.clone()).await.unwrap()
@@ -2964,19 +3080,59 @@ fn supervised_credential_parent_entrypoint() {
     };
     std::fs::write(pid_path, pid.to_string()).unwrap();
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        match supervisor
+            .next_event()
+            .expect("credential supervision failed")
+        {
+            symbiotic_supervise::Event::Started(_) => {}
+            symbiotic_supervise::Event::Exited(status) => {
+                panic!("credential child exited: {status}");
+            }
+        }
     }
 }
 
 #[tokio::test]
-async fn supervision_credential_child_exits_when_app_is_killed() {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+async fn regression_supervised_credential_parent_exits_on_child_startup_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervised_credential_parent_entrypoint",
+                "--nocapture",
+            ])
+            .env(
+                "CREDENTIAL_PARENT_CONFIG",
+                dir.path().join("missing-config.json"),
+            )
+            .env("CREDENTIAL_CHILD_PID", dir.path().join("child.pid"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let status = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+        loop {
+            if let Some(status) = parent.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
+    })
+    .await
+    .expect("parent stayed alive after credential child startup failure");
+    assert!(
+        dir.path().join("child.pid").exists(),
+        "child must have started"
+    );
+    assert!(
+        !status.success(),
+        "child startup failure must fail the parent"
+    );
+}
+
+#[tokio::test]
+async fn supervision_credential_child_exits_when_app_is_killed() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     let config = fixture.dir.path().join("config.json");
     std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
@@ -3005,22 +3161,15 @@ async fn supervision_credential_child_exits_when_app_is_killed() {
         .unwrap()
         .sign_attempt_id(attempt.attempt.attempt_id())
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match client.attempt_status(id.clone()).await {
-                Ok(AttemptStatus::NotIssued) => break,
-                Err(EgressError::Transport) => tokio::time::sleep(Duration::from_millis(5)).await,
-                _ => panic!("readiness refused"),
-            }
-        }
-    })
-    .await
-    .unwrap();
+    assert!(matches!(
+        wait_for_child_startup(&mut parent, || client.attempt_status(id.clone())).await,
+        AttemptStatus::NotIssued
+    ));
     let pid: u32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
     parent.0.kill().unwrap();
     parent.0.wait().unwrap();
     // Lock release, rather than PID disappearance, also works with Linux orphan zombies.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         loop {
             if let Ok(process) = CredentialProcess::open(fixture.config.clone()) {
                 assert!(server::bind(&process).is_ok());
@@ -3135,13 +3284,7 @@ async fn supervision_engine_restart_consumes_saved_completion_without_second_pay
     let symbiotic_supervise::Event::Started(first_pid) = supervisor.next_event().unwrap() else {
         panic!("missing engine");
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !fixture.dir.path().join("engine.ready").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_engine_startup(first_pid, &fixture.dir.path().join("engine.ready")).await;
     let response = client
         .exchange(Request {
             version: PROTOCOL_VERSION,
@@ -3162,7 +3305,7 @@ async fn supervision_engine_restart_consumes_saved_completion_without_second_pay
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         while fixture.calls.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -3196,7 +3339,7 @@ async fn supervision_engine_restart_consumes_saved_completion_without_second_pay
     assert!(
         matches!(&result.output, Some(ProviderOutput::Chat { text, .. }) if text == "saved completion")
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         while !fixture.dir.path().join("engine.result").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -4578,13 +4721,6 @@ async fn jobs_scope_and_mac_are_checked_before_any_control_operation() {
 
 #[tokio::test]
 async fn jobs_kill_after_dispatch_recovers_uncertain_without_resending() {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let mut fixture = Fixture::new(200, "late answer".into(), Duration::from_secs(10)).await;
     fixture.config.jobs.claim_lease_seconds = 1;
     fixture.config.routes[0].timeout_seconds = 30;
@@ -4613,34 +4749,15 @@ async fn jobs_kill_after_dispatch_recovers_uncertain_without_resending() {
         timeout: Duration::from_secs(3),
     };
     async fn ready(child: &mut Child, client: &socket::UnixEgressClient) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                assert!(child.0.try_wait().unwrap().is_none());
-                match client
-                    .exchange(Request {
-                        version: PROTOCOL_VERSION,
-                        operation: publish_revision(1),
-                    })
-                    .await
-                {
-                    Ok(response) => {
-                        response.result.unwrap();
-                        break;
-                    }
-                    Err(EgressError::Transport) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    other => panic!("startup failed: {}", other.is_err()),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        assert!(matches!(
+            wait_for_child_startup(child, || exchange_client(client, publish_revision(1))).await,
+            Reply::GrantRevisionPublished
+        ));
     }
     ready(&mut child, &client).await;
     let input = queued(&fixture, "crashed");
     let id = enqueue_id(&client, input.clone()).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         while fixture.calls.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -6130,13 +6247,6 @@ async fn rabbithole_classification_charges_once_and_recovers_typed_answers() {
 
 #[tokio::test]
 async fn rabbithole_classification_crash_never_resends_or_charges_again() {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let fixture = rabbithole_jev_fixture(Some(Arc::new(tokio::sync::Semaphore::new(0)))).await;
     let config = fixture.dir.path().join("config.json");
     std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
@@ -6162,18 +6272,10 @@ async fn rabbithole_classification_crash_never_resends_or_charges_again() {
         max_frame_bytes: fixture.config.max_frame_bytes,
         timeout: Duration::from_secs(2),
     };
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            assert!(child.0.try_wait().unwrap().is_none());
-            match exchange_client(&client, publish_revision(1)).await {
-                Ok(Reply::GrantRevisionPublished) => break,
-                Err(EgressError::Transport) => tokio::time::sleep(Duration::from_millis(10)).await,
-                _ => panic!("child startup failed"),
-            }
-        }
-    })
-    .await
-    .unwrap();
+    assert!(matches!(
+        wait_for_child_startup(&mut child, || exchange_client(&client, publish_revision(1))).await,
+        Reply::GrantRevisionPublished
+    ));
     let (admission, payload) = rabbithole_classify_attempt(&fixture);
     let Reply::Permit(grant) =
         exchange_client(&client, Operation::IssuePermit(admission.clone().into()))
@@ -6187,7 +6289,7 @@ async fn rabbithole_classification_crash_never_resends_or_charges_again() {
         inject(admission.clone(), payload.clone(), grant.permit.clone()),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
         while fixture.calls.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -7110,13 +7212,6 @@ async fn regression_answer_recovery_jobs_never_write_paid_results() {
 
 #[tokio::test]
 async fn regression_answer_recovery_crash_after_answer_before_consumption() {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     for classify in [false, true] {
         let mut fixture = answer_recovery_fixture(classify).await;
         fixture.config.routes[0].answer_recovery =
@@ -7137,20 +7232,11 @@ async fn regression_answer_recovery_crash_after_answer_before_consumption() {
             max_frame_bytes: fixture.config.max_frame_bytes,
             timeout: Duration::from_secs(2),
         };
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                assert!(child.0.try_wait().unwrap().is_none());
-                match exchange_client(&client, publish_revision(1)).await {
-                    Ok(Reply::GrantRevisionPublished) => break,
-                    Err(EgressError::Transport) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    _ => panic!("startup failed"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        assert!(matches!(
+            wait_for_child_startup(&mut child, || exchange_client(&client, publish_revision(1)))
+                .await,
+            Reply::GrantRevisionPublished
+        ));
         let (admission, payload) = if classify {
             rabbithole_classify_attempt(&fixture)
         } else {
@@ -7168,7 +7254,7 @@ async fn regression_answer_recovery_crash_after_answer_before_consumption() {
             inject(admission.clone(), payload.clone(), grant.permit.clone()),
         )
         .await;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
             loop {
                 let conn = rusqlite::Connection::open(
                     fixture
@@ -7736,14 +7822,7 @@ async fn regression_request_budget_durable_admission_write_failure_refuses_befor
 
 #[tokio::test]
 async fn regression_request_budget_durable_crash_after_send_blocks_different_invocation() {
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut fixture = Fixture::with_response_gate(
             400,
@@ -7773,21 +7852,11 @@ async fn regression_request_budget_durable_crash_after_send_blocks_different_inv
             max_frame_bytes: fixture.config.max_frame_bytes,
             timeout: Duration::from_secs(2),
         };
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                assert!(child.0.try_wait().unwrap().is_none());
-                match exchange_client(&client, publish_revision(1)).await {
-                    Ok(Reply::GrantRevisionPublished) => break,
-                    Err(EgressError::Transport) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await
-                    }
-                    Err(error) => panic!("startup failed: {error:?}"),
-                    Ok(_) => panic!("unexpected startup reply"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        assert!(matches!(
+            wait_for_child_startup(&mut child, || exchange_client(&client, publish_revision(1)))
+                .await,
+            Reply::GrantRevisionPublished
+        ));
         let (admission, payload) = fixture.attempt("crashed", 1, 1);
         let Reply::Permit(grant) =
             exchange_client(&client, Operation::IssuePermit(admission.clone().into()))
@@ -7798,7 +7867,7 @@ async fn regression_request_budget_durable_crash_after_send_blocks_different_inv
         };
         let peer =
             send_without_reading(&client, inject(admission.clone(), payload, grant.permit)).await;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
             while fixture.calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
