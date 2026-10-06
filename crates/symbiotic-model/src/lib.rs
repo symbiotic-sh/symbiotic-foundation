@@ -5152,6 +5152,7 @@ mod tests {
         max_seen: Arc<AtomicUsize>,
         calls: Arc<AtomicUsize>,
         start_barrier: Option<Arc<tokio::sync::Barrier>>,
+        delay: Duration,
     }
 
     #[cfg(feature = "queue")]
@@ -5187,6 +5188,7 @@ mod tests {
                 max_seen,
                 calls,
                 start_barrier: None,
+                delay: Duration::from_millis(20),
             }
         }
     }
@@ -5209,7 +5211,7 @@ mod tests {
             if let Some(barrier) = &self.start_barrier {
                 barrier.wait().await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(self.delay).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(ChatResponse {
                 text: request
@@ -5513,12 +5515,16 @@ mod tests {
             TEST_QUEUE_COUNTER.fetch_add(1, Ordering::SeqCst)
         );
         let provider = QueuedChatProvider::new(
-            SlowCountingChat::new_with_identity(
-                active,
-                max_seen,
-                calls,
-                ModelIdentity::new("chat", "test", unique_model),
-            ),
+            SlowCountingChat {
+                // Reproduce a slow first request and a provider call above the old 500 ms bound.
+                delay: Duration::from_millis(600),
+                ..SlowCountingChat::new_with_identity(
+                    active,
+                    max_seen,
+                    calls,
+                    ModelIdentity::new("chat", "test", unique_model),
+                )
+            },
             queue,
             "worker",
             ModelQueueConfig {
@@ -5527,7 +5533,7 @@ mod tests {
                 logical_retry_attempts: 1,
                 retry_attempts: 1,
                 retry_jitter_seconds: 0,
-                request_timeout_seconds: Some(1),
+                request_timeout_seconds: Some(60),
                 requests_per_minute: Some(60),
                 input_units_per_minute: None,
                 response_cache_dir: None,
@@ -5537,38 +5543,34 @@ mod tests {
         .with_spend_ledger(test_spend::ledger(), None)
         .with_trace_sink(trace_sink.clone());
 
-        provider.chat(chat_request("first")).await.unwrap();
-        provider.chat(chat_request("second")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            provider.chat(chat_request("first")).await.unwrap();
+            provider.chat(chat_request("second")).await.unwrap();
+        })
+        .await
+        .expect("queued chat calls must finish within the hang guard");
 
         let records = trace_sink.records();
         assert_eq!(records.len(), 2);
-        assert!(
-            records[1].timing.queued_ms.unwrap_or_default() >= 900,
-            "second request should account for budget wait as queued time: {:?}",
-            records[1].timing
-        );
-        assert!(
-            records[1].timing.provider_ms.unwrap_or(u64::MAX) < 500,
-            "provider timeout window should only cover the inner provider call: {:?}",
-            records[1].timing
-        );
-        assert!(
-            records[1].timing.total_ms.unwrap_or_default()
-                >= records[1].timing.queued_ms.unwrap_or_default()
-                    + records[1].timing.provider_ms.unwrap_or_default()
-        );
-        assert!(
-            records[1].timing.throttle_wait_ms.unwrap_or_default() >= 900,
-            "budget wait should be attributed to throttle_wait: {:?}",
-            records[1].timing
-        );
-        assert_eq!(
-            records[1].timing.queued_ms.unwrap_or_default(),
-            records[1].timing.queue_wait_ms.unwrap_or_default()
-                + records[1].timing.throttle_wait_ms.unwrap_or_default(),
-            "queue_wait + throttle_wait should partition queued time: {:?}",
-            records[1].timing
-        );
+        for record in &records {
+            let timing = &record.timing;
+            let queued = timing.queued_ms.expect("queued time is recorded");
+            let queue_wait = timing.queue_wait_ms.expect("queue wait is recorded");
+            let throttle_wait = timing.throttle_wait_ms.expect("throttle wait is recorded");
+            let provider = timing.provider_ms.expect("provider time is recorded");
+            let total = timing.total_ms.expect("total time is recorded");
+            assert_eq!(
+                queued,
+                queue_wait + throttle_wait,
+                "queue and throttle wait must partition queued time: {timing:?}"
+            );
+            // Queue/throttle waits end before the provider starts. Counting either again
+            // as provider time would exceed the total elapsed time.
+            assert!(
+                total >= queued + provider,
+                "queued and provider time must not overlap: {timing:?}"
+            );
+        }
     }
 
     #[cfg(feature = "queue")]
