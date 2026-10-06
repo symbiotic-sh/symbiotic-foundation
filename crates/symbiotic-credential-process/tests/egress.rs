@@ -7405,6 +7405,66 @@ fn assert_request_budget_refused(result: &DispatchResult) {
     assert!(result.receipt_persisted);
 }
 
+fn assert_reconciliation_required(result: &DispatchResult) {
+    assert_eq!(result.error, Some(EgressError::ReconciliationRequired));
+    assert_eq!(result.receipt.spend_state, SpendState::Released);
+    assert!(result.output.is_none() && result.receipt_persisted);
+}
+
+#[tokio::test]
+async fn regression_unresolved_request_different_input_proceeds_until_reconciliation() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for policy in [None, Some(None), Some(Some(0))] {
+            let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+            if let Some(renewal) = policy {
+                configure_request_budget(&mut fixture, 3, renewal);
+            }
+            let process = fixture.process().await;
+            let conn = rusqlite::Connection::open(
+                fixture
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_completion BEFORE UPDATE OF finished ON egress_permits
+                 BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;",
+            )
+            .unwrap();
+            let original =
+                request_budget_call(&fixture, &process, "unfinished", false, false).await;
+            assert!(!original.receipt_persisted);
+            assert_eq!(original.receipt.spend_state, SpendState::Unknown);
+            conn.execute_batch("DROP TRIGGER reject_completion")
+                .unwrap();
+            let different =
+                request_budget_call(&fixture, &process, "different-input", false, true).await;
+            assert!(different.error.is_none() && different.output.is_some());
+            assert_reconciliation_required(
+                &request_budget_call(&fixture, &process, "same-input", false, false).await,
+            );
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+            // Existing canonical reconciliation resolves the original reservation.
+            let tx = conn.unchecked_transaction().unwrap();
+            symbiotic_ai_runtime::spend::SqliteSpendLedger::finish_in(
+                &tx,
+                &original.receipt.reference,
+                SpendState::Settled,
+                Some(original.receipt.usage.clone()),
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            let resolved = request_budget_call(&fixture, &process, "resolved", false, false).await;
+            assert!(resolved.error.is_none() && resolved.output.is_some());
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
+        }
+    })
+    .await
+    .expect("bounded unresolved request identity regression");
+}
+
 #[tokio::test]
 async fn regression_request_budget_durable_completion_failure_keeps_allowance_consumed() {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -7416,7 +7476,7 @@ async fn regression_request_budget_durable_completion_failure_keeps_allowance_co
         ] {
             for restart in [false, true] {
                 let mut fixture = Fixture::new(status_code, "answer".into(), Duration::ZERO).await;
-                configure_request_budget(&mut fixture, 1, None);
+                configure_request_budget(&mut fixture, 3, None);
                 if pre_send_failure {
                     // A trusted pre-send failure must keep its debit if the
                     // transaction that would undo it cannot commit.
@@ -7458,7 +7518,7 @@ async fn regression_request_budget_durable_completion_failure_keeps_allowance_co
                     drop(process);
                     process = fixture.process().await;
                 }
-                assert_request_budget_refused(
+                assert_reconciliation_required(
                     &request_budget_call(&fixture, &process, "different-invocation", false, false)
                         .await,
                 );
@@ -7535,7 +7595,7 @@ async fn regression_request_budget_durable_crash_after_send_blocks_different_inv
             Some(response_gate.clone()),
         )
         .await;
-        configure_request_budget(&mut fixture, 1, None);
+        configure_request_budget(&mut fixture, 3, None);
         fixture.config.routes[0].timeout_seconds = 5;
         let config = fixture.dir.path().join("config.json");
         std::fs::write(&config, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
@@ -7594,10 +7654,37 @@ async fn regression_request_budget_durable_crash_after_send_blocks_different_inv
             panic!("crashed attempt must remain uncertain")
         };
         assert_eq!(receipt.spend_state, SpendState::Unknown);
-        assert_request_budget_refused(
+        assert_eq!(receipt.attempt_id, admission.attempt.attempt_id());
+        let recovered = permit(&process, &admission).await;
+        assert_eq!(
+            recovered.attempt_digest,
+            digest(&admission.attempt).unwrap()
+        );
+        assert_reconciliation_required(
             &request_budget_call(&fixture, &process, "after-crash", false, false).await,
         );
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let failures: u32 = conn
+            .query_row(
+                "SELECT failed_sends FROM egress_request_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1, "two attempts remain unused");
+        let AttemptStatus::Dispatched { receipt: original } = status(&process, &admission).await
+        else {
+            panic!("original attempt must remain recoverable")
+        };
+        assert_eq!(original.reference, receipt.reference);
+        assert_eq!(original.spend_state, SpendState::Unknown);
     })
     .await
     .expect("bounded crash/restart budget regression");

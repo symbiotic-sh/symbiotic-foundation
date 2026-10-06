@@ -165,9 +165,9 @@ exactly like a failed send; measured usage still settles spend, and missing usag
 keeps spend unknown with content-free output-received evidence. Under
 `answer_recovery: "off"`, no rejected answer is persisted. A dropped caller future
 does not cancel validation or completion; a crash before completion keeps the
-debit. Callers without this callback, socket dispatches, signed jobs, and
-unconfigured or zero-renewal budget behavior remain unchanged. No wire operation
-or persistent structure is added.
+debit. Answer validation leaves callers without this callback, socket dispatches
+and signed jobs unchanged; completed calls retain unconfigured and zero-renewal
+budget behavior. Answer validation adds no wire operation or persistent structure.
 
 After single-use permit consumption and credential resolution, an exhausted
 key returns `DispatchResult.error = RequestBudgetExhausted` (wire code
@@ -187,8 +187,29 @@ send updates the renewal timestamp at completion. Completion commits success
 clearing or a trusted pre-send debit undo atomically with egress completion and
 spend bookkeeping. Undo restores the previous renewal timestamp. A failed completion
 write reports `receipt_persisted: false` and retains unknown spend and the debit;
-a process crash before completion likewise preserves the debit. Both prevent a
-different invocation with identical input from bypassing the shared allowance.
+a process crash before completion likewise preserves the debit. Remaining allowance
+alone does not authorize resubmitting an unresolved request.
+
+Before every direct HTTP execution, including routes without a request budget,
+Foundation binds the existing request-key digest to the consumed canonical
+`egress_permits` row. In the same immediate SQLite transaction, it checks for an
+unfinished earlier send with that key whose canonical spend is neither Released
+nor Settled, and commits any configured budget debit. Such a predecessor returns
+`DispatchResult.error = ReconciliationRequired` without an HTTP send or another
+debit; the new attempt's reservation is released and its permit remains consumed.
+The original attempt identity, receipt and unknown reservation remain available
+through authenticated same-attempt recovery after restart. Budget renewal,
+a different invocation ID and answer-recovery expiry do not resolve it.
+Reconciliation of the original receipt to Released or Settled removes this block.
+Durably completed calls keep the shared failure-count behavior above; different
+request keys proceed independently.
+
+The nullable `egress_permits.request_key` field records this pre-send identity;
+there is no separate unresolved-attempt table, cache or index. The bare SQLite
+operation scans canonical permits for matching unfinished sends, joins their
+existing receipts to the ledger by receipt reference, and updates one permit row.
+The request binding connects the budget's identity to recovery without deriving
+meaning from invocation IDs or keeping another execution-state owner.
 
 Evidence: the `regression_request_budget_*` tests in
 `crates/symbiotic-credential-process/tests/egress.rs` cover three sends for six
@@ -203,14 +224,18 @@ measured and missing usage, and unchanged unconfigured/fresh-per-call dispatch.
 The `regression_request_budget_durable_*` tests cover admission-write refusal,
 completion-write failure after provider failure, caller rejection or success,
 and crash/restart after a
-send followed by a different invocation with identical input. The registry test
+send followed by a different invocation with identical input and two attempts
+still unused. `regression_unresolved_request_different_input_proceeds_until_reconciliation`
+covers different input, canonical reconciliation, omitted budgets and zero renewal.
+The registry `unresolved_request_*` tests exercise the same admission and restart
+checks without network fixtures. The registry test
 `request_budget_pre_send_undo_restores_only_unexpired_consumption` covers renewal
 timestamp restoration and expiry.
 
 ## Same-attempt recovery (v4)
 
 V4 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 8 and queue schema is 17.
+versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 9 and queue schema is 17.
 Opening a registry with a different stamp fails with `Version`; no migration or reset is
 performed. An incomplete registry refuses startup instead of recreating lost
 canonical permit, grant-revision or request-budget tables. Its result-expiry index
@@ -447,12 +472,14 @@ errors retain `FailureCharge::Unknown` and the unknown spend reservation. This
 repository holds no provider billing documentation supporting status exceptions.
 Evidence lives only in the failed call's error; released accounting and retry
 admission use the existing canonical spend ledger and attempt records.
-Admission checks only the latest attempt using the invocation/ordinal index. For a
+Permit admission checks the latest attempt using the invocation/ordinal index. For a
 consumed predecessor, its receipt's canonical ledger state must be Released;
 an unconsumed predecessor follows the revocation rule above. Success is terminal,
 and other charges require reconciliation. The latest row carries the cumulative accepted
 handoff count, incremented only with atomic consumption/reservation and copied to the next
-row; earlier history needs no aggregate scan.
+row; earlier invocation history needs no aggregate scan. Direct send admission
+also checks unresolved predecessors across invocation IDs using the request identity
+and canonical ledger as described above.
 If the atomic final result/receipt write fails, the paid output still returns with
 `receipt_persisted = false` and `SpendState::Unknown`; restart retains the earlier reservation and
 `Dispatched` state. Receipt reconciliation and references follow the

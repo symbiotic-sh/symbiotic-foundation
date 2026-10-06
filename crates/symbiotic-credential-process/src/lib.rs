@@ -639,30 +639,20 @@ impl CredentialProcess {
         let mut budget_admission = None;
         match secret {
             Ok(Ok(secret)) => {
-                let budget_key = route
-                    .request_budget
-                    .as_ref()
-                    .map(|_| {
-                        symbiotic_ai_runtime::model::configuration_revision(&(
-                            &route.tenant,
-                            &route.route,
-                            symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
-                            &input_digest,
-                        ))
-                        .map(|digest| digest.0)
-                        .map_err(|_| EgressError::StateUnavailable)
-                    })
-                    .transpose();
-                let admission = budget_key.and_then(|key| {
-                    key.zip(route.request_budget.as_ref())
-                        .map(|(key, policy)| {
-                            self.inner
-                                .registry
-                                .lock()
-                                .map_err(|_| EgressError::StateUnavailable)?
-                                .admit_request_budget(key, policy)
-                        })
-                        .transpose()
+                let request_key = symbiotic_ai_runtime::model::configuration_revision(&(
+                    &route.tenant,
+                    &route.route,
+                    symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
+                    &input_digest,
+                ))
+                .map(|digest| digest.0)
+                .map_err(|_| EgressError::StateUnavailable);
+                let admission = request_key.and_then(|key| {
+                    self.inner
+                        .registry
+                        .lock()
+                        .map_err(|_| EgressError::StateUnavailable)?
+                        .admit_request(&receipt.attempt_digest, key, route.request_budget.as_ref())
                 });
                 let execution = match admission {
                     Ok(admission) => {

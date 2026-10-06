@@ -17,7 +17,7 @@ pub(crate) struct RequestBudgetAdmission {
 
 // A request or idle tick must never drain an arbitrarily large expired cohort.
 const EXPIRY_BATCH_SIZE: usize = 64;
-const REGISTRY_SCHEMA_VERSION: u16 = 8;
+const REGISTRY_SCHEMA_VERSION: u16 = 9;
 
 // Stored receipt identity/status; accounting is projected from the ledger on reads.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -92,7 +92,7 @@ impl Registry {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
-            INSERT INTO egress_schema SELECT 8 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
+            INSERT INTO egress_schema SELECT 9 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
                 invocation_key TEXT NOT NULL,
@@ -109,10 +109,13 @@ impl Registry {
                 result TEXT,
                 consumed INTEGER NOT NULL DEFAULT 0,
                 receipt TEXT,
+                request_key TEXT,
                 UNIQUE(invocation_key, ordinal)
             );
             CREATE INDEX IF NOT EXISTS egress_result_expiry
                 ON egress_permits(recovery_expires_at) WHERE result IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS egress_unresolved_request
+                ON egress_permits(request_key) WHERE consumed=1 AND finished=0;
             CREATE TABLE IF NOT EXISTS egress_grant_revisions (
                 grant_key TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL
@@ -363,17 +366,63 @@ impl Registry {
         Ok(receipt)
     }
 
-    /// Commit one debit before execution while holding the budget dispatch lock
-    /// until finish commits. Restart or a failed completion keeps that debit.
-    pub(crate) fn admit_request_budget(
+    /// Bind the canonical attempt to its request before execution. The writer
+    /// transaction orders competing sends, reconciliation and any budget debit.
+    pub(crate) fn admit_request(
         &mut self,
+        attempt_digest: &str,
         key: String,
-        policy: &RequestBudget,
-    ) -> Result<RequestBudgetAdmission, EgressError> {
+        policy: Option<&RequestBudget>,
+    ) -> Result<Option<RequestBudgetAdmission>, EgressError> {
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
+        let unresolved: Option<Option<String>> = tx
+            .query_row(
+                "SELECT s.state FROM egress_permits p
+             LEFT JOIN spend_receipts s ON s.reference=json_extract(p.receipt, '$.reference')
+             WHERE p.request_key=?1 AND p.consumed=1 AND p.finished=0
+             AND (s.state IS NULL OR s.state NOT IN ('released', 'settled')) LIMIT 1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(state)?;
+        if let Some(ledger_state) = unresolved {
+            return Err(if ledger_state.is_some() {
+                EgressError::ReconciliationRequired
+            } else {
+                EgressError::StateUnavailable
+            });
+        }
+        // The identity must commit before HTTP execution, atomically with the
+        // optional debit. Completion and reconciliation use the existing owners;
+        // neither unused nor renewed allowance resolves an unfinished send.
+        let changed = tx
+            .execute(
+                "UPDATE egress_permits SET request_key=?1
+             WHERE attempt_digest=?2 AND consumed=1 AND finished=0 AND request_key IS NULL",
+                params![key, attempt_digest],
+            )
+            .map_err(state)?;
+        if changed != 1 {
+            return Err(EgressError::PermitRefused);
+        }
+        let admission = policy
+            .map(|policy| Self::admit_request_budget_in(&tx, key, policy))
+            .transpose()?;
+        tx.commit().map_err(state)?;
+        Ok(admission)
+    }
+
+    // Dropping the returned token leaves the committed debit consumed. Only a
+    // durably recorded trusted pre-send failure can restore its previous state.
+    fn admit_request_budget_in(
+        tx: &rusqlite::Transaction<'_>,
+        key: String,
+        policy: &RequestBudget,
+    ) -> Result<RequestBudgetAdmission, EgressError> {
         let current_time = now()?;
         let previous: Option<(u32, u64)> = tx.query_row(
             "SELECT failed_sends, last_failure FROM egress_request_failures WHERE request_key=?1",
@@ -406,7 +455,6 @@ impl Registry {
         if changed != 1 {
             return Err(EgressError::StateUnavailable);
         }
-        tx.commit().map_err(state)?;
         Ok(RequestBudgetAdmission { key, previous })
     }
 
@@ -798,6 +846,242 @@ mod tests {
         .unwrap()
     }
 
+    fn accepted_request(
+        registry: &mut Registry,
+        invocation: &str,
+    ) -> (DurableAttempt, DispatchReceipt) {
+        let mut a = attempt();
+        a.invocation_id = invocation.into();
+        let permit = registry.issue(&a, 3).unwrap().permit;
+        let receipt = registry.consume(&a, &permit, &reservation(&a), 3).unwrap();
+        (a, receipt)
+    }
+
+    #[test]
+    fn unresolved_request_crash_recovery_keeps_original_with_unused_allowance() {
+        let _clock = TestClock::new(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let policy = RequestBudget {
+            attempts: 3,
+            renewal_seconds: None,
+        };
+        let mut registry = open(&path);
+        let (original, receipt) = accepted_request(&mut registry, "crashed");
+        registry
+            .admit_request(
+                &receipt.attempt_digest,
+                "same-request".into(),
+                Some(&policy),
+            )
+            .unwrap();
+        drop(registry); // No completion: the durable admission survives restart.
+        let mut registry = open(&path);
+        let AttemptStatus::Dispatched { receipt: recovered } =
+            registry.existing(&original).unwrap().unwrap().status
+        else {
+            panic!("original attempt must be recovered")
+        };
+        assert_eq!(recovered.attempt_id, original.attempt_id());
+        assert_eq!(recovered.reference, receipt.reference);
+        assert_eq!(recovered.spend_state, SpendState::Unknown);
+        // Expired answer recovery and authority do not resolve an admitted send.
+        _clock.set(original.recovery_expires_at);
+        let (_, retry) = accepted_request(&mut registry, "new-invocation");
+        assert!(matches!(
+            registry.admit_request(&retry.attempt_digest, "same-request".into(), Some(&policy)),
+            Err(EgressError::ReconciliationRequired)
+        ));
+        let failures: u32 = registry
+            .0
+            .query_row(
+                "SELECT failed_sends FROM egress_request_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1, "refusal must leave two attempts unused");
+        finish_released(&mut registry, retry);
+        assert_eq!(
+            registry
+                .receipt(&original.attempt_id())
+                .unwrap()
+                .unwrap()
+                .spend_state,
+            SpendState::Unknown
+        );
+    }
+
+    #[test]
+    fn unresolved_request_completion_failure_blocks_retry_without_budget_or_after_renewal() {
+        let _clock = TestClock::new(1000);
+        for policy in [
+            None,
+            Some(RequestBudget {
+                attempts: 3,
+                renewal_seconds: None,
+            }),
+            Some(RequestBudget {
+                attempts: 3,
+                renewal_seconds: Some(0),
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = open(&dir.path().join("registry.sqlite"));
+            let (original, receipt) = accepted_request(&mut registry, "unfinished");
+            registry
+                .admit_request(
+                    &receipt.attempt_digest,
+                    "same-request".into(),
+                    policy.as_ref(),
+                )
+                .unwrap();
+            registry
+                .0
+                .execute_batch(
+                    "CREATE TRIGGER reject_completion BEFORE UPDATE OF finished ON egress_permits
+                 BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;",
+                )
+                .unwrap();
+            assert!(matches!(
+                registry.finish(
+                    AnswerRecovery::Off,
+                    &DispatchResult {
+                        receipt,
+                        output: None,
+                        error: Some(EgressError::Provider { status: Some(400) }),
+                        diagnostics: Vec::new(),
+                        receipt_persisted: true,
+                    },
+                    None,
+                    false
+                ),
+                Err(EgressError::StateUnavailable)
+            ));
+            registry
+                .0
+                .execute_batch("DROP TRIGGER reject_completion")
+                .unwrap();
+            let (_, retry) = accepted_request(&mut registry, "retry");
+            assert!(matches!(
+                registry.admit_request(
+                    &retry.attempt_digest,
+                    "same-request".into(),
+                    policy.as_ref()
+                ),
+                Err(EgressError::ReconciliationRequired)
+            ));
+            assert_eq!(
+                registry
+                    .receipt(&original.attempt_id())
+                    .unwrap()
+                    .unwrap()
+                    .spend_state,
+                SpendState::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_request_different_identity_proceeds_and_reconciliation_removes_block() {
+        let _clock = TestClock::new(1000);
+        for resolution in [SpendState::Released, SpendState::Settled] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut registry = open(&dir.path().join("registry.sqlite"));
+            let (_, original) = accepted_request(&mut registry, "original");
+            registry
+                .admit_request(&original.attempt_digest, "same-request".into(), None)
+                .unwrap();
+            let (_, different) = accepted_request(&mut registry, "different-input");
+            registry
+                .admit_request(&different.attempt_digest, "different-request".into(), None)
+                .unwrap();
+            let (_, retry) = accepted_request(&mut registry, "same-input");
+            assert!(matches!(
+                registry.admit_request(&retry.attempt_digest, "same-request".into(), None),
+                Err(EgressError::ReconciliationRequired)
+            ));
+            let tx = registry.0.transaction().unwrap();
+            SqliteSpendLedger::finish_in(
+                &tx,
+                &original.reference,
+                resolution,
+                (resolution == SpendState::Settled).then(|| symbiotic_trace::UsageTrace {
+                    input_tokens: Some(7),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            registry
+                .admit_request(&retry.attempt_digest, "same-request".into(), None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn completed_unknown_requests_preserve_shared_failure_counts() {
+        let _clock = TestClock::new(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = open(&dir.path().join("registry.sqlite"));
+        let policy = RequestBudget {
+            attempts: 3,
+            renewal_seconds: None,
+        };
+        for ordinal in 0..3 {
+            let (_, receipt) = accepted_request(&mut registry, &format!("completed-{ordinal}"));
+            let budget = registry
+                .admit_request(
+                    &receipt.attempt_digest,
+                    "same-request".into(),
+                    Some(&policy),
+                )
+                .unwrap();
+            registry
+                .finish(
+                    AnswerRecovery::Off,
+                    &DispatchResult {
+                        receipt,
+                        output: None,
+                        error: Some(EgressError::Provider { status: Some(400) }),
+                        diagnostics: Vec::new(),
+                        receipt_persisted: true,
+                    },
+                    budget.as_ref(),
+                    false,
+                )
+                .unwrap();
+        }
+        let (_, exhausted) = accepted_request(&mut registry, "exhausted");
+        assert!(matches!(
+            registry.admit_request(
+                &exhausted.attempt_digest,
+                "same-request".into(),
+                Some(&policy)
+            ),
+            Err(EgressError::RequestBudgetExhausted)
+        ));
+        let failures: u32 = registry
+            .0
+            .query_row(
+                "SELECT failed_sends FROM egress_request_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 3);
+        let bound: bool = registry
+            .0
+            .query_row(
+                "SELECT request_key IS NOT NULL FROM egress_permits WHERE attempt_digest=?1",
+                [&exhausted.attempt_digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!bound, "budget refusal must roll back the request binding");
+    }
+
     #[test]
     fn request_budget_pre_send_undo_restores_only_unexpired_consumption() {
         let clock = TestClock::new(1000);
@@ -816,8 +1100,12 @@ mod tests {
                     attempts: 3,
                     renewal_seconds: renewal,
                 };
+                let a = attempt();
+                let permit = registry.issue(&a, 1).unwrap().permit;
+                let mut receipt = registry.consume(&a, &permit, &reservation(&a), 1).unwrap();
                 let admission = registry
-                    .admit_request_budget("request".into(), &policy)
+                    .admit_request(&receipt.attempt_digest, "request".into(), Some(&policy))
+                    .unwrap()
                     .unwrap();
                 let renewed = renewal.is_some_and(|seconds| {
                     seconds == 0 || 1000 >= last_failure && 1000 - last_failure >= seconds
@@ -838,9 +1126,6 @@ mod tests {
                         (3, last_failure.max(1000))
                     }
                 );
-                let a = attempt();
-                let permit = registry.issue(&a, 1).unwrap().permit;
-                let mut receipt = registry.consume(&a, &permit, &reservation(&a), 1).unwrap();
                 receipt.spend_state = SpendState::Released;
                 clock.set(1010);
                 registry
@@ -1634,7 +1919,7 @@ mod tests {
 
     #[test]
     fn obsolete_registry_versions_are_refused_without_migration() {
-        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("registry.sqlite");
             symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path).unwrap();
