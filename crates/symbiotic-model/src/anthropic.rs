@@ -216,7 +216,12 @@ impl ChatProvider for AnthropicChatProvider {
                     "cache_miss_tokens": miss,
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                 });
-                provider_usage_identity(&mut trace, &raw);
+                provider_usage_identity(&mut trace, &raw, |identity| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains(identity))
+                });
                 Ok(ChatResponse {
                     text,
                     finish_reason: Some(parsed.stop_reason),
