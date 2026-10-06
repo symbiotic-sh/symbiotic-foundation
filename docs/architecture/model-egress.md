@@ -158,7 +158,7 @@ Thread-mode direct callers can attach
 prompt callback receives the normalized `ProviderOutput` and returns whether the
 final answer is valid. Foundation invokes it on its owned dispatch task after
 provider execution and before committing egress completion, while still holding
-the configured budget lock. Returning `false` reports
+the configured per-key budget lock. Returning `false` reports
 `EgressError::Provider { status: None }` with `ProviderFailed` receipt status and
 no output. Rejection keeps the debit and updates the failure renewal timestamp
 exactly like a failed send; measured usage still settles spend, and missing usage
@@ -177,9 +177,20 @@ send or spend. With retained recovery the typed failure is recoverable; with
 The permit stays consumed. Budget admission failure refuses execution visibly.
 
 The existing process state lock excludes other processes. One in-memory async
-lock serializes configured budget dispatches from admission through completion,
-including unrelated budget keys; unconfigured dispatches retain their existing
-concurrency. Failure counts and last-failure Unix seconds live in the single
+lock per request-budget key serializes admission through durable completion for
+that key, after credential resolution supplies its fingerprint. Different keys
+can execute and complete while another provider is blocked, including keys on the
+same account when its configured concurrency permits. The lock map is protected
+only during lookup and pruning; its weak entries do not retain idle gates. The
+registry mutex protects synchronous SQLite operations and is never held across a
+provider call or an async wait. Acquisition order is budget-key gate, then the
+registry mutex for admission; execution reuses the runtime's existing account
+concurrency slots, cooldown checks and rate gates; completion takes the registry
+mutex while retaining the budget-key gate. Runtime rate gates protect allowance
+checks through charging before a send, and account slots enforce configured
+concurrency. No additional account lock is introduced. Unconfigured dispatches
+retain their existing concurrency. Failure counts and last-failure Unix seconds
+live in the single
 `egress_request_failures` table in the existing SQLite operational database.
 Admission checks renewal and commits one debit before provider execution; a failed
 write prevents execution. Admission timestamps uncertain sends; a recorded failed
@@ -203,7 +214,13 @@ measured and missing usage, and unchanged unconfigured/fresh-per-call dispatch.
 The `regression_request_budget_durable_*` tests cover admission-write refusal,
 completion-write failure after provider failure, caller rejection or success,
 and crash/restart after a
-send followed by a different invocation with identical input. The registry test
+send followed by a different invocation with identical input.
+`regression_request_budget_unrelated_routes_complete_while_provider_is_blocked`
+holds provider A behind an explicit response barrier and completes route B before
+releasing A, with separate accounts and with a shared account.
+`regression_request_budget_concurrent_dispatches_cannot_overspend` checks each
+same-key admission debit before releasing its provider barrier: six concurrent
+failing calls produce exactly three sends. The registry test
 `request_budget_pre_send_undo_restores_only_unexpired_consumption` covers renewal
 timestamp restoration and expiry.
 

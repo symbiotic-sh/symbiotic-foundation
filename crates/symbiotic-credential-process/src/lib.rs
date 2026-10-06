@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 pub use symbiotic_ai_runtime::AnswerRecovery;
 use symbiotic_ai_runtime::{Runtime, RuntimeConfig};
@@ -275,15 +275,32 @@ fn validate_frame_size(max_frame_bytes: u32) -> Result<(), EgressError> {
     Ok(())
 }
 
+#[derive(Default)]
+struct RequestBudgetDispatch(Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+
+impl RequestBudgetDispatch {
+    fn gate(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, EgressError> {
+        let mut gates = self.0.lock().map_err(|_| EgressError::StateUnavailable)?;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let entry = gates.entry(key.to_owned()).or_default();
+        if let Some(gate) = entry.upgrade() {
+            return Ok(gate);
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        *entry = Arc::downgrade(&gate);
+        Ok(gate)
+    }
+}
+
 struct Inner {
     config: ProcessConfig,
     key: AdmissionKey,
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
-    // Hold from budget lookup through durable completion. The process state lock
-    // excludes other processes; this lock prevents simultaneous sends overspending
-    // a request key without another durable in-flight owner.
-    request_budget_dispatch: tokio::sync::Mutex<()>,
+    // One gate per request-budget key, held from admission through durable
+    // completion so snapshot undo and success clearing cannot race another debit.
+    // Weak entries are pruned at lookup; holders and waiters own the live gates.
+    request_budget_dispatch: RequestBudgetDispatch,
     runtime: Runtime,
     job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
     _process_lock: Arc<ProcessLock>,
@@ -344,7 +361,7 @@ impl CredentialProcess {
                 key,
                 routes,
                 registry: Mutex::new(registry),
-                request_budget_dispatch: tokio::sync::Mutex::new(()),
+                request_budget_dispatch: RequestBudgetDispatch::default(),
                 runtime,
                 job_runners: tokio::sync::Mutex::new(HashMap::new()),
                 _process_lock: Arc::new(process_lock),
@@ -621,11 +638,8 @@ impl CredentialProcess {
         input_digest: String,
         answer_validator: Option<AnswerValidator>,
     ) -> DispatchResult {
-        let _budget_guard = if route.request_budget.is_some() {
-            Some(self.inner.request_budget_dispatch.lock().await)
-        } else {
-            None
-        };
+        // Resolve first: the credential fingerprint is part of the budget key.
+        let mut _budget_guard = None;
         let source = route.secret.clone();
         let max = self.inner.config.max_secret_bytes;
         let secret = tokio::task::spawn_blocking(move || match source {
@@ -653,17 +667,22 @@ impl CredentialProcess {
                         .map_err(|_| EgressError::StateUnavailable)
                     })
                     .transpose();
-                let admission = budget_key.and_then(|key| {
-                    key.zip(route.request_budget.as_ref())
-                        .map(|(key, policy)| {
-                            self.inner
-                                .registry
-                                .lock()
-                                .map_err(|_| EgressError::StateUnavailable)?
-                                .admit_request_budget(key, policy)
-                        })
-                        .transpose()
-                });
+                let admission = async {
+                    let Some((key, policy)) = budget_key?.zip(route.request_budget.as_ref()) else {
+                        return Ok(None);
+                    };
+                    let gate = self.inner.request_budget_dispatch.gate(&key)?;
+                    // Never await a key or account while holding the map/registry
+                    // mutex. Retain this key's guard until finish commits or fails.
+                    _budget_guard = Some(gate.lock_owned().await);
+                    self.inner
+                        .registry
+                        .lock()
+                        .map_err(|_| EgressError::StateUnavailable)?
+                        .admit_request_budget(key, policy)
+                        .map(Some)
+                }
+                .await;
                 let execution = match admission {
                     Ok(admission) => {
                         budget_admission = admission;
@@ -1008,6 +1027,35 @@ fn spend_reservation(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_budget_gates_keep_same_key_waiters_together_and_allow_other_keys() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let gates = RequestBudgetDispatch::default();
+            let first = gates.gate("same").unwrap().lock_owned().await;
+            let same = gates.gate("same").unwrap();
+            let waiter = same.clone().lock_owned();
+            tokio::pin!(waiter);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let other = gates.gate("other").unwrap().try_lock_owned().unwrap();
+            assert!(Arc::ptr_eq(&same, &gates.gate("same").unwrap()));
+            drop(first);
+            let held = waiter.await;
+            drop(same);
+            // The owned guard alone must retain the gate during later lookups.
+            assert!(gates.gate("same").unwrap().try_lock_owned().is_err());
+            drop(held);
+            drop(other);
+            let _next = gates.gate("next").unwrap();
+            assert_eq!(gates.0.lock().unwrap().len(), 1, "idle keys are pruned");
+        })
+        .await
+        .expect("bounded request budget gate regression");
+    }
 
     #[test]
     fn startup_builds_the_validated_registry_once_before_state_access() {
