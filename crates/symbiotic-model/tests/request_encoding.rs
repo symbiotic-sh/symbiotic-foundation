@@ -118,8 +118,14 @@ fn request_encoding_jev_state_is_counted_without_copies() {
             .insert("text".into(), Value::String("x".repeat(size)));
         refused(
             || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-            expected_error,
+            DiagnosticCode::ProviderRequestLimitExceeded,
         );
+        if expected_error == DiagnosticCode::InvalidConfiguration {
+            refused(
+                || wire::jev_classify_body("jev", &request, None),
+                expected_error,
+            );
+        }
     }
 }
 
@@ -134,8 +140,14 @@ fn request_encoding_jev_questions_are_counted_without_copies() {
         request.questions[0].instructions = "x".repeat(size);
         refused(
             || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-            expected_error,
+            DiagnosticCode::ProviderRequestLimitExceeded,
         );
+        if expected_error == DiagnosticCode::InvalidConfiguration {
+            refused(
+                || wire::jev_classify_body("jev", &request, None),
+                expected_error,
+            );
+        }
     }
 }
 
@@ -147,7 +159,26 @@ fn request_encoding_jev_many_questions_are_refused_before_uniqueness_allocation(
         .collect();
     refused(
         || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::ProviderRequestLimitExceeded,
+    );
+    refused(
+        || wire::jev_classify_body("jev", &request, None),
         DiagnosticCode::InvalidConfiguration,
+    );
+}
+
+#[test]
+fn request_encoding_jev_byte_limit_precedes_question_uniqueness_allocation() {
+    let request = ClassifyRequest::new(
+        serde_json::Map::new(),
+        (0..1000)
+            .map(|id| ClassifierQuestion::noul(id.to_string(), "", None, None))
+            .collect(),
+    );
+    assert!(wire::jev_classify_body("jev", &request, None).is_ok());
+    refused(
+        || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::ProviderRequestLimitExceeded,
     );
 }
 
@@ -161,6 +192,10 @@ fn request_encoding_jev_many_options_are_refused_before_uniqueness_allocation() 
     )];
     refused(
         || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::ProviderRequestLimitExceeded,
+    );
+    refused(
+        || wire::jev_classify_body("jev", &request, None),
         DiagnosticCode::InvalidConfiguration,
     );
 }

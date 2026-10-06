@@ -6,6 +6,11 @@ use serde::Serialize;
 use serde_json::Value;
 use std::io::{self, Write};
 
+#[cfg(test)]
+thread_local! {
+    static SERIALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct CappedWriter<W> {
     output: W,
     written: usize,
@@ -18,6 +23,8 @@ impl<W: Write> Write for CappedWriter<W> {
             return Err(io::Error::other("provider request limit exceeded"));
         }
         self.output.write_all(bytes)?;
+        #[cfg(test)]
+        SERIALIZED_BYTES.with(|count| count.set(count.get() + bytes.len()));
         self.written += bytes.len();
         Ok(bytes.len())
     }
@@ -270,6 +277,34 @@ pub fn anthropic_chat_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_encoding_jev_byte_limit_precedes_whole_input_counting() {
+        let state_request = crate::ClassifyRequest::new(
+            serde_json::from_value(serde_json::json!({"text": "x".repeat(16_384)})).unwrap(),
+            vec![crate::ClassifierQuestion::noul("q", "", None, None)],
+        );
+        let questions_request = crate::ClassifyRequest::new(
+            serde_json::Map::new(),
+            (0..1000)
+                .map(|id| crate::ClassifierQuestion::noul(id.to_string(), "", None, None))
+                .collect(),
+        );
+        for (trigger, request) in [("state", state_request), ("questions", questions_request)] {
+            assert!(jev_classify_body("jev", &request, None).is_ok());
+            SERIALIZED_BYTES.with(|count| count.set(0));
+            let error = jev_classify_body("jev", &request, Some(1024)).unwrap_err();
+            let serialized = SERIALIZED_BYTES.with(|count| count.get());
+            assert_eq!(
+                error.code(),
+                symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded
+            );
+            eprintln!("Jev {trigger} rejected: {serialized} serialized bytes, cap 1024");
+            // Count successful writes across both counting and encoding. Internal
+            // string escape scans are outside the capped-writer contract.
+            assert!(serialized <= 1024, "serialized {serialized} bytes");
+        }
+    }
 
     #[test]
     fn gemini_wire_refuses_unsupported_task_and_conflicting_dimensions() {
