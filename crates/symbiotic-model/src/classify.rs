@@ -1181,8 +1181,12 @@ pub fn jev_classify_body(
     request: &ClassifyRequest,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
+    // Keep the empty-question diagnostic ahead of token limits; otherwise bound
+    // the input before validation allocates question and option uniqueness sets.
+    if !request.questions.is_empty() {
+        JevClassifierProvider::check_limits(request)?;
+    }
     request.validate()?;
-    JevClassifierProvider::check_limits(request)?;
     wire::encode(
         &JevWireRequest {
             model,

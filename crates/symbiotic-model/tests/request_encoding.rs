@@ -138,3 +138,42 @@ fn request_encoding_jev_questions_are_counted_without_copies() {
         );
     }
 }
+
+#[test]
+fn request_encoding_jev_many_questions_are_refused_before_uniqueness_allocation() {
+    let mut request = classify();
+    request.questions = (0..4096)
+        .map(|id| ClassifierQuestion::noul(id.to_string(), "Check.", None, None))
+        .collect();
+    refused(
+        || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::InvalidConfiguration,
+    );
+}
+
+#[test]
+fn request_encoding_jev_many_options_are_refused_before_uniqueness_allocation() {
+    let mut request = classify();
+    request.questions = vec![ClassifierQuestion::choice(
+        "q",
+        "Choose.",
+        (0..4096).map(|id| (id.to_string(), "Option.")),
+    )];
+    refused(
+        || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::InvalidConfiguration,
+    );
+}
+
+#[test]
+fn request_encoding_jev_empty_questions_keep_their_diagnostic_before_token_limits() {
+    let mut request = classify();
+    request.questions.clear();
+    request
+        .state
+        .insert("text".into(), Value::String("x".repeat(LARGE)));
+    refused(
+        || wire::jev_classify_body("jev", &request, Some(LIMIT)),
+        DiagnosticCode::AClassifyRequestNeedsAtLeastOneQuestion,
+    );
+}
