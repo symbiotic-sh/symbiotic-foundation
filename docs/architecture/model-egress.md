@@ -395,11 +395,14 @@ never synthesized. Response identity survives recovery even without token counts
 while spend remains unknown without measured usage. The complete credential
 boundary checks these fields before any runtime or ledger write; reasoning text,
 prompts, answers, raw responses and credentials are excluded from usage.
-For OpenAI-compatible and Anthropic egress calls, `response_id` and `served_model`
-are screened against every string in response choices and content blocks, including
-nested reasoning, thinking, signatures and redacted thinking data. An identity
-that occurs in those strings is omitted from both typed usage and provider trace
-metadata, with an `invalid_usage_identity` diagnostic; the paid answer is preserved.
+For all OpenAI-compatible and Anthropic calls, independently of HTTP observation
+scope, `response_id` and `served_model` are screened against answer and reasoning
+payload values in response choices and content blocks, including nested reasoning,
+thinking, signatures and redacted thinking data. Protocol discriminators such as
+roles, block types and finish reasons are excluded. An identity that occurs in a
+payload string, or contains a complete nonempty payload string, is omitted from
+both typed usage and provider trace metadata, with an `invalid_usage_identity`
+diagnostic; the paid answer is preserved.
 No new persistent store is introduced: immediate replies and recovery derive
 usage from the existing canonical spend receipt.
 `reported_cost_usd` is separate from integer `cost_micro_usd`; the process neither
@@ -772,7 +775,8 @@ On
 success it refuses credential echoes in raw JSON and typed output: exact bytes,
 JSON-escaped UTF-8, numeric re-spellings (including `arbitrary_precision` numbers),
 percent-encoded UTF-8 (upper/lower hex), standard Base64 and URL-safe Base64
-(padded/unpadded). It discards raw provider JSON after checking it. On failure it
+(padded/unpadded). It discards raw provider JSON on every successful result,
+including keyless calls where credential inspection does not apply. On failure it
 preserves typed error classes with static messages, so provider text never reaches
 receipts, traces, queue storage or the response cache. All adapter clients are
 Foundation-owned, disable redirects and HTTP retries, and ignore ambient proxies;

@@ -4769,21 +4769,38 @@ fn parse_retry_after(
 }
 
 fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
-    if !egress_observations_enabled() {
-        trace.usage.response_id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
-        trace.usage.served_model = raw.get("model").and_then(Value::as_str).map(str::to_owned);
-        trace.usage.created = raw.get("created").and_then(Value::as_i64);
-        return;
-    }
-    fn contains_identity(value: &Value, identity: &str) -> bool {
+    fn contains_identity(value: &Value, identity: &str, payload: bool) -> bool {
         match value {
-            Value::String(text) => text.contains(identity),
+            Value::String(text) => {
+                payload
+                    && (text.contains(identity) || (!text.is_empty() && identity.contains(text)))
+            }
             Value::Array(values) => values
                 .iter()
-                .any(|value| contains_identity(value, identity)),
-            Value::Object(values) => values
-                .values()
-                .any(|value| contains_identity(value, identity)),
+                .any(|value| contains_identity(value, identity, payload)),
+            Value::Object(values) => values.iter().any(|(field, value)| {
+                // Protocol labels describe payloads; they are not answer or reasoning text.
+                !matches!(
+                    field.as_str(),
+                    "type" | "role" | "finish_reason" | "stop_reason"
+                ) && contains_identity(
+                    value,
+                    identity,
+                    payload
+                        || matches!(
+                            field.as_str(),
+                            "content"
+                                | "text"
+                                | "refusal"
+                                | "reasoning_content"
+                                | "reasoning"
+                                | "reasoning_details"
+                                | "thinking"
+                                | "signature"
+                                | "data"
+                        ),
+                )
+            }),
             _ => false,
         }
     }
@@ -4795,11 +4812,10 @@ fn provider_usage_identity(trace: &mut ModelInvocationTrace, raw: &Value) {
                     && text
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
-                    // Inspect all OpenAI choices and Anthropic content blocks, including
-                    // nested reasoning/thinking fields discarded by typed answer parsing.
+                    // Screen payloads in every choice/block, independently of HTTP observations.
                     && !["choices", "content"].iter().any(|field| {
                         raw.get(field)
-                            .is_some_and(|value| contains_identity(value, text))
+                            .is_some_and(|value| contains_identity(value, text, *field == "content"))
                     })
             });
             invalid |= token.is_none();
@@ -6506,6 +6522,93 @@ mod egress_http_tests {
                         assert!(!trace.metadata.to_string().contains("PRIVATE_REASONING"));
                     }
                 }
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn regression_payload_boundary_screens_unscoped_reasoning_and_metadata() {
+        assert!(!egress_observations_enabled());
+        for raw in [
+            serde_json::json!({"id":"PRIVATE_REASONING", "model":"PRIVATE_REASONING",
+                "choices":[{"message":{"content":"OK","reasoning":"PRIVATE_REASONING"}}]}),
+            serde_json::json!({"id":"PRIVATE_REASONING", "model":"PRIVATE_REASONING",
+                "content":[{"type":"thinking","thinking":"PRIVATE_REASONING"}]}),
+        ] {
+            let mut trace = success_trace(
+                &StaticChatProvider::new("OK").descriptor,
+                None,
+                None,
+                String::new(),
+                Some("OK"),
+            );
+            trace.metadata = serde_json::json!({"provider": {
+                "response_id": raw["id"], "served_model": raw["model"]
+            }});
+            provider_usage_identity(&mut trace, &raw);
+            assert!(trace.usage.response_id.is_none());
+            assert!(trace.usage.served_model.is_none());
+            assert!(!trace.metadata.to_string().contains("PRIVATE_REASONING"));
+            assert_eq!(
+                trace.metadata[RUNTIME_DIAGNOSTICS][0]["kind"],
+                "invalid_usage_identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_payload_boundary_rejects_prefixed_and_suffixed_reasoning() {
+        with_egress_http_observations(async {
+            for identity in ["chatcmpl-PRIVATE_REASONING", "PRIVATE_REASONING-suffix", "REASONING"] {
+                for payload in [
+                    serde_json::json!({"choices":[{"message":{"content":"OK","reasoning_content":"PRIVATE_REASONING"}}]}),
+                    serde_json::json!({"content":[{"type":"thinking","thinking":"PRIVATE_REASONING"}]}),
+                ] {
+                    let mut raw = payload;
+                    raw["id"] = serde_json::json!(identity);
+                    raw["model"] = serde_json::json!(identity);
+                    let mut trace = success_trace(
+                        &StaticChatProvider::new("OK").descriptor, None, None, String::new(), Some("OK"),
+                    );
+                    provider_usage_identity(&mut trace, &raw);
+                    assert!(trace.usage.response_id.is_none(), "{identity}");
+                    assert!(trace.usage.served_model.is_none(), "{identity}");
+                }
+            }
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn regression_payload_boundary_preserves_protocol_label_identities() {
+        with_egress_http_observations(async {
+            for label in [
+                "assistant",
+                "stop",
+                "text",
+                "thinking",
+                "reasoning.text",
+                "end_turn",
+            ] {
+                let raw = serde_json::json!({"id":label,"model":label,
+                    "choices":[{"message":{"role":"assistant","content":"OK","reasoning_content":"",
+                        "reasoning_details":[{"type":"reasoning.text","text":"PRIVATE_REASONING"}]},
+                        "finish_reason":"stop"}],
+                    "stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"OK"},
+                        {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"}]
+                });
+                let mut trace = success_trace(
+                    &StaticChatProvider::new("OK").descriptor,
+                    None,
+                    None,
+                    String::new(),
+                    Some("OK"),
+                );
+                provider_usage_identity(&mut trace, &raw);
+                assert_eq!(trace.usage.response_id.as_deref(), Some(label));
+                assert_eq!(trace.usage.served_model.as_deref(), Some(label));
+                assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
             }
         })
         .await;

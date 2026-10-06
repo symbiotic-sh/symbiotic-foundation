@@ -417,7 +417,17 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
             "thinking",
         ] {
             for identity_field in ["id", "model"] {
-                for echo in [false, true] {
+                for (scoped, echoed_identity) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some("PRIVATE_REASONING")),
+                    (true, Some("PRIVATE_REASONING")),
+                    (false, Some("chatcmpl-PRIVATE_REASONING")),
+                    (true, Some("chatcmpl-PRIVATE_REASONING")),
+                    (false, Some("PRIVATE_REASONING-suffix")),
+                    (true, Some("PRIVATE_REASONING-suffix")),
+                ] {
+                    let echo = echoed_identity.is_some();
                     let mut body = serde_json::json!({
                         "id":"fixture-id", "model":"served-model",
                         "choices":[{"message":{"content":"OK"}}]
@@ -429,19 +439,28 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
                     } else {
                         serde_json::json!("PRIVATE_REASONING")
                     };
-                    if echo {
-                        body[identity_field] = serde_json::json!("PRIVATE_REASONING");
+                    if let Some(identity) = echoed_identity {
+                        body[identity_field] = serde_json::json!(identity);
                     }
                     let (url, server) = fixture(body);
                     let provider = OpenAiCompatibleChatProvider::new("fixture", "fixture", url, "")
                         .with_timeout(1)
                         .unwrap();
-                    let response =
-                        symbiotic_model::with_egress_http_observations(provider.chat(request()))
-                            .await
-                            .expect("identity screening must preserve the paid answer");
+                    let call = provider.chat(request());
+                    let response = if scoped {
+                        symbiotic_model::with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
+                    .expect("identity screening must preserve the paid answer");
                     server.join().unwrap();
                     assert_eq!(response.text, "OK");
+                    assert!(response.raw_provider_response.is_none());
+                    assert!(
+                        !serde_json::to_string(&response)
+                            .unwrap()
+                            .contains("PRIVATE_REASONING")
+                    );
                     let identity = if identity_field == "id" {
                         &response.trace.usage.response_id
                     } else {

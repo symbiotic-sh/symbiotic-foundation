@@ -215,19 +215,19 @@ credential_response!(
 /// The sole credential boundary for a complete adapter result, after HTTP,
 /// typed decoding and answer validation, and before runtime bookkeeping.
 /// Inspect raw JSON and the final typed value together; never export raw JSON
-/// or provider-controlled error text from a credential-bearing call.
+/// from successful calls, including keyless calls. Credential inspection and
+/// provider-controlled error protection apply when a credential is present.
 pub(crate) fn credential_boundary<T: CredentialResponse>(
     result: Result<T, crate::ModelError>,
     boundary: &CredentialBoundary,
 ) -> Result<T, crate::ModelError> {
     let secret = boundary.secret();
-    if secret.is_empty() {
-        return result;
-    }
     let mut response = match result {
         Ok(response) => response,
         Err(error) => {
-            if let Some((status, retry)) = error.http_details() {
+            if !secret.is_empty()
+                && let Some((status, retry)) = error.http_details()
+            {
                 check_response(
                     &serde_json::json!({"status":status,"retry_after_seconds":retry}),
                     secret,
@@ -236,10 +236,12 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
             return Err(error);
         }
     };
-    let value = serde_json::to_value(&response).map_err(|_| {
-        crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidResponse)
-    })?;
-    check_response(&value, secret)?;
+    if !secret.is_empty() {
+        let value = serde_json::to_value(&response).map_err(|_| {
+            crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidResponse)
+        })?;
+        check_response(&value, secret)?;
+    }
     response.discard_raw();
     Ok(response)
 }
@@ -247,6 +249,32 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regression_payload_boundary_discards_keyless_raw_results() {
+        let boundary = CredentialBoundary::new(String::new().into());
+        let response = credential_boundary(
+            Ok(serde_json::json!({"text":"OK", "raw_provider_response":{
+                "choices":[{"message":{"reasoning_content":"PRIVATE_REASONING"}}]
+            }})),
+            &boundary,
+        )
+        .unwrap();
+        assert_eq!(response["text"], "OK");
+        assert!(response.get("raw_provider_response").is_none());
+        assert!(!response.to_string().contains("PRIVATE_REASONING"));
+        assert!(matches!(
+            credential_boundary::<serde_json::Value>(
+                Err(crate::ModelError::Timeout(
+                    symbiotic_core::DiagnosticCode::HttpTimeout
+                )),
+                &boundary,
+            ),
+            Err(crate::ModelError::Timeout(
+                symbiotic_core::DiagnosticCode::HttpTimeout
+            ))
+        ));
+    }
+
     #[test]
     fn rejects_every_declared_credential_encoding() {
         let secret = "key-\"/\n+?=é";

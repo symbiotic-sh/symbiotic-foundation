@@ -496,23 +496,44 @@ async fn regression_reasoning_echoes_are_not_usage_identities() {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         for reasoning_field in ["thinking", "signature", "data"] {
             for identity_field in ["id", "model"] {
-                for echo in [false, true] {
+                for (scoped, echoed_identity) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some("PRIVATE_REASONING")),
+                    (true, Some("PRIVATE_REASONING")),
+                    (false, Some("chatcmpl-PRIVATE_REASONING")),
+                    (true, Some("chatcmpl-PRIVATE_REASONING")),
+                    (false, Some("PRIVATE_REASONING-suffix")),
+                    (true, Some("PRIVATE_REASONING-suffix")),
+                ] {
+                    let echo = echoed_identity.is_some();
                     let mut body = answer();
                     body["content"][1]["text"] = json!("OK");
                     body["content"][3]["text"] = json!("");
                     let block = if reasoning_field == "data" { 2 } else { 0 };
                     body["content"][block][reasoning_field] = json!("PRIVATE_REASONING");
-                    if echo {
-                        body[identity_field] = json!("PRIVATE_REASONING");
+                    if let Some(identity) = echoed_identity {
+                        body[identity_field] = json!(identity);
                     }
                     let (url, server) = fixture(200, &body.to_string(), false);
-                    let response = symbiotic_model::with_egress_http_observations(
-                        provider(&url).with_timeout(1).unwrap().chat(request()),
-                    )
-                    .await
+                    let provider = AnthropicChatProvider::new("fixture", "fixture-model", &url, "")
+                        .with_timeout(1)
+                        .unwrap();
+                    let call = provider.chat(request());
+                    let response = if scoped {
+                        symbiotic_model::with_egress_http_observations(call).await
+                    } else {
+                        call.await
+                    }
                     .expect("identity screening must preserve the paid answer");
                     server.join().unwrap();
                     assert_eq!(response.text, "OK");
+                    assert!(response.raw_provider_response.is_none());
+                    assert!(
+                        !serde_json::to_string(&response)
+                            .unwrap()
+                            .contains("PRIVATE_REASONING")
+                    );
                     let identity = if identity_field == "id" {
                         &response.trace.usage.response_id
                     } else {
