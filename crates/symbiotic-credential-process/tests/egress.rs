@@ -87,6 +87,7 @@ struct Fixture {
     dir: tempfile::TempDir,
     config: ProcessConfig,
     calls: Arc<AtomicUsize>,
+    arrivals: Arc<tokio::sync::Semaphore>,
     requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
 }
 impl Fixture {
@@ -161,12 +162,15 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let arrivals = Arc::new(tokio::sync::Semaphore::new(0));
+        let arrived = arrivals.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let output = output.clone();
                 let count = count.clone();
+                let arrived = arrived.clone();
                 let captured = captured.clone();
                 let response_gate = response_gate.clone();
                 tokio::spawn(async move {
@@ -218,10 +222,13 @@ impl Fixture {
                         }
                     }
                     count.fetch_add(1, Ordering::SeqCst);
+                    arrived.add_permits(1);
                     if let Some(gate) = response_gate {
                         gate.acquire().await.unwrap().forget();
                     }
-                    tokio::time::sleep(delay).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let body = if status == 200 && !raw_response {
                         // Insert the raw JSON literal so the test's own serde_json
                         // feature set cannot round a numeric cost before transmission.
@@ -289,6 +296,7 @@ impl Fixture {
             dir,
             config,
             calls,
+            arrivals,
             requests,
         }
     }
@@ -7964,19 +7972,128 @@ async fn regression_request_budget_input_and_rotated_credentials_have_fresh_budg
 }
 
 #[tokio::test]
+async fn regression_request_budget_unrelated_routes_complete_while_provider_is_blocked() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for shared_account in [false, true] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut a = Fixture::with_response_gate(
+                200,
+                "answer A".into(),
+                Duration::ZERO,
+                "null",
+                false,
+                false,
+                Some(gate.clone()),
+            )
+            .await;
+            let mut b = Fixture::new(200, "answer B".into(), Duration::ZERO).await;
+            configure_request_budget(&mut a, 3, None);
+            configure_request_budget(&mut b, 3, None);
+            a.config.routes[0].timeout_seconds = 30;
+            b.config.routes[0].timeout_seconds = 30;
+            b.config.routes[0].route = "independent".into();
+            if !shared_account {
+                b.config.routes[0].account = "independent".into();
+            }
+            a.config.routes.push(b.config.routes[0].clone());
+            let process = a.process().await;
+            let (admission, payload) = a.attempt("blocked-provider", 1, 1);
+            let granted = permit(&process, &admission).await;
+            let first = tokio::spawn({
+                let process = process.clone();
+                async move {
+                    dispatched(
+                        exchange_wire(&process, inject(admission, payload, granted))
+                            .await
+                            .unwrap(),
+                    )
+                }
+            });
+            a.arrivals.acquire().await.unwrap().forget();
+
+            let (signed, payload) = b.attempt("independent-provider", 1, 1);
+            let mut attempt = signed.attempt;
+            attempt.route = b.config.routes[0].route.clone();
+            let admission = AdmissionKey::new(KEY.to_vec())
+                .unwrap()
+                .sign_attempt(attempt)
+                .unwrap();
+            let granted = permit(&process, &admission).await;
+            let result = dispatched(
+                exchange_wire(&process, inject(admission, payload, granted))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result.error, None);
+            assert!(result.receipt_persisted);
+            assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                !first.is_finished(),
+                "A must still be waiting on its response barrier"
+            );
+            gate.add_permits(1);
+            let result = first.await.unwrap();
+            assert_eq!(result.error, None);
+            assert!(result.receipt_persisted);
+        }
+    })
+    .await
+    .expect("bounded unrelated request budget concurrency regression");
+}
+
+#[tokio::test]
 async fn regression_request_budget_concurrent_dispatches_cannot_overspend() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut fixture = Fixture::new(400, "rejected".into(), Duration::from_millis(100)).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut fixture = Fixture::with_response_gate(
+            400,
+            "rejected".into(),
+            Duration::ZERO,
+            "null",
+            false,
+            false,
+            Some(gate.clone()),
+        )
+        .await;
         configure_request_budget(&mut fixture, 3, None);
+        fixture.config.routes[0].timeout_seconds = 30;
         let process = fixture.process().await;
-        let (a, b, c, d, e, f) = tokio::join!(
-            request_budget_call(&fixture, &process, "parallel-a", false, false),
-            request_budget_call(&fixture, &process, "parallel-b", false, false),
-            request_budget_call(&fixture, &process, "parallel-c", false, false),
-            request_budget_call(&fixture, &process, "parallel-d", false, false),
-            request_budget_call(&fixture, &process, "parallel-e", false, false),
-            request_budget_call(&fixture, &process, "parallel-f", false, false),
-        );
+        let calls = async {
+            tokio::join!(
+                request_budget_call(&fixture, &process, "parallel-a", false, false),
+                request_budget_call(&fixture, &process, "parallel-b", false, false),
+                request_budget_call(&fixture, &process, "parallel-c", false, false),
+                request_budget_call(&fixture, &process, "parallel-d", false, false),
+                request_budget_call(&fixture, &process, "parallel-e", false, false),
+                request_budget_call(&fixture, &process, "parallel-f", false, false),
+            )
+        };
+        let release = async {
+            for admitted in 1..=3 {
+                fixture.arrivals.acquire().await.unwrap().forget();
+                assert_eq!(fixture.calls.load(Ordering::SeqCst), admitted);
+                let db = rusqlite::Connection::open(
+                    fixture
+                        .config
+                        .state_dir
+                        .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                )
+                .unwrap();
+                let debits: usize = db
+                    .query_row(
+                        "SELECT failed_sends FROM egress_request_failures",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    debits, admitted,
+                    "same-key admission must wait for completion"
+                );
+                gate.add_permits(1);
+            }
+        };
+        let ((a, b, c, d, e, f), ()) = tokio::join!(calls, release);
         let results = [a, b, c, d, e, f];
         assert_eq!(
             results
