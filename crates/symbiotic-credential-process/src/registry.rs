@@ -58,7 +58,7 @@ impl Registry {
     pub(crate) fn open(path: &std::path::Path) -> Result<Self, EgressError> {
         symbiotic_ai_runtime::model::private_fs::ensure_private_file(path)
             .map_err(|_| EgressError::StateUnavailable)?;
-        let conn = Connection::open(path).map_err(state)?;
+        let mut conn = Connection::open(path).map_err(state)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(state)?;
         let existing: bool = conn
@@ -88,10 +88,32 @@ impl Registry {
                 return Err(EgressError::StateUnavailable);
             }
         }
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA secure_delete=ON;").map_err(state)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(state)?;
+        // Rebuild only the obsolete derived predicate; canonical permits and
+        // receipts remain intact. Missing derived indexes are recreated below.
+        let request_index: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='egress_unresolved_request'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(state)?;
+        let rebuild_request_index =
+            request_index.is_some_and(|sql| !sql.contains("request_key IS NOT NULL"));
+        let installed_retirement: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='egress_retire_request_binding')",
+            [], |row| row.get(0),
+        ).map_err(state)?;
+        if rebuild_request_index {
+            tx.execute_batch("DROP INDEX egress_unresolved_request")
+                .map_err(state)?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS egress_schema (version INTEGER NOT NULL);
             INSERT INTO egress_schema SELECT 9 WHERE NOT EXISTS(SELECT 1 FROM egress_schema);
             CREATE TABLE IF NOT EXISTS egress_permits (
                 attempt_digest TEXT PRIMARY KEY,
@@ -115,7 +137,18 @@ impl Registry {
             CREATE INDEX IF NOT EXISTS egress_result_expiry
                 ON egress_permits(recovery_expires_at) WHERE result IS NOT NULL;
             CREATE INDEX IF NOT EXISTS egress_unresolved_request
-                ON egress_permits(request_key) WHERE consumed=1 AND finished=0;
+                ON egress_permits(request_key) WHERE consumed=1 AND finished=0 AND request_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS egress_request_receipt
+                ON egress_permits(json_extract(receipt, '$.reference'))
+                WHERE consumed=1 AND finished=0 AND request_key IS NOT NULL;
+            CREATE TRIGGER IF NOT EXISTS egress_retire_request_binding
+                AFTER UPDATE OF state ON spend_receipts
+                WHEN NEW.state IN ('released', 'settled')
+                BEGIN
+                    UPDATE egress_permits SET request_key=NULL
+                    WHERE json_extract(receipt, '$.reference')=NEW.reference
+                    AND consumed=1 AND finished=0 AND request_key IS NOT NULL;
+                END;
             CREATE TABLE IF NOT EXISTS egress_grant_revisions (
                 grant_key TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL
@@ -124,9 +157,23 @@ impl Registry {
                 request_key TEXT PRIMARY KEY,
                 failed_sends INTEGER NOT NULL CHECK(failed_sends > 0),
                 last_failure INTEGER NOT NULL
-            ); COMMIT;",
+            );",
         )
         .map_err(state)?;
+        if existing && (!installed_retirement || rebuild_request_index) {
+            // Repair current live bindings left by the old derived index. Later
+            // retirement is atomic at the canonical ledger writer, without scans.
+            tx.execute(
+                "UPDATE egress_permits SET request_key=NULL
+                WHERE consumed=1 AND finished=0 AND request_key IS NOT NULL
+                AND EXISTS(SELECT 1 FROM spend_receipts s
+                    WHERE s.reference=json_extract(egress_permits.receipt, '$.reference')
+                    AND s.state IN ('released', 'settled'))",
+                [],
+            )
+            .map_err(state)?;
+        }
+        tx.commit().map_err(state)?;
         let mut registry = Self(conn);
         registry.purge_expired(now()?)?;
         Ok(registry)
@@ -378,6 +425,18 @@ impl Registry {
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
+        let admission = Self::admit_request_in(&tx, attempt_digest, key, policy)?;
+        tx.commit().map_err(state)?;
+        Ok(admission)
+    }
+
+    /// Shared direct/job pre-send admission under the caller's writer transaction.
+    pub(crate) fn admit_request_in(
+        tx: &rusqlite::Transaction<'_>,
+        attempt_digest: &str,
+        key: String,
+        policy: Option<&RequestBudget>,
+    ) -> Result<Option<RequestBudgetAdmission>, EgressError> {
         let unresolved: Option<Option<String>> = tx
             .query_row(
                 "SELECT s.state FROM egress_permits p
@@ -410,10 +469,27 @@ impl Registry {
             return Err(EgressError::PermitRefused);
         }
         let admission = policy
-            .map(|policy| Self::admit_request_budget_in(&tx, key, policy))
+            .map(|policy| Self::admit_request_budget_in(tx, key, policy))
             .transpose()?;
-        tx.commit().map_err(state)?;
         Ok(admission)
+    }
+
+    /// Retire a completed signed job's binding without copying its ledger-owned result.
+    pub(crate) fn complete_job_in(
+        tx: &rusqlite::Transaction<'_>,
+        attempt_digest: &str,
+    ) -> Result<(), EgressError> {
+        let changed = tx
+            .execute(
+                "UPDATE egress_permits SET request_key=NULL
+            WHERE attempt_digest=?1 AND consumed=1",
+                [attempt_digest],
+            )
+            .map_err(state)?;
+        if changed != 1 {
+            return Err(EgressError::StateUnavailable);
+        }
+        Ok(())
     }
 
     // Dropping the returned token leaves the committed debit consumed. Only a
@@ -483,7 +559,7 @@ impl Registry {
         let changed = tx
             .execute(
                 // finished: 0 = in flight, 1 = recoverable completion, 2 = no retained answer.
-                "UPDATE egress_permits SET receipt=?1, finished=CASE WHEN ?5 THEN 2 ELSE 1 END,
+                "UPDATE egress_permits SET receipt=?1, request_key=NULL, finished=CASE WHEN ?5 THEN 2 ELSE 1 END,
              result=CASE WHEN recovery_expires_at>?4 THEN ?2 ELSE NULL END
              WHERE attempt_digest=?3 AND consumed=1 AND finished=0",
                 params![
@@ -1018,6 +1094,112 @@ mod tests {
                 .admit_request(&retry.attempt_digest, "same-request".into(), None)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn reconciled_request_bindings_retire_atomically_with_indexed_work() {
+        let _clock = TestClock::new(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = open(&dir.path().join("registry.sqlite"));
+        let (_, unknown) = accepted_request(&mut registry, "still-unknown");
+        registry
+            .admit_request(&unknown.attempt_digest, "unknown-request".into(), None)
+            .unwrap();
+        let tx = registry.0.transaction().unwrap();
+        SqliteSpendLedger::finish_in(&tx, &unknown.reference, SpendState::Unknown, None, None)
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            registry
+                .0
+                .query_row(
+                    "SELECT request_key IS NOT NULL FROM egress_permits WHERE attempt_digest=?1",
+                    [&unknown.attempt_digest],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        for resolution in [SpendState::Released, SpendState::Settled] {
+            for n in 0..32 {
+                let (attempt, receipt) =
+                    accepted_request(&mut registry, &format!("{resolution:?}-{n}"));
+                registry
+                    .admit_request(&receipt.attempt_digest, "same-request".into(), None)
+                    .unwrap();
+                // Both retirement and later admission must fit this fixed VM bound.
+                registry.0.progress_handler(500, Some(|| true));
+                let tx = registry.0.transaction().unwrap();
+                SqliteSpendLedger::finish_in(
+                    &tx,
+                    &receipt.reference,
+                    resolution,
+                    (resolution == SpendState::Settled).then(|| symbiotic_trace::UsageTrace {
+                        input_tokens: Some(7),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .unwrap();
+                tx.rollback().unwrap();
+                assert!(registry.0.query_row("SELECT request_key IS NOT NULL FROM egress_permits WHERE attempt_digest=?1", [&receipt.attempt_digest], |r| r.get::<_, bool>(0)).unwrap());
+                let tx = registry.0.transaction().unwrap();
+                SqliteSpendLedger::finish_in(
+                    &tx,
+                    &receipt.reference,
+                    resolution,
+                    (resolution == SpendState::Settled).then(|| symbiotic_trace::UsageTrace {
+                        input_tokens: Some(7),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                assert!(!registry.0.query_row("SELECT request_key IS NOT NULL FROM egress_permits WHERE attempt_digest=?1", [&receipt.attempt_digest], |r| r.get::<_, bool>(0)).unwrap());
+                assert_eq!(
+                    registry
+                        .receipt(&attempt.attempt_id())
+                        .unwrap()
+                        .unwrap()
+                        .spend_state,
+                    resolution
+                );
+                registry.0.progress_handler(0, None::<fn() -> bool>);
+            }
+        }
+        let (_, retry) = accepted_request(&mut registry, "after-history");
+        registry.0.progress_handler(500, Some(|| true));
+        registry
+            .admit_request(&retry.attempt_digest, "same-request".into(), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn unresolved_request_index_rebuild_excludes_unbound_permits() {
+        let _clock = TestClock::new(1000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut registry = open(&path);
+        accepted_request(&mut registry, "unbound");
+        let (_, bound) = accepted_request(&mut registry, "bound");
+        registry
+            .admit_request(&bound.attempt_digest, "request".into(), None)
+            .unwrap();
+        registry.0.execute_batch("DROP INDEX egress_unresolved_request;
+            CREATE INDEX egress_unresolved_request ON egress_permits(request_key) WHERE consumed=1 AND finished=0;").unwrap();
+        drop(registry);
+        let registry = open(&path);
+        let sql: String = registry
+            .0
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='egress_unresolved_request'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("request_key IS NOT NULL"), "{sql}");
+        let candidates: usize = registry.0.query_row("SELECT count(*) FROM egress_permits INDEXED BY egress_unresolved_request WHERE consumed=1 AND finished=0 AND request_key IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(candidates, 1);
     }
 
     #[test]

@@ -2517,6 +2517,17 @@ where
             return Err(error);
         }
     };
+    let fingerprint = provider.credential_fingerprint();
+    let owner = job.clone();
+    if let Err(error) = run_blocking(move || owner.admit_request(fingerprint)).await {
+        // Admission ran before constructing any transport future. Its refusal is
+        // known zero charge and must remain visible in the canonical job result.
+        let owner = job.clone();
+        let failure = error.code();
+        run_blocking(move || owner.finish(SpendState::Released, None, None, Some(failure), false))
+            .await?;
+        return Err(error);
+    }
     let provider_started = Instant::now();
     let dispatch = this.clone();
     let transport_provider = provider.clone();

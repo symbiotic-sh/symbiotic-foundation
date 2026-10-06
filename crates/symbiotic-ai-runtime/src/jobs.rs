@@ -48,6 +48,21 @@ pub trait ModelJobAdmission: Send + Sync {
         row: &JobRecord,
         reservation: &SpendReservation,
     ) -> Result<(), JobError>;
+    /// Bind the resolved credential's request identity before transport, preserving
+    /// the existing per-job allowance. Runs in the canonical writer transaction.
+    fn before_send(
+        &self,
+        _tx: &Transaction<'_>,
+        _row: &JobRecord,
+        _credential_fingerprint: Option<String>,
+    ) -> Result<(), JobError> {
+        Ok(())
+    }
+    /// Retire a request binding in the canonical job completion transaction,
+    /// including completed attempts whose charge remains unknown.
+    fn finish(&self, _tx: &Transaction<'_>, _row: &JobRecord) -> Result<(), JobError> {
+        Ok(())
+    }
     /// Recheck current authority after obtaining the account slot, before claim/reservation.
     fn claim(
         &self,
@@ -767,6 +782,28 @@ impl model::ModelJob for ClaimOwner {
         }
         Ok(payload)
     }
+    fn admit_request(&self, credential_fingerprint: Option<String>) -> Result<(), ModelError> {
+        let Some(admission) = &self.jobs.admission else {
+            return Ok(());
+        };
+        let claim = self.claim_record()?;
+        self.jobs
+            .transaction(|tx, now| {
+                let JobResponse::Job(Some(row)) =
+                    self.jobs.op(tx, now, JobRequest::Get(claim.id.clone()))?
+                else {
+                    return Err(JobError::NotFound);
+                };
+                if row.generation != claim.generation {
+                    return Err(JobError::StaleClaim);
+                }
+                admission.before_send(tx, &row, credential_fingerprint)
+            })
+            .map_err(|error| match error {
+                JobError::Execution(code) => ModelError::InvalidRequest(code),
+                other => storage(other),
+            })
+    }
     fn heartbeat(&self) -> Result<bool, ModelError> {
         let (job, generation) = {
             let claim = self.claim.lock().map_err(storage)?;
@@ -842,6 +879,9 @@ impl model::ModelJob for ClaimOwner {
                 .map_err(|_| JobError::Storage)?;
                 spend::SqliteSpendLedger::finish_in(tx, &reference, state, usage, evidence)
                     .map_err(|_| JobError::Storage)?;
+                if let Some(admission) = &self.jobs.admission {
+                    admission.finish(tx, &current)?;
+                }
                 if output.is_none() && current.cancel_requested && !current.purged {
                     self.jobs.op(
                         tx,

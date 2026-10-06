@@ -99,6 +99,36 @@ impl ModelJobAdmission for Admission {
             other => invalid(other),
         })
     }
+    fn before_send(
+        &self,
+        tx: &Transaction<'_>,
+        row: &JobRecord,
+        credential_fingerprint: Option<String>,
+    ) -> Result<(), JobError> {
+        let process = self.process()?;
+        let signed = decode(row.admission.as_deref())?;
+        let route = process.validate_attempt(&signed.attempt).map_err(invalid)?;
+        let key = crate::request_key(route, &signed.attempt.input_digest, credential_fingerprint)
+            .map_err(storage)?;
+        crate::registry::Registry::admit_request_in(
+            tx,
+            &digest(&signed.attempt).map_err(storage)?,
+            key,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|error| match error {
+            EgressError::ReconciliationRequired => {
+                JobError::Execution(model::DiagnosticCode::SpendReconciliationRequired)
+            }
+            other => storage(other),
+        })
+    }
+    fn finish(&self, tx: &Transaction<'_>, row: &JobRecord) -> Result<(), JobError> {
+        let signed = decode(row.admission.as_deref())?;
+        crate::registry::Registry::complete_job_in(tx, &digest(&signed.attempt).map_err(storage)?)
+            .map_err(storage)
+    }
     fn claim(
         &self,
         tx: &Transaction<'_>,
@@ -193,6 +223,15 @@ impl ModelProvider for JobProvider {
     }
     fn validate_configuration(&self) -> Result<(), ModelError> {
         self.prototype.validate_configuration()
+    }
+    fn credential_fingerprint(&self) -> Option<String> {
+        match &self.prepared {
+            Some(PreparedAdapter::Chat(adapter)) => adapter.credential_fingerprint(),
+            Some(PreparedAdapter::Embedding(adapter)) => adapter.credential_fingerprint(),
+            Some(PreparedAdapter::Rerank(adapter)) => adapter.credential_fingerprint(),
+            Some(PreparedAdapter::Classifier(adapter)) => adapter.credential_fingerprint(),
+            None => None,
+        }
     }
     fn credential_boundary(&self) -> Option<&model::CredentialBoundary> {
         self.prototype.credential_boundary()
@@ -682,5 +721,264 @@ impl CredentialProcess {
             JobResponse::Job(None) => Err(JobError::NotFound),
             _ => Err(JobError::InvalidRequest),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use symbiotic_queue::jobs::{Enqueued, JobConfig, JobState};
+
+    #[derive(Clone)]
+    struct CountedChat {
+        prototype: Arc<dyn ModelProvider>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ModelProvider for CountedChat {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            self.prototype.descriptor()
+        }
+        fn credential_boundary(&self) -> Option<&model::CredentialBoundary> {
+            self.prototype.credential_boundary()
+        }
+    }
+    #[async_trait]
+    impl ChatProvider for CountedChat {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            model::StaticChatProvider::new("answer").chat(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_jobs_refuse_unfinished_requests_and_retire_unknown_completions() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let admission_path = dir.path().join("admission");
+            std::fs::write(&admission_path, [0u8; 32]).unwrap();
+            std::fs::set_permissions(&admission_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let route: RouteConfig = serde_json::from_value(serde_json::json!({
+                "tenant": "tenant", "account": "account", "account_sharing_key": null,
+                "max_attempts": 3, "request_budget": {"attempts": 3, "renewal_seconds": null},
+                "route": "chat", "secret_ref": "", "secret": {"backend": "none"},
+                "destination": "https://example.com/v1", "model": "test-model",
+                "provider": {"kind": "open_ai_chat", "operator": "test"},
+                "allow_loopback_http": false, "max_field_bytes": 1024, "max_output_tokens": 100,
+                "max_in_flight": 4, "requests_per_minute": null, "input_units_per_minute": null,
+                "timeout_seconds": 1
+            }))
+            .unwrap();
+            let config = crate::ProcessConfig {
+                version: PROTOCOL_VERSION,
+                state_dir: dir.path().join("state"),
+                socket_path: dir.path().join("unused.sock"),
+                admission_key: SecretSource::OwnerOnlyFile {
+                    path: admission_path,
+                },
+                max_secret_bytes: 4096,
+                max_frame_bytes: 8 * model::DEFAULT_MAX_RESPONSE_BYTES as u32,
+                max_connections: 8,
+                io_timeout_seconds: 2,
+                clock_rollback_warning_tolerance_seconds: 5,
+                jobs: JobConfig::default(),
+                job_runner: Default::default(),
+                routes: vec![route.clone()],
+            };
+            let process = CredentialProcess::open(config.clone()).unwrap();
+            let request = ChatRequest {
+                messages: vec![model::ChatMessage {
+                    role: "user".into(),
+                    content: "input".into(),
+                }],
+                max_output_tokens: Some(10),
+                temperature: None,
+                response_format: None,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            };
+            let now = chrono::Utc::now().timestamp() as u64;
+            let mut attempt = DurableAttempt {
+                tenant: "tenant".into(),
+                incarnation: "incarnation".into(),
+                invocation_id: "unfinished".into(),
+                job_queue: None,
+                attempt_ordinal: 1,
+                record_sequence: 1,
+                recorded_at: now,
+                expires_at: now + 3600,
+                recovery_expires_at: now + 3600,
+                caller_binding: "caller".into(),
+                route: "chat".into(),
+                destination: route.destination.clone(),
+                model: route.model.clone(),
+                method: "POST".into(),
+                secret_ref: "".into(),
+                manifest_ref: "manifest".into(),
+                input_manifest_digest: "a".repeat(64),
+                input_digest: ProviderPayload::Chat(request.clone()).digest().unwrap(),
+                grant_revision: 1,
+            };
+            let original = {
+                let mut registry = process.inner.registry.lock().unwrap();
+                registry
+                    .publish_revision(&GrantRevision {
+                        tenant: "tenant".into(),
+                        incarnation: "incarnation".into(),
+                        revision: 1,
+                    })
+                    .unwrap();
+                let permit = registry.issue(&attempt, 3).unwrap().permit;
+                let handoff = model::AcceptedSpendHandoff {
+                    reservation: crate::spend_reservation(&attempt, &route).unwrap(),
+                    input_identity: "input".into(),
+                };
+                let receipt = registry.consume(&attempt, &permit, &handoff, 3).unwrap();
+                registry
+                    .admit_request(
+                        &receipt.attempt_digest,
+                        model::configuration_revision(&(
+                            &route.tenant,
+                            &route.route,
+                            None::<String>,
+                            &attempt.input_digest,
+                        ))
+                        .unwrap()
+                        .0,
+                        route.request_budget.as_ref(),
+                    )
+                    .unwrap();
+                receipt
+            };
+            drop(process);
+            let process = CredentialProcess::open(config).unwrap();
+            let scope = JobScope {
+                tenant: "tenant".into(),
+                incarnation: "incarnation".into(),
+                queue: "jobs".into(),
+            };
+            let jobs = process.model_jobs(scope.clone()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = CountedChat {
+                prototype: process.job_provider(&route).unwrap().prototype,
+                calls: calls.clone(),
+            };
+            let binding = provider::route_binding(&process.inner.runtime, &route, counted)
+                .unwrap()
+                .with_response_cache(ResponseCacheMode::Off);
+            let runner = jobs
+                .start_chat(binding.clone(), Default::default(), "chat".into())
+                .await
+                .unwrap();
+            attempt.job_queue = Some(scope.queue);
+            for (key, expected) in [
+                ("refused", JobState::Failed),
+                ("resolved", JobState::Succeeded),
+                ("completed", JobState::Succeeded),
+            ] {
+                attempt.invocation_id = key.into();
+                let signed = process.inner.key.sign_attempt(attempt.clone()).unwrap();
+                let spec = JobSpec {
+                    key: key.into(),
+                    group: None,
+                    owners: vec![],
+                    kind: "chat".into(),
+                    execution: Execution::Model,
+                    payload: model_job_payload(&binding, &request).unwrap(),
+                    admission: Some(serde_json::to_vec(&signed).unwrap()),
+                    limits: JobLimits { max_attempts: 3 },
+                    recovery_until: None,
+                };
+                let JobResponse::Enqueued(items) =
+                    jobs.request(JobRequest::Enqueue(vec![spec])).await.unwrap()
+                else {
+                    panic!("enqueue")
+                };
+                let Enqueued::Inserted(id) = &items[0] else {
+                    panic!("inserted")
+                };
+                let row = loop {
+                    let JobResponse::Job(Some(row)) =
+                        jobs.request(JobRequest::Get(id.clone())).await.unwrap()
+                    else {
+                        panic!("job")
+                    };
+                    if !row.state.unfinished() {
+                        break row;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
+                assert_eq!(row.state, expected);
+                if key == "refused" {
+                    assert_eq!(
+                        row.diagnostic,
+                        Some(model::DiagnosticCode::SpendReconciliationRequired)
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        process
+                            .inner
+                            .registry
+                            .lock()
+                            .unwrap()
+                            .receipt(&original.attempt_id)
+                            .unwrap()
+                            .unwrap()
+                            .spend_state,
+                        SpendState::Unknown
+                    );
+                    let ledger = symbiotic_ai_runtime::spend::SqliteSpendLedger::open(
+                        &process
+                            .inner
+                            .config
+                            .state_dir
+                            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+                    )
+                    .unwrap();
+                    let refused_ref =
+                        SpendReceiptRef::new(row.receipt.as_deref().unwrap()).unwrap();
+                    assert_eq!(
+                        model::SpendLedger::receipt(&ledger, &refused_ref)
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        SpendState::Released
+                    );
+                    model::SpendLedger::finish(
+                        &ledger,
+                        &original.reference,
+                        SpendState::Released,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let conn = rusqlite::Connection::open(
+                process
+                    .inner
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            let debits: u32 = conn
+                .query_row(
+                    "SELECT failed_sends FROM egress_request_failures",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(debits, 1, "signed jobs preserve their per-job allowance");
+            runner.shutdown().await.unwrap();
+        })
+        .await
+        .expect("bounded signed job request guard and completion");
     }
 }

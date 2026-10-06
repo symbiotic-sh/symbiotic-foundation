@@ -190,7 +190,8 @@ write reports `receipt_persisted: false` and retains unknown spend and the debit
 a process crash before completion likewise preserves the debit. Remaining allowance
 alone does not authorize resubmitting an unresolved request.
 
-Before every direct HTTP execution, including routes without a request budget,
+Before every direct or signed-job HTTP execution, including routes without a
+request budget,
 Foundation binds the existing request-key digest to the consumed canonical
 `egress_permits` row. In the same immediate SQLite transaction, it checks for an
 unfinished earlier send with that key whose canonical spend is neither Released
@@ -201,15 +202,33 @@ The original attempt identity, receipt and unknown reservation remain available
 through authenticated same-attempt recovery after restart. Budget renewal,
 a different invocation ID and answer-recovery expiry do not resolve it.
 Reconciliation of the original receipt to Released or Settled removes this block.
-Durably completed calls keep the shared failure-count behavior above; different
-request keys proceed independently.
+Durably completed direct calls keep the shared failure-count behavior above;
+signed jobs retain their existing per-job allowance and do not debit the direct
+request budget. Job refusal before transport records `SpendReconciliationRequired`
+and releases its new reservation. Different request keys proceed independently.
 
-The nullable `egress_permits.request_key` field records this pre-send identity;
-there is no separate unresolved-attempt table, cache or index. The bare SQLite
-operation scans canonical permits for matching unfinished sends, joins their
-existing receipts to the ledger by receipt reference, and updates one permit row.
-The request binding connects the budget's identity to recovery without deriving
-meaning from invocation IDs or keeping another execution-state owner.
+The nullable `egress_permits.request_key` field records this pre-send identity.
+SQLite's native `egress_unresolved_request` partial index covers only consumed,
+unfinished permits with `request_key IS NOT NULL`; unbound and completed permits
+add no entries. The bare-engine admission cost is an indexed request-key lookup,
+a receipt-reference lookup in the canonical ledger, and one permit update. The
+index earns its write cost by excluding historical recovery rows from admission.
+Signed-job admission also reads its claimed canonical job row by the existing
+job ID to obtain the original signed input digest after trace replacement; that
+read earns the shared request identity without storing another admission copy.
+A second native partial expression index, `egress_request_receipt`, covers the
+same live candidates by their structured receipt reference. It earns one entry
+per bound request by letting the canonical ledger writer retire the matching
+binding without scanning permits. The `egress_retire_request_binding` SQLite
+trigger clears that binding when the canonical ledger transaction records Released
+or Settled; an Unknown ledger update alone leaves it intact. Direct completion and
+the signed-job completion callback also clear their bindings in the existing
+completion transaction, including completed unknown-charge attempts. Rollback
+preserves the binding.
+Both indexes are rebuildable from canonical permits, and startup rebuilds the
+obsolete predicate and retires its resolved bindings without changing receipts
+or recovery. There is no separate unresolved-attempt table or cache and no
+second execution-state owner.
 
 Evidence: the `regression_request_budget_*` tests in
 `crates/symbiotic-credential-process/tests/egress.rs` cover three sends for six
@@ -227,7 +246,19 @@ and crash/restart after a
 send followed by a different invocation with identical input and two attempts
 still unused. `regression_unresolved_request_different_input_proceeds_until_reconciliation`
 covers different input, canonical reconciliation, omitted budgets and zero renewal.
-The registry `unresolved_request_*` tests exercise the same admission and restart
+`regression_jobs_share_unresolved_request_admission_and_completion` covers
+unfinished direct and signed-job predecessors after restart, released refusal,
+original receipt recovery, reconciliation and completed jobs with unknown usage.
+The in-process `signed_jobs_refuse_unfinished_requests_and_retire_unknown_completions`
+test exercises the signed-job runner and admission owner without an HTTP fixture,
+including restart, refusal, receipt release, reconciliation, completed unknown
+charge and preservation of the direct budget.
+The registry `reconciled_request_bindings_retire_atomically_with_indexed_work`
+test covers rollback, receipt preservation, 64 reconciliations and subsequent
+admission under a 500-VM-instruction interruption bound;
+`unresolved_request_index_rebuild_excludes_unbound_permits` covers the rebuilt
+non-null predicate. The registry `unresolved_request_*` tests exercise the same
+admission and restart
 checks without network fixtures. The registry test
 `request_budget_pre_send_undo_restores_only_unexpired_consumption` covers renewal
 timestamp restoration and expiry.

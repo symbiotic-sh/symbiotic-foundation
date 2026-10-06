@@ -491,6 +491,11 @@ pub trait ModelJob: Send + Sync {
         reservation: &crate::SpendReservation,
         limit: u32,
     ) -> Result<Option<Vec<u8>>, ModelError>;
+    /// Admit the resolved credential's request identity before any transport.
+    /// The default adds no boundary for jobs without a signed admission owner.
+    fn admit_request(&self, _credential_fingerprint: Option<String>) -> Result<(), ModelError> {
+        Ok(())
+    }
     /// Renew the claim and read cancellation intent in one store call.
     fn heartbeat(&self) -> Result<bool, ModelError>;
     /// Settle accounting and the job together. Retry requires known-zero evidence.

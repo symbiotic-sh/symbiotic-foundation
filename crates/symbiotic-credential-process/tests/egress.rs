@@ -4939,6 +4939,79 @@ async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_n
 }
 
 #[tokio::test]
+async fn regression_jobs_share_unresolved_request_admission_and_completion() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for original_job in [false, true] {
+            let mut fixture = Fixture::with_http_response(200,
+                r#"{"choices":[{"message":{"content":"paid once"},"finish_reason":"stop"}]}"#.into(),
+                Duration::ZERO, "null", true, false).await;
+            configure_request_budget(&mut fixture, 3, None);
+            let process = fixture.process().await;
+            let conn = rusqlite::Connection::open(fixture.config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+            let (original, reference) = if original_job {
+                conn.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE OF state ON spend_receipts BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;").unwrap();
+                let input = queued(&fixture, "unfinished-job");
+                let client = InProcessEgressClient::new(process.clone());
+                let id = enqueue_id(&client, input.clone()).await;
+                loop {
+                    if matches!(job_call(&client, JobsCommand::JobStatus(id.clone())).await,
+                        Err(JobsClientError::Egress(EgressError::StateUnavailable))) { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                conn.execute_batch("DROP TRIGGER reject_completion").unwrap();
+                let AttemptStatus::Dispatched { receipt } = status(&process, &input.admission).await else { panic!("unfinished job receipt") };
+                (input.admission, receipt.reference)
+            } else {
+                conn.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE OF finished ON egress_permits BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;").unwrap();
+                let (signed, _) = fixture.attempt("unfinished-direct", 1, 1);
+                let result = request_budget_call(&fixture, &process, "unfinished-direct", false, false).await;
+                assert!(!result.receipt_persisted);
+                conn.execute_batch("DROP TRIGGER reject_completion").unwrap();
+                (signed, result.receipt.reference)
+            };
+            drop(process);
+            let process = reopen_jobs(&fixture).await;
+            let client = InProcessEgressClient::new(process.clone());
+            assert_reconciliation_required(&request_budget_call(
+                &fixture, &process, "retry-direct", false, false).await);
+            let id = enqueue_id(&client, queued(&fixture, "retry-job")).await;
+            let row = loop {
+                let JobsReply::Status(row) = job_call(&client, JobsCommand::JobStatus(id.clone())).await.unwrap() else { panic!("status") };
+                if !row.state.unfinished() { break row }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(row.state, JobState::Failed);
+            let refused_state: String = conn.query_row("SELECT state FROM spend_receipts WHERE reference=?1", [row.receipt.as_deref().unwrap()], |r| r.get(0)).unwrap();
+            assert_eq!(refused_state, "released");
+            assert_eq!(row.diagnostic, Some(symbiotic_ai_runtime::model::DiagnosticCode::SpendReconciliationRequired));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+            let AttemptStatus::Dispatched { receipt } = status(&process, &original).await else { panic!("original recovery") };
+            assert_eq!(receipt.reference, reference);
+            assert_eq!(receipt.spend_state, SpendState::Unknown);
+            let mut different = queued(&fixture, "different-job");
+            let ProviderPayload::Chat(request) = &mut different.payload else { panic!("chat") };
+            request.messages[0].content = "different input".into();
+            different.admission.attempt.input_digest = different.payload.digest().unwrap();
+            different.admission = AdmissionKey::new(KEY.to_vec()).unwrap().sign_attempt(different.admission.attempt).unwrap();
+            let different_id = enqueue_id(&client, different).await;
+            wait_job(&client, &different_id, JobState::Succeeded).await;
+            let tx = conn.unchecked_transaction().unwrap();
+            symbiotic_ai_runtime::spend::SqliteSpendLedger::finish_in(&tx, &reference, SpendState::Settled, Some(symbiotic_trace::UsageTrace { input_tokens: Some(7), ..Default::default() }), None).unwrap();
+            tx.commit().unwrap();
+            let id = enqueue_id(&client, queued(&fixture, "resolved-job")).await;
+            wait_job(&client, &id, JobState::Succeeded).await;
+            // Completion with missing usage retires the binding while keeping
+            // unknown spend; signed jobs retain their separate per-job allowance.
+            let id = enqueue_id(&client, queued(&fixture, "completed-job")).await;
+            wait_job(&client, &id, JobState::Succeeded).await;
+            let completed = request_budget_call(&fixture, &process, "after-completed-job", false, false).await;
+            assert!(completed.error.is_none() && completed.output.is_some());
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 5);
+        }
+    }).await.expect("bounded signed-job request admission regression");
+}
+
+#[tokio::test]
 async fn jobs_refuse_signed_attempt_already_dispatched_directly_after_restart() {
     let fixture = Fixture::new(200, "paid once".into(), Duration::ZERO).await;
     let process = fixture.process().await;

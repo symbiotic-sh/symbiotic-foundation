@@ -639,14 +639,11 @@ impl CredentialProcess {
         let mut budget_admission = None;
         match secret {
             Ok(Ok(secret)) => {
-                let request_key = symbiotic_ai_runtime::model::configuration_revision(&(
-                    &route.tenant,
-                    &route.route,
-                    symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
+                let request_key = request_key(
+                    &route,
                     &input_digest,
-                ))
-                .map(|digest| digest.0)
-                .map_err(|_| EgressError::StateUnavailable);
+                    symbiotic_ai_runtime::model::api_key_fingerprint(secret.value()),
+                );
                 let admission = request_key.and_then(|key| {
                     self.inner
                         .registry
@@ -971,6 +968,21 @@ fn egress_reference(
 ) -> Result<symbiotic_ai_runtime::SpendReceiptRef, EgressError> {
     symbiotic_ai_runtime::SpendReceiptRef::new(format!("egress:{}", digest(a)?))
         .map_err(|_| EgressError::LimitExceeded)
+}
+
+fn request_key(
+    route: &RouteConfig,
+    input_digest: &str,
+    credential_fingerprint: Option<String>,
+) -> Result<String, EgressError> {
+    symbiotic_ai_runtime::model::configuration_revision(&(
+        &route.tenant,
+        &route.route,
+        credential_fingerprint,
+        input_digest,
+    ))
+    .map(|digest| digest.0)
+    .map_err(|_| EgressError::StateUnavailable)
 }
 
 fn spend_reservation(
