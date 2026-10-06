@@ -181,7 +181,8 @@ lock per request-budget key serializes admission through durable completion for
 that key, after credential resolution supplies its fingerprint. Different keys
 can execute and complete while another provider is blocked, including keys on the
 same account when its configured concurrency permits. The lock map is protected
-only during lookup and pruning; its weak entries do not retain idle gates. The
+only during keyed lookup and retirement. The final holder or waiter removes its
+own weak entry under that mutex; admission never scans unrelated keys. The
 registry mutex protects synchronous SQLite operations and is never held across a
 provider call or an async wait. Acquisition order is budget-key gate, then the
 registry mutex for admission; execution reuses the runtime's existing account
