@@ -118,7 +118,7 @@ fn request_encoding_jev_state_is_counted_without_copies() {
             .insert("text".into(), Value::String("x".repeat(size)));
         refused(
             || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-            DiagnosticCode::ProviderRequestLimitExceeded,
+            expected_error,
         );
         if expected_error == DiagnosticCode::InvalidConfiguration {
             refused(
@@ -140,7 +140,7 @@ fn request_encoding_jev_questions_are_counted_without_copies() {
         request.questions[0].instructions = "x".repeat(size);
         refused(
             || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-            DiagnosticCode::ProviderRequestLimitExceeded,
+            expected_error,
         );
         if expected_error == DiagnosticCode::InvalidConfiguration {
             refused(
@@ -159,7 +159,7 @@ fn request_encoding_jev_many_questions_are_refused_before_uniqueness_allocation(
         .collect();
     refused(
         || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-        DiagnosticCode::ProviderRequestLimitExceeded,
+        DiagnosticCode::InvalidConfiguration,
     );
     refused(
         || wire::jev_classify_body("jev", &request, None),
@@ -192,10 +192,22 @@ fn request_encoding_jev_many_options_are_refused_before_uniqueness_allocation() 
     )];
     refused(
         || wire::jev_classify_body("jev", &request, Some(LIMIT)),
-        DiagnosticCode::ProviderRequestLimitExceeded,
+        DiagnosticCode::InvalidConfiguration,
     );
     refused(
         || wire::jev_classify_body("jev", &request, None),
+        DiagnosticCode::InvalidConfiguration,
+    );
+}
+
+#[test]
+fn request_encoding_jev_many_levels_keep_their_diagnostic_with_a_byte_cap() {
+    let request = ClassifyRequest::new(
+        serde_json::Map::new(),
+        vec![ClassifierQuestion::score("q", "Rate.", ["Level."; 11])],
+    );
+    refused(
+        || wire::jev_classify_body("jev", &request, Some(0)),
         DiagnosticCode::InvalidConfiguration,
     );
 }

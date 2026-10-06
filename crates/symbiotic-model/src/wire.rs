@@ -279,7 +279,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_encoding_jev_byte_limit_precedes_whole_input_counting() {
+    fn request_encoding_jev_preflight_stays_within_token_budgets_and_body_cap() {
         let state_request = crate::ClassifyRequest::new(
             serde_json::from_value(serde_json::json!({"text": "x".repeat(16_384)})).unwrap(),
             vec![crate::ClassifierQuestion::noul("q", "", None, None)],
@@ -300,9 +300,14 @@ mod tests {
                 symbiotic_core::DiagnosticCode::ProviderRequestLimitExceeded
             );
             eprintln!("Jev {trigger} rejected: {serialized} serialized bytes, cap 1024");
-            // Count successful writes across both counting and encoding. Internal
-            // string escape scans are outside the capped-writer contract.
-            assert!(serialized <= 1024, "serialized {serialized} bytes");
+            // The fixed token budgets precede the byte cap to preserve diagnostics.
+            // Count successful writes across preflight and capped body encoding.
+            // Internal string escape scans are outside the capped-writer contract.
+            let preflight_budget = 63_488;
+            assert!(
+                serialized <= preflight_budget + 1024,
+                "serialized {serialized} bytes"
+            );
         }
     }
 

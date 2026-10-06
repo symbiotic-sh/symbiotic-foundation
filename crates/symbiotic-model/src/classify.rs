@@ -1181,22 +1181,21 @@ pub fn jev_classify_body(
     request: &ClassifyRequest,
     max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, ModelError> {
-    // Empty questions keep their shape diagnostic. For nonempty requests the
-    // configured byte cap applies before token counting or uniqueness allocation.
+    // Empty questions keep their shape diagnostic. Allocation-free count checks
+    // and bounded token counting preserve provider-limit diagnostic precedence.
     if request.questions.is_empty() {
         request.validate()?;
     }
+    JevClassifierProvider::check_limits(request)?;
     let wire_request = JevWireRequest {
         model,
         state: &request.state,
         questions: &request.questions,
     };
-    // Reuse the admitted body rather than serializing it again. Uncapped callers
-    // still check token bounds before allocating the body.
+    // Cap body buffering before uniqueness allocation and reuse the admitted body.
     let body = max_bytes
         .map(|max| wire::encode(&wire_request, Some(max)))
         .transpose()?;
-    JevClassifierProvider::check_limits(request)?;
     request.validate()?;
     match body {
         Some(body) => Ok(body),
