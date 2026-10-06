@@ -4744,6 +4744,79 @@ async fn jobs_cancel_sent_call_keeps_answer_and_ack_discards_only_recovery() {
 }
 
 #[tokio::test]
+async fn jobs_owner_erasure_during_transport_preserves_settlement_and_retires_binding() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for measured in [true, false] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let output = if measured {
+                r#"{"choices":[{"message":{"content":"erased answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"cost":"0.1"}}"#
+            } else {
+                r#"{"choices":[{"message":{"content":"erased answer"},"finish_reason":"stop"}]}"#
+            };
+            let fixture = Fixture::with_response_gate(
+                200, output.into(), Duration::ZERO, "null", true, false, Some(gate.clone()),
+            ).await;
+            let process = fixture.process().await;
+            let client = InProcessEgressClient::new(process.clone());
+            let input = queued(&fixture, "erased-during-send");
+            let attempt_digest = digest(&input.admission.attempt).unwrap();
+            let id = enqueue_id(&client, input).await;
+            while fixture.calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+
+            let runtime = symbiotic_ai_runtime::Runtime::open(symbiotic_ai_runtime::RuntimeConfig {
+                state_dir: Some(fixture.config.state_dir.clone()),
+                ..Default::default()
+            }).unwrap();
+            let jobs = runtime.model_jobs(jobs_scope(), fixture.config.jobs.clone()).unwrap();
+            assert!(matches!(
+                jobs.request(symbiotic_queue::jobs::JobRequest::PurgeOwner("input-owner".into())).await.unwrap(),
+                symbiotic_queue::jobs::JobResponse::Changed(1)
+            ));
+            let symbiotic_queue::jobs::JobResponse::Job(Some(erased)) =
+                jobs.request(symbiotic_queue::jobs::JobRequest::Get(id.clone())).await.unwrap()
+            else { panic!("erased running job") };
+            assert_eq!(erased.state, JobState::Running);
+            assert!(erased.purged && erased.owners.is_empty());
+            assert!(erased.admission.is_none() && erased.payload.is_none() && erased.output.is_none());
+            let reference = erased.receipt.unwrap();
+            let conn = rusqlite::Connection::open(fixture.config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+            let binding: Option<String> = conn.query_row(
+                "SELECT request_key FROM egress_permits WHERE attempt_digest=?1",
+                [&attempt_digest], |row| row.get(0),
+            ).unwrap();
+            assert!(binding.is_some());
+
+            gate.add_permits(1);
+            let row = wait_job(&client, &id, JobState::Purged).await;
+            assert_eq!(row.receipt.as_deref(), Some(reference.as_str()));
+            assert!(row.purged && row.owners.is_empty(), "{row:?}");
+            assert_eq!(row.diagnostic, Some(symbiotic_ai_runtime::model::DiagnosticCode::InvocationCompleted));
+            let (state, usage, recovery): (String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT state,usage,recovery FROM spend_receipts WHERE reference=?1",
+                [&reference], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(state, if measured { "settled" } else { "unknown" });
+            if measured {
+                let usage: symbiotic_trace::UsageTrace = serde_json::from_str(&usage.unwrap()).unwrap();
+                assert_eq!(usage.input_tokens, Some(7));
+                assert_eq!(usage.output_tokens, Some(3));
+            } else {
+                assert!(usage.is_none());
+            }
+            assert!(recovery.is_none());
+            let binding: Option<String> = conn.query_row(
+                "SELECT request_key FROM egress_permits WHERE attempt_digest=?1",
+                [&attempt_digest], |row| row.get(0),
+            ).unwrap();
+            assert!(binding.is_none());
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        }
+    }).await.expect("bounded owner erasure during signed-job transport");
+}
+
+#[tokio::test]
 async fn jobs_only_local_credential_failures_are_known_zero_charge() {
     for missing_secret in [false, true] {
         let fixture = Fixture::new(401, "refused".into(), Duration::ZERO).await;

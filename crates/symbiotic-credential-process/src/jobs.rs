@@ -125,9 +125,11 @@ impl ModelJobAdmission for Admission {
         })
     }
     fn finish(&self, tx: &Transaction<'_>, row: &JobRecord) -> Result<(), JobError> {
-        let signed = decode(row.admission.as_deref())?;
-        crate::registry::Registry::complete_job_in(tx, &digest(&signed.attempt).map_err(storage)?)
-            .map_err(storage)
+        crate::registry::Registry::complete_job_in(
+            tx,
+            row.receipt.as_deref().ok_or(JobError::Storage)?,
+        )
+        .map_err(storage)
     }
     fn claim(
         &self,

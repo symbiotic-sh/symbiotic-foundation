@@ -477,18 +477,18 @@ impl Registry {
     /// Retire a completed signed job's binding without copying its ledger-owned result.
     pub(crate) fn complete_job_in(
         tx: &rusqlite::Transaction<'_>,
-        attempt_digest: &str,
+        reference: &str,
     ) -> Result<(), EgressError> {
-        let changed = tx
-            .execute(
-                "UPDATE egress_permits SET request_key=NULL
-            WHERE attempt_digest=?1 AND consumed=1",
-                [attempt_digest],
-            )
-            .map_err(state)?;
-        if changed != 1 {
-            return Err(EgressError::StateUnavailable);
-        }
+        // Owner erasure deletes admission bytes, but the canonical job receipt
+        // survives. Use its existing live-binding index; settlement's ledger
+        // trigger may already have retired the binding in this transaction.
+        tx.execute(
+            "UPDATE egress_permits SET request_key=NULL
+            WHERE json_extract(receipt, '$.reference')=?1
+            AND consumed=1 AND finished=0 AND request_key IS NOT NULL",
+            [reference],
+        )
+        .map_err(state)?;
         Ok(())
     }
 
