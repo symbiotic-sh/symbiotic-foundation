@@ -95,6 +95,7 @@ impl ModelJobAdmission for Admission {
             | EgressError::InvocationComplete => {
                 JobError::Execution(model::DiagnosticCode::InvocationCompleted)
             }
+            EgressError::InvalidProviderJson => JobError::InvalidRequest,
             other => invalid(other),
         })
     }

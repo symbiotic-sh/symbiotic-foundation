@@ -1,6 +1,79 @@
 use symbiotic_egress::*;
 
 #[test]
+fn invalid_provider_json_round_trips_as_a_distinct_v4_wire_error() {
+    let json = r#"{"version":4,"result":{"Err":"invalid_provider_json"}}"#;
+    let response: Response = serde_json::from_str(json).unwrap();
+    assert_eq!(response.version, PROTOCOL_VERSION);
+    assert_eq!(serde_json::to_string(&response).unwrap(), json);
+    assert_eq!(
+        serde_json::to_value(response.result.err().unwrap()).unwrap(),
+        serde_json::json!("invalid_provider_json")
+    );
+}
+
+#[test]
+fn existing_error_codes_keep_their_wire_bytes() {
+    for (error, json) in [
+        (EgressError::Version, r#""version""#),
+        (EgressError::InvalidRequest, r#""invalid_request""#),
+        (
+            EgressError::InvalidFrameConfiguration,
+            r#""invalid_frame_configuration""#,
+        ),
+        (
+            EgressError::ResolverRequiresThreadMode,
+            r#""resolver_requires_thread_mode""#,
+        ),
+        (EgressError::Unauthorized, r#""unauthorized""#),
+        (EgressError::RouteRefused, r#""route_refused""#),
+        (EgressError::PermitRefused, r#""permit_refused""#),
+        (EgressError::AuthorityExpired, r#""authority_expired""#),
+        (
+            EgressError::ReconciliationRequired,
+            r#""reconciliation_required""#,
+        ),
+        (EgressError::InvocationComplete, r#""invocation_complete""#),
+        (EgressError::BudgetRefused, r#""budget_refused""#),
+        (
+            EgressError::RequestBudgetExhausted,
+            r#""request_budget_exhausted""#,
+        ),
+        (
+            EgressError::CredentialUnavailable,
+            r#""credential_unavailable""#,
+        ),
+        (EgressError::StateUnavailable, r#""state_unavailable""#),
+        (EgressError::LimitExceeded, r#""limit_exceeded""#),
+        (
+            EgressError::RateLimited {
+                retry_after_seconds: None,
+            },
+            r#"{"rate_limited":{"retry_after_seconds":null}}"#,
+        ),
+        (
+            EgressError::RateLimited {
+                retry_after_seconds: Some(7),
+            },
+            r#"{"rate_limited":{"retry_after_seconds":7}}"#,
+        ),
+        (EgressError::Timeout, r#""timeout""#),
+        (
+            EgressError::Provider { status: None },
+            r#"{"provider":{"status":null}}"#,
+        ),
+        (
+            EgressError::Provider { status: Some(500) },
+            r#"{"provider":{"status":500}}"#,
+        ),
+        (EgressError::Transport, r#""transport""#),
+    ] {
+        assert_eq!(serde_json::to_string(&error).unwrap(), json);
+        assert_eq!(serde_json::from_str::<EgressError>(json).unwrap(), error);
+    }
+}
+
+#[test]
 fn v4_refusal_has_the_documented_wire_shape() {
     let response = Response {
         version: PROTOCOL_VERSION,

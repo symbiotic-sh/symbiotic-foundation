@@ -402,13 +402,19 @@ rounds it nor estimates prices, and does not establish a monetary ceiling.
 Every failed dispatch returns a closed, credential-free `error` alongside
 its receipt (`None` on success). Provider failures keep `rate_limited` with an
 optional `retry_after_seconds`, `timeout`, `provider` with an optional HTTP
-`status`, or `transport`. Provider HTTP status and Retry-After survive runtime
-attempt exhaustion and secondary bookkeeping diagnostics. HTTP-date Retry-After
+`status`, `invalid_provider_json`, or `transport`. Provider HTTP status and
+Retry-After survive runtime attempt exhaustion and secondary bookkeeping diagnostics. HTTP-date Retry-After
 values become a nonnegative delay relative to receipt time; malformed hints fail
 visibly rather than being ignored. Send and response-body read timeouts share the
 same timeout classification. Provider error bodies and raw header strings never
 leave the transport. These classes are observations, not permission to retry:
 unknown spend still requires reconciliation before another admitted attempt.
+`EgressError::InvalidProviderJson` (wire code `invalid_provider_json`) identifies
+a successful HTTP response whose body is not valid JSON, preserving
+`ModelError::Unavailable(InvalidResponse)` separately from status-less `provider`
+failures. The malformed body contributes no diagnostics or provider text. This
+failure retains unknown charge and the existing request failure budget debit;
+no parsed answer reaches caller answer validation.
 Credential-loading and setup/queue failures before
 transport handoff report `SpendState::Released` and release that reservation for a
 subsequent admitted attempt, while the attempt-count limit still applies. The shared
