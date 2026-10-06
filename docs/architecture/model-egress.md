@@ -616,6 +616,16 @@ live in `symbiotic-model`, re-exported through `symbiotic_ai_runtime::model`.
 Credential-process version-4 route deserialization and the adapters use that
 shared definition; applications need no local copy.
 
+For an OpenRouter `qwen/qwen3-embedding-8b` route using `compatible_embedding`
+with adapter `open_ai_embedding`, operator `openrouter`, dimensions 1024 and
+`embedding_input_tokens: 32000`, the 250 × 1024 loopback batch in
+[`embedding_route.rs`](../../crates/symbiotic-credential-process/tests/embedding_route.rs)
+measures **2,729,388 response bytes**. It needs raised bounds: the test accepts
+`max_response_bytes: 8388608` (8 MiB) and `max_frame_bytes: 37748736` (36 MiB),
+with `max_field_bytes: 1024`; the default response limit returns
+`EgressError::Provider { status: None }`. These are sufficient bounds for the
+synthetic fixture, not a measured live-provider maximum.
+
 These are **provisional configured hard limits per provider call**, not measured
 capacity or guaranteed production provider maxima. Repository evidence is limited
 to the [example registry's 8,192-token context](../../examples/model-registry.json),
