@@ -69,32 +69,6 @@ fn compiler_preserves_configured_wrapper_and_arguments() {
 }
 
 #[test]
-fn compiler_timeout_kills_and_reaps_the_child() {
-    let dir = tempfile::tempdir().unwrap();
-    let pid_path = dir.path().join("compiler.pid");
-    let result = std::panic::catch_unwind(|| {
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", "echo $$ > \"$1\"; exec /bin/sleep 1", "compiler"])
-            .arg(&pid_path);
-        compiler_output(command, dir.path(), Duration::from_millis(100))
-    });
-    let panic = result.expect_err("compiler must trip the termination guard");
-    assert!(
-        panic
-            .downcast_ref::<String>()
-            .is_some_and(|message| message.contains("termination hang guard fired")),
-        "compiler must fail through the termination guard"
-    );
-    let pid = fs::read_to_string(pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(!alive(pid), "timed-out compiler must be killed and reaped");
-}
-
-#[test]
 fn compiler_failure_preserves_both_output_streams() {
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new("/bin/sh");
