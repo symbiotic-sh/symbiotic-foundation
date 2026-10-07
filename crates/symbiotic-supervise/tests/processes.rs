@@ -2,7 +2,7 @@
 use std::{
     fs,
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 mod common;
@@ -29,6 +29,85 @@ impl Drop for Reap {
         let _ = self.0.wait();
     }
 }
+fn c_compiler(configured: Option<&str>) -> Command {
+    let mut compiler = configured.unwrap_or("cc").split_whitespace();
+    let mut command = Command::new(compiler.next().expect("C compiler executable"));
+    command.args(compiler);
+    command
+}
+
+fn compiler_output(mut command: Command, dir: &Path, timeout: Duration) -> Output {
+    // Files retain both streams without risking a full capture pipe during the wait.
+    let stdout = dir.join("compiler.stdout");
+    let stderr = dir.join("compiler.stderr");
+    let mut compiler = Reap(
+        command
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    common::until_termination_with_timeout(timeout, || compiler.0.try_wait().unwrap().is_some());
+    Output {
+        status: compiler.0.wait().unwrap(),
+        stdout: fs::read(stdout).unwrap(),
+        stderr: fs::read(stderr).unwrap(),
+    }
+}
+
+#[test]
+fn compiler_defaults_to_platform_cc_when_unconfigured() {
+    assert_eq!(c_compiler(None).get_program(), "cc");
+}
+
+#[test]
+fn compiler_preserves_configured_wrapper_and_arguments() {
+    let command = c_compiler(Some("cache-wrapper clang -O2"));
+    assert_eq!(command.get_program(), "cache-wrapper");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["clang", "-O2"]);
+}
+
+#[test]
+fn compiler_timeout_kills_and_reaps_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("compiler.pid");
+    let result = std::panic::catch_unwind(|| {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec /bin/sleep 1", "compiler"])
+            .arg(&pid_path);
+        compiler_output(command, dir.path(), Duration::from_millis(100))
+    });
+    let panic = result.expect_err("compiler must trip the termination guard");
+    assert!(
+        panic
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains("termination hang guard fired")),
+        "compiler must fail through the termination guard"
+    );
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!alive(pid), "timed-out compiler must be killed and reaped");
+}
+
+#[test]
+fn compiler_failure_preserves_both_output_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf compiler-out; printf compiler-error >&2; exit 7",
+    ]);
+    let output = compiler_output(command, dir.path(), Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"compiler-out");
+    assert_eq!(output.stderr, b"compiler-error");
+}
+
 fn read_pid(path: &Path) -> u32 {
     until(|| fs::read_to_string(path).is_ok_and(|text| text.trim().parse::<u32>().is_ok()));
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
@@ -247,10 +326,13 @@ fn shutdown_error(refuse_kill: bool) {
         } else {
             "refuse-term.so"
         });
-        let compiler = std::env::var("CC").expect("configured compiler cache");
-        let mut compiler = compiler.split_whitespace();
-        let output = Command::new(compiler.next().unwrap())
-            .args(compiler)
+        let configured = std::env::var_os("CC");
+        let mut compiler = c_compiler(
+            configured
+                .as_deref()
+                .map(|value| value.to_str().expect("CC must be valid UTF-8")),
+        );
+        compiler
             .args(if cfg!(target_os = "macos") {
                 vec!["-O2", "-dynamiclib"]
             } else {
@@ -264,12 +346,12 @@ fn shutdown_error(refuse_kill: bool) {
                 .join("tests/refuse_term.c"),
             )
             .arg("-o")
-            .arg(&library)
-            .output()
-            .unwrap();
+            .arg(&library);
+        let output = compiler_output(compiler, dir.path(), Duration::from_secs(60));
         assert!(
             output.status.success(),
-            "{}",
+            "compiler stdout:\n{}\ncompiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         command.env(

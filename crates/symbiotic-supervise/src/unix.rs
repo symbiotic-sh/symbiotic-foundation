@@ -29,7 +29,30 @@ pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
         }
         let bytes = format!("{message}\n");
         // In particular, EAGAIN is ignored; diagnostics cannot delay cleanup.
-        let _ = libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+        write_diagnostic(bytes.as_bytes(), |remaining| {
+            let written = libc::write(
+                libc::STDERR_FILENO,
+                remaining.as_ptr().cast(),
+                remaining.len(),
+            );
+            if written == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        });
+    }
+}
+
+fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
+    while !bytes.is_empty() {
+        match write(bytes) {
+            Ok(0) => break,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // In particular, never wait or retry when output would block.
+            Err(_) => break,
+        }
     }
 }
 
@@ -293,8 +316,63 @@ pub fn watch_parent(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
+    use super::write_diagnostic;
+    use std::io;
+
+    #[test]
+    fn diagnostic_continues_after_partial_writes() {
+        let message = b"cleanup failed\n";
+        let mut output = Vec::new();
+        let mut calls = 0;
+        write_diagnostic(message, |remaining| {
+            calls += 1;
+            assert!(calls <= message.len(), "partial writes must make progress");
+            let count = remaining.len().min(3);
+            output.extend_from_slice(&remaining[..count]);
+            Ok(count)
+        });
+        assert_eq!(output, message);
+    }
+
+    #[test]
+    fn diagnostic_continues_after_interruption() {
+        let message = b"cleanup failed\n";
+        let mut calls = 0;
+        let mut output = Vec::new();
+        write_diagnostic(message, |remaining| {
+            calls += 1;
+            assert!(calls <= 2, "interrupted write must finish on the next call");
+            if calls == 1 {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                output.extend_from_slice(remaining);
+                Ok(remaining.len())
+            }
+        });
+        assert_eq!(output, message);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn diagnostic_stops_when_output_cannot_progress() {
+        for outcome in [
+            Ok(0),
+            Err(io::ErrorKind::WouldBlock),
+            Err(io::ErrorKind::BrokenPipe),
+        ] {
+            let mut calls = 0;
+            write_diagnostic(b"cleanup failed\n", |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "must not retry output that cannot progress");
+                outcome.map_err(io::Error::from)
+            });
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn parent_mismatch_exits_after_arming_death_signal() {
         // SAFETY: the fork child performs only the async-signal-safe setup and _exit;
