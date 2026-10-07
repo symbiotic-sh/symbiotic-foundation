@@ -2387,6 +2387,134 @@ async fn jobs_candidate_claim_is_bounded() {
     ));
 }
 
+/// Direct handler claims accept inputs whose numeric-array encoding exceeds a page.
+#[tokio::test]
+async fn jobs_enqueue_accepts_handler_input_larger_than_candidate_page() {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let s = Suite::new();
+        let mut spec = s.spec("large-handler-input");
+        spec.payload = vec![b'x'; 512 * 1024];
+        assert!(spec.payload.len() < s.config.max_pending_bytes);
+        let id = s.insert(spec.clone()).await;
+        assert!(encoded_bytes(&s.get(&id).await).unwrap() + 2 > s.config.max_page_bytes);
+
+        let row = s.claim().await;
+        assert_eq!(row.id, id);
+        assert_eq!(row.payload.as_ref(), Some(&spec.payload));
+        s.complete(&row, Vec::new()).await;
+        assert_eq!(s.get(&id).await.state, JobState::Succeeded);
+    })
+    .await
+    .expect("handler enqueue and direct claim must finish within two seconds");
+}
+
+/// Numeric-array expansion is bounded before any member of an enqueue batch commits.
+#[tokio::test]
+async fn jobs_enqueue_refuses_unreadable_input() {
+    let probe = Suite::new();
+    let mut spec = probe.spec("chat-page-bound");
+    spec.execution = Execution::Model;
+    spec.payload = Vec::new();
+    spec.admission = Some(b"signed authority".to_vec());
+    let probe_id = probe.insert(spec.clone()).await;
+    let mut expected = probe.get(&probe_id).await;
+    spec.payload = vec![b'x'; JobConfig::default().max_page_bytes / 4];
+    expected.payload = Some(spec.payload.clone());
+    let bytes = encoded_bytes(&expected).unwrap() + 2;
+    assert!(bytes > probe.config.max_page_bytes);
+    assert!(spec.payload.len() < probe.config.max_page_bytes);
+
+    let mut s = Suite::new();
+    // The default bound refuses the expanded input, despite ample raw-byte capacity.
+    assert!(matches!(
+        s.op(JobRequest::Enqueue(vec![spec.clone()])).await,
+        Err(JobError::CandidateTooLarge { bytes: actual, .. }) if actual == bytes
+    ));
+    s.config.max_page_bytes = bytes - 1;
+    assert!(matches!(
+        s.op(JobRequest::Enqueue(vec![s.spec("batch-prefix"), spec.clone()])).await,
+        Err(JobError::CandidateTooLarge { bytes: actual, .. }) if actual == bytes
+    ));
+    let JobResponse::Usage(usage) = s.op(JobRequest::PendingUsage).await.unwrap() else {
+        panic!("usage")
+    };
+    assert_eq!(usage.items, 0);
+    assert_eq!(usage.bytes, 0);
+
+    // The identical input fits just under the configured bound and reads back.
+    s.config.max_page_bytes = bytes + 1;
+    let id = s.insert(spec.clone()).await;
+    let JobResponse::Candidates(rows) = s
+        .op(JobRequest::Candidates {
+            kinds: vec![spec.kind],
+            limit: 1,
+            max_bytes: s.config.max_page_bytes,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("candidates")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].payload.as_ref(), Some(&spec.payload));
+    assert_eq!(encoded_bytes(&rows).unwrap(), bytes);
+}
+
+/// Renewed authority cannot grow a claimable record beyond its candidate page.
+#[tokio::test]
+async fn jobs_admission_refuses_unreadable_input() {
+    let mut s = Suite::new();
+    let mut spec = s.spec("renew-page-bound");
+    spec.execution = Execution::Model;
+    spec.admission = Some(b"old authority".to_vec());
+    let id = s.insert(spec.clone()).await;
+    let admission = vec![b'x'; s.config.max_page_bytes / 4];
+    let mut expected = s.get(&id).await;
+    expected.admission = Some(admission.clone());
+    let bytes = encoded_bytes(&expected).unwrap() + 2;
+    assert!(bytes > s.config.max_page_bytes);
+
+    for state in [JobState::Pending, JobState::AwaitingAdmission] {
+        if state == JobState::AwaitingAdmission {
+            s.op(JobRequest::AwaitAdmission(id.clone())).await.unwrap();
+        }
+        s.config.max_page_bytes = bytes - 1;
+        assert!(matches!(
+            s.op(JobRequest::Admit { job: id.clone(), admission: admission.clone() }).await,
+            Err(JobError::CandidateTooLarge { job, bytes: actual }) if job == id && actual == bytes
+        ));
+        let row = s.get(&id).await;
+        assert_eq!(row.state, state);
+        assert_eq!(row.admission, spec.admission);
+        assert_eq!(row.generation, 0);
+    }
+
+    s.config.max_page_bytes = bytes + 1;
+    s.op(JobRequest::Admit {
+        job: id.clone(),
+        admission: admission.clone(),
+    })
+    .await
+    .unwrap();
+    let JobResponse::Candidates(rows) = s
+        .op(JobRequest::Candidates {
+            kinds: vec![spec.kind],
+            limit: 1,
+            max_bytes: s.config.max_page_bytes,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("candidates")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].state, JobState::Pending);
+    assert_eq!(rows[0].admission.as_ref(), Some(&admission));
+    assert_eq!(encoded_bytes(&rows).unwrap(), bytes);
+}
+
 /// A mixed final/pending ack batch or foreign selector cannot partly commit.
 #[tokio::test]
 async fn jobs_ack_and_cancel_batches_roll_back() {
