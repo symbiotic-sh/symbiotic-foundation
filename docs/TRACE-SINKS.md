@@ -34,7 +34,9 @@ The central event is `ModelInvocationTrace`:
 - audit references
 - free-form metadata
 
-## Required Sinks
+## Sink Adapter Roles
+
+These are adapter roles for optional telemetry; no deployment must run every sink.
 
 | sink | responsibility |
 | --- | --- |

@@ -103,6 +103,8 @@ set and the effective grant revision. The explicit release stands until changed 
 another explicit release; later input-grant changes do not recompute its reader set.
 The automatic input-intersection rule applies only to outputs without an explicit
 release and carries provider restrictions into those outputs.
+Initial readers for outputs using only product-supplied inputs are defined by
+[Memory's redesign](https://github.com/symbiotic-sh/symbiotic-memory/issues/545).
 Once data is returned to an agent, Memory cannot control which model that agent
 subsequently uses.
 
@@ -184,8 +186,12 @@ grant. Removing P's access to an input of D does not remove P's access to D; ano
 explicit release must change D's readers to do that. An output with the same inputs
 but no explicit release loses P through the input-intersection rule.
 
-The audit trail stays global. Changing
-the embedding provider triggers re-embedding. Products that want to regenerate
+The audit trail stays global. Read authority across tenants is defined by
+[Memory's redesign](https://github.com/symbiotic-sh/symbiotic-memory/issues/545).
+Changing the embedding provider triggers re-embedding. Re-embedding failure and
+search readiness across embedding generations are defined by
+[Memory's redesign](https://github.com/symbiotic-sh/symbiotic-memory/issues/545).
+Products that want to regenerate
 old outputs page `derivations.list` by producer and explicitly request new runs.
 
 ## Spend ledger and budgets
@@ -207,6 +213,9 @@ A lost dispatch reply is recovered by authenticated same-attempt status/receipt
 lookup. It does not authorize replaying the provider request. Unknown external
 outcomes stop automatic resubmission and require reconciliation. Single-use permits
 protect Foundation handoff; they do not promise exactly-once external execution.
+The local backend describes its [unresolved-request guard](model-egress.md#shared-direct-request-failure-budget),
+[recovery status](model-egress.md#same-attempt-recovery-v4),
+and [replay rules](model-egress.md#revocation-replay-and-unknown-charges).
 
 Dispatch requires an explicit runtime `state_dir`; `Runtime::in_memory()` and
 `state_dir: None` refuse with the typed `SpendLedgerUnavailable` error. Foundation
@@ -218,6 +227,7 @@ attempt was pre-transport or otherwise known zero-charge. An attempt whose trans
 may have started is never blindly resent: an uncertain timeout or other unknown
 outcome enters Foundation's same-attempt recovery and reconciliation path. An error
 class or unused attempt allowance alone does not establish that retry is safe.
+The current retry-class inventory is in [AI runtime](ai-runtime.md#policy-knobs).
 The shared queued chat, embedding, rerank and classification paths retain unknown
 charge after uncertain raw-provider failures and stop retries regardless of error class
 or unused attempt allowance. A trusted adapter may explicitly establish KnownZero;
@@ -261,6 +271,9 @@ Use the current state format only; there are no pre-release migration or legacy
 reader requirements. Re-ingest rebuildable data from raw inputs. Unresolved paid
 attempts must be reconciled before retiring replay/accounting state: rebuilding a
 cache or Memory index does not authorize forgetting an uncertain provider charge.
+Invalidation of cached and recoverable output when an input is erased before its
+recovery deadline is defined by
+[Memory's redesign](https://github.com/symbiotic-sh/symbiotic-memory/issues/545).
 
 ## Supported modes and trusted channels
 

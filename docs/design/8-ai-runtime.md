@@ -72,6 +72,7 @@ rate-limiter, rerank and queue implementations from consumers.
 7. **Retry knobs over forks.** A base delay (sub-second allowed), an opt-in to
    retry provider errors, and rate burst cover the behaviour a consumer's copy
    had. The defaults are unchanged.
+   The current retry-class inventory is in [AI runtime](../architecture/ai-runtime.md#policy-knobs).
    Retry admission and recovery follow the
    [spend contract](../architecture/boundary.md#spend-ledger-and-budgets).
    Automatic retry now requires explicit known-zero charge evidence; uncertain

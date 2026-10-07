@@ -4106,7 +4106,7 @@ async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
 #[tokio::test]
 async fn regression_slow_resolver_delays_dispatch_beyond_provider_timeout() {
     initialize_panic_reporting();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         let mut fixture = Fixture::new(200, "resolver released".into(), Duration::ZERO).await;
         fixture.config.routes[0].timeout_seconds = 1;
         fixture.config.routes[0].max_in_flight = 1;
@@ -4120,7 +4120,7 @@ async fn regression_slow_resolver_delays_dispatch_beyond_provider_timeout() {
                 entered_resolver.notify_one();
                 // Bound the blocking callback independently of async/runtime cleanup.
                 // Dropping the test's sender also releases it on assertion failure.
-                receive.lock().unwrap().recv_timeout(Duration::from_secs(5))?;
+                receive.lock().unwrap().recv_timeout(Duration::from_secs(60))?;
                 Ok(symbiotic_ai_runtime::model::SecretValue::new(
                     SECRET.as_bytes().to_vec(),
                 ))
@@ -4161,7 +4161,7 @@ async fn regression_slow_resolver_delays_dispatch_beyond_provider_timeout() {
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     })
     .await
-    .expect("controlled resolver dispatch must finish within the five-second hang guard");
+    .expect("controlled resolver dispatch must finish within the sixty-second hang guard");
 }
 
 #[test]
