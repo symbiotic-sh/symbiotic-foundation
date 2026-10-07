@@ -440,7 +440,10 @@ impl CredentialProcess {
         operation: Operation,
         answer_validator: Option<AnswerValidator>,
     ) -> Result<Reply, EgressError> {
-        self.purge_expired_results()?;
+        // Owner erasure validates its MAC and scope before even expiry maintenance.
+        if !matches!(&operation, Operation::PurgeOwner(_)) {
+            self.purge_expired_results()?;
+        }
         match operation {
             Operation::EnqueueJobs(signed)
                 if matches!(signed.request.command, JobsCommand::EnqueueJobs(_)) =>
@@ -472,11 +475,17 @@ impl CredentialProcess {
             {
                 self.jobs_operation(*signed).await
             }
+            Operation::PurgeOwner(signed)
+                if matches!(signed.request.command, JobsCommand::PurgeOwner(_)) =>
+            {
+                self.jobs_operation(*signed).await
+            }
             Operation::EnqueueJobs(_)
             | Operation::AdmitJob(_)
             | Operation::Completions(_)
             | Operation::AckJobs(_)
             | Operation::CancelJobs(_)
+            | Operation::PurgeOwner(_)
             | Operation::JobStatus(_) => Err(EgressError::InvalidRequest),
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;

@@ -61,10 +61,11 @@ implementation.
 
 ## Signed model jobs (Memory FQ4)
 
-`JobsClient<C>` offers `enqueue`, `admit`, `completions`, `ack`, `cancel` and
-`status` on either `InProcessEgressClient` or `UnixEgressClient`. The corresponding
-wire operations are `EnqueueJobs`, `AdmitJob`, `Completions`, `AckJobs`, `CancelJobs`
-and `JobStatus`. Each carries a `SignedJobsRequest`; the MAC covers the complete
+`JobsClient<C>` offers `enqueue`, `admit`, `completions`, `ack`, `cancel`,
+`purge_owner` and `status` on either `InProcessEgressClient` or `UnixEgressClient`.
+The corresponding wire operations are `EnqueueJobs`, `AdmitJob`, `Completions`,
+`AckJobs`, `CancelJobs`, `PurgeOwner` and `JobStatus`. Each carries a
+`SignedJobsRequest`; the MAC covers the complete
 `JobsRequest { scope, command }` under `symbiotic-egress/v4/jobs\0`. The outer
 operation must match the signed command. Foreign job/token scopes are refused
 before lookup or mutation. Replies use `Reply::Jobs(Result<JobsReply, JobError>)`.
@@ -105,7 +106,17 @@ precede admission notices. A notice contains an ID/state/code and no delivery
 fence; acknowledging an unfinished job returns `NotFinal`. An individually
 oversized completion returns `CompletionTooLarge` before taking a delivery lease.
 `JobStatus` reads one job's metadata without loading input, admission or output.
-Group summaries and diagnostics are outside this six-operation subset.
+Group summaries and diagnostics are outside this seven-operation subset.
+
+`PurgeOwner(owner)` verifies the MAC and scope before any lookup, maintenance or
+mutation, then calls the existing scoped `JobRequest::PurgeOwner`. It returns
+`JobsReply::Purged(count)`. The store removes matching waiting inputs, admissions,
+owner metadata and saved recovery answers in its existing SQLite transaction;
+other owners and scopes are unaffected. Accounting remains intact. An erased
+in-flight job can settle accounting but cannot persist an answer. This adds no
+storage layer or schema: the cost is the existing scoped owner selection and
+job/ledger updates, plus authenticated request encoding and verification.
+Memory's job adapter must call `purge_owner` when erasing an input owner.
 
 `ProcessConfig.jobs` and `.job_runner` use the existing versioned `JobConfig` and
 `RunnerConfig` defaults. Admission bytes count against pending utilization and

@@ -4359,7 +4359,292 @@ async fn wait_job(client: &impl EgressClient, job: &JobId, state: JobState) -> B
 }
 
 #[tokio::test]
-async fn jobs_six_operations_round_trip_on_both_transports_and_join_by_key() {
+async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "saved answer".into(), Duration::ZERO).await;
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process);
+        let runtime = symbiotic_ai_runtime::Runtime::open(symbiotic_ai_runtime::RuntimeConfig {
+            state_dir: Some(fixture.config.state_dir.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let jobs = runtime
+            .model_jobs(jobs_scope(), fixture.config.jobs.clone())
+            .unwrap();
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let receipt = |reference: &str| -> (String, Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT state,usage,recovery FROM spend_receipts WHERE reference=?1",
+                [reference],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let mut ids = Vec::new();
+        for owner in ["input-owner", "other-owner"] {
+            for waiting in [false, true] {
+                let mut input = queued(&fixture, &format!("{owner}-{waiting}"));
+                input.owners = vec![owner.into()];
+                if waiting {
+                    input.admission.attempt.expires_at = unix_seconds();
+                    input.admission = AdmissionKey::new(KEY.to_vec())
+                        .unwrap()
+                        .sign_attempt(input.admission.attempt)
+                        .unwrap();
+                }
+                let id = enqueue_id(&client, input).await;
+                let row = wait_job(
+                    &client,
+                    &id,
+                    if waiting {
+                        JobState::AwaitingAdmission
+                    } else {
+                        JobState::Succeeded
+                    },
+                )
+                .await;
+                let accounting = row.receipt.as_deref().map(receipt);
+                if let Some((state, usage, recovery)) = &accounting {
+                    assert_eq!(state, "settled");
+                    assert!(usage.is_some() && recovery.is_some());
+                }
+                ids.push((owner, waiting, id, row.receipt, accounting));
+            }
+        }
+        // The same owner in another authenticated queue must remain untouched.
+        let mut foreign_scope = jobs_scope();
+        foreign_scope.queue = "other-queue".into();
+        let foreign_client = JobsClient::new(
+            client.clone(),
+            foreign_scope.clone(),
+            AdmissionKey::new(KEY.to_vec()).unwrap(),
+        );
+        let mut foreign_input = queued(&fixture, "foreign-owner-copy");
+        foreign_input.admission.attempt.job_queue = Some(foreign_scope.queue.clone());
+        foreign_input.admission.attempt.expires_at = unix_seconds();
+        foreign_input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(foreign_input.admission.attempt)
+            .unwrap();
+        let foreign_ids = foreign_client.enqueue(vec![foreign_input]).await.unwrap();
+        let Enqueued::Inserted(foreign_id) = &foreign_ids[0] else {
+            panic!("foreign queue enqueue")
+        };
+        let foreign_jobs = runtime
+            .model_jobs(foreign_scope, fixture.config.jobs.clone())
+            .unwrap();
+
+        // Decode the new public wire command so this regression also runs on the base.
+        let command = serde_json::from_value(
+            serde_json::json!({"operation": "purge_owner", "body": "input-owner"}),
+        )
+        .expect("owner purge must be a public job command");
+        let reply = job_call(&client, command).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            serde_json::json!({"reply": "purged", "body": 2})
+        );
+        let symbiotic_queue::jobs::JobResponse::Job(Some(foreign)) = foreign_jobs
+            .request(symbiotic_queue::jobs::JobRequest::Get(foreign_id.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("foreign queue copy")
+        };
+        assert!(!foreign.purged);
+        assert_eq!(foreign.owners, ["input-owner"]);
+        assert!(foreign.payload.is_some() && foreign.admission.is_some());
+        assert_eq!(
+            JobsClient::new(
+                client,
+                jobs_scope(),
+                AdmissionKey::new(KEY.to_vec()).unwrap()
+            )
+            .purge_owner("input-owner".into())
+            .await
+            .unwrap(),
+            0
+        );
+        for (owner, waiting, id, reference, accounting) in ids {
+            let symbiotic_queue::jobs::JobResponse::Job(Some(row)) = jobs
+                .request(symbiotic_queue::jobs::JobRequest::Get(id))
+                .await
+                .unwrap()
+            else {
+                panic!("job")
+            };
+            if owner == "input-owner" {
+                assert_eq!(row.state, JobState::Purged);
+                assert!(row.purged && row.owners.is_empty());
+                assert!(row.payload.is_none() && row.admission.is_none() && row.output.is_none());
+                if let Some(reference) = reference {
+                    let (state, usage, recovery) = receipt(&reference);
+                    let before = accounting.unwrap();
+                    assert_eq!((state, usage), (before.0, before.1));
+                    assert!(recovery.is_none());
+                }
+            } else {
+                assert!(!row.purged);
+                assert_eq!(row.owners, ["other-owner"]);
+                assert_eq!(
+                    row.state,
+                    if waiting {
+                        JobState::AwaitingAdmission
+                    } else {
+                        JobState::Succeeded
+                    }
+                );
+                if waiting {
+                    assert!(row.payload.is_some() && row.admission.is_some());
+                }
+                if let Some(reference) = reference {
+                    assert_eq!(Some(receipt(&reference)), accounting);
+                }
+            }
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("bounded authenticated owner purge");
+}
+
+#[tokio::test]
+async fn jobs_owner_purge_refuses_unsigned_and_wrong_scope_before_mutation() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process);
+        let mut input = queued(&fixture, "purge-refused");
+        input.admission.attempt.expires_at = unix_seconds();
+        input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(input.admission.attempt)
+            .unwrap();
+        let id = enqueue_id(&client, input).await;
+        wait_job(&client, &id, JobState::AwaitingAdmission).await;
+        let saved = enqueue_id(&client, queued(&fixture, "purge-refused-saved")).await;
+        wait_job(&client, &saved, JobState::Succeeded).await;
+        let conn = rusqlite::Connection::open(
+            fixture
+                .config
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        // A refused purge must not even perform generic expiry maintenance.
+        assert_eq!(
+            conn.execute(
+                "UPDATE egress_permits SET recovery_expires_at=0,result='synthetic expired result'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+        let command: JobsCommand = serde_json::from_value(
+            serde_json::json!({"operation": "purge_owner", "body": "input-owner"}),
+        )
+        .expect("owner purge must be a public job command");
+        for tamper in ["unsigned", "tenant", "incarnation", "queue", "owner"] {
+            let mut signed = key
+                .sign_jobs(JobsRequest {
+                    scope: jobs_scope(),
+                    command: command.clone(),
+                })
+                .unwrap();
+            match tamper {
+                "unsigned" => signed.authentication.clear(),
+                "tenant" => signed.request.scope.tenant = "other".into(),
+                "incarnation" => signed.request.scope.incarnation = "other".into(),
+                "queue" => signed.request.scope.queue = "other".into(),
+                _ => {
+                    signed.request.command = serde_json::from_value(
+                        serde_json::json!({"operation": "purge_owner", "body": "other-owner"}),
+                    )
+                    .unwrap()
+                }
+            }
+            assert!(
+                matches!(
+                    client
+                        .exchange(Request {
+                            version: PROTOCOL_VERSION,
+                            operation: signed.operation()
+                        })
+                        .await
+                        .unwrap()
+                        .result,
+                    Err(EgressError::Unauthorized)
+                ),
+                "{tamper}"
+            );
+        }
+        let mut foreign = jobs_scope();
+        foreign.tenant = "other".into();
+        let empty_queue = JobScope {
+            queue: String::new(),
+            ..jobs_scope()
+        };
+        for scope in [foreign, empty_queue] {
+            let signed = key
+                .sign_jobs(JobsRequest {
+                    scope,
+                    command: command.clone(),
+                })
+                .unwrap();
+            assert!(matches!(
+                client
+                    .exchange(Request {
+                        version: PROTOCOL_VERSION,
+                        operation: signed.operation()
+                    })
+                    .await
+                    .unwrap()
+                    .result,
+                Err(EgressError::Unauthorized)
+            ));
+        }
+        let mismatched = key
+            .sign_jobs(JobsRequest {
+                scope: jobs_scope(),
+                command: JobsCommand::JobStatus(id.clone()),
+            })
+            .unwrap();
+        assert!(matches!(
+            client
+                .exchange(Request {
+                    version: PROTOCOL_VERSION,
+                    operation: Operation::PurgeOwner(Box::new(mismatched))
+                })
+                .await
+                .unwrap()
+                .result,
+            Err(EgressError::InvalidRequest)
+        ));
+        assert_eq!(
+            conn.query_row("SELECT result FROM egress_permits", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "synthetic expired result"
+        );
+        let row = wait_job(&client, &id, JobState::AwaitingAdmission).await;
+        assert!(!row.purged);
+        assert_eq!(row.owners, ["input-owner"]);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded owner purge authentication rejection");
+}
+
+#[tokio::test]
+async fn jobs_seven_operations_round_trip_on_both_transports_and_join_by_key() {
     for socket_mode in [false, true] {
         let fixture = Fixture::new(200, "job answer".into(), Duration::ZERO).await;
         let process = fixture.process().await;
@@ -4492,6 +4777,20 @@ async fn jobs_six_operations_round_trip_on_both_transports_and_join_by_key() {
             JobsReply::Cancelled(1)
         ));
         wait_job(&client, &waiting, JobState::Cancelled).await;
+        // The confirmed job already has no owner metadata or copies.
+        assert!(matches!(
+            job_call(&client, JobsCommand::PurgeOwner("input-owner".into()))
+                .await
+                .unwrap(),
+            JobsReply::Purged(1)
+        ));
+        wait_job(&client, &waiting, JobState::Purged).await;
+        assert!(matches!(
+            job_call(&client, JobsCommand::PurgeOwner("input-owner".into()))
+                .await
+                .unwrap(),
+            JobsReply::Purged(0)
+        ));
         if let Some(task) = server_task {
             task.abort();
         }
@@ -4896,8 +5195,8 @@ async fn jobs_owner_erasure_during_transport_preserves_settlement_and_retires_bi
             }).unwrap();
             let jobs = runtime.model_jobs(jobs_scope(), fixture.config.jobs.clone()).unwrap();
             assert!(matches!(
-                jobs.request(symbiotic_queue::jobs::JobRequest::PurgeOwner("input-owner".into())).await.unwrap(),
-                symbiotic_queue::jobs::JobResponse::Changed(1)
+                job_call(&client, JobsCommand::PurgeOwner("input-owner".into())).await.unwrap(),
+                JobsReply::Purged(1)
             ));
             let symbiotic_queue::jobs::JobResponse::Job(Some(erased)) =
                 jobs.request(symbiotic_queue::jobs::JobRequest::Get(id.clone())).await.unwrap()

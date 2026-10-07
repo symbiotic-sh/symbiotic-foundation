@@ -49,6 +49,8 @@ pub enum JobsCommand {
     AckJobs(Vec<(DeliveryToken, Disposition)>),
     /// Cancel waiting work or signal sent work through its heartbeat.
     CancelJobs(Selector),
+    /// Erase an input owner's waiting and saved copies within the signed scope.
+    PurgeOwner(String),
     /// Content-free per-job status (queue design §13).
     JobStatus(JobId),
 }
@@ -101,6 +103,7 @@ impl SignedJobsRequest {
             JobsCommand::Completions { .. } => Operation::Completions(Box::new(self)),
             JobsCommand::AckJobs(_) => Operation::AckJobs(Box::new(self)),
             JobsCommand::CancelJobs(_) => Operation::CancelJobs(Box::new(self)),
+            JobsCommand::PurgeOwner(_) => Operation::PurgeOwner(Box::new(self)),
             JobsCommand::JobStatus(_) => Operation::JobStatus(Box::new(self)),
         }
     }
@@ -140,6 +143,8 @@ pub enum JobsReply {
     Acked(Vec<AckResult>),
     /// Number of jobs affected by cancellation.
     Cancelled(usize),
+    /// Number of jobs affected by owner erasure.
+    Purged(usize),
     /// Scoped content-free status; absent IDs return a typed NotFound error.
     Status(Box<JobRecord>),
 }
@@ -222,6 +227,13 @@ impl<C: EgressClient> JobsClient<C> {
             _ => Err(EgressError::InvalidRequest.into()),
         }
     }
+    /// Erase an input owner's job copies and recovery answers, preserving accounting.
+    pub async fn purge_owner(&self, owner: String) -> Result<usize, JobsClientError> {
+        match self.request(JobsCommand::PurgeOwner(owner)).await? {
+            JobsReply::Purged(count) => Ok(count),
+            _ => Err(EgressError::InvalidRequest.into()),
+        }
+    }
     /// Read content-free scoped lifecycle and receipt metadata.
     pub async fn status(&self, job: JobId) -> Result<Box<JobRecord>, JobsClientError> {
         match self.request(JobsCommand::JobStatus(job)).await? {
@@ -252,5 +264,47 @@ impl<C: EgressClient> JobsClient<C> {
             Reply::Jobs(result) => Ok(result?),
             _ => Err(EgressError::InvalidRequest.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_purge_round_trips_signed_wire_request_and_reply() {
+        let key = AdmissionKey::new(b"synthetic-job-signing-key-32-bytes".to_vec()).unwrap();
+        let signed = key
+            .sign_jobs(JobsRequest {
+                scope: JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "incarnation".into(),
+                    queue: "jobs".into(),
+                },
+                command: JobsCommand::PurgeOwner("input-owner".into()),
+            })
+            .unwrap();
+        let request = Request {
+            version: PROTOCOL_VERSION,
+            operation: signed.operation(),
+        };
+        let bytes = crate::encode_frame(&request, 4096).unwrap();
+        let decoded: Request = serde_json::from_slice(&bytes).unwrap();
+        let Operation::PurgeOwner(mut decoded) = decoded.operation else {
+            panic!("owner purge wire operation")
+        };
+        key.verify_jobs(&decoded).unwrap();
+        assert!(
+            matches!(&decoded.request.command, JobsCommand::PurgeOwner(owner) if owner == "input-owner")
+        );
+        decoded.request.command = JobsCommand::PurgeOwner("other-owner".into());
+        assert_eq!(key.verify_jobs(&decoded), Err(EgressError::Unauthorized));
+        let reply = JobsReply::Purged(2);
+        let bytes = crate::encode_frame(&reply, 4096).unwrap();
+        assert_eq!(bytes, br#"{"reply":"purged","body":2}"#);
+        assert!(matches!(
+            serde_json::from_slice::<JobsReply>(&bytes).unwrap(),
+            JobsReply::Purged(2)
+        ));
     }
 }

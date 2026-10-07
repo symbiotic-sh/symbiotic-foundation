@@ -486,6 +486,9 @@ impl CredentialProcess {
             }
             _ => {}
         }
+        if matches!(&command, JobsCommand::PurgeOwner(_)) {
+            self.purge_expired_results()?;
+        }
         self.check_job_runners(&scope).await?;
         let jobs = match self.model_jobs(scope.clone()) {
             Ok(jobs) => jobs,
@@ -531,6 +534,7 @@ impl CredentialProcess {
         jobs: &ModelJobs,
         command: JobsCommand,
     ) -> Result<JobsReply, JobError> {
+        let purging = matches!(&command, JobsCommand::PurgeOwner(_));
         let request = match command {
             JobsCommand::EnqueueJobs(items) => {
                 if items.len() > self.inner.config.jobs.max_batch {
@@ -598,6 +602,7 @@ impl CredentialProcess {
             },
             JobsCommand::AckJobs(acks) => JobRequest::Ack(acks),
             JobsCommand::CancelJobs(target) => JobRequest::Cancel(target),
+            JobsCommand::PurgeOwner(owner) => JobRequest::PurgeOwner(owner),
             JobsCommand::JobStatus(job) => JobRequest::Status(job),
             JobsCommand::Completions {
                 limit,
@@ -712,6 +717,7 @@ impl CredentialProcess {
         match jobs.request(request).await? {
             JobResponse::Enqueued(items) => Ok(JobsReply::Enqueued(items)),
             JobResponse::Acks(items) => Ok(JobsReply::Acked(items)),
+            JobResponse::Changed(count) if purging => Ok(JobsReply::Purged(count)),
             JobResponse::Changed(count) => Ok(JobsReply::Cancelled(count)),
             JobResponse::Done => Ok(JobsReply::Admitted),
             JobResponse::Job(Some(mut row)) => {
