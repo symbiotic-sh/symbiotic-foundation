@@ -15,69 +15,32 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Queued diagnostics beyond this are dropped while stderr does not drain.
-const DIAGNOSTIC_QUEUE: usize = 16;
-// The parent-death watcher waits at most this long for its diagnostic before exit.
-const EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_secs(1);
-
-type Diagnostic = (Vec<u8>, Option<mpsc::SyncSender<()>>);
-static DIAGNOSTICS: OnceLock<Option<mpsc::SyncSender<Diagnostic>>> = OnceLock::new();
-
-/// Drop and termination diagnostics are best effort and never make the caller
-/// wait on stderr. One writer thread performs ordinary blocking writes, so fd 2's
-/// file status flags, which the app and every process that inherited its stderr
-/// share, are never changed. A message is dropped only when the queue is full.
+/// Drop and termination diagnostics write immediately after cleanup, without
+/// waiting for stderr to drain. O_NONBLOCK stays set on stderr's shared open file
+/// description: restoring it could make a concurrent diagnostic block.
 pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    queue_diagnostic(message, None);
-}
-
-/// Like `diagnostic`, but waits up to `EXIT_DIAGNOSTIC_WAIT` for the write
-/// because the process exits next and the writer thread ends with it.
-fn diagnostic_before_exit(message: std::fmt::Arguments<'_>) {
-    let (written, done) = mpsc::sync_channel(1);
-    if queue_diagnostic(message, Some(written)) {
-        let _ = done.recv_timeout(EXIT_DIAGNOSTIC_WAIT);
+    // SAFETY: fcntl operates on fd 2; write borrows the live message buffer.
+    unsafe {
+        let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if flags == -1
+            || libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1
+        {
+            return;
+        }
+        let bytes = format!("{message}\n");
+        write_diagnostic(bytes.as_bytes(), |remaining| {
+            let count = libc::write(
+                libc::STDERR_FILENO,
+                remaining.as_ptr().cast(),
+                remaining.len(),
+            );
+            if count == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        });
     }
-}
-
-fn queue_diagnostic(
-    message: std::fmt::Arguments<'_>,
-    written: Option<mpsc::SyncSender<()>>,
-) -> bool {
-    let Some(diagnostics) = DIAGNOSTICS.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel::<Diagnostic>(DIAGNOSTIC_QUEUE);
-        std::thread::Builder::new()
-            .name("foundation-diagnostics".into())
-            .spawn(move || {
-                for (bytes, written) in rx {
-                    write_diagnostic(&bytes, |remaining| {
-                        // SAFETY: write borrows the live message buffer.
-                        let count = unsafe {
-                            libc::write(
-                                libc::STDERR_FILENO,
-                                remaining.as_ptr().cast(),
-                                remaining.len(),
-                            )
-                        };
-                        if count == -1 {
-                            Err(io::Error::last_os_error())
-                        } else {
-                            Ok(count as usize)
-                        }
-                    });
-                    if let Some(written) = written {
-                        let _ = written.send(());
-                    }
-                }
-            })
-            .ok()
-            .map(|_| tx)
-    }) else {
-        return false;
-    };
-    diagnostics
-        .try_send((format!("{message}\n").into_bytes(), written))
-        .is_ok()
 }
 
 fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
@@ -86,8 +49,8 @@ fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result
             Ok(0) => break,
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            // Any other error ends this message, including WouldBlock when the
-            // app itself made stderr nonblocking.
+            // Any other error ends this message. In particular, never wait or
+            // retry when stderr returns WouldBlock.
             Err(_) => break,
         }
     }
@@ -345,7 +308,7 @@ pub fn watch_parent(
                 }
             };
             if let Err(error) = cleanup() {
-                diagnostic_before_exit(format_args!("parent-death cleanup failed: {error}"));
+                diagnostic(format_args!("parent-death cleanup failed: {error}"));
                 std::process::exit(1);
             }
             std::process::exit(code);

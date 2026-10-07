@@ -276,7 +276,7 @@ fn cleanup_failure_writes_its_diagnostic_before_exit() {
 }
 
 #[test]
-fn full_stderr_does_not_block_parent_death_exit() {
+fn full_stderr_exits_without_waiting_for_a_writer() {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let dir = tempfile::tempdir().unwrap();
     let (reader, writer) = std::io::pipe().unwrap();
@@ -299,34 +299,46 @@ fn full_stderr_does_not_block_parent_death_exit() {
     drop(reader);
     until_termination(|| dir.path().join("full-stderr.ready").exists());
     drop(writer);
-    until_termination(|| child.0.try_wait().unwrap().is_some());
+    // The old writer acknowledgement waited one second on this full pipe.
+    common::until_termination_with_timeout(Duration::from_millis(750), || {
+        child.0.try_wait().unwrap().is_some()
+    });
     assert_eq!(child.0.wait().unwrap().code(), Some(1));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn shutdown_error_returns_after_emergency_cleanup() {
-    shutdown_error(false);
+    shutdown_error(false, false);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn full_stderr_does_not_block_emergency_reaping() {
-    shutdown_error(true);
+    shutdown_error(true, true);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn shutdown_error(refuse_kill: bool) {
+#[test]
+fn emergency_reaping_writes_its_diagnostic_before_exit() {
+    shutdown_error(true, false);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shutdown_error(refuse_kill: bool, full_stderr: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = fixture("shutdown-error-parent", dir.path());
+    let stderr = dir.path().join("emergency.stderr");
+    if full_stderr {
+        command.env("SUPERVISE_TEST_FULL_STDERR", "1");
+    } else {
+        command.stderr(fs::File::create(&stderr).unwrap());
+    }
     if refuse_kill {
-        command
-            .env("SUPERVISE_TEST_REFUSE_KILL", "1")
-            .env("SUPERVISE_TEST_FULL_STDERR", "1")
-            .env(
-                "SUPERVISE_TEST_EXIT_TRIGGER",
-                dir.path().join("exit-trigger"),
-            );
+        command.env("SUPERVISE_TEST_REFUSE_KILL", "1").env(
+            "SUPERVISE_TEST_EXIT_TRIGGER",
+            dir.path().join("exit-trigger"),
+        );
     }
     if cfg!(target_os = "macos") || refuse_kill {
         let library = dir.path().join(if cfg!(target_os = "macos") {
@@ -441,6 +453,13 @@ fn shutdown_error(refuse_kill: bool) {
     let mut parent = Reap(command.spawn().unwrap());
     until_termination(|| parent.0.try_wait().unwrap().is_some());
     assert!(parent.0.wait().unwrap().success());
+    if refuse_kill && !full_stderr {
+        let written = fs::read_to_string(stderr).unwrap();
+        assert!(
+            written.contains("child kill failed"),
+            "writable stderr must receive the diagnostic before exit, got {written:?}"
+        );
+    }
 }
 
 #[test]
