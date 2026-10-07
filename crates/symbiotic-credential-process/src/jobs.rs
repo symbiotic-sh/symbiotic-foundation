@@ -486,9 +486,6 @@ impl CredentialProcess {
             }
             _ => {}
         }
-        if matches!(&command, JobsCommand::PurgeOwner(_)) {
-            self.purge_expired_results()?;
-        }
         self.check_job_runners(&scope).await?;
         let jobs = match self.model_jobs(scope.clone()) {
             Ok(jobs) => jobs,

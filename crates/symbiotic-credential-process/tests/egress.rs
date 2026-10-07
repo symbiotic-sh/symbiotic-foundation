@@ -4361,9 +4361,12 @@ async fn wait_job(client: &impl EgressClient, job: &JobId, state: JobState) -> B
 #[tokio::test]
 async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let fixture = Fixture::new(200, "saved answer".into(), Duration::ZERO).await;
+        let mut fixture = Fixture::new(200, "saved answer".into(), Duration::ZERO).await;
+        let mut foreign_route = fixture.config.routes[0].clone();
+        foreign_route.tenant = "foreign-tenant".into();
+        fixture.config.routes.push(foreign_route);
         let process = fixture.process().await;
-        let client = InProcessEgressClient::new(process);
+        let client = InProcessEgressClient::new(process.clone());
         let runtime = symbiotic_ai_runtime::Runtime::open(symbiotic_ai_runtime::RuntimeConfig {
             state_dir: Some(fixture.config.state_dir.clone()),
             ..Default::default()
@@ -4441,6 +4444,50 @@ async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
             .model_jobs(foreign_scope, fixture.config.jobs.clone())
             .unwrap();
 
+        // Leave another tenant's answer expired between independent maintenance sweeps.
+        let key = AdmissionKey::new(KEY.to_vec()).unwrap();
+        exchange(
+            &process,
+            Operation::PublishGrantRevision(
+                key.sign_grant_revision(GrantRevision {
+                    tenant: "foreign-tenant".into(),
+                    incarnation: "incarnation".into(),
+                    revision: 1,
+                })
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let (admission, payload) = fixture.attempt("foreign-expired-answer", 1, 1);
+        let mut attempt = admission.attempt;
+        attempt.tenant = "foreign-tenant".into();
+        let admission = key.sign_attempt(attempt).unwrap();
+        let granted = permit(&process, &admission).await;
+        let foreign_digest = granted.attempt_digest.clone();
+        dispatched(
+            exchange(&process, inject(admission, payload, granted))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            conn.execute(
+                "UPDATE egress_permits SET recovery_expires_at=0 WHERE attempt_digest=?1",
+                [&foreign_digest],
+            )
+            .unwrap(),
+            1
+        );
+        let foreign_result = || -> String {
+            conn.query_row(
+                "SELECT result FROM egress_permits WHERE attempt_digest=?1",
+                [&foreign_digest],
+                |row| row.get(0),
+            )
+            .expect("owner purge must retain the expired foreign answer")
+        };
+        let before = foreign_result();
+
         // Decode the new public wire command so this regression also runs on the base.
         let command = serde_json::from_value(
             serde_json::json!({"operation": "purge_owner", "body": "input-owner"}),
@@ -4451,6 +4498,7 @@ async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
             serde_json::to_value(reply).unwrap(),
             serde_json::json!({"reply": "purged", "body": 2})
         );
+        assert_eq!(foreign_result(), before);
         let symbiotic_queue::jobs::JobResponse::Job(Some(foreign)) = foreign_jobs
             .request(symbiotic_queue::jobs::JobRequest::Get(foreign_id.clone()))
             .await
@@ -4472,6 +4520,7 @@ async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
             .unwrap(),
             0
         );
+        assert_eq!(foreign_result(), before);
         for (owner, waiting, id, reference, accounting) in ids {
             let symbiotic_queue::jobs::JobResponse::Job(Some(row)) = jobs
                 .request(symbiotic_queue::jobs::JobRequest::Get(id))
@@ -4509,7 +4558,7 @@ async fn jobs_authenticated_owner_purge_removes_only_owners_copies() {
                 }
             }
         }
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
     })
     .await
     .expect("bounded authenticated owner purge");
