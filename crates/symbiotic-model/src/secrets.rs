@@ -181,9 +181,11 @@ pub(crate) fn composed_result<T: serde::Serialize + serde::de::DeserializeOwned>
     })
 }
 
-/// Adapter responses support raw disposal after credential inspection or runtime dispatch.
+/// Adapter responses support raw disposal and runtime finish-label normalization.
 pub(crate) trait CredentialResponse: serde::Serialize {
     fn discard_raw(&mut self);
+    #[cfg(feature = "queue")]
+    fn normalize_finish_reason(&mut self) {}
 }
 
 // The erased representation used by object-safe composed adapters. It follows
@@ -205,8 +207,18 @@ macro_rules! credential_response {
         }
     )+};
 }
+impl CredentialResponse for crate::ChatResponse {
+    fn discard_raw(&mut self) {
+        self.raw_provider_response = None;
+    }
+    #[cfg(feature = "queue")]
+    fn normalize_finish_reason(&mut self) {
+        self.finish_reason =
+            crate::provider_finish_reason(&mut self.trace, self.finish_reason.take());
+    }
+}
+
 credential_response!(
-    crate::ChatResponse,
     crate::EmbeddingResponse,
     crate::RerankResponse,
     crate::ClassifyResponse

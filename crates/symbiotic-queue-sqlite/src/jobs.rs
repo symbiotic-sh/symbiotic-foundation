@@ -769,9 +769,27 @@ fn admit_page_bytes(
     Ok((required <= max_bytes).then_some(required))
 }
 
+fn candidate_page_bytes(
+    row: &JobRecord,
+    used: usize,
+    max_bytes: usize,
+    comma: bool,
+) -> Result<Option<usize>, JobError> {
+    page_bytes(row, used, max_bytes, comma, |bytes| {
+        JobError::CandidateTooLarge {
+            job: row.id.clone(),
+            bytes,
+        }
+    })
+}
+
 // Enqueue is the sole creator of live rows and retained input. Both utilization
 // checks derive from canonical rows under the same IMMEDIATE transaction.
 fn insert_job(rows: &mut SqlRows<'_>, config: &JobConfig, row: JobRecord) -> Result<(), JobError> {
+    // Model workers read candidate pages; handler runners claim rows directly.
+    if row.execution == Execution::Model {
+        candidate_page_bytes(&row, 2, config.max_page_bytes, false)?;
+    }
     if rows.live_count(&row.id.scope)? >= config.max_live_jobs
         || rows
             .usage(&row.id.scope)?
@@ -869,6 +887,7 @@ fn apply_job_request(
             }
             row.admission = Some(admission);
             row.state = JobState::Pending;
+            candidate_page_bytes(&row, 2, config.max_page_bytes, false)?;
             rows.save(row)?;
             if rows.usage(scope)?.bytes > config.max_pending_bytes {
                 return Err(JobError::QueueFull);
@@ -997,12 +1016,7 @@ fn apply_job_request(
             let mut bytes: usize = 2;
             for row in selected {
                 let Some(required) =
-                    page_bytes(&row, bytes, max_bytes, !page.is_empty(), |bytes| {
-                        JobError::CandidateTooLarge {
-                            job: row.id.clone(),
-                            bytes,
-                        }
-                    })?
+                    candidate_page_bytes(&row, bytes, max_bytes, !page.is_empty())?
                 else {
                     break;
                 };
@@ -1026,12 +1040,7 @@ fn apply_job_request(
             let mut bytes = 2;
             for row in selected {
                 let Some(required) =
-                    page_bytes(&row, bytes, max_bytes, !page.is_empty(), |bytes| {
-                        JobError::CandidateTooLarge {
-                            job: row.id.clone(),
-                            bytes,
-                        }
-                    })?
+                    candidate_page_bytes(&row, bytes, max_bytes, !page.is_empty())?
                 else {
                     break;
                 };
