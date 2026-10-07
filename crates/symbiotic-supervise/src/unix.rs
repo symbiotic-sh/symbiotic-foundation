@@ -17,31 +17,40 @@ use std::{
 
 pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
     // Drop/termination diagnostics are best effort. Do not take stderr's Rust
-    // lock or wait for an undrained pipe. Leave O_NONBLOCK set: restoring it could
-    // make a concurrent diagnostic's write block on the shared descriptor.
-    // SAFETY: fcntl operates on fd 2 and write borrows the live message buffer.
-    unsafe {
-        let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-        if flags == -1
-            || libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1
-        {
-            return;
-        }
-        let bytes = format!("{message}\n");
-        // In particular, EAGAIN is ignored; diagnostics cannot delay cleanup.
-        write_diagnostic(bytes.as_bytes(), |remaining| {
+    // lock, wait for an undrained pipe, or change fd 2's file status flags: they
+    // are shared with the app and every process that inherited its stderr.
+    // Each write follows a zero-timeout poll and is at most PIPE_BUF bytes, so a
+    // pipe that poll reports writable accepts it without waiting. A writer that
+    // fills the pipe between poll and write can still delay this write.
+    let bytes = format!("{message}\n");
+    write_diagnostic(bytes.as_bytes(), |remaining| {
+        let mut ready = libc::pollfd {
+            fd: libc::STDERR_FILENO,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll reads one live pollfd; write borrows the live message buffer.
+        unsafe {
+            match libc::poll(&mut ready, 1, 0) {
+                -1 => return Err(io::Error::last_os_error()),
+                // In particular, never wait or retry when output would block.
+                _ if ready.revents & libc::POLLOUT == 0 => {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                _ => {}
+            }
             let written = libc::write(
                 libc::STDERR_FILENO,
                 remaining.as_ptr().cast(),
-                remaining.len(),
+                remaining.len().min(libc::PIPE_BUF),
             );
             if written == -1 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(written as usize)
             }
-        });
-    }
+        }
+    });
 }
 
 fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
