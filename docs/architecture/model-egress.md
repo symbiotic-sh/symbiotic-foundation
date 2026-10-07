@@ -354,7 +354,9 @@ state independently of the recovery deadline.
 Expired result rows are cleared incrementally at startup, before operations, and every
 second during socket serving, even when idle or connection slots are occupied. Each call
 clears at most 64 results selected by the partial deadline index, regardless of the
-expired backlog. Status lookup enforces the deadline even before physical cleanup.
+expired backlog. The hard-coded 64-result batch and one-second cadence are current
+provisional values, pending replacement by versioned maintenance settings.
+Status lookup enforces the deadline even before physical cleanup.
 Embedded users must periodically call `CredentialProcess::purge_expired_results()` while idle. Cleanup failure
 returns `StateUnavailable`; the daemon fails visibly. SQLite secure-delete is enabled;
 this is logical retention, not a forensic erasure guarantee for WAL files, backups, or
