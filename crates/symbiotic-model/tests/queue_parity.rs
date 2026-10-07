@@ -949,6 +949,7 @@ struct CountsRenewals {
     fail_replacements: std::sync::atomic::AtomicBool,
     fail_heartbeats: std::sync::atomic::AtomicBool,
     fail_heartbeat_at: AtomicUsize,
+    heartbeat_entered: tokio::sync::Notify,
     completion_state: AtomicUsize,
     running_read: tokio::sync::Notify,
     pause_claim: std::sync::atomic::AtomicBool,
@@ -973,6 +974,7 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         fail_replacements: std::sync::atomic::AtomicBool::new(false),
         fail_heartbeats: std::sync::atomic::AtomicBool::new(false),
         fail_heartbeat_at: AtomicUsize::new(0),
+        heartbeat_entered: tokio::sync::Notify::new(),
         completion_state: AtomicUsize::new(0),
         running_read: tokio::sync::Notify::new(),
         pause_claim: std::sync::atomic::AtomicBool::new(false),
@@ -1110,6 +1112,7 @@ impl QueueBackend for CountsRenewals {
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
         let renewal = self.renewals.fetch_add(1, Ordering::SeqCst) + 1;
+        self.heartbeat_entered.notify_waiters();
         if self.fail_heartbeats.load(Ordering::SeqCst)
             || self.fail_heartbeat_at.load(Ordering::SeqCst) == renewal
         {
@@ -1456,6 +1459,96 @@ async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
         "{backend}: the lease is renewed while the provider works"
     );
     assert_no_more_renewals(&queue, backend).await;
+}
+
+#[tokio::test]
+async fn provider_panic_drains_a_contended_sqlite_heartbeat_before_propagating() {
+    #[derive(Clone)]
+    struct PanicsWhenSignalled {
+        descriptor: ProviderDescriptor,
+        entered: Arc<tokio::sync::Notify>,
+        panic_now: Arc<tokio::sync::Notify>,
+        panicked: Arc<tokio::sync::Notify>,
+    }
+
+    impl ModelProvider for PanicsWhenSignalled {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for PanicsWhenSignalled {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            self.entered.notify_one();
+            self.panic_now.notified().await;
+            self.panicked.notify_one();
+            panic!("provider bug during a pending heartbeat");
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir_in(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = counted(Arc::new(SqliteQueue::open(&path).unwrap()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let panic_now = Arc::new(tokio::sync::Notify::new());
+        let panicked = Arc::new(tokio::sync::Notify::new());
+        let provider = QueuedChatProvider::new(
+            PanicsWhenSignalled {
+                descriptor: Loopback::new(unique_identity()).descriptor,
+                entered: entered.clone(),
+                panic_now: panic_now.clone(),
+                panicked: panicked.clone(),
+            },
+            queue.clone(),
+            "worker",
+            leased(),
+        )
+        .with_spend_ledger(test_spend::ledger(), None);
+        let call = tokio::spawn(async move { provider.chat(request("contended panic")).await });
+        entered.notified().await;
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(path).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+            tx.rollback().unwrap();
+            released
+        });
+        locked_rx.await.unwrap();
+        queue.heartbeat_entered.notified().await;
+        panic_now.notify_one();
+        panicked.notified().await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let panic_escaped_while_locked = call.is_finished();
+        release_tx.send(()).unwrap();
+        let err = call
+            .await
+            .expect_err("provider panic must reach the caller");
+        assert!(
+            holder.join().unwrap(),
+            "lock was released only by the guard"
+        );
+        assert!(err.is_panic());
+        assert_eq!(
+            *err.into_panic().downcast::<&str>().unwrap(),
+            "provider bug during a pending heartbeat"
+        );
+        assert!(
+            !panic_escaped_while_locked,
+            "provider panic escaped before its pending heartbeat was drained"
+        );
+        assert_no_more_renewals(&queue, "sqlite").await;
+    })
+    .await
+    .expect("contended provider panic test exceeded its bound");
 }
 
 /// A trace sink whose first write takes `delay`.

@@ -607,14 +607,18 @@ impl QueueBackend for SqliteQueue {
         worker_id: &str,
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
-        let now = Utc::now();
-        let lease_until = lease_deadline(now, lease_seconds)?;
+        // Reject invalid durations before waiting for a connection.
+        lease_deadline(Utc::now(), lease_seconds)?;
         let item_id = item_id.clone();
         let worker_id = worker_id.to_owned();
         let item = self
             .with_connection(move |conn| {
                 let (item_id, worker_id) = (&item_id, worker_id.as_str());
                 update_running_item(conn, item_id, worker_id, |conn| {
+                    // Renewal deadlines follow write-transaction order, not
+                    // the order in which async callers reached the blocking pool.
+                    let now = Utc::now();
+                    let lease_until = lease_deadline(now, lease_seconds)?;
                     conn.execute(
                 "update queue_items set lease_until = ?2, updated_at = ?3 where item_id = ?1",
                 params![item_id.0, ts(lease_until), ts(now)],
@@ -1472,6 +1476,70 @@ mod tests {
         let inserted = queue.enqueue(forced).await.unwrap();
         assert_eq!(inserted.disposition, EnqueueDisposition::Inserted);
         assert_ne!(inserted.item.item_id.0, first.item.item_id.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_heartbeats_renew_in_write_transaction_order() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir_in(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let older_queue = SqliteQueue::open(&path).unwrap();
+        let newer_queue = SqliteQueue::open(&path).unwrap();
+        let item = older_queue.enqueue(request("overlap")).await.unwrap().item;
+        older_queue
+            .claim_item(&item.item_id, "worker", 3, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let conn = older_queue.conn.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        locked_rx.await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                older_queue.heartbeat(&item.item_id, "worker", u64::MAX),
+            )
+            .await
+            .expect("invalid duration waited for the connection"),
+            Err(QueueError::InvalidRequest(_))
+        ));
+        let older = older_queue.heartbeat(&item.item_id, "worker", 3);
+        tokio::pin!(older);
+        assert!(futures::poll!(&mut older).is_pending());
+        // Separate the captured times while the older call waits for its connection.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            newer_queue.heartbeat(&item.item_id, "worker", 3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let newer = newer_queue.get_item(&item.item_id).await.unwrap().unwrap();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut older)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "lock was released only by the guard"
+        );
+        let final_item = older_queue.get_item(&item.item_id).await.unwrap().unwrap();
+        assert!(
+            final_item.lease_until >= newer.lease_until,
+            "an older heartbeat shortened the newer lease"
+        );
+        assert!(final_item.updated_at >= newer.updated_at);
+        assert_eq!(final_item.attempt, newer.attempt);
     }
 
     #[tokio::test(flavor = "current_thread")]
