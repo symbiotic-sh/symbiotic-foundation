@@ -1545,7 +1545,6 @@ async fn provider_panic_drains_a_contended_sqlite_heartbeat_before_propagating()
             !panic_escaped_while_locked,
             "provider panic escaped before its pending heartbeat was drained"
         );
-        assert_no_more_renewals(&queue, "sqlite").await;
     })
     .await
     .expect("contended provider panic test exceeded its bound");

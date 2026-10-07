@@ -1515,7 +1515,14 @@ mod tests {
         tokio::pin!(older);
         assert!(futures::poll!(&mut older).is_pending());
         // Separate the captured times while the older call waits for its connection.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_older_poll = Utc::now();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Utc::now() <= after_older_poll {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clock did not advance while the older heartbeat waited");
         tokio::time::timeout(
             Duration::from_secs(1),
             newer_queue.heartbeat(&item.item_id, "worker", 3),
