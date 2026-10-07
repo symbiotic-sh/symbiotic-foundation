@@ -243,6 +243,201 @@ fn copies(dir: &std::path::Path) -> usize {
 
 const ANSWER_ID_MARKER: &str = "ProviderAnswerIdentifierMarker97";
 
+fn finish_reason_binding<P>(provider: P) -> ModelBinding<P> {
+    ModelBinding::new(provider)
+        .with_identity(BindingIdentity::new("tenant", "provider", "1", "account"))
+        .with_policy(ModelQueueConfig::default())
+        .with_answer_recovery(AnswerRecovery::Retain)
+}
+
+async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
+    make_provider: impl Fn(String) -> P,
+    anthropic: bool,
+    reasons: &[Option<&str>],
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let started = std::time::Instant::now();
+    for &reason in reasons {
+        for path in ["execute", "job", "queued", "transport"] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                let body = if anthropic {
+                    serde_json::json!({"id":"fixture-id","model":"served-model",
+                        "content":[{"type":"text","text":"OK"},
+                            {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"}],
+                        "stop_reason":reason,"usage":{"input_tokens":3,"output_tokens":1}})
+                } else {
+                    serde_json::json!({"id":"fixture-id","model":"served-model",
+                        "choices":[{"message":{"content":"OK","reasoning_content":"PRIVATE_REASONING"},
+                            "finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})
+                };
+                let server = tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut stream = BufReader::new(stream);
+                        let mut length = None;
+                        loop {
+                            let mut line = String::new();
+                            assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                            if line == "\r\n" { break; }
+                            if let Some((key, value)) = line.split_once(':')
+                                && key.eq_ignore_ascii_case("content-length") {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                        }
+                        let mut request = vec![0; length.unwrap()];
+                        stream.read_exact(&mut request).await.unwrap();
+                        let payload = body.to_string();
+                        stream.get_mut().write_all(format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            payload.len(), payload
+                        ).as_bytes()).await.unwrap();
+                    }).await.expect("finish-reason HTTP fixture must finish promptly");
+                });
+                let p = make_provider(endpoint);
+                let configured = finish_reason_binding(p.clone());
+                let dir = tempfile::tempdir().unwrap();
+                let r = runtime(dir.path());
+                let output = match path {
+                    "transport" => serde_json::to_value(p.chat(request()).await.unwrap()).unwrap(),
+                    "queued" => {
+                        let chat = r.chat(configured.clone()).unwrap();
+                        let response = chat.chat(request()).await.unwrap();
+                        serde_json::to_value(response).unwrap()
+                    }
+                    "execute" => serde_json::to_value(r.execute_chat(
+                        configured.clone(), "finish-reason", request()
+                    ).await.unwrap().output).unwrap(),
+                    "job" => {
+                        let j = jobs(&r, JobConfig::default());
+                        let id = enqueue(&j, JobSpec {
+                            key: "finish-reason".into(), group: None, owners: vec!["owner".into()],
+                            kind: "chat".into(), execution: Execution::Model,
+                            payload: model_job_payload(&configured, &request()).unwrap(),
+                            admission: None, limits: JobLimits { max_attempts: 1 }, recovery_until: None,
+                        }).await;
+                        let runner = j.start_chat(configured.clone(), RunnerConfig {
+                            poll_interval_ms: 5, ..Default::default()
+                        }, "chat".into()).await.unwrap();
+                        wait_state(&j, &id, JobState::Succeeded).await;
+                        runner.shutdown().await.unwrap();
+                        drop(j);
+                        let recovery: String = sql(dir.path()).query_row(
+                            "SELECT recovery FROM spend_receipts WHERE recovery IS NOT NULL", [], |r| r.get(0)
+                        ).unwrap();
+                        serde_json::from_str(&recovery).unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                server.await.unwrap();
+                let invalid = reason == Some("PRIVATE_REASONING");
+                let expected = if invalid { Some("other") } else { reason };
+                let check = |output: &serde_json::Value| {
+                    assert_eq!(output["text"], "OK", "{path}");
+                    assert_eq!(output["finish_reason"], serde_json::json!(expected), "{path}");
+                    assert!(!output.to_string().contains("PRIVATE_REASONING"), "{path}");
+                    let diagnostics = &output["trace"]["metadata"][model::RUNTIME_DIAGNOSTICS];
+                    if invalid {
+                        assert_eq!(diagnostics[0]["kind"], "invalid_finish_reason", "{path}");
+                        assert_eq!(diagnostics[0]["error"], "invalid_response", "{path}");
+                    } else {
+                        assert!(diagnostics.is_null(), "{path}: {diagnostics}");
+                    }
+                };
+                if path != "transport" {
+                    let recovery = if path == "queued" { None } else {
+                        Some(sql(dir.path()).query_row::<String, _, _>(
+                            "SELECT recovery FROM spend_receipts WHERE recovery IS NOT NULL", [], |r| r.get(0)
+                        ).unwrap())
+                    };
+                    drop(r);
+                    let reopened = runtime(dir.path());
+                    let recovered = match path {
+                        "queued" => serde_json::to_value(reopened.chat(configured).unwrap()
+                            .chat(request()).await.unwrap()).unwrap(),
+                        "execute" => serde_json::to_value(reopened.execute_chat(configured,
+                            "finish-reason", request()).await.unwrap().output).unwrap(),
+                        "job" => jobs(&reopened, JobConfig::default()).completions(1, 10000)
+                            .await.unwrap().remove(0).output.unwrap(),
+                        _ => unreachable!(),
+                    };
+                    check(&recovered);
+                    if let Some(recovery) = recovery {
+                        check(&serde_json::from_str(&recovery).unwrap());
+                    }
+                }
+                check(&output);
+            }).await.expect("finish-reason path must finish within five seconds");
+        }
+    }
+    eprintln!(
+        "finish-reason paths: anthropic={anthropic}, reasons={}, paths=4, elapsed={:?}",
+        reasons.len(),
+        started.elapsed()
+    );
+}
+
+fn finish_reason_openai(url: String) -> model::OpenAiCompatibleChatProvider {
+    model::OpenAiCompatibleChatProvider::new("fixture", "fixture-model", url, "synthetic-key")
+        .with_timeout(1)
+        .unwrap()
+        .with_request_limit(65536)
+        .with_response_limit(65536)
+}
+
+fn finish_reason_anthropic(url: String) -> model::AnthropicChatProvider {
+    model::AnthropicChatProvider::new("fixture", "fixture-model", url, "synthetic-key")
+        .with_timeout(1)
+        .unwrap()
+        .with_request_limit(65536)
+        .with_response_limit(65536)
+}
+
+#[tokio::test]
+async fn regression_finish_reason_openai_reasoning_stays_out_of_restart_recovery() {
+    assert_finish_reason_paths(finish_reason_openai, false, &[Some("PRIVATE_REASONING")]).await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_anthropic_reasoning_stays_out_of_restart_recovery() {
+    assert_finish_reason_paths(finish_reason_anthropic, true, &[Some("PRIVATE_REASONING")]).await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_openai_known_labels_and_absence_are_unchanged() {
+    assert_finish_reason_paths(
+        finish_reason_openai,
+        false,
+        &[
+            Some("stop"),
+            Some("length"),
+            Some("end_turn"),
+            Some("stop_sequence"),
+            Some("max_tokens"),
+            Some("model_context_window_exceeded"),
+            Some("other"),
+            None,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_anthropic_known_labels_are_unchanged() {
+    assert_finish_reason_paths(
+        finish_reason_anthropic,
+        true,
+        &[
+            Some("end_turn"),
+            Some("stop_sequence"),
+            Some("max_tokens"),
+            Some("model_context_window_exceeded"),
+        ],
+    )
+    .await;
+}
+
 fn answer_id_files_contain_marker(dir: &std::path::Path, off: bool) -> bool {
     let mut found = false;
     for entry in std::fs::read_dir(dir).unwrap() {

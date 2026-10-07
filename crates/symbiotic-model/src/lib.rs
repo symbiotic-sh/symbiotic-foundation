@@ -4375,7 +4375,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                 };
                 Ok(ChatResponse {
                     text: content.to_string(),
-                    finish_reason: choice.finish_reason,
+                    finish_reason: provider_finish_reason(&mut trace, choice.finish_reason),
                     trace,
                     raw_provider_response: Some(raw),
                 })
@@ -4818,6 +4818,35 @@ fn parse_retry_after(
         .map_err(|_| invalid())?
         .into();
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
+}
+
+fn provider_finish_reason(
+    trace: &mut ModelInvocationTrace,
+    reason: Option<String>,
+) -> Option<String> {
+    reason.map(|reason| match reason.as_str() {
+        // Preserve the wire labels recognized by egress, without retaining arbitrary text.
+        "stop"
+        | "end_turn"
+        | "stop_sequence"
+        | "length"
+        | "max_tokens"
+        | "model_context_window_exceeded"
+        | "other" => reason,
+        _ => {
+            note_trace_diagnostic(
+                trace,
+                "invalid_finish_reason",
+                DiagnosticCode::InvalidResponse,
+            );
+            tracing::warn!(
+                kind = "invalid_finish_reason",
+                error = DiagnosticCode::InvalidResponse.code(),
+                "provider finish reason replaced with other"
+            );
+            "other".to_owned()
+        }
+    })
 }
 
 fn provider_usage_identity(

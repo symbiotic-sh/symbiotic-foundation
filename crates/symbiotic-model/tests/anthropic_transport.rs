@@ -292,6 +292,14 @@ async fn malformed_refusal_and_unsupported_blocks_fail_visibly() {
         (json!({}), true),
         (json!({"content":[],"stop_reason":"refusal"}), false),
         (
+            json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"tool_use"}),
+            false,
+        ),
+        (
+            json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"pause_turn"}),
+            false,
+        ),
+        (
             json!({"content":[{"type":"text"}],"stop_reason":"end_turn"}),
             true,
         ),
