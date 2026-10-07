@@ -662,6 +662,30 @@ Resolver configs cannot be serialized. `ProcessConfig::validate_child_process()`
 refuses them with `ResolverRequiresThreadMode`; no callback crosses into a child.
 In thread mode, the credential boundary protects against accidents, not same-process code.
 
+The app's resolver must return promptly with a value or error and support concurrent
+calls. Startup resolves the admission key synchronously, including when reopening
+for recovery. Direct dispatch awaits provider resolution in `spawn_blocking` after
+permit consumption and before request-budget admission or provider execution.
+Provider `timeout_seconds` and `max_in_flight` therefore exclude that resolution;
+distinct accepted dispatches can invoke the resolver concurrently even when
+`max_in_flight` is one. Queued jobs acquire their account slot before resolving,
+but their provider timeout still does not bound the callback. Foundation imposes
+no resolver deadline. The app owns any lookup deadline and concurrency control
+its resolver needs.
+
+A slow resolver delays startup or dispatch and can delay shutdown. Dropping or
+cancelling the awaiting future cannot stop an already running callback. Tokio
+runtime drop waits for outstanding blocking callbacks to return; a runtime
+shutdown timeout only stops waiting and does not terminate them. After a crash,
+same-attempt recovery preserves an accepted unfinished direct dispatch as uncertain
+and does not rerun its provider lookup or resend it. Reopening still resolves the
+admission key. For example, with a one-second provider timeout, a provider resolver
+that waits for app release keeps direct dispatch pending without sending HTTP
+beyond that second; after release, provider execution starts with its own timeout.
+`regression_slow_resolver_delays_dispatch_beyond_provider_timeout` in
+`crates/symbiotic-credential-process/tests/egress.rs` pins this behavior with a
+test-controlled release and a callback hang guard.
+
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
 must be an owner-only regular file. Before reading configuration or secrets, the executable
 sets both core resource limits to zero and, on Linux, clears dumpability with
