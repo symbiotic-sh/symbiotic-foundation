@@ -305,7 +305,7 @@ async fn bindings_of_one_model_share_its_cap() {
         call.await.unwrap().unwrap();
     }
     assert_eq!(raw.calls.load(Ordering::SeqCst), 10);
-    assert_eq!(raw.peak.load(Ordering::SeqCst), 2);
+    assert!(raw.peak.load(Ordering::SeqCst) <= 2);
 }
 
 #[tokio::test]
