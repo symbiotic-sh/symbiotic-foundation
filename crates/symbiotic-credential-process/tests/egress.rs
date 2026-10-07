@@ -4765,6 +4765,7 @@ async fn jobs_seven_operations_round_trip_on_both_transports_and_join_by_key() {
             job_call(
                 &client,
                 JobsCommand::Completions {
+                    after: None,
                     limit: 1,
                     max_bytes: 40,
                     wait_seconds: 0
@@ -4782,6 +4783,7 @@ async fn jobs_seven_operations_round_trip_on_both_transports_and_join_by_key() {
         let JobsReply::Completions(page) = job_call(
             &client,
             JobsCommand::Completions {
+                after: None,
                 limit: 8,
                 max_bytes: 65536,
                 wait_seconds: 0,
@@ -4865,6 +4867,120 @@ async fn jobs_seven_operations_round_trip_on_both_transports_and_join_by_key() {
 }
 
 #[tokio::test]
+async fn jobs_notice_cursor_reaches_unresolved_notices_within_page_bounds() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process);
+        let mut expected = Vec::new();
+        for i in 0..5 {
+            let mut input = queued(&fixture, &format!("notice-{i}"));
+            input.admission.attempt.expires_at = unix_seconds();
+            input.admission = AdmissionKey::new(KEY.to_vec())
+                .unwrap()
+                .sign_attempt(input.admission.attempt)
+                .unwrap();
+            let id = enqueue_id(&client, input).await;
+            wait_job(&client, &id, JobState::AwaitingAdmission).await;
+            expected.push(id);
+        }
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        // Exercise the optional cursor through the public wire encoding.
+        let poll = |after: Option<String>, limit, max_bytes| {
+            let client = &client;
+            async move {
+                let command = serde_json::from_value(serde_json::json!({
+                    "operation": "completions",
+                    "body": { "after": after, "limit": limit,
+                        "max_bytes": max_bytes, "wait_seconds": 0 }
+                }))
+                .unwrap();
+                let JobsReply::Completions(page) = job_call(client, command).await.unwrap() else {
+                    panic!("notice page")
+                };
+                let wire = serde_json::to_value(&page).unwrap();
+                let next = wire
+                    .get("after")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                (page, next)
+            }
+        };
+        let (first, next) = poll(None, 2, 65536).await;
+        assert_eq!(
+            first
+                .notices
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>(),
+            expected[..2]
+        );
+        assert_eq!(next.as_deref(), Some(expected[1].id.as_str()));
+        let (repeated, _) = poll(None, 2, 65536).await;
+        assert_eq!(repeated.notices[0].id, expected[0]);
+        let mut seen = first
+            .notices
+            .iter()
+            .map(|n| n.id.clone())
+            .collect::<Vec<_>>();
+        let mut after = next;
+        for count in [2, 1, 0] {
+            let (page, next) = poll(after.clone(), 2, 65536).await;
+            assert!(page.items.is_empty());
+            assert_eq!(page.notices.len(), count);
+            seen.extend(page.notices.iter().map(|n| n.id.clone()));
+            if let Some(last) = page.notices.last() {
+                assert_eq!(next.as_deref(), Some(last.id.id.as_str()));
+            } else {
+                assert_eq!(next, after);
+            }
+            after = next;
+        }
+        assert_eq!(seen, expected);
+        // Use an exact one-notice byte budget while the count allows two.
+        let (one, _) = poll(None, 1, 65536).await;
+        let max_bytes = serde_json::to_vec(&one).unwrap().len();
+        assert!(matches!(
+            job_call(&client, JobsCommand::Completions {
+                after: None, limit: 2, max_bytes: max_bytes - 1, wait_seconds: 0,
+            }).await,
+            Err(JobsClientError::Job(JobError::CompletionTooLarge { job, bytes }))
+                if job == expected[0] && bytes == max_bytes
+        ));
+        let mut after = None;
+        let mut seen = Vec::new();
+        for id in &expected {
+            let (page, next) = poll(after, 2, max_bytes).await;
+            assert!(page.items.is_empty());
+            assert_eq!(page.notices.len(), 1);
+            assert_eq!(&page.notices[0].id, id);
+            assert_eq!(serde_json::to_vec(&page).unwrap().len(), max_bytes);
+            seen.push(page.notices[0].id.clone());
+            after = next;
+        }
+        assert_eq!(seen, expected);
+        let final_id = enqueue_id(&client, queued(&fixture, "notice-final")).await;
+        wait_job(&client, &final_id, JobState::Succeeded).await;
+        let after = Some(expected[0].id.clone());
+        let (final_page, next) = poll(after.clone(), 1, 65536).await;
+        assert_eq!(final_page.items[0].delivery.completion.id, final_id);
+        assert!(final_page.notices.is_empty());
+        assert_eq!(next, after);
+        let (page, _) = poll(next, 2, 65536).await;
+        assert_eq!(
+            page.notices
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>(),
+            expected[1..3]
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("bounded admission-notice pagination");
+}
+
+#[tokio::test]
 async fn jobs_recheck_grants_after_account_wait_and_readmit_without_renewing_ceiling() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut fixture = Fixture::with_response_gate(
@@ -4903,6 +5019,7 @@ async fn jobs_recheck_grants_after_account_wait_and_readmit_without_renewing_cei
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -4917,6 +5034,7 @@ async fn jobs_recheck_grants_after_account_wait_and_readmit_without_renewing_cei
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -5008,6 +5126,7 @@ async fn jobs_expired_recovery_keeps_waiting_input_and_settles_without_output() 
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -5193,6 +5312,7 @@ async fn jobs_cancel_sent_call_keeps_answer_and_ack_discards_only_recovery() {
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -5419,6 +5539,7 @@ async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_n
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -5479,6 +5600,7 @@ async fn jobs_stored_operations_survive_execution_config_changes_and_misses_do_n
             Err(JobsClientError::Job(JobError::NotFound))
         ));
         jobs.request(JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -5670,6 +5792,7 @@ async fn jobs_keyless_completions_discard_raw_json_for_every_response_type() {
         let JobsReply::Completions(page) = job_call(
             &client,
             JobsCommand::Completions {
+                after: None,
                 limit: 1,
                 max_bytes: 65536,
                 wait_seconds: 0,
@@ -6017,6 +6140,7 @@ async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
         job_call(
             &client,
             JobsCommand::Completions {
+                after: None,
                 limit: 1,
                 max_bytes: 65536,
                 wait_seconds: 0
@@ -6041,6 +6165,7 @@ async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
         JobsCommand::AckJobs(vec![(token.clone(), Disposition::Accepted)]),
         JobsCommand::CancelJobs(Selector::Ids(vec![id.clone()])),
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -6061,6 +6186,7 @@ async fn jobs_finished_worker_failure_remains_visible_after_acknowledgement() {
         job_call(
             &client,
             JobsCommand::Completions {
+                after: None,
                 limit: 1,
                 max_bytes: 65536,
                 wait_seconds: 0
@@ -6371,6 +6497,7 @@ async fn rabbithole_jobs_preserve_canonical_completion_shapes() {
         let JobsReply::Completions(page) = job_call(
             &client,
             JobsCommand::Completions {
+                after: None,
                 limit: 1,
                 max_bytes: 65536,
                 wait_seconds: 0,
@@ -6743,6 +6870,7 @@ async fn rabbithole_classification_jobs_reuse_runner_and_strip_raw_response() {
     let JobsReply::Completions(page) = job_call(
         &client,
         JobsCommand::Completions {
+            after: None,
             limit: 1,
             max_bytes: 65536,
             wait_seconds: 0,
@@ -7525,6 +7653,7 @@ async fn regression_answer_recovery_jobs_never_write_paid_results() {
             let JobsReply::Completions(page) = job_call(
                 &client,
                 JobsCommand::Completions {
+                    after: None,
                     limit: 1,
                     max_bytes: 65536,
                     wait_seconds: 0,

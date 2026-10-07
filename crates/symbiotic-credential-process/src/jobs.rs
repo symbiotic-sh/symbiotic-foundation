@@ -602,6 +602,7 @@ impl CredentialProcess {
             JobsCommand::PurgeOwner(owner) => JobRequest::PurgeOwner(owner),
             JobsCommand::JobStatus(job) => JobRequest::Status(job),
             JobsCommand::Completions {
+                after,
                 limit,
                 max_bytes,
                 wait_seconds,
@@ -609,12 +610,13 @@ impl CredentialProcess {
                 let empty = JobsCompletions {
                     items: Vec::new(),
                     notices: Vec::new(),
+                    after: after.clone(),
                 };
                 let body_bytes = encoded_bytes(&empty)?;
                 let frame_bytes = encode_frame(
                     &Response {
                         version: PROTOCOL_VERSION,
-                        result: Ok(Reply::Jobs(Ok(JobsReply::Completions(empty)))),
+                        result: Ok(Reply::Jobs(Ok(JobsReply::Completions(empty.clone())))),
                     },
                     self.inner.config.max_frame_bytes,
                 )
@@ -660,6 +662,7 @@ impl CredentialProcess {
                     let mut page = JobsCompletions {
                         items,
                         notices: Vec::new(),
+                        after: after.clone(),
                     };
                     let mut used = encoded_bytes(&page)?;
                     if used > max_bytes {
@@ -668,25 +671,34 @@ impl CredentialProcess {
                     if page.items.len() < limit {
                         let JobResponse::Diagnostics(notices) = jobs
                             .request(JobRequest::AdmissionNotices {
+                                after: after.clone(),
                                 limit: limit - page.items.len(),
                             })
                             .await?
                         else {
                             return Err(JobError::Storage);
                         };
+                        // Count the cursor through the shared serializer, as part of the body.
+                        let mut header = empty.clone();
+                        let mut header_bytes = body_bytes;
                         for notice in notices.items {
                             let size =
                                 encoded_bytes(&notice)? + usize::from(!page.notices.is_empty());
-                            if used + size > max_bytes {
+                            header.after = Some(notice.id.id.clone());
+                            let next_header_bytes = encoded_bytes(&header)?;
+                            let required = used - header_bytes + next_header_bytes + size;
+                            if required > max_bytes {
                                 if page.items.is_empty() && page.notices.is_empty() {
                                     return Err(JobError::CompletionTooLarge {
                                         job: notice.id,
-                                        bytes: used + size,
+                                        bytes: required,
                                     });
                                 }
                                 break;
                             }
-                            used += size;
+                            used = required;
+                            header_bytes = next_header_bytes;
+                            page.after = header.after.clone();
                             page.notices.push(notice);
                         }
                     }

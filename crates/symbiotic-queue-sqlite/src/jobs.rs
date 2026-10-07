@@ -500,7 +500,10 @@ impl SqlRows<'_> {
         }
         let mut args = vec![rusqlite::types::Value::Text(json(scope)?)];
         let (filter, order, index) = match query {
-            JobQuery::Admission => ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state='\"AwaitingAdmission\"'".to_string(), "id", "jobs_claim"),
+            JobQuery::Admission { after } => {
+                args.push(after.unwrap_or_default().into());
+                ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state='\"AwaitingAdmission\"' AND id>?2".to_string(), "id", "jobs_claim")
+            }
             JobQuery::Execution(kind) => {
                 args.push(kind.into());
                 ("state IN ('\"Pending\"','\"AwaitingAdmission\"','\"Running\"','\"Uncertain\"') AND state!='\"AwaitingAdmission\"' AND kind=?2".to_string(), "created_at, id", "jobs_claim")
@@ -606,7 +609,9 @@ impl SqliteQueue {
 /// Backend row selection; all operational pages are bounded at the storage read.
 #[derive(Clone, Debug)]
 enum JobQuery {
-    Admission,
+    Admission {
+        after: Option<String>,
+    },
     /// Unfinished work requiring execution or recovery, excluding admission waits.
     Execution(String),
     /// Unfinished scoped group scan for atomic group cancellation.
@@ -894,11 +899,11 @@ fn apply_job_request(
             }
             Ok(JobResponse::Done)
         }
-        JobRequest::AdmissionNotices { limit } => {
+        JobRequest::AdmissionNotices { after, limit } => {
             page(config, limit)?;
             let notices = rows.select_with(
                 scope,
-                JobQuery::Admission,
+                JobQuery::Admission { after },
                 now,
                 limit,
                 ("scope, id, state, diagnostic", |r| {
