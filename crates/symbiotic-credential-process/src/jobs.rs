@@ -366,6 +366,13 @@ impl CredentialProcess {
             let binding =
                 provider::route_binding(&self.inner.runtime, route, self.job_provider(route)?)?
                     .with_response_cache(ResponseCacheMode::Off);
+            // Sleeping observation must not retain admission's process lock.
+            // Execution tasks keep their signed jobs owner until they drain.
+            let observation = self
+                .inner
+                .runtime
+                .model_jobs(scope.clone(), self.inner.config.jobs.clone())
+                .map_err(|_| EgressError::StateUnavailable)?;
             let config = self.inner.config.job_runner.clone();
             let poll = std::time::Duration::from_millis(config.poll_interval_ms);
             let runner = match route.provider {
@@ -389,7 +396,7 @@ impl CredentialProcess {
             .map_err(|_| EgressError::StateUnavailable)?;
             runners.insert(key.clone(), Some(runner));
             let process = Arc::downgrade(&self.inner);
-            let jobs = jobs.clone();
+            let jobs = observation;
             let kind = route.route.clone();
             tokio::spawn(async move {
                 loop {
@@ -524,6 +531,19 @@ impl CredentialProcess {
             Ok(jobs) => jobs,
             Err(error) => return Ok(Reply::Jobs(Err(error))),
         };
+        // Own the entire commit-to-attachment sequence. Dropping a direct
+        // caller's future cannot cancel attachment after a blocking commit.
+        let process = self.clone();
+        tokio::spawn(async move { process.run_jobs_operation(scope, jobs, command).await })
+            .await
+            .map_err(|_| EgressError::Transport)?
+    }
+    async fn run_jobs_operation(
+        &self,
+        scope: JobScope,
+        jobs: ModelJobs,
+        command: JobsCommand,
+    ) -> Result<Reply, EgressError> {
         let admitted = match &command {
             JobsCommand::AdmitJob { job, .. } => Some(job.clone()),
             _ => None,
@@ -774,7 +794,7 @@ mod tests {
         scope: JobScope,
         key: String,
         server: tokio::task::JoinHandle<()>,
-        _dir: tempfile::TempDir,
+        _dir: Arc<tempfile::TempDir>,
     }
 
     impl Drop for RetirementFixture {
@@ -785,6 +805,10 @@ mod tests {
 
     impl RetirementFixture {
         async fn new() -> Self {
+            Self::with_poll(1).await
+        }
+
+        async fn with_poll(poll_interval_ms: u64) -> Self {
             use std::os::unix::fs::PermissionsExt;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let dir = tempfile::tempdir().unwrap();
@@ -823,7 +847,7 @@ mod tests {
                 "admission_key": {"backend": "owner_only_file", "path": admission},
                 "max_secret_bytes": 4096, "max_frame_bytes": 262144,
                 "max_connections": 8, "io_timeout_seconds": 2,
-                "job_runner": {"version": 1, "worker_count": 1, "poll_interval_ms": 1,
+                "job_runner": {"version": 1, "worker_count": 1, "poll_interval_ms": poll_interval_ms,
                     "heartbeat_interval_ms": null, "maintenance_interval_ms": 60000},
                 "routes": [{"tenant": "tenant", "account": "account", "account_sharing_key": null,
                     "max_attempts": 1, "route": "chat", "secret_ref": "", "secret": {"backend": "none"},
@@ -854,7 +878,7 @@ mod tests {
                 scope,
                 key,
                 server,
-                _dir: dir,
+                _dir: Arc::new(dir),
             }
         }
 
@@ -901,6 +925,98 @@ mod tests {
                 panic!("inserted")
             };
             id.clone()
+        }
+
+        fn signed_enqueue(&self, key: &str) -> Request {
+            let route = &self.process.inner.config.routes[0];
+            let payload = ProviderPayload::Chat(ChatRequest {
+                messages: vec![model::ChatMessage {
+                    role: "user".into(),
+                    content: "input".into(),
+                }],
+                max_output_tokens: Some(10),
+                temperature: None,
+                response_format: None,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            });
+            let now = Utc::now().timestamp() as u64;
+            let admission = self
+                .process
+                .inner
+                .key
+                .sign_attempt(DurableAttempt {
+                    tenant: self.scope.tenant.clone(),
+                    incarnation: self.scope.incarnation.clone(),
+                    invocation_id: key.into(),
+                    job_queue: Some(self.scope.queue.clone()),
+                    attempt_ordinal: 1,
+                    record_sequence: 1,
+                    recorded_at: now,
+                    expires_at: now + 3600,
+                    recovery_expires_at: now + 3600,
+                    caller_binding: "caller".into(),
+                    route: route.route.clone(),
+                    destination: route.destination.clone(),
+                    model: route.model.clone(),
+                    method: "POST".into(),
+                    secret_ref: route.secret_ref.clone(),
+                    manifest_ref: "manifest".into(),
+                    input_manifest_digest: "a".repeat(64),
+                    input_digest: payload.digest().unwrap(),
+                    grant_revision: 1,
+                })
+                .unwrap();
+            self.process
+                .inner
+                .registry
+                .lock()
+                .unwrap()
+                .publish_revision(&GrantRevision {
+                    tenant: self.scope.tenant.clone(),
+                    incarnation: self.scope.incarnation.clone(),
+                    revision: 1,
+                })
+                .unwrap();
+            let signed = self
+                .process
+                .inner
+                .key
+                .sign_jobs(JobsRequest {
+                    scope: self.scope.clone(),
+                    command: JobsCommand::EnqueueJobs(vec![EnqueueJob {
+                        admission,
+                        payload,
+                        group: None,
+                        owners: vec![],
+                    }]),
+                })
+                .unwrap();
+            Request {
+                version: PROTOCOL_VERSION,
+                operation: signed.operation(),
+            }
+        }
+
+        fn committed_id(&self, key: &str) -> Option<JobId> {
+            use rusqlite::OptionalExtension;
+            let conn = rusqlite::Connection::open(
+                self.process
+                    .inner
+                    .config
+                    .state_dir
+                    .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            )
+            .unwrap();
+            let id = conn
+                .query_row("SELECT id FROM jobs WHERE key=?1", [key], |row| row.get(0))
+                .optional()
+                .unwrap()?;
+            Some(JobId {
+                scope: self.scope.clone(),
+                id,
+            })
         }
 
         async fn succeeded(&self, id: &JobId) {
@@ -1081,6 +1197,73 @@ mod tests {
         })
         .await
         .expect("60 s failure visibility hang guard");
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_enqueue_still_attaches_and_executes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = RetirementFixture::new().await;
+            let request = fixture.signed_enqueue("cancelled-caller");
+            let mut handler = Box::pin(fixture.process.handle(request));
+            // One poll passes the uncontended attachment check and starts the
+            // blocking enqueue (or its owned task), before returning Pending.
+            std::future::poll_fn(|cx| {
+                assert!(handler.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let runners = fixture.process.inner.job_runners.lock().await;
+            let id = loop {
+                if let Some(id) = fixture.committed_id("cancelled-caller") {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            };
+            // The canonical row committed while runner attachment is blocked.
+            drop(handler);
+            drop(runners);
+            fixture.succeeded(&id).await;
+            eprintln!("cancelled direct enqueue: committed job attached and succeeded");
+        })
+        .await
+        .expect("5 s cancelled enqueue regression bound");
+    }
+
+    #[tokio::test]
+    async fn stopped_signed_workers_allow_reopen_before_retirement_poll() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = RetirementFixture::with_poll(60_000).await;
+            let request = fixture.signed_enqueue("reopen");
+            let response = fixture.process.handle(request).await;
+            assert!(matches!(
+                response.result,
+                Ok(Reply::Jobs(Ok(JobsReply::Enqueued(_))))
+            ));
+            let id = fixture.committed_id("reopen").unwrap();
+            fixture.succeeded(&id).await;
+            let config = fixture.process.inner.config.clone();
+            let _dir = fixture._dir.clone();
+            let process = fixture.process.clone();
+            let jobs = fixture.jobs.clone();
+            drop(fixture);
+            drop(jobs);
+            drop(process);
+            // Reopen waits only for execution tasks to observe stop and drain,
+            // never for the 60-second retirement observer's next poll.
+            loop {
+                match CredentialProcess::open(config.clone()) {
+                    Ok(reopened) => {
+                        drop(reopened);
+                        break;
+                    }
+                    Err(EgressError::StateUnavailable) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected reopen error: {error:?}"),
+                }
+            }
+            eprintln!("signed workers stopped: reopened before the 60 s observer poll");
+        })
+        .await
+        .expect("5 s signed worker reopen regression bound");
     }
 
     #[derive(Clone)]
