@@ -19,6 +19,22 @@ pub type ResolverError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Resolve a named key into the same zeroizing bytes used by file sources.
 /// Initialize [`initialize_resolver_panic_hook`] before loading a resolver source.
+///
+/// The app must return promptly with a value or error and support concurrent calls.
+/// Admission-key resolution runs synchronously during startup (including reopening).
+/// Provider resolution runs in an awaited blocking task during dispatch. Direct
+/// dispatch resolves before request-budget admission and provider execution, so
+/// provider `timeout_seconds` and `max_in_flight` do not cover that resolution.
+/// Queued jobs acquire their account slot before resolving, but the provider
+/// timeout still does not bound the callback. The app owns any lookup deadline
+/// and concurrency control it needs; Foundation imposes no resolver deadline.
+///
+/// Slow resolution delays startup or dispatch. Dropping or cancelling an awaiting
+/// future cannot stop a running callback. During shutdown, Tokio runtime drop waits
+/// for outstanding blocking callbacks to return; a runtime shutdown timeout only
+/// stops waiting, not the callbacks. After a crash, recovery preserves an accepted
+/// unfinished direct dispatch as uncertain and does not rerun its provider lookup
+/// or resend it. Opening the credential process still resolves its admission key.
 pub type SecretResolver = dyn Fn(&str) -> Result<SecretValue<Vec<u8>>, ResolverError> + Send + Sync;
 
 /// Configured backend; references carry locations or callbacks, never secret values.

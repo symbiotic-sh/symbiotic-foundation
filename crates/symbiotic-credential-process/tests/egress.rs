@@ -4103,6 +4103,67 @@ async fn resolver_is_lazy_and_provider_uses_its_key_in_thread_mode() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn regression_slow_resolver_delays_dispatch_beyond_provider_timeout() {
+    initialize_panic_reporting();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(200, "resolver released".into(), Duration::ZERO).await;
+        fixture.config.routes[0].timeout_seconds = 1;
+        fixture.config.routes[0].max_in_flight = 1;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_resolver = entered.clone();
+        let (release, receive) = std::sync::mpsc::channel();
+        let receive = std::sync::Mutex::new(receive);
+        fixture.config.routes[0].secret = SecretSource::Resolver {
+            name: "provider-key".into(),
+            resolve: Arc::new(move |_| {
+                entered_resolver.notify_one();
+                // Bound the blocking callback independently of async/runtime cleanup.
+                // Dropping the test's sender also releases it on assertion failure.
+                receive.lock().unwrap().recv_timeout(Duration::from_secs(5))?;
+                Ok(symbiotic_ai_runtime::model::SecretValue::new(
+                    SECRET.as_bytes().to_vec(),
+                ))
+            }),
+        };
+        let process = fixture.process().await;
+        let (admission, payload) = fixture.attempt("slow-resolver", 1, 1);
+        let granted = permit(&process, &admission).await;
+        let mut dispatch = Box::pin(exchange(
+            &process,
+            inject(admission.clone(), payload, granted),
+        ));
+        tokio::select! {
+            _ = entered.notified() => (),
+            _ = &mut dispatch => panic!("dispatch completed before resolver entry"),
+        }
+
+        // Observe past the one-second provider timeout while keeping the callback held.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), &mut dispatch)
+                .await
+                .is_err(),
+            "provider timeout must not complete dispatch while its resolver is blocked"
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            status(&process, &admission).await,
+            AttemptStatus::Dispatched { .. }
+        ));
+
+        release.send(()).unwrap();
+        let result = dispatched(dispatch.await.unwrap());
+        assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
+        assert!(result.receipt_persisted);
+        assert!(
+            matches!(result.output, Some(ProviderOutput::Chat { text, .. }) if text == "resolver released")
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    })
+    .await
+    .expect("controlled resolver dispatch must finish within the five-second hang guard");
+}
+
 #[test]
 fn resolver_debug_redacts_captured_key_without_invoking_callback() {
     let key = symbiotic_ai_runtime::model::SecretValue::new(SECRET.as_bytes().to_vec());
@@ -7358,16 +7419,6 @@ async fn regression_egress_classification_rejects_cache_contradictions() {
 }
 
 #[tokio::test]
-async fn regression_invalid_provider_json_preserves_charge_and_budget_openai() {
-    invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
-}
-
-#[tokio::test]
-async fn regression_invalid_provider_json_preserves_charge_and_budget_anthropic() {
-    invalid_provider_json_preserves_charge_and_budget(true, "invalid JSON").await;
-}
-
-#[tokio::test]
 async fn regression_wrong_shape_matches_unparsable_send_count_openai() {
     let wrong_shape = invalid_provider_json_preserves_charge_and_budget(false, "{}").await;
     let unparsable = invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
@@ -8011,7 +8062,10 @@ async fn regression_request_budget_answer_rejections_share_allowance_across_rest
                     &fixture.config.state_dir,
                     ANSWER_RECOVERY_MARKER
                 ));
-                assert!(!state_has_bytes(&fixture.config.state_dir, "hello"));
+                assert!(!state_has_bytes(
+                    &fixture.config.state_dir,
+                    "private test input"
+                ));
                 assert!(!state_has_bytes(&fixture.config.state_dir, SECRET));
             }
         }
