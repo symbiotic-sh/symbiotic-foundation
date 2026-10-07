@@ -1,7 +1,7 @@
 use crate::{Error, Policy};
 use std::{
     collections::HashSet,
-    io::{self, Read, Write},
+    io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::process::CommandExt,
@@ -16,8 +16,21 @@ use std::{
 };
 
 pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    // Diagnostics must not interrupt emergency cleanup or process termination.
-    let _ = writeln!(io::stderr().lock(), "{message}");
+    // Drop/termination diagnostics are best effort. Do not take stderr's Rust
+    // lock or wait for an undrained pipe. Leave O_NONBLOCK set: restoring it could
+    // make a concurrent diagnostic's write block on the shared descriptor.
+    // SAFETY: fcntl operates on fd 2 and write borrows the live message buffer.
+    unsafe {
+        let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if flags == -1
+            || libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1
+        {
+            return;
+        }
+        let bytes = format!("{message}\n");
+        // In particular, EAGAIN is ignored; diagnostics cannot delay cleanup.
+        let _ = libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+    }
 }
 
 const PARENT_FD: &str = "SYMBIOTIC_PARENT_FD";
@@ -66,7 +79,10 @@ impl Drop for Writer {
                     drop(fd);
                 }
             }
-            Err(_) => diagnostic(format_args!("parent pipe registry unavailable")),
+            Err(_) => {
+                drop(self.0.take());
+                diagnostic(format_args!("parent pipe registry unavailable"));
+            }
         }
     }
 }
@@ -120,10 +136,13 @@ impl Drop for ManagedChild {
     fn drop(&mut self) {
         if !self.reaped {
             // Emergency cleanup on an error path. Explicit shutdown reports errors.
-            if let Err(error) = self.child.kill() {
+            let killed = self.child.kill();
+            let reaped = self.child.wait();
+            // Complete both cleanup operations before reporting either failure.
+            if let Err(error) = killed {
                 diagnostic(format_args!("child kill failed: {error}"));
             }
-            if let Err(error) = self.child.wait() {
+            if let Err(error) = reaped {
                 diagnostic(format_args!("child reap failed: {error}"));
             }
         }

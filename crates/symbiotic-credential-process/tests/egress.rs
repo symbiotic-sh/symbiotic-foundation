@@ -2992,6 +2992,113 @@ async fn frame_config_refuses_identity_fields_that_cannot_fit_with_the_response(
 }
 
 #[tokio::test]
+async fn supervision_concurrent_binders_preserve_the_winning_stale_socket_replacement() {
+    use std::sync::{Condvar, Mutex, mpsc};
+    let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+    // This valid socket name must not collide with the lifetime state lock,
+    // credential-process.lock, and make the binder wait on its own process.
+    fixture.config.socket_path = fixture.config.state_dir.join("credential-process");
+    let process = fixture.process().await;
+    let mut other_config = fixture.config.clone();
+    other_config.state_dir = fixture.dir.path().join("other-state");
+    let other = CredentialProcess::open(other_config).unwrap();
+    // Exercise cloned state owners and different state directories naming one socket.
+    // Repeating the simultaneous start exposes the probe/unlink/bind race without
+    // introducing sleeps or test hooks into socket ownership.
+    for round in 0..512 {
+        let stale = std::os::unix::net::UnixListener::bind(&fixture.config.socket_path).unwrap();
+        drop(stale);
+        let (ready, started) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let start = Arc::new((Mutex::new(false), Condvar::new()));
+        let contenders = [
+            process.clone(),
+            if round % 2 == 0 {
+                process.clone()
+            } else {
+                other.clone()
+            },
+        ];
+        let mut workers = Vec::new();
+        for contender in contenders {
+            let start = start.clone();
+            let ready = ready.clone();
+            let tx = tx.clone();
+            let runtime = tokio::runtime::Handle::current();
+            workers.push(std::thread::spawn(move || {
+                let _runtime = runtime.enter();
+                let go = start.0.lock().unwrap();
+                ready.send(()).unwrap();
+                let (go, timeout) = start
+                    .1
+                    .wait_timeout_while(go, Duration::from_secs(60), |go| !*go)
+                    .unwrap();
+                assert!(*go && !timeout.timed_out(), "start hang guard fired");
+                drop(go);
+                tx.send(server::bind(&contender)).unwrap();
+            }));
+        }
+        drop(tx);
+        for _ in 0..2 {
+            started
+                .recv_timeout(Duration::from_secs(60))
+                .expect("ready hang guard fired");
+        }
+        *start.0.lock().unwrap() = true;
+        start.1.notify_all();
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                rx.recv_timeout(Duration::from_secs(60))
+                    .expect("binder hang guard fired")
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut listeners = Vec::new();
+        for result in results {
+            match result {
+                Ok(listener) => listeners.push(listener),
+                Err(error) => assert!(matches!(error, EgressError::StateUnavailable)),
+            }
+        }
+        assert_eq!(
+            listeners.len(),
+            1,
+            "only one binder may replace the stale socket, round {round}"
+        );
+        let listener = listeners.pop().unwrap();
+        let client = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::net::UnixStream::connect(&fixture.config.socket_path),
+        )
+        .await
+        .expect("connect hang guard fired")
+        .expect("winning socket must remain reachable");
+        let peer = tokio::time::timeout(Duration::from_secs(60), listener.accept())
+            .await
+            .expect("accept hang guard fired")
+            .unwrap();
+        drop((client, peer, listener));
+        std::fs::remove_file(&fixture.config.socket_path).unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(
+            fixture
+                .config
+                .state_dir
+                .join("credential-process.bind.lock")
+        )
+        .unwrap()
+        .permissions()
+        .mode()
+            & 0o777,
+        0o600,
+        "the retained socket lock must be owner-only"
+    );
+}
+
+#[tokio::test]
 async fn supervision_socket_recovery_preserves_live_owner_and_non_socket_paths() {
     let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
     let process = fixture.process().await;
