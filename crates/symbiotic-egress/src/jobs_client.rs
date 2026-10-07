@@ -38,6 +38,10 @@ pub enum JobsCommand {
     },
     /// Final deliveries first, then non-confirmable admission notices, within both bounds.
     Completions {
+        /// Exclusive notice ID cursor; an empty string starts a paginated scan.
+        /// Omit to poll the first notice page without a response cursor or its byte cost.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
         /// Maximum number of final deliveries and notices combined.
         limit: usize,
         /// Maximum encoded completion-body bytes.
@@ -127,6 +131,10 @@ pub struct JobsCompletions {
     pub items: Vec<JobDelivery>,
     /// Waiting jobs that need successor authority.
     pub notices: Vec<JobDiagnostic>,
+    /// Last returned notice ID, or the request cursor when no notice fits.
+    /// Omitted when the request does not opt into notice pagination with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 /// Typed job replies; errors preserve the queue's static code and scoped identity.
@@ -192,14 +200,19 @@ impl<C: EgressClient> JobsClient<C> {
         }
     }
     /// Fetch bounded final deliveries and admission notices, optionally long-polling.
+    /// Pass `Some(String::new())` to start pagination, then each response `after` to continue.
+    /// None polls the first notice page without a response cursor or its byte cost.
+    /// Final deliveries are polled independently of the notice cursor.
     pub async fn completions(
         &self,
         limit: usize,
         max_bytes: usize,
         wait_seconds: u64,
+        after: Option<String>,
     ) -> Result<JobsCompletions, JobsClientError> {
         match self
             .request(JobsCommand::Completions {
+                after,
                 limit,
                 max_bytes,
                 wait_seconds,
@@ -270,6 +283,66 @@ impl<C: EgressClient> JobsClient<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_notice_cursor_round_trips_authenticated_wire() {
+        let key = AdmissionKey::new(b"synthetic-job-signing-key-32-bytes".to_vec()).unwrap();
+        let cursor = "notice-\"\\\n";
+        let signed = key
+            .sign_jobs(JobsRequest {
+                scope: JobScope {
+                    tenant: "tenant".into(),
+                    incarnation: "incarnation".into(),
+                    queue: "jobs".into(),
+                },
+                command: JobsCommand::Completions {
+                    after: Some(cursor.into()),
+                    limit: 2,
+                    max_bytes: 1024,
+                    wait_seconds: 0,
+                },
+            })
+            .unwrap();
+        let request = Request {
+            version: PROTOCOL_VERSION,
+            operation: signed.operation(),
+        };
+        let bytes = crate::encode_frame(&request, 4096).unwrap();
+        let decoded: Request = serde_json::from_slice(&bytes).unwrap();
+        let Operation::Completions(mut signed) = decoded.operation else {
+            panic!("completion wire operation")
+        };
+        key.verify_jobs(&signed).unwrap();
+        let JobsCommand::Completions { after, .. } = &mut signed.request.command else {
+            panic!("completion command")
+        };
+        assert_eq!(after.as_deref(), Some(cursor));
+        *after = Some("other-notice".into());
+        assert_eq!(key.verify_jobs(&signed), Err(EgressError::Unauthorized));
+        let reply = JobsReply::Completions(JobsCompletions {
+            items: Vec::new(),
+            notices: Vec::new(),
+            after: Some(cursor.into()),
+        });
+        let bytes = crate::encode_frame(&reply, 4096).unwrap();
+        let JobsReply::Completions(page) = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("completion reply")
+        };
+        assert_eq!(page.after.as_deref(), Some(cursor));
+        // Missing optional fields preserve the existing request and response encodings.
+        let old =
+            br#"{"operation":"completions","body":{"limit":2,"max_bytes":1024,"wait_seconds":0}}"#;
+        let command: JobsCommand = serde_json::from_slice(old).unwrap();
+        assert!(matches!(
+            command,
+            JobsCommand::Completions { after: None, .. }
+        ));
+        assert_eq!(crate::encode_frame(&command, 4096).unwrap(), old);
+        let old = br#"{"items":[],"notices":[]}"#;
+        let page: JobsCompletions = serde_json::from_slice(old).unwrap();
+        assert!(page.after.is_none());
+        assert_eq!(crate::encode_frame(&page, 4096).unwrap(), old);
+    }
 
     #[test]
     fn owner_purge_round_trips_signed_wire_request_and_reply() {

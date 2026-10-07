@@ -2461,6 +2461,59 @@ async fn jobs_enqueue_refuses_unreadable_input() {
     assert_eq!(encoded_bytes(&rows).unwrap(), bytes);
 }
 
+#[tokio::test]
+async fn jobs_admission_notice_cursor_pages_unresolved_rows_in_id_order() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut s = Suite::new();
+        s.config.max_page = 2;
+        let mut expected = Vec::new();
+        for i in 0..5 {
+            let mut spec = s.spec(&format!("notice-{i}"));
+            spec.execution = Execution::Model;
+            spec.admission = Some(b"synthetic authority".to_vec());
+            let id = s.insert(spec).await;
+            s.op(JobRequest::AwaitAdmission(id.clone())).await.unwrap();
+            expected.push(id);
+        }
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut after = None;
+        let mut seen = Vec::new();
+        for count in [2, 2, 1, 0] {
+            let JobResponse::Diagnostics(page) = s
+                .op(JobRequest::AdmissionNotices { after, limit: 2 })
+                .await
+                .unwrap()
+            else {
+                panic!("notice page")
+            };
+            assert_eq!(page.items.len(), count);
+            assert_eq!(page.after, page.items.last().map(|n| n.id.id.clone()));
+            seen.extend(page.items.iter().map(|n| n.id.clone()));
+            after = page.after;
+        }
+        assert_eq!(seen, expected);
+        let JobResponse::Diagnostics(first) = s
+            .op(JobRequest::AdmissionNotices {
+                after: None,
+                limit: 2,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("first page")
+        };
+        assert_eq!(
+            first.items.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            expected[..2]
+        );
+        for id in expected {
+            assert_eq!(s.get(&id).await.state, JobState::AwaitingAdmission);
+        }
+    })
+    .await
+    .expect("bounded store notice pagination");
+}
+
 /// Renewed authority cannot grow a claimable record beyond its candidate page.
 #[tokio::test]
 async fn jobs_admission_refuses_unreadable_input() {
