@@ -50,6 +50,21 @@ pub struct SqliteQueue {
 }
 
 impl SqliteQueue {
+    // Lock acquisition and all SQLite work stay on the blocking pool. Callers
+    // await the committed result before delivering events on the async runtime.
+    async fn with_connection<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, QueueError> + Send + 'static,
+    ) -> Result<T, QueueError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().map_err(lock_error)?;
+            operation(&mut conn)
+        })
+        .await
+        .map_err(storage_error)?
+    }
+
     /// Initialize the current queue/job format on a caller-owned ledger connection.
     /// Unknown formats are refused; pre-release state has no migrations.
     pub fn initialize_connection(conn: &mut Connection) -> Result<(), QueueError> {
@@ -123,16 +138,17 @@ impl SqliteQueue {
         reason: symbiotic_core::DiagnosticCode,
     ) -> Result<usize, QueueError> {
         let now = Utc::now();
-        let (updated, items) = {
-            let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
-            let items = stale_active_items_in_tx(&tx, queue_id, stale_before, now)?;
-            let updated = match queue_id {
-                Some(queue_id) => tx
-                    .execute(
-                        "update queue_items
+        let queue_id = queue_id.cloned();
+        let (updated, items) = self
+            .with_connection(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(storage_error)?;
+                let items = stale_active_items_in_tx(&tx, queue_id.as_ref(), stale_before, now)?;
+                let updated = match queue_id.as_ref() {
+                    Some(queue_id) => tx
+                        .execute(
+                            "update queue_items
                          set status = 'dead',
                              lease_owner = null,
                              lease_until = null,
@@ -142,12 +158,12 @@ impl SqliteQueue {
                            and status in ('pending', 'failed', 'running')
                            and updated_at < ?2
                            and (status != 'running' or lease_until is null or lease_until < ?4)",
-                        params![queue_id.0, ts(stale_before), reason.code(), ts(now)],
-                    )
-                    .map_err(storage_error)?,
-                None => tx
-                    .execute(
-                        "update queue_items
+                            params![queue_id.0, ts(stale_before), reason.code(), ts(now)],
+                        )
+                        .map_err(storage_error)?,
+                    None => tx
+                        .execute(
+                            "update queue_items
                          set status = 'dead',
                              lease_owner = null,
                              lease_until = null,
@@ -156,13 +172,14 @@ impl SqliteQueue {
                          where status in ('pending', 'failed', 'running')
                            and updated_at < ?1
                            and (status != 'running' or lease_until is null or lease_until < ?3)",
-                        params![ts(stale_before), reason.code(), ts(now)],
-                    )
-                    .map_err(storage_error)?,
-            };
-            tx.commit().map_err(storage_error)?;
-            (updated, items)
-        };
+                            params![ts(stale_before), reason.code(), ts(now)],
+                        )
+                        .map_err(storage_error)?,
+                };
+                tx.commit().map_err(storage_error)?;
+                Ok((updated, items))
+            })
+            .await?;
         if let Some(sink) = &self.event_sink {
             for mut item in items {
                 item.status = QueueStatus::Dead;
@@ -257,8 +274,8 @@ impl SqliteQueue {
         let max_attempts = request.max_attempts.unwrap_or(3).max(1);
         let payload = serde_json::to_string(&request.payload).map_err(storage_error)?;
 
-        let (item, disposition) = {
-            let mut conn = self.conn.lock().map_err(lock_error)?;
+        let replacing = replacing.cloned();
+        let outcome = self.with_connection(move |conn| {
             // Acquire the writer lock before reading deduplication state;
             // a concurrent ledger writer must not cause a read-to-write upgrade.
             let tx = conn
@@ -275,7 +292,7 @@ impl SqliteQueue {
                         existing.status,
                         QueueStatus::Succeeded | QueueStatus::Dead | QueueStatus::Stopped
                     );
-                    let superseded = replacing.is_some_and(|current| existing.item_id != *current);
+                    let superseded = replacing.as_ref().is_some_and(|current| existing.item_id != *current);
                     let reclaimed = replacing.is_some()
                         && existing.status == QueueStatus::Failed
                         && existing.last_error
@@ -295,7 +312,7 @@ impl SqliteQueue {
                 }
             }
 
-            if let Some(current) = replacing {
+            if let Some(current) = &replacing {
                 tx.execute("UPDATE queue_items SET status='stopped', last_error_class='queue' WHERE item_id=?1 AND status='failed'", [&current.0]).map_err(storage_error)?;
             }
             let item = QueueItem {
@@ -347,11 +364,13 @@ impl SqliteQueue {
                 return Err(storage_error(err));
             }
             tx.commit().map_err(storage_error)?;
-            (item, EnqueueDisposition::Inserted)
-        };
+            Ok(EnqueueOutcome { item, disposition: EnqueueDisposition::Inserted })
+        }).await?;
 
-        self.emit(item.clone(), None).await;
-        Ok(EnqueueOutcome { item, disposition })
+        if outcome.disposition == EnqueueDisposition::Inserted {
+            self.emit(outcome.item.clone(), None).await;
+        }
+        Ok(outcome)
     }
 
     async fn emit(&self, item: QueueItem, error: Option<symbiotic_core::DiagnosticCode>) {
@@ -408,54 +427,54 @@ impl QueueBackend for SqliteQueue {
         let now = Utc::now();
         let lease_until = lease_deadline(now, request.lease_seconds)?;
         let mut limit = request.limit.max(1);
-        let claimed = {
-            let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
-            if cooldown_active(&tx, &request.queue_id)? {
-                return Ok(Vec::new());
-            }
-            reclaim_expired_in_tx(&tx, &request.queue_id, now)?;
-            if let Some(max_in_flight) = request.max_in_flight {
-                let running: i64 = tx
-                    .query_row(
-                        "select count(*) from queue_items
-                         where queue_id = ?1 and status = 'running'",
-                        params![request.queue_id.0],
-                        |row| row.get(0),
-                    )
+        let claimed = self
+            .with_connection(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(storage_error)?;
-                if running >= max_in_flight as i64 {
-                    tx.commit().map_err(storage_error)?;
+                if cooldown_active(&tx, &request.queue_id)? {
                     return Ok(Vec::new());
                 }
-                limit = limit.min(max_in_flight.saturating_sub(running as usize));
-            }
-            let ids = {
-                let mut stmt = tx
-                    .prepare(
-                        "select item_id from queue_items
+                reclaim_expired_in_tx(&tx, &request.queue_id, now)?;
+                if let Some(max_in_flight) = request.max_in_flight {
+                    let running: i64 = tx
+                        .query_row(
+                            "select count(*) from queue_items
+                         where queue_id = ?1 and status = 'running'",
+                            params![request.queue_id.0],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage_error)?;
+                    if running >= max_in_flight as i64 {
+                        tx.commit().map_err(storage_error)?;
+                        return Ok(Vec::new());
+                    }
+                    limit = limit.min(max_in_flight.saturating_sub(running as usize));
+                }
+                let ids = {
+                    let mut stmt = tx
+                        .prepare(
+                            "select item_id from queue_items
                          where queue_id = ?1
                            and status in ('pending', 'failed')
                            and attempt < max_attempts
                            and run_after <= ?2
                          order by run_after asc, created_at asc
                          limit ?3",
-                    )
-                    .map_err(storage_error)?;
-                stmt.query_map(params![request.queue_id.0, ts(now), limit as i64], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(storage_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(storage_error)?
-            };
-            let mut out = Vec::new();
-            for id in ids {
-                let updated = tx
-                    .execute(
-                        "update queue_items
+                        )
+                        .map_err(storage_error)?;
+                    stmt.query_map(params![request.queue_id.0, ts(now), limit as i64], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(storage_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(storage_error)?
+                };
+                let mut out = Vec::new();
+                for id in ids {
+                    let updated = tx
+                        .execute(
+                            "update queue_items
                      set status = 'running',
                          attempt = attempt + 1,
                          lease_owner = ?2,
@@ -464,18 +483,19 @@ impl QueueBackend for SqliteQueue {
                     where item_id = ?1
                        and status in ('pending', 'failed')
                        and attempt < max_attempts",
-                        params![id, request.worker_id, ts(lease_until), ts(now)],
-                    )
-                    .map_err(storage_error)?;
-                if updated == 1
-                    && let Some(item) = get_in_tx(&tx, &QueueItemId(id))?
-                {
-                    out.push(item);
+                            params![id, request.worker_id, ts(lease_until), ts(now)],
+                        )
+                        .map_err(storage_error)?;
+                    if updated == 1
+                        && let Some(item) = get_in_tx(&tx, &QueueItemId(id))?
+                    {
+                        out.push(item);
+                    }
                 }
-            }
-            tx.commit().map_err(storage_error)?;
-            out
-        };
+                tx.commit().map_err(storage_error)?;
+                Ok(out)
+            })
+            .await?;
         for item in claimed.clone() {
             self.emit(item, None).await;
         }
@@ -496,57 +516,60 @@ impl QueueBackend for SqliteQueue {
         }
         let now = Utc::now();
         let lease_until = lease_deadline(now, lease_seconds)?;
-        let claimed = {
-            let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
-            let item = get_required(&tx, item_id)?;
-            if cooldown_active(&tx, &item.queue_id)? {
-                return Ok(None);
-            }
-            reclaim_expired_in_tx(&tx, &item.queue_id, now)?;
-            if let Some(max_in_flight) = max_in_flight {
-                let running: i64 = tx
-                    .query_row(
-                        "select count(*) from queue_items
-                         where queue_id = ?1 and status = 'running'",
-                        params![item.queue_id.0],
-                        |row| row.get(0),
-                    )
+        let item_id = item_id.clone();
+        let worker_id = worker_id.to_owned();
+        let claimed = self
+            .with_connection(move |conn| {
+                let (item_id, worker_id) = (&item_id, worker_id.as_str());
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(storage_error)?;
-                if running >= max_in_flight as i64 {
-                    tx.commit().map_err(storage_error)?;
+                let item = get_required(&tx, item_id)?;
+                if cooldown_active(&tx, &item.queue_id)? {
                     return Ok(None);
                 }
-            }
-            let refreshed = get_required(&tx, item_id)?;
-            if matches!(refreshed.status, QueueStatus::Pending | QueueStatus::Failed)
-                && refreshed.attempt >= refreshed.max_attempts
-            {
-                // Every allowed attempt is used: the item is dead, not
-                // claimable (items reclaimed before this rule existed).
-                tx.execute(
-                    "update queue_items
+                reclaim_expired_in_tx(&tx, &item.queue_id, now)?;
+                if let Some(max_in_flight) = max_in_flight {
+                    let running: i64 = tx
+                        .query_row(
+                            "select count(*) from queue_items
+                         where queue_id = ?1 and status = 'running'",
+                            params![item.queue_id.0],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage_error)?;
+                    if running >= max_in_flight as i64 {
+                        tx.commit().map_err(storage_error)?;
+                        return Ok(None);
+                    }
+                }
+                let refreshed = get_required(&tx, item_id)?;
+                if matches!(refreshed.status, QueueStatus::Pending | QueueStatus::Failed)
+                    && refreshed.attempt >= refreshed.max_attempts
+                {
+                    // Every allowed attempt is used: the item is dead, not
+                    // claimable (items reclaimed before this rule existed).
+                    tx.execute(
+                        "update queue_items
                      set status = 'dead',
                          last_error = coalesce(last_error, 'attempt_budget_exhausted'),
                          updated_at = ?2
                      where item_id = ?1",
-                    params![item_id.0, ts(now)],
-                )
-                .map_err(storage_error)?;
-                tx.commit().map_err(storage_error)?;
-                return Ok(None);
-            }
-            if !matches!(refreshed.status, QueueStatus::Pending | QueueStatus::Failed)
-                || refreshed.run_after > now
-            {
-                tx.commit().map_err(storage_error)?;
-                return Ok(None);
-            }
-            let updated = tx
-                .execute(
-                    "update queue_items
+                        params![item_id.0, ts(now)],
+                    )
+                    .map_err(storage_error)?;
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(None);
+                }
+                if !matches!(refreshed.status, QueueStatus::Pending | QueueStatus::Failed)
+                    || refreshed.run_after > now
+                {
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(None);
+                }
+                let updated = tx
+                    .execute(
+                        "update queue_items
                  set status = 'running',
                      attempt = attempt + 1,
                      lease_owner = ?2,
@@ -554,17 +577,18 @@ impl QueueBackend for SqliteQueue {
                      updated_at = ?4
                 where item_id = ?1
                    and status in ('pending', 'failed')",
-                    params![item_id.0, worker_id, ts(lease_until), ts(now)],
-                )
-                .map_err(storage_error)?;
-            if updated != 1 {
+                        params![item_id.0, worker_id, ts(lease_until), ts(now)],
+                    )
+                    .map_err(storage_error)?;
+                if updated != 1 {
+                    tx.commit().map_err(storage_error)?;
+                    return Ok(None);
+                }
+                let claimed = get_required(&tx, item_id)?;
                 tx.commit().map_err(storage_error)?;
-                return Ok(None);
-            }
-            let claimed = get_required(&tx, item_id)?;
-            tx.commit().map_err(storage_error)?;
-            Some(claimed)
-        };
+                Ok(Some(claimed))
+            })
+            .await?;
         if let Some(item) = claimed.clone() {
             self.emit(item, None).await;
         }
@@ -572,7 +596,9 @@ impl QueueBackend for SqliteQueue {
     }
 
     async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
-        self.get(item_id)
+        let item_id = item_id.clone();
+        self.with_connection(move |conn| get_in_tx(conn, &item_id))
+            .await
     }
 
     async fn heartbeat(
@@ -581,25 +607,41 @@ impl QueueBackend for SqliteQueue {
         worker_id: &str,
         lease_seconds: u64,
     ) -> Result<(), QueueError> {
-        let now = Utc::now();
-        let lease_until = lease_deadline(now, lease_seconds)?;
-        let item = update_running_item(&self.conn, item_id, worker_id, |conn| {
-            conn.execute(
+        // Reject invalid durations before waiting for a connection.
+        lease_deadline(Utc::now(), lease_seconds)?;
+        let item_id = item_id.clone();
+        let worker_id = worker_id.to_owned();
+        let item = self
+            .with_connection(move |conn| {
+                let (item_id, worker_id) = (&item_id, worker_id.as_str());
+                update_running_item(conn, item_id, worker_id, |conn| {
+                    // Renewal deadlines follow write-transaction order, not
+                    // the order in which async callers reached the blocking pool.
+                    let now = Utc::now();
+                    let lease_until = lease_deadline(now, lease_seconds)?;
+                    conn.execute(
                 "update queue_items set lease_until = ?2, updated_at = ?3 where item_id = ?1",
                 params![item_id.0, ts(lease_until), ts(now)],
             )
             .map_err(storage_error)?;
-            get_required(conn, item_id)
-        })?;
+                    get_required(conn, item_id)
+                })
+            })
+            .await?;
         self.emit(item, None).await;
         Ok(())
     }
 
     async fn complete(&self, item_id: &QueueItemId, worker_id: &str) -> Result<(), QueueError> {
         let now = Utc::now();
-        let item = update_running_item(&self.conn, item_id, worker_id, |conn| {
-            conn.execute(
-                "update queue_items
+        let item_id = item_id.clone();
+        let worker_id = worker_id.to_owned();
+        let item = self
+            .with_connection(move |conn| {
+                let (item_id, worker_id) = (&item_id, worker_id.as_str());
+                update_running_item(conn, item_id, worker_id, |conn| {
+                    conn.execute(
+                        "update queue_items
                  set status = 'succeeded',
                      lease_owner = null,
                      lease_until = null,
@@ -607,11 +649,13 @@ impl QueueBackend for SqliteQueue {
                      last_error_class = null,
                      updated_at = ?2
                  where item_id = ?1",
-                params![item_id.0, ts(now)],
-            )
-            .map_err(storage_error)?;
-            get_required(conn, item_id)
-        })?;
+                        params![item_id.0, ts(now)],
+                    )
+                    .map_err(storage_error)?;
+                    get_required(conn, item_id)
+                })
+            })
+            .await?;
         self.emit(item, None).await;
         Ok(())
     }
@@ -647,18 +691,23 @@ impl QueueBackend for SqliteQueue {
         let run_after = failure
             .run_after
             .unwrap_or_else(|| now + ChronoDuration::seconds(1));
-        let (item, outcome) = update_running_item(&self.conn, item_id, worker_id, |conn| {
-            let item = get_required(conn, item_id)?;
-            let exhausted = item.attempt >= item.max_attempts;
-            let status = if failure.run_after.is_none() {
-                QueueStatus::Stopped
-            } else if exhausted {
-                QueueStatus::Dead
-            } else {
-                QueueStatus::Failed
-            };
-            conn.execute(
-                "update queue_items
+        let item_id = item_id.clone();
+        let worker_id = worker_id.to_owned();
+        let (item, outcome) = self
+            .with_connection(move |conn| {
+                let (item_id, worker_id) = (&item_id, worker_id.as_str());
+                update_running_item(conn, item_id, worker_id, |conn| {
+                    let item = get_required(conn, item_id)?;
+                    let exhausted = item.attempt >= item.max_attempts;
+                    let status = if failure.run_after.is_none() {
+                        QueueStatus::Stopped
+                    } else if exhausted {
+                        QueueStatus::Dead
+                    } else {
+                        QueueStatus::Failed
+                    };
+                    conn.execute(
+                        "update queue_items
                  set status = ?2,
                      run_after = ?3,
                      lease_owner = null,
@@ -667,58 +716,62 @@ impl QueueBackend for SqliteQueue {
                      last_error_class = ?5,
                      updated_at = ?6
                  where item_id = ?1",
-                params![
-                    item_id.0,
-                    status_str(status),
-                    ts(run_after),
-                    failure.error.code(),
-                    failure.error_class.map(|class| class.as_str()),
-                    ts(now)
-                ],
-            )
-            .map_err(storage_error)?;
-            let updated = get_required(conn, item_id)?;
-            let outcome = if failure.run_after.is_none() {
-                FailOutcome::Stopped
-            } else if exhausted {
-                FailOutcome::MovedToDead
-            } else {
-                FailOutcome::RetryScheduled
-            };
-            Ok((updated, outcome))
-        })?;
+                        params![
+                            item_id.0,
+                            status_str(status),
+                            ts(run_after),
+                            failure.error.code(),
+                            failure.error_class.map(|class| class.as_str()),
+                            ts(now)
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                    let updated = get_required(conn, item_id)?;
+                    let outcome = if failure.run_after.is_none() {
+                        FailOutcome::Stopped
+                    } else if exhausted {
+                        FailOutcome::MovedToDead
+                    } else {
+                        FailOutcome::RetryScheduled
+                    };
+                    Ok((updated, outcome))
+                })
+            })
+            .await?;
         self.emit(item, Some(failure.error)).await;
         Ok(outcome)
     }
 
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
         let now = Utc::now();
-        let (reclaimed, events) = {
-            let mut conn = self.conn.lock().map_err(lock_error)?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
-            let expired = expired_running_items_in_tx(&tx, queue_id, now)?;
-            let reclaimed = reclaim_expired_in_tx(&tx, queue_id, now)?;
-            let events = expired
-                .into_iter()
-                .map(|mut item| {
-                    item.status = if item.attempt >= item.max_attempts {
-                        QueueStatus::Dead
-                    } else {
-                        QueueStatus::Failed
-                    };
-                    item.lease_owner = None;
-                    item.lease_until = None;
-                    item.last_error
-                        .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
-                    item.updated_at = now;
-                    item
-                })
-                .collect::<Vec<_>>();
-            tx.commit().map_err(storage_error)?;
-            (reclaimed, events)
-        };
+        let queue_id = queue_id.clone();
+        let (reclaimed, events) = self
+            .with_connection(move |conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(storage_error)?;
+                let expired = expired_running_items_in_tx(&tx, &queue_id, now)?;
+                let reclaimed = reclaim_expired_in_tx(&tx, &queue_id, now)?;
+                let events = expired
+                    .into_iter()
+                    .map(|mut item| {
+                        item.status = if item.attempt >= item.max_attempts {
+                            QueueStatus::Dead
+                        } else {
+                            QueueStatus::Failed
+                        };
+                        item.lease_owner = None;
+                        item.lease_until = None;
+                        item.last_error
+                            .get_or_insert(symbiotic_core::DiagnosticCode::LeaseExpired);
+                        item.updated_at = now;
+                        item
+                    })
+                    .collect::<Vec<_>>();
+                tx.commit().map_err(storage_error)?;
+                Ok((reclaimed, events))
+            })
+            .await?;
         if let Some(sink) = &self.event_sink {
             for item in events {
                 sink.record_queue_event(QueueEvent {
@@ -740,20 +793,24 @@ impl QueueBackend for SqliteQueue {
         &self,
         queue_id: &QueueId,
     ) -> Result<Option<DateTime<Utc>>, QueueError> {
-        let conn = self.conn.lock().map_err(lock_error)?;
-        let raw: Option<String> = conn
-            .query_row(
-                "select cooldown_until from queue_cooldowns where queue_id = ?1",
-                params![queue_id.0],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage_error)?;
-        raw.map(|value| {
-            parse_ts(value)
-                .map_err(|_err| QueueError::Storage(symbiotic_core::DiagnosticCode::StorageFailure))
+        let queue_id = queue_id.clone();
+        self.with_connection(move |conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "select cooldown_until from queue_cooldowns where queue_id = ?1",
+                    params![queue_id.0],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            raw.map(|value| {
+                parse_ts(value).map_err(|_err| {
+                    QueueError::Storage(symbiotic_core::DiagnosticCode::StorageFailure)
+                })
+            })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     async fn note_cooldown(
@@ -762,9 +819,10 @@ impl QueueBackend for SqliteQueue {
         until: DateTime<Utc>,
     ) -> Result<(), QueueError> {
         let now = Utc::now();
-        let conn = self.conn.lock().map_err(lock_error)?;
-        conn.execute(
-            "insert into queue_cooldowns(queue_id, cooldown_until, updated_at)
+        let queue_id = queue_id.clone();
+        self.with_connection(move |conn| {
+            conn.execute(
+                "insert into queue_cooldowns(queue_id, cooldown_until, updated_at)
              values (?1, ?2, ?3)
              on conflict(queue_id) do update set
                cooldown_until = case
@@ -773,10 +831,12 @@ impl QueueBackend for SqliteQueue {
                  else queue_cooldowns.cooldown_until
                end,
                updated_at = excluded.updated_at",
-            params![queue_id.0, ts(until), ts(now)],
-        )
-        .map_err(storage_error)?;
-        Ok(())
+                params![queue_id.0, ts(until), ts(now)],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -962,12 +1022,11 @@ fn get_required(conn: &Connection, item_id: &QueueItemId) -> Result<QueueItem, Q
 }
 
 fn update_running_item<T>(
-    conn: &Arc<Mutex<Connection>>,
+    conn: &mut Connection,
     item_id: &QueueItemId,
     worker_id: &str,
     update: impl FnOnce(&Connection) -> Result<T, QueueError>,
 ) -> Result<T, QueueError> {
-    let mut conn = conn.lock().map_err(lock_error)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(storage_error)?;
@@ -1417,6 +1476,238 @@ mod tests {
         let inserted = queue.enqueue(forced).await.unwrap();
         assert_eq!(inserted.disposition, EnqueueDisposition::Inserted);
         assert_ne!(inserted.item.item_id.0, first.item.item_id.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_heartbeats_renew_in_write_transaction_order() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir_in(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let older_queue = SqliteQueue::open(&path).unwrap();
+        let newer_queue = SqliteQueue::open(&path).unwrap();
+        let item = older_queue.enqueue(request("overlap")).await.unwrap().item;
+        older_queue
+            .claim_item(&item.item_id, "worker", 3, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let conn = older_queue.conn.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        locked_rx.await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                older_queue.heartbeat(&item.item_id, "worker", u64::MAX),
+            )
+            .await
+            .expect("invalid duration waited for the connection"),
+            Err(QueueError::InvalidRequest(_))
+        ));
+        let older = older_queue.heartbeat(&item.item_id, "worker", 3);
+        tokio::pin!(older);
+        assert!(futures::poll!(&mut older).is_pending());
+        // Separate the captured times while the older call waits for its connection.
+        let after_older_poll = Utc::now();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Utc::now() <= after_older_poll {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clock did not advance while the older heartbeat waited");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            newer_queue.heartbeat(&item.item_id, "worker", 3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let newer = newer_queue.get_item(&item.item_id).await.unwrap().unwrap();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut older)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "lock was released only by the guard"
+        );
+        let final_item = older_queue.get_item(&item.item_id).await.unwrap().unwrap();
+        assert!(
+            final_item.lease_until >= newer.lease_until,
+            "an older heartbeat shortened the newer lease"
+        );
+        assert!(final_item.updated_at >= newer.updated_at);
+        assert_eq!(final_item.attempt, newer.attempt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_heartbeat_leaves_async_worker_free() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let queue = SqliteQueue::open(&path).unwrap();
+        let item = queue.enqueue(request("heartbeat")).await.unwrap().item;
+        let claimed = queue
+            .claim_item(&item.item_id, "worker", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut conn = Connection::open(path).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            // An independent thread bounds failure even if the runtime is blocked.
+            let released_by_task = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            tx.rollback().unwrap();
+            released_by_task
+        });
+        locked_rx.await.unwrap();
+
+        let renewal = queue.heartbeat(&item.item_id, "worker", 120);
+        tokio::pin!(renewal);
+        let pending = futures::poll!(&mut renewal).is_pending();
+        if pending {
+            let conn = queue.conn.clone();
+            let progress = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    // Wait for the database worker to acquire the queue connection.
+                    while conn.try_lock().is_ok() {
+                        tokio::task::yield_now().await;
+                    }
+                    for _ in 0..16 {
+                        tokio::task::yield_now().await;
+                    }
+                    release_tx.send(()).unwrap();
+                })
+                .await
+                .expect("async task did not progress while heartbeat waited");
+            });
+            tokio::time::timeout(Duration::from_secs(5), &mut renewal)
+                .await
+                .expect("heartbeat did not finish after lock release")
+                .unwrap();
+            progress.await.unwrap();
+        }
+        let released_by_task = holder.join().unwrap();
+        assert!(pending, "heartbeat blocked the current-thread runtime");
+        assert!(released_by_task, "lock was released only by the hang guard");
+        let renewed = queue.get_item(&item.item_id).await.unwrap().unwrap();
+        assert!(renewed.lease_until > claimed.lease_until);
+        assert!(renewed.lease_until.unwrap() > Utc::now());
+        assert_eq!(renewed.attempt, claimed.attempt);
+        queue.complete(&item.item_id, "worker").await.unwrap();
+    }
+
+    async fn connection_wait_yields<T>(
+        queue: &SqliteQueue,
+        operation: impl std::future::Future<Output = Result<T, QueueError>>,
+    ) -> T {
+        use std::time::Duration;
+
+        let conn = queue.conn.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        locked_rx.await.unwrap();
+        tokio::pin!(operation);
+        let pending = futures::poll!(&mut operation).is_pending();
+        let result = if pending {
+            // Only a task on the same current-thread runtime can release the lock.
+            let progress = tokio::spawn(async move { release_tx.send(()).unwrap() });
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut operation).await;
+            progress.await.unwrap();
+            Some(result)
+        } else {
+            None
+        };
+        let released_by_task = holder.join().unwrap();
+        assert!(pending, "connection wait blocked the async worker");
+        assert!(released_by_task, "lock was released only by the hang guard");
+        result.unwrap().expect("queue call did not finish").unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_calls_leave_async_worker_free_during_connection_wait() {
+        let queue = SqliteQueue::in_memory().unwrap();
+        let item = connection_wait_yields(&queue, queue.enqueue(request("connection")))
+            .await
+            .item;
+        let duplicate = connection_wait_yields(
+            &queue,
+            queue.enqueue_replacing(request("connection"), &item.item_id),
+        )
+        .await;
+        assert_eq!(duplicate.disposition, EnqueueDisposition::ActiveDuplicate);
+        connection_wait_yields(
+            &queue,
+            queue.claim(ClaimRequest {
+                queue_id: item.queue_id.clone(),
+                worker_id: "worker".into(),
+                limit: 1,
+                lease_seconds: 60,
+                max_in_flight: None,
+            }),
+        )
+        .await;
+        connection_wait_yields(&queue, queue.get_item(&item.item_id)).await;
+        connection_wait_yields(&queue, queue.heartbeat(&item.item_id, "worker", 60)).await;
+        connection_wait_yields(&queue, queue.reclaim_expired_leases(&item.queue_id)).await;
+        connection_wait_yields(&queue, queue.cooldown_until(&item.queue_id)).await;
+        connection_wait_yields(
+            &queue,
+            queue.note_cooldown(&item.queue_id, Utc::now() - ChronoDuration::seconds(1)),
+        )
+        .await;
+        let reason = symbiotic_core::DiagnosticCode::LeaseExpired;
+        connection_wait_yields(
+            &queue,
+            queue.mark_stale_active_dead(&item.queue_id, Utc::now(), reason),
+        )
+        .await;
+        connection_wait_yields(&queue, queue.mark_all_stale_active_dead(Utc::now(), reason)).await;
+        connection_wait_yields(&queue, queue.complete(&item.item_id, "worker")).await;
+
+        for key in ["fail", "fail_with"] {
+            let item = queue.enqueue(request(key)).await.unwrap().item;
+            connection_wait_yields(&queue, queue.claim_item(&item.item_id, "worker", 60, None))
+                .await;
+            if key == "fail" {
+                connection_wait_yields(&queue, queue.fail(&item.item_id, "worker", reason, None))
+                    .await;
+            } else {
+                connection_wait_yields(
+                    &queue,
+                    queue.fail_with(
+                        &item.item_id,
+                        "worker",
+                        Failure {
+                            error: reason,
+                            error_class: None,
+                            run_after: None,
+                        },
+                    ),
+                )
+                .await;
+            }
+        }
     }
 
     #[tokio::test]
