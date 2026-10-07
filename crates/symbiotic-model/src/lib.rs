@@ -4830,6 +4830,9 @@ fn is_known_finish_reason(reason: &str) -> bool {
             | "length"
             | "max_tokens"
             | "model_context_window_exceeded"
+            | "content_filter"
+            | "tool_calls"
+            | "function_call"
             | "other"
     )
 }
@@ -6892,6 +6895,9 @@ mod egress_http_tests {
             "length",
             "max_tokens",
             "model_context_window_exceeded",
+            "content_filter",
+            "tool_calls",
+            "function_call",
             "other",
         ] {
             let raw = serde_json::json!({"id":label,"model":label,
