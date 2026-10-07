@@ -995,8 +995,11 @@ impl Drop for ProcessLock {
 }
 
 fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
-    let path = dir.join("credential-process.lock");
-    symbiotic_ai_runtime::model::private_fs::ensure_private_file(&path)
+    lock_file(&dir.join("credential-process.lock"), false)
+}
+
+fn lock_file(path: &std::path::Path, wait: bool) -> Result<ProcessLock, EgressError> {
+    symbiotic_ai_runtime::model::private_fs::ensure_private_file(path)
         .map_err(|_| EgressError::StateUnavailable)?;
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -1006,7 +1009,8 @@ fn lock_process(dir: &std::path::Path) -> Result<ProcessLock, EgressError> {
     {
         use std::os::fd::AsRawFd;
         // SAFETY: the descriptor belongs to this live File; flock retains no pointer.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let operation = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
             return Err(EgressError::StateUnavailable);
         }
     }

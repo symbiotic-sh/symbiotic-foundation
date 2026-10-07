@@ -34,6 +34,19 @@ pub(super) fn until(mut check: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+pub(super) fn until_termination(check: impl FnMut() -> bool) {
+    until_termination_with_timeout(Duration::from_secs(60), check);
+}
+pub(super) fn until_termination_with_timeout(timeout: Duration, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !check() {
+        assert!(
+            Instant::now() < deadline,
+            "{timeout:?} termination hang guard fired"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 pub(super) fn alive(pid: u32) -> bool {
     // Linux containers may leave an exited orphan as a zombie until PID 1 reaps it.
     #[cfg(target_os = "linux")]

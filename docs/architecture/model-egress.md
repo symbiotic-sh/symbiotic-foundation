@@ -917,9 +917,15 @@ request debug capture and raw trace metadata forwarding are disabled. Provider-s
 cache isolation remains a provider-configuration/deployment responsibility; the broker does not
 claim control over a remote provider's private prefix-cache implementation.
 
-The process refuses an existing socket path instead of unlinking another listener.
-After a crash, the owner verifies the old process is stopped before removing its stale
-socket. Preserve the state directory to preserve single-use and accounting history.
+In socket mode, binders take an exclusive `flock` on the owner-only (`0600`)
+`<socket_path>.bind.lock` file beside the socket (for example, `egress.sock.bind.lock`
+for `egress.sock`), including when different state
+directories name the same socket. The lock covers the connection probe, stale
+socket removal, bind and permission setup, and is released when bind returns.
+Only `ECONNREFUSED` permits stale socket removal; a live listener or non-socket
+path is refused. Keep the lock file in place across restarts: removing it could
+let competing binders lock different inodes. Preserve the state directory to
+preserve single-use and accounting history.
 
 ## Evidence boundary
 

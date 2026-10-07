@@ -15,6 +15,35 @@ fn fixture(role: &str, dir: &Path) -> Command {
     common::fixture(&std::env::current_exe().unwrap(), role, dir)
 }
 
+fn full_stderr() -> std::io::PipeReader {
+    use std::os::fd::AsRawFd;
+    let (reader, writer) = std::io::pipe().unwrap();
+    let write_fd = writer.as_raw_fd();
+    // SAFETY: this isolated fixture owns both new descriptors and fd 2.
+    unsafe {
+        assert_eq!(libc::fcntl(write_fd, libc::F_SETFL, libc::O_NONBLOCK), 0);
+        let byte = b"x";
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "pipe fill hang guard");
+            if libc::write(write_fd, byte.as_ptr().cast(), 1) == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+        assert_eq!(libc::fcntl(write_fd, libc::F_SETFL, 0), 0);
+        assert_eq!(
+            libc::dup2(write_fd, libc::STDERR_FILENO),
+            libc::STDERR_FILENO
+        );
+        drop(writer);
+        reader // Keep the undrained reader open: writes must face EAGAIN, not EPIPE.
+    }
+}
+
 fn main() {
     let Ok(role) = std::env::var("SUPERVISE_TEST_ROLE") else {
         return;
@@ -27,6 +56,7 @@ fn main() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os("SUPERVISE_TEST_DIR").unwrap());
+    let _stderr_reader = std::env::var_os("SUPERVISE_TEST_FULL_STDERR").map(|_| full_stderr());
     if role == "closed-stdin-parent" {
         // Close all standard streams so both pipe ends need relocation.
         // SAFETY: this isolated fixture owns its standard descriptors.
@@ -51,14 +81,55 @@ fn main() {
     }
     if role == "shutdown-error-parent" {
         let child_dir = dir.clone();
-        let child = Supervisor::start(move || fixture("busy", &child_dir), policy()).unwrap();
+        let reap_error = std::env::var_os("SUPERVISE_TEST_REFUSE_KILL").is_some();
+        let child = Supervisor::start(
+            move || {
+                fixture(
+                    if reap_error {
+                        "exit-on-trigger"
+                    } else {
+                        "busy"
+                    },
+                    &child_dir,
+                )
+            },
+            policy(),
+        )
+        .unwrap();
         let pid = started(&child);
-        until(|| dir.join("busy.ready").exists());
+        until(|| {
+            dir.join(if reap_error {
+                "exit-on-trigger.ready"
+            } else {
+                "busy.ready"
+            })
+            .exists()
+        });
         assert!(
             matches!(child.stop(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EPERM))
         );
         assert!(!alive(pid), "shutdown failure must still kill and reap");
+        if reap_error {
+            let mut status = 0;
+            // SAFETY: probe only this managed child; WNOHANG cannot block.
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD),
+                "emergency cleanup must reap, not leave a zombie"
+            );
+        }
         std::process::exit(0);
+    }
+    if role == "full-stderr" {
+        watch_parent(|| Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap();
+        fs::write(dir.join("full-stderr.ready"), "ready").unwrap();
+        loop {
+            std::thread::park();
+        }
     }
     if role == "broken-stderr" {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -192,6 +263,10 @@ fn main() {
         }
     }
     fs::write(dir.join(format!("{role}.ready")), "ready").unwrap();
+    if role == "exit-on-trigger" {
+        common::until_termination(|| dir.join("exit-trigger").exists());
+        return;
+    }
     // Parent watcher runs independently while the main thread is occupied.
     loop {
         std::hint::spin_loop();

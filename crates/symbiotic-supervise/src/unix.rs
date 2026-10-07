@@ -1,7 +1,7 @@
 use crate::{Error, Policy};
 use std::{
     collections::HashSet,
-    io::{self, Read, Write},
+    io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::process::CommandExt,
@@ -15,9 +15,88 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Queued diagnostics beyond this are dropped while stderr does not drain.
+const DIAGNOSTIC_QUEUE: usize = 16;
+// The parent-death watcher waits at most this long for its diagnostic before exit.
+const EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_secs(1);
+
+type Diagnostic = (Vec<u8>, Option<mpsc::SyncSender<()>>);
+// A failed writer start is not remembered: the next diagnostic tries again.
+static DIAGNOSTICS: Mutex<Option<mpsc::SyncSender<Diagnostic>>> = Mutex::new(None);
+
+/// Drop and termination diagnostics are best effort and never make the caller
+/// wait on stderr. One writer thread performs ordinary blocking writes, so fd 2's
+/// file status flags, which the app and every process that inherited its stderr
+/// share, are never changed. A message is dropped only when the queue is full.
 pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    // Diagnostics must not interrupt emergency cleanup or process termination.
-    let _ = writeln!(io::stderr().lock(), "{message}");
+    queue_diagnostic(message, None);
+}
+
+/// Like `diagnostic`, but waits up to `EXIT_DIAGNOSTIC_WAIT` for the write
+/// because the process exits next and the writer thread ends with it.
+fn diagnostic_before_exit(message: std::fmt::Arguments<'_>) {
+    let (written, done) = mpsc::sync_channel(1);
+    if queue_diagnostic(message, Some(written)) {
+        let _ = done.recv_timeout(EXIT_DIAGNOSTIC_WAIT);
+    }
+}
+
+fn queue_diagnostic(
+    message: std::fmt::Arguments<'_>,
+    written: Option<mpsc::SyncSender<()>>,
+) -> bool {
+    let Ok(mut diagnostics) = DIAGNOSTICS.lock() else {
+        return false;
+    };
+    if diagnostics.is_none() {
+        let (tx, rx) = mpsc::sync_channel::<Diagnostic>(DIAGNOSTIC_QUEUE);
+        let started = std::thread::Builder::new()
+            .name("foundation-diagnostics".into())
+            .spawn(move || {
+                for (bytes, written) in rx {
+                    write_diagnostic(&bytes, |remaining| {
+                        // SAFETY: write borrows the live message buffer.
+                        let count = unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                remaining.as_ptr().cast(),
+                                remaining.len(),
+                            )
+                        };
+                        if count == -1 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(count as usize)
+                        }
+                    });
+                    if let Some(written) = written {
+                        let _ = written.send(());
+                    }
+                }
+            });
+        if started.is_err() {
+            return false;
+        }
+        *diagnostics = Some(tx);
+    }
+    diagnostics.as_ref().is_some_and(|sender| {
+        sender
+            .try_send((format!("{message}\n").into_bytes(), written))
+            .is_ok()
+    })
+}
+
+fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
+    while !bytes.is_empty() {
+        match write(bytes) {
+            Ok(0) => break,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // Any other error ends this message, including WouldBlock when the
+            // app itself made stderr nonblocking.
+            Err(_) => break,
+        }
+    }
 }
 
 const PARENT_FD: &str = "SYMBIOTIC_PARENT_FD";
@@ -66,7 +145,10 @@ impl Drop for Writer {
                     drop(fd);
                 }
             }
-            Err(_) => diagnostic(format_args!("parent pipe registry unavailable")),
+            Err(_) => {
+                drop(self.0.take());
+                diagnostic(format_args!("parent pipe registry unavailable"));
+            }
         }
     }
 }
@@ -120,10 +202,13 @@ impl Drop for ManagedChild {
     fn drop(&mut self) {
         if !self.reaped {
             // Emergency cleanup on an error path. Explicit shutdown reports errors.
-            if let Err(error) = self.child.kill() {
+            let killed = self.child.kill();
+            let reaped = self.child.wait();
+            // Complete both cleanup operations before reporting either failure.
+            if let Err(error) = killed {
                 diagnostic(format_args!("child kill failed: {error}"));
             }
-            if let Err(error) = self.child.wait() {
+            if let Err(error) = reaped {
                 diagnostic(format_args!("child reap failed: {error}"));
             }
         }
@@ -266,7 +351,7 @@ pub fn watch_parent(
                 }
             };
             if let Err(error) = cleanup() {
-                diagnostic(format_args!("parent-death cleanup failed: {error}"));
+                diagnostic_before_exit(format_args!("parent-death cleanup failed: {error}"));
                 std::process::exit(1);
             }
             std::process::exit(code);
@@ -274,8 +359,63 @@ pub fn watch_parent(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
+    use super::write_diagnostic;
+    use std::io;
+
+    #[test]
+    fn diagnostic_continues_after_partial_writes() {
+        let message = b"cleanup failed\n";
+        let mut output = Vec::new();
+        let mut calls = 0;
+        write_diagnostic(message, |remaining| {
+            calls += 1;
+            assert!(calls <= message.len(), "partial writes must make progress");
+            let count = remaining.len().min(3);
+            output.extend_from_slice(&remaining[..count]);
+            Ok(count)
+        });
+        assert_eq!(output, message);
+    }
+
+    #[test]
+    fn diagnostic_continues_after_interruption() {
+        let message = b"cleanup failed\n";
+        let mut calls = 0;
+        let mut output = Vec::new();
+        write_diagnostic(message, |remaining| {
+            calls += 1;
+            assert!(calls <= 2, "interrupted write must finish on the next call");
+            if calls == 1 {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                output.extend_from_slice(remaining);
+                Ok(remaining.len())
+            }
+        });
+        assert_eq!(output, message);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn diagnostic_stops_when_output_cannot_progress() {
+        for outcome in [
+            Ok(0),
+            Err(io::ErrorKind::WouldBlock),
+            Err(io::ErrorKind::BrokenPipe),
+        ] {
+            let mut calls = 0;
+            write_diagnostic(b"cleanup failed\n", |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "must not retry output that cannot progress");
+                outcome.map_err(io::Error::from)
+            });
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn parent_mismatch_exits_after_arming_death_signal() {
         // SAFETY: the fork child performs only the async-signal-safe setup and _exit;

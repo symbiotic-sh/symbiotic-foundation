@@ -2,11 +2,11 @@
 use std::{
     fs,
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 mod common;
-use common::{alive, policy, started, until};
+use common::{alive, policy, started, until, until_termination};
 
 use symbiotic_supervise::{Error, Event, Supervisor};
 
@@ -29,6 +29,59 @@ impl Drop for Reap {
         let _ = self.0.wait();
     }
 }
+fn c_compiler(configured: Option<&str>) -> Command {
+    let mut compiler = configured.unwrap_or("cc").split_whitespace();
+    let mut command = Command::new(compiler.next().expect("C compiler executable"));
+    command.args(compiler);
+    command
+}
+
+fn compiler_output(mut command: Command, dir: &Path, timeout: Duration) -> Output {
+    // Files retain both streams without risking a full capture pipe during the wait.
+    let stdout = dir.join("compiler.stdout");
+    let stderr = dir.join("compiler.stderr");
+    let mut compiler = Reap(
+        command
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    common::until_termination_with_timeout(timeout, || compiler.0.try_wait().unwrap().is_some());
+    Output {
+        status: compiler.0.wait().unwrap(),
+        stdout: fs::read(stdout).unwrap(),
+        stderr: fs::read(stderr).unwrap(),
+    }
+}
+
+#[test]
+fn compiler_defaults_to_platform_cc_when_unconfigured() {
+    assert_eq!(c_compiler(None).get_program(), "cc");
+}
+
+#[test]
+fn compiler_preserves_configured_wrapper_and_arguments() {
+    let command = c_compiler(Some("cache-wrapper clang -O2"));
+    assert_eq!(command.get_program(), "cache-wrapper");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["clang", "-O2"]);
+}
+
+#[test]
+fn compiler_failure_preserves_both_output_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf compiler-out; printf compiler-error >&2; exit 7",
+    ]);
+    let output = compiler_output(command, dir.path(), Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"compiler-out");
+    assert_eq!(output.stderr, b"compiler-error");
+}
+
 fn read_pid(path: &Path) -> u32 {
     until(|| fs::read_to_string(path).is_ok_and(|text| text.trim().parse::<u32>().is_ok()));
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
@@ -164,21 +217,17 @@ fn closed_standard_streams_do_not_replace_the_parent_pipe() {
 
 #[test]
 fn cleanup_failure_exits_even_with_a_broken_stderr_pipe() {
-    use std::os::{
-        fd::{FromRawFd, OwnedFd},
-        unix::process::CommandExt,
-    };
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let dir = tempfile::tempdir().unwrap();
-    let mut fds = [-1; 2];
-    // SAFETY: pipe initializes two uniquely owned descriptors.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (reader, writer) = std::io::pipe().unwrap();
+    let read_fd = reader.as_raw_fd();
     let mut command = fixture("broken-stderr", dir.path());
-    command.env("SYMBIOTIC_PARENT_FD", fds[0].to_string());
-    // SAFETY: pre_exec closes only the test's inherited writer.
+    command.env("SYMBIOTIC_PARENT_FD", read_fd.to_string());
+    // The pipe is close-on-exec, so unrelated fixtures cannot retain its writer.
+    // SAFETY: pre_exec explicitly inherits only this child's parent reader.
     unsafe {
         command.pre_exec(move || {
-            if libc::close(fds[1]) != 0 {
+            if libc::fcntl(read_fd, libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -192,19 +241,111 @@ fn cleanup_failure_exits_even_with_a_broken_stderr_pipe() {
     assert_eq!(child.0.wait().unwrap().code(), Some(1));
 }
 
+#[test]
+fn cleanup_failure_writes_its_diagnostic_before_exit() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let dir = tempfile::tempdir().unwrap();
+    let stderr = dir.path().join("watcher.stderr");
+    let (reader, writer) = std::io::pipe().unwrap();
+    let read_fd = reader.as_raw_fd();
+    let mut command = fixture("full-stderr", dir.path());
+    command
+        .env("SYMBIOTIC_PARENT_FD", read_fd.to_string())
+        .stderr(fs::File::create(&stderr).unwrap());
+    // The pipe is close-on-exec, so unrelated fixtures cannot retain its writer.
+    // SAFETY: pre_exec explicitly inherits only this child's parent reader.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(read_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(reader);
+    until_termination(|| dir.path().join("full-stderr.ready").exists());
+    drop(writer);
+    until_termination(|| child.0.try_wait().unwrap().is_some());
+    assert_eq!(child.0.wait().unwrap().code(), Some(1));
+    let written = fs::read_to_string(&stderr).unwrap();
+    assert!(
+        written.contains("parent-death cleanup failed"),
+        "writable stderr must receive the diagnostic, got {written:?}"
+    );
+}
+
+#[test]
+fn full_stderr_does_not_block_parent_death_exit() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let dir = tempfile::tempdir().unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let read_fd = reader.as_raw_fd();
+    let mut command = fixture("full-stderr", dir.path());
+    command
+        .env("SYMBIOTIC_PARENT_FD", read_fd.to_string())
+        .env("SUPERVISE_TEST_FULL_STDERR", "1");
+    // The pipe is close-on-exec, so unrelated fixtures cannot retain its writer.
+    // SAFETY: pre_exec explicitly inherits only this child's parent reader.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(read_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(reader);
+    until_termination(|| dir.path().join("full-stderr.ready").exists());
+    drop(writer);
+    until_termination(|| child.0.try_wait().unwrap().is_some());
+    assert_eq!(child.0.wait().unwrap().code(), Some(1));
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn shutdown_error_returns_after_emergency_cleanup() {
+    shutdown_error(false);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn full_stderr_does_not_block_emergency_reaping() {
+    shutdown_error(true);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shutdown_error(refuse_kill: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = fixture("shutdown-error-parent", dir.path());
-    #[cfg(target_os = "macos")]
-    {
-        let library = dir.path().join("refuse-term.dylib");
-        let compiler = std::env::var("CC").expect("configured compiler cache");
-        let mut compiler = compiler.split_whitespace();
-        let output = Command::new(compiler.next().unwrap())
-            .args(compiler)
-            .args(["-O2", "-dynamiclib"])
+    if refuse_kill {
+        command
+            .env("SUPERVISE_TEST_REFUSE_KILL", "1")
+            .env("SUPERVISE_TEST_FULL_STDERR", "1")
+            .env(
+                "SUPERVISE_TEST_EXIT_TRIGGER",
+                dir.path().join("exit-trigger"),
+            );
+    }
+    if cfg!(target_os = "macos") || refuse_kill {
+        let library = dir.path().join(if cfg!(target_os = "macos") {
+            "refuse-term.dylib"
+        } else {
+            "refuse-term.so"
+        });
+        let configured = std::env::var_os("CC");
+        let mut compiler = c_compiler(
+            configured
+                .as_deref()
+                .map(|value| value.to_str().expect("CC must be valid UTF-8")),
+        );
+        compiler
+            .args(if cfg!(target_os = "macos") {
+                vec!["-O2", "-dynamiclib"]
+            } else {
+                vec!["-O2", "-shared", "-fPIC", "-ldl"]
+            })
             .arg(
                 std::path::Path::new(
                     &std::env::var_os("CARGO_MANIFEST_DIR")
@@ -213,18 +354,25 @@ fn shutdown_error_returns_after_emergency_cleanup() {
                 .join("tests/refuse_term.c"),
             )
             .arg("-o")
-            .arg(&library)
-            .output()
-            .unwrap();
+            .arg(&library);
+        let output = compiler_output(compiler, dir.path(), Duration::from_secs(60));
         assert!(
             output.status.success(),
-            "{}",
+            "compiler stdout:\n{}\ncompiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        command.env("DYLD_INSERT_LIBRARIES", library);
+        command.env(
+            if cfg!(target_os = "macos") {
+                "DYLD_INSERT_LIBRARIES"
+            } else {
+                "LD_PRELOAD"
+            },
+            library,
+        );
     }
     #[cfg(target_os = "linux")]
-    {
+    if !refuse_kill {
         use std::os::unix::process::CommandExt;
         // SAFETY: pre_exec uses only prctl and preallocated seccomp data.
         unsafe {
@@ -291,7 +439,7 @@ fn shutdown_error_returns_after_emergency_cleanup() {
         }
     }
     let mut parent = Reap(command.spawn().unwrap());
-    until(|| parent.0.try_wait().unwrap().is_some());
+    until_termination(|| parent.0.try_wait().unwrap().is_some());
     assert!(parent.0.wait().unwrap().success());
 }
 

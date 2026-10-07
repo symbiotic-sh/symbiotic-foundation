@@ -7,14 +7,19 @@ use symbiotic_egress::{
 };
 use tokio::{net::UnixListener, sync::Semaphore};
 
-/// Bind while holding the state lock, removing only a stale socket.
-/// The lock proves the previous state owner has exited. An active listener or
-/// non-socket path is refused, even if a different state directory names it.
+/// Bind under the state lock and an exclusive `<socket_path>.bind.lock` flock.
+/// The socket lock serializes probe, stale unlink and bind across state owners.
+/// An active listener or non-socket path is always refused.
 pub fn bind(process: &CredentialProcess) -> Result<UnixListener, EgressError> {
     let path = &process.config().socket_path;
     let parent = path.parent().ok_or(EgressError::InvalidRequest)?;
     symbiotic_ai_runtime::model::private_fs::check_private_dir(parent)
         .map_err(|_| EgressError::StateUnavailable)?;
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".bind.lock");
+    // Open a separate descriptor on every bind, even for cloned state owners.
+    // Keep the lock file: unlinking it would let binders lock different inodes.
+    let _socket_lock = crate::lock_file(std::path::Path::new(&lock_path), true)?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             use std::os::unix::fs::FileTypeExt;
