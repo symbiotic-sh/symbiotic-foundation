@@ -2258,6 +2258,20 @@ where
             }
             if !matches!(reserve, Ok(true)) {
                 let err = reserve.err().unwrap_or_else(spend::reconciliation);
+                // A parallel replay can finish between our recovery lookup
+                // and the atomic reservation refusal. Its answer is paid for.
+                let err = match this.recovered::<Res>().await {
+                    Ok(Some(response)) => {
+                        let completed = queue.complete(&item.item_id, worker_id).await;
+                        return Ok(Settled::Succeeded {
+                            response,
+                            provider_ms: 0,
+                            completed,
+                        });
+                    }
+                    Ok(None) => err,
+                    Err(recovery_err) => err.with_diagnostics([recovery_err.code()]),
+                };
                 let (err, failed) = this.abort_before_dispatch(&item, None, err).await;
                 failed.map_err(queue_error)?;
                 return Err(err);
