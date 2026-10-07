@@ -3113,9 +3113,10 @@ async fn within_timeout<T>(
 
 /// Run `work` while renewing its item's lease every third of the lease.
 ///
-/// The renewal is part of this future, not a task of its own, so it cannot
-/// outlive `work`: it ends when `work` does, or earlier once a renewal fails
-/// because the lease was lost.
+/// The renewal is part of this future, not a task of its own. An in-flight
+/// heartbeat is drained before returning or propagating a panic from `work`,
+/// because a backend may already have dispatched uncancellable database work.
+/// No further renewal starts after `work` ends or a renewal fails.
 #[cfg(feature = "queue")]
 async fn holding_lease<T>(
     queue: &dyn QueueBackend,
@@ -3125,26 +3126,43 @@ async fn holding_lease<T>(
     ownership_lost: Arc<std::sync::atomic::AtomicBool>,
     work: impl std::future::Future<Output = T>,
 ) -> T {
-    let renew = async {
-        let interval =
-            Duration::from_millis((lease_seconds.saturating_mul(1000) / 3).clamp(1, 60_000));
-        loop {
-            tokio::time::sleep(interval).await;
-            if queue
-                .heartbeat(item_id, worker_id, lease_seconds)
-                .await
-                .is_err()
-            {
-                ownership_lost.store(true, std::sync::atomic::Ordering::SeqCst);
-                return;
-            }
+    let mut work = std::pin::pin!(work);
+    let work = std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    });
+    let mut work = std::pin::pin!(work);
+    let interval = Duration::from_millis((lease_seconds.saturating_mul(1000) / 3).clamp(1, 60_000));
+    let output = loop {
+        tokio::select! {
+            biased;
+            output = &mut work => break output,
+            () = tokio::time::sleep(interval) => {},
+        }
+        let mut heartbeat = std::pin::pin!(queue.heartbeat(item_id, worker_id, lease_seconds));
+        let (output, renewal) = tokio::select! {
+            biased;
+            // Start the heartbeat before polling work again, so the drain
+            // never starts a previously unpolled renewal after work ends.
+            renewal = &mut heartbeat => (None, renewal),
+            output = &mut work => (Some(output), heartbeat.await),
+        };
+        let lost = renewal.is_err();
+        if lost {
+            ownership_lost.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(output) = output {
+            break output;
+        }
+        if lost {
+            break work.await;
         }
     };
-    let mut work = std::pin::pin!(work);
-    tokio::select! {
-        biased;
-        output = &mut work => output,
-        () = renew => work.await,
+    match output {
+        Ok(output) => output,
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
