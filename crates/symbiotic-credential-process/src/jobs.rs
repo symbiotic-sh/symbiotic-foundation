@@ -367,6 +367,7 @@ impl CredentialProcess {
                 provider::route_binding(&self.inner.runtime, route, self.job_provider(route)?)?
                     .with_response_cache(ResponseCacheMode::Off);
             let config = self.inner.config.job_runner.clone();
+            let poll = std::time::Duration::from_millis(config.poll_interval_ms);
             let runner = match route.provider {
                 RouteProvider::OpenAiChat { .. } | RouteProvider::AnthropicChat { .. } => {
                     jobs.start_chat(binding, config, route.route.clone()).await
@@ -386,7 +387,39 @@ impl CredentialProcess {
                 }
             }
             .map_err(|_| EgressError::StateUnavailable)?;
-            runners.insert(key, Some(runner));
+            runners.insert(key.clone(), Some(runner));
+            let process = Arc::downgrade(&self.inner);
+            let jobs = jobs.clone();
+            let kind = route.route.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(poll).await;
+                    let Some(process) = process.upgrade() else {
+                        return;
+                    };
+                    let mut runners = process.job_runners.lock().await;
+                    if Self::check_job_runner(&mut runners, &key).await.is_err()
+                        || !runners.contains_key(&key)
+                    {
+                        return;
+                    }
+                    // Keep the attachment lock from the canonical lookup through
+                    // shutdown/removal. Enqueue's start_jobs either keeps this
+                    // runner for new work or starts one after retirement.
+                    let needed = jobs.needs_execution(kind.clone()).await;
+                    if matches!(needed, Ok(true)) {
+                        continue;
+                    }
+                    if let Some(runner) = runners.insert(key.clone(), None).flatten() {
+                        // Successful shutdown is the drained result. Failure
+                        // keeps the marker so subsequent operations report it.
+                        if runner.shutdown().await.is_ok() && needed.is_ok() {
+                            runners.remove(&key);
+                        }
+                    }
+                    return;
+                }
+            });
         }
         Ok(())
     }
@@ -734,6 +767,321 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use symbiotic_queue::jobs::{Enqueued, JobConfig, JobState};
+
+    struct RetirementFixture {
+        process: CredentialProcess,
+        jobs: ModelJobs,
+        scope: JobScope,
+        key: String,
+        server: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for RetirementFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl RetirementFixture {
+        async fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let dir = tempfile::tempdir().unwrap();
+            let admission = dir.path().join("admission");
+            std::fs::write(&admission, [0u8; 32]).unwrap();
+            std::fs::set_permissions(&admission, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                        let mut request = Vec::new();
+                        loop {
+                            let mut bytes = [0; 4096];
+                            let count = stream.read(&mut bytes).await.unwrap();
+                            assert_ne!(count, 0);
+                            request.extend_from_slice(&bytes[..count]);
+                            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&request[..end]);
+                                let len: usize = headers.lines().find_map(|line| {
+                                    line.to_ascii_lowercase().strip_prefix("content-length: ")?.parse().ok()
+                                }).unwrap();
+                                if request.len() >= end + 4 + len { break; }
+                            }
+                        }
+                        let body = r#"{"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }).await.unwrap();
+                }
+            });
+            let config = serde_json::from_value(serde_json::json!({
+                "version": PROTOCOL_VERSION, "state_dir": dir.path().join("state"),
+                "socket_path": dir.path().join("unused.sock"),
+                "admission_key": {"backend": "owner_only_file", "path": admission},
+                "max_secret_bytes": 4096, "max_frame_bytes": 262144,
+                "max_connections": 8, "io_timeout_seconds": 2,
+                "job_runner": {"version": 1, "worker_count": 1, "poll_interval_ms": 1,
+                    "heartbeat_interval_ms": null, "maintenance_interval_ms": 60000},
+                "routes": [{"tenant": "tenant", "account": "account", "account_sharing_key": null,
+                    "max_attempts": 1, "route": "chat", "secret_ref": "", "secret": {"backend": "none"},
+                    "destination": format!("http://{address}/v1"), "model": "test-model",
+                    "provider": {"kind": "open_ai_chat", "operator": "test"},
+                    "allow_loopback_http": true, "max_field_bytes": 1024, "max_output_tokens": 10,
+                    "max_input_bytes": 32768, "max_response_bytes": 32768,
+                    "max_in_flight": 1, "requests_per_minute": null, "input_units_per_minute": null,
+                    "timeout_seconds": 1}]
+            })).unwrap();
+            let process = CredentialProcess::open(config).unwrap();
+            let scope = JobScope {
+                tenant: "tenant".into(),
+                incarnation: "incarnation".into(),
+                queue: "jobs".into(),
+            };
+            // Trusted embedded jobs avoid signed-admission setup; the actual route
+            // runner, store, retirement watcher and attachment lock are unchanged.
+            let jobs = process
+                .inner
+                .runtime
+                .model_jobs(scope.clone(), JobConfig::default())
+                .unwrap();
+            let key = serde_json::to_string(&(&scope, "chat")).unwrap();
+            Self {
+                process,
+                jobs,
+                scope,
+                key,
+                server,
+                _dir: dir,
+            }
+        }
+
+        async fn enqueue(&self, key: &str) -> JobId {
+            let route = &self.process.inner.config.routes[0];
+            let binding = provider::route_binding(
+                &self.process.inner.runtime,
+                route,
+                self.process.job_provider(route).unwrap(),
+            )
+            .unwrap();
+            let request = ChatRequest {
+                messages: vec![model::ChatMessage {
+                    role: "user".into(),
+                    content: "input".into(),
+                }],
+                max_output_tokens: Some(10),
+                temperature: None,
+                response_format: None,
+                role_binding: None,
+                source: None,
+                metadata: serde_json::Value::Null,
+            };
+            let spec = JobSpec {
+                key: key.into(),
+                group: None,
+                owners: vec![],
+                kind: "chat".into(),
+                execution: Execution::Model,
+                payload: model_job_payload(&binding, &request).unwrap(),
+                admission: None,
+                limits: JobLimits { max_attempts: 1 },
+                recovery_until: None,
+            };
+            let JobResponse::Enqueued(items) = self
+                .jobs
+                .request(JobRequest::Enqueue(vec![spec]))
+                .await
+                .unwrap()
+            else {
+                panic!("enqueue")
+            };
+            let Enqueued::Inserted(id) = &items[0] else {
+                panic!("inserted")
+            };
+            id.clone()
+        }
+
+        async fn succeeded(&self, id: &JobId) {
+            loop {
+                let JobResponse::Job(Some(row)) = self
+                    .jobs
+                    .request(JobRequest::Status(id.clone()))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("status")
+                };
+                if row.state == JobState::Succeeded {
+                    return;
+                }
+                assert!(row.state.unfinished(), "job failed: {:?}", row.state);
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn drain_barrier(
+            &self,
+            fail: bool,
+        ) -> (
+            Arc<tokio::sync::Semaphore>,
+            Arc<AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let first = self.enqueue("first").await;
+            self.process
+                .start_jobs(&self.scope, &self.jobs, Some("chat"))
+                .await
+                .unwrap();
+            let mut runners = self.process.inner.job_runners.lock().await;
+            self.succeeded(&first).await;
+            // Hold the real attachment lock so the real watcher cannot retire
+            // before a deterministic shutdown barrier is installed.
+            runners
+                .remove(&self.key)
+                .flatten()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+            let draining = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let tick = Arc::new(tokio::sync::Notify::new());
+            let runner = JobRunner::start_owned(
+                1,
+                {
+                    let polls = polls.clone();
+                    let tick = tick.clone();
+                    move |mut stop| {
+                        let polls = polls.clone();
+                        let tick = tick.clone();
+                        async move {
+                            loop {
+                                if *stop.borrow() {
+                                    return Ok(());
+                                }
+                                polls.fetch_add(1, Ordering::SeqCst);
+                                tokio::select! { _ = stop.changed() => {}, _ = tick.notified() => {} }
+                            }
+                        }
+                    }
+                },
+                {
+                    let draining = draining.clone();
+                    let release = release.clone();
+                    move |mut stop| async move {
+                        while !*stop.borrow_and_update() {
+                            stop.changed().await.unwrap();
+                        }
+                        draining.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        if fail {
+                            Err(symbiotic_queue::runner::RunnerError::Store(
+                                JobError::Storage,
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+            );
+            runners.insert(self.key.clone(), Some(runner));
+            while polls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            drop(runners);
+            draining.acquire().await.unwrap().forget();
+            (release, polls, tick)
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_scope_removes_runner_and_stops_polling() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let fixture = RetirementFixture::new().await;
+            let (release, polls, tick) = fixture.drain_barrier(false).await;
+            release.add_permits(1);
+            loop {
+                if fixture.process.inner.job_runners.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let before = polls.load(Ordering::SeqCst);
+            tick.notify_one();
+            fixture
+                .process
+                .check_job_runners(&fixture.scope)
+                .await
+                .unwrap();
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                before,
+                "joined workers cannot poll again"
+            );
+            eprintln!(
+                "drained scope: attachment removed; worker and maintenance joined; polls={before}"
+            );
+        })
+        .await
+        .expect("60 s drain hang guard");
+    }
+
+    #[tokio::test]
+    async fn enqueue_racing_drain_starts_runner_and_completes_job() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let fixture = RetirementFixture::new().await;
+            let (release, _, _) = fixture.drain_barrier(false).await;
+            // Canonical enqueue commits while retirement holds the attachment
+            // lock and awaits maintenance. start_jobs must wait, then replace it.
+            let next = fixture.enqueue("next").await;
+            assert!(fixture.process.inner.job_runners.try_lock().is_err());
+            let process = fixture.process.clone();
+            let jobs = fixture.jobs.clone();
+            let scope = fixture.scope.clone();
+            let start =
+                tokio::spawn(async move { process.start_jobs(&scope, &jobs, Some("chat")).await });
+            release.add_permits(1);
+            start.await.unwrap().unwrap();
+            fixture.succeeded(&next).await;
+            eprintln!("enqueue during retirement: replacement runner completed the job");
+        })
+        .await
+        .expect("60 s enqueue/drain hang guard");
+    }
+
+    #[tokio::test]
+    async fn drained_scope_preserves_real_runner_failure() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let fixture = RetirementFixture::new().await;
+            let (release, _, _) = fixture.drain_barrier(true).await;
+            release.add_permits(1);
+            let runners = fixture.process.inner.job_runners.lock().await;
+            assert!(
+                runners.get(&fixture.key).unwrap().is_none(),
+                "maintenance failure must leave the failure marker"
+            );
+            drop(runners);
+            for _ in 0..2 {
+                assert!(matches!(
+                    fixture.process.check_job_runners(&fixture.scope).await,
+                    Err(EgressError::StateUnavailable)
+                ));
+            }
+            assert!(matches!(
+                fixture
+                    .process
+                    .start_jobs(&fixture.scope, &fixture.jobs, Some("chat"))
+                    .await,
+                Err(EgressError::StateUnavailable)
+            ));
+            eprintln!("drained scope: real maintenance failure remains StateUnavailable");
+        })
+        .await
+        .expect("60 s failure visibility hang guard");
+    }
 
     #[derive(Clone)]
     struct CountedChat {
