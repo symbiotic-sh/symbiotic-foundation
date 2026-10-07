@@ -2377,12 +2377,16 @@ async fn trial_enqueue_clamps_preexisting_answer_and_adoption_preserves_deadline
             wait_state(&j, &id, JobState::Succeeded).await;
             runner.shutdown().await.unwrap();
         }
-        let deadline: String = sql(dir.path())
+        let deadline: Option<String> = sql(dir.path())
             .query_row("SELECT recovery_expires_at FROM spend_receipts", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert!(chrono::DateTime::parse_from_rfc3339(&deadline).unwrap() <= until);
+        if let Some(deadline) = deadline {
+            assert!(chrono::DateTime::parse_from_rfc3339(&deadline).unwrap() <= until);
+        } else {
+            assert_eq!(copies(dir.path()), 0);
+        }
         tokio::time::sleep(
             (until - chrono::Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(5),
         )

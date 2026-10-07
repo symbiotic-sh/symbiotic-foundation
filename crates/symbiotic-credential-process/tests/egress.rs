@@ -7172,16 +7172,6 @@ async fn regression_egress_classification_rejects_cache_contradictions() {
 }
 
 #[tokio::test]
-async fn regression_invalid_provider_json_preserves_charge_and_budget_openai() {
-    invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
-}
-
-#[tokio::test]
-async fn regression_invalid_provider_json_preserves_charge_and_budget_anthropic() {
-    invalid_provider_json_preserves_charge_and_budget(true, "invalid JSON").await;
-}
-
-#[tokio::test]
 async fn regression_wrong_shape_matches_unparsable_send_count_openai() {
     let wrong_shape = invalid_provider_json_preserves_charge_and_budget(false, "{}").await;
     let unparsable = invalid_provider_json_preserves_charge_and_budget(false, "invalid JSON").await;
@@ -7824,7 +7814,10 @@ async fn regression_request_budget_answer_rejections_share_allowance_across_rest
                     &fixture.config.state_dir,
                     ANSWER_RECOVERY_MARKER
                 ));
-                assert!(!state_has_bytes(&fixture.config.state_dir, "hello"));
+                assert!(!state_has_bytes(
+                    &fixture.config.state_dir,
+                    "private test input"
+                ));
                 assert!(!state_has_bytes(&fixture.config.state_dir, SECRET));
             }
         }
