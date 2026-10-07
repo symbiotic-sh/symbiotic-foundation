@@ -578,6 +578,8 @@ pub enum Operation {
     AckJobs(Box<SignedJobsRequest>),
     /// Scoped job cancellation.
     CancelJobs(Box<SignedJobsRequest>),
+    /// Scoped erasure of an input owner's job copies and recovery answers.
+    PurgeOwner(Box<SignedJobsRequest>),
     /// Content-free scoped job status.
     JobStatus(Box<SignedJobsRequest>),
     /// Verify durable admission and issue its single-use permit.

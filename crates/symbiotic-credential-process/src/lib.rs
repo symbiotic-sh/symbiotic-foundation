@@ -440,44 +440,46 @@ impl CredentialProcess {
         operation: Operation,
         answer_validator: Option<AnswerValidator>,
     ) -> Result<Reply, EgressError> {
-        self.purge_expired_results()?;
+        // Reject mismatched job envelopes before any expiry maintenance.
+        let command_matches = match &operation {
+            Operation::EnqueueJobs(signed) => {
+                matches!(signed.request.command, JobsCommand::EnqueueJobs(_))
+            }
+            Operation::AdmitJob(signed) => {
+                matches!(signed.request.command, JobsCommand::AdmitJob { .. })
+            }
+            Operation::Completions(signed) => {
+                matches!(signed.request.command, JobsCommand::Completions { .. })
+            }
+            Operation::AckJobs(signed) => {
+                matches!(signed.request.command, JobsCommand::AckJobs(_))
+            }
+            Operation::CancelJobs(signed) => {
+                matches!(signed.request.command, JobsCommand::CancelJobs(_))
+            }
+            Operation::JobStatus(signed) => {
+                matches!(signed.request.command, JobsCommand::JobStatus(_))
+            }
+            Operation::PurgeOwner(signed) => {
+                matches!(signed.request.command, JobsCommand::PurgeOwner(_))
+            }
+            _ => true,
+        };
+        if !command_matches {
+            return Err(EgressError::InvalidRequest);
+        }
+        // Owner erasure validates its MAC and scope before even expiry maintenance.
+        if !matches!(&operation, Operation::PurgeOwner(_)) {
+            self.purge_expired_results()?;
+        }
         match operation {
             Operation::EnqueueJobs(signed)
-                if matches!(signed.request.command, JobsCommand::EnqueueJobs(_)) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::AdmitJob(signed)
-                if matches!(signed.request.command, JobsCommand::AdmitJob { .. }) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::Completions(signed)
-                if matches!(signed.request.command, JobsCommand::Completions { .. }) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::AckJobs(signed)
-                if matches!(signed.request.command, JobsCommand::AckJobs(_)) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::CancelJobs(signed)
-                if matches!(signed.request.command, JobsCommand::CancelJobs(_)) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::JobStatus(signed)
-                if matches!(signed.request.command, JobsCommand::JobStatus(_)) =>
-            {
-                self.jobs_operation(*signed).await
-            }
-            Operation::EnqueueJobs(_)
-            | Operation::AdmitJob(_)
-            | Operation::Completions(_)
-            | Operation::AckJobs(_)
-            | Operation::CancelJobs(_)
-            | Operation::JobStatus(_) => Err(EgressError::InvalidRequest),
+            | Operation::AdmitJob(signed)
+            | Operation::Completions(signed)
+            | Operation::AckJobs(signed)
+            | Operation::CancelJobs(signed)
+            | Operation::JobStatus(signed)
+            | Operation::PurgeOwner(signed) => self.jobs_operation(*signed).await,
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
                 let foundation_now = registry::now()?;
