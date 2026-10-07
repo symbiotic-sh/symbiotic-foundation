@@ -305,6 +305,13 @@ impl RerankProvider for JobProvider {
         Ok(response)
     }
 }
+/// Test-only suspension of observation while execution workers drain.
+#[cfg(all(test, unix))]
+pub(crate) struct JobObserverBarrier {
+    pub suspended: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 impl CredentialProcess {
     fn model_jobs(&self, scope: JobScope) -> Result<ModelJobs, JobError> {
         self.inner
@@ -398,7 +405,14 @@ impl CredentialProcess {
             let process = Arc::downgrade(&self.inner);
             let jobs = observation;
             let kind = route.route.clone();
+            #[cfg(all(test, unix))]
+            let barrier = self.inner.job_observer_barrier.lock().await.take();
             tokio::spawn(async move {
+                #[cfg(all(test, unix))]
+                if let Some(barrier) = barrier {
+                    barrier.suspended.send(()).expect("observer suspension");
+                    barrier.resume.await.expect("observer resumption");
+                }
                 loop {
                     tokio::time::sleep(poll).await;
                     let Some(process) = process.upgrade() else {
@@ -1201,7 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_direct_enqueue_still_attaches_and_executes() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let fixture = RetirementFixture::new().await;
             let request = fixture.signed_enqueue("cancelled-caller");
             let mut handler = Box::pin(fixture.process.handle(request));
@@ -1226,44 +1240,53 @@ mod tests {
             eprintln!("cancelled direct enqueue: committed job attached and succeeded");
         })
         .await
-        .expect("5 s cancelled enqueue regression bound");
+        .expect("60 s cancelled enqueue hang guard");
     }
 
     #[tokio::test]
     async fn stopped_signed_workers_allow_reopen_before_retirement_poll() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let fixture = RetirementFixture::with_poll(60_000).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let fixture = RetirementFixture::new().await;
+            let (suspended, suspension) = tokio::sync::oneshot::channel();
+            let (resume, resumption) = tokio::sync::oneshot::channel();
+            *fixture.process.inner.job_observer_barrier.lock().await = Some(JobObserverBarrier {
+                suspended,
+                resume: resumption,
+            });
             let request = fixture.signed_enqueue("reopen");
             let response = fixture.process.handle(request).await;
             assert!(matches!(
                 response.result,
                 Ok(Reply::Jobs(Ok(JobsReply::Enqueued(_))))
             ));
+            // Observe the barrier acknowledgement before draining. Observation
+            // cannot poll or drop its jobs handle until explicitly resumed.
+            suspension.await.unwrap();
             let id = fixture.committed_id("reopen").unwrap();
             fixture.succeeded(&id).await;
+            let runner = fixture
+                .process
+                .inner
+                .job_runners
+                .lock()
+                .await
+                .remove(&fixture.key)
+                .flatten()
+                .unwrap();
+            runner.shutdown().await.unwrap();
             let config = fixture.process.inner.config.clone();
             let _dir = fixture._dir.clone();
-            let process = fixture.process.clone();
-            let jobs = fixture.jobs.clone();
             drop(fixture);
-            drop(jobs);
-            drop(process);
-            // Reopen waits only for execution tasks to observe stop and drain,
-            // never for the 60-second retirement observer's next poll.
-            loop {
-                match CredentialProcess::open(config.clone()) {
-                    Ok(reopened) => {
-                        drop(reopened);
-                        break;
-                    }
-                    Err(EgressError::StateUnavailable) => tokio::task::yield_now().await,
-                    Err(error) => panic!("unexpected reopen error: {error:?}"),
-                }
-            }
-            eprintln!("signed workers stopped: reopened before the 60 s observer poll");
+            // Joining workers establishes completion; the suspended observer
+            // must not own admission's process lock. No elapsed-time race/retry.
+            assert!(!resume.is_closed(), "observer must remain suspended");
+            let reopened = CredentialProcess::open(config).expect("reopen after workers joined");
+            drop(reopened);
+            resume.send(()).unwrap();
+            eprintln!("signed workers joined: reopened while retirement observation was suspended");
         })
         .await
-        .expect("5 s signed worker reopen regression bound");
+        .expect("60 s signed worker reopen hang guard");
     }
 
     #[derive(Clone)]

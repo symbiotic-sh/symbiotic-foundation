@@ -343,6 +343,8 @@ struct Inner {
     request_budget_dispatch: RequestBudgetDispatch,
     runtime: Runtime,
     job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
+    #[cfg(all(test, unix))]
+    job_observer_barrier: tokio::sync::Mutex<Option<jobs::JobObserverBarrier>>,
     _process_lock: Arc<ProcessLock>,
 }
 
@@ -404,6 +406,8 @@ impl CredentialProcess {
                 request_budget_dispatch: RequestBudgetDispatch::default(),
                 runtime,
                 job_runners: tokio::sync::Mutex::new(HashMap::new()),
+                #[cfg(all(test, unix))]
+                job_observer_barrier: tokio::sync::Mutex::new(None),
                 _process_lock: Arc::new(process_lock),
             }),
         })
