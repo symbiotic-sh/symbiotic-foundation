@@ -786,8 +786,10 @@ fn candidate_page_bytes(
 // Enqueue is the sole creator of live rows and retained input. Both utilization
 // checks derive from canonical rows under the same IMMEDIATE transaction.
 fn insert_job(rows: &mut SqlRows<'_>, config: &JobConfig, row: JobRecord) -> Result<(), JobError> {
-    // Reserve the same complete single-row array the runner must read back.
-    candidate_page_bytes(&row, 2, config.max_page_bytes, false)?;
+    // Model workers read candidate pages; handler runners claim rows directly.
+    if row.execution == Execution::Model {
+        candidate_page_bytes(&row, 2, config.max_page_bytes, false)?;
+    }
     if rows.live_count(&row.id.scope)? >= config.max_live_jobs
         || rows
             .usage(&row.id.scope)?

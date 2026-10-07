@@ -1387,8 +1387,6 @@ async fn runner_handoff_retains_only_one_payload_buffer() {
     }
     let mut s = Suite::new();
     s.now = Utc::now();
-    // Keep the 8 MiB handoff workload readable as a numeric-array candidate.
-    s.config.max_page_bytes = CLAIM_BYTES * 3 + 1024;
     let mut spec = s.spec("large-claim");
     spec.payload = vec![42; CLAIM_BYTES];
     let id = s.insert(spec).await;
@@ -2387,6 +2385,27 @@ async fn jobs_candidate_claim_is_bounded() {
         s.op(JobRequest::ClaimJob(id)).await.unwrap(),
         JobResponse::Job(None)
     ));
+}
+
+/// Direct handler claims accept inputs whose numeric-array encoding exceeds a page.
+#[tokio::test]
+async fn jobs_enqueue_accepts_handler_input_larger_than_candidate_page() {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let s = Suite::new();
+        let mut spec = s.spec("large-handler-input");
+        spec.payload = vec![b'x'; 512 * 1024];
+        assert!(spec.payload.len() < s.config.max_pending_bytes);
+        let id = s.insert(spec.clone()).await;
+        assert!(encoded_bytes(&s.get(&id).await).unwrap() + 2 > s.config.max_page_bytes);
+
+        let row = s.claim().await;
+        assert_eq!(row.id, id);
+        assert_eq!(row.payload.as_ref(), Some(&spec.payload));
+        s.complete(&row, Vec::new()).await;
+        assert_eq!(s.get(&id).await.state, JobState::Succeeded);
+    })
+    .await
+    .expect("handler enqueue and direct claim must finish within two seconds");
 }
 
 /// Numeric-array expansion is bounded before any member of an enqueue batch commits.
