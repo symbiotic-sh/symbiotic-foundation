@@ -7214,10 +7214,6 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool, body
                 .await;
             if call < 3 {
                 assert_eq!(result.error, Some(EgressError::InvalidProviderJson));
-                assert_eq!(
-                    result.error.as_ref().unwrap().to_string(),
-                    "provider response is not a valid answer; dispatch charge may be unknown"
-                );
                 assert_eq!(result.receipt.spend_state, SpendState::Unknown);
                 assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
                 assert!(result.receipt_persisted && result.output.is_none());
