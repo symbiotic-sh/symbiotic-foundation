@@ -2391,6 +2391,7 @@ async fn dispatch_model<
     )?;
     // Direct keyless adapters return raw JSON; runtime bookkeeping never retains it.
     response.discard_raw();
+    response.normalize_finish_reason();
     if let Some(error) = answer_recovery.usage_diagnostic(&response.trace().usage) {
         note_side_effect(&mut response, queue, "invalid_reported_cost", error);
     }
@@ -4820,32 +4821,39 @@ fn parse_retry_after(
     Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
 }
 
+fn is_known_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "stop"
+            | "end_turn"
+            | "stop_sequence"
+            | "length"
+            | "max_tokens"
+            | "model_context_window_exceeded"
+            | "other"
+    )
+}
+
 fn provider_finish_reason(
     trace: &mut ModelInvocationTrace,
     reason: Option<String>,
 ) -> Option<String> {
-    reason.map(|reason| match reason.as_str() {
+    reason.map(|reason| {
         // Preserve the wire labels recognized by egress, without retaining arbitrary text.
-        "stop"
-        | "end_turn"
-        | "stop_sequence"
-        | "length"
-        | "max_tokens"
-        | "model_context_window_exceeded"
-        | "other" => reason,
-        _ => {
-            note_trace_diagnostic(
-                trace,
-                "invalid_finish_reason",
-                DiagnosticCode::InvalidResponse,
-            );
-            tracing::warn!(
-                kind = "invalid_finish_reason",
-                error = DiagnosticCode::InvalidResponse.code(),
-                "provider finish reason replaced with other"
-            );
-            "other".to_owned()
+        if is_known_finish_reason(&reason) {
+            return reason;
         }
+        note_trace_diagnostic(
+            trace,
+            "invalid_finish_reason",
+            DiagnosticCode::InvalidResponse,
+        );
+        tracing::warn!(
+            kind = "invalid_finish_reason",
+            error = DiagnosticCode::InvalidResponse.code(),
+            "provider finish reason replaced with other"
+        );
+        "other".to_owned()
     })
 }
 
@@ -4861,27 +4869,30 @@ fn provider_usage_identity(
                 .iter()
                 .any(|value| contains_identity(value, identity, payload)),
             Value::Object(values) => values.iter().any(|(field, value)| {
-                // Protocol labels describe payloads; they are not answer or reasoning text.
-                !matches!(
-                    field.as_str(),
-                    "type" | "role" | "finish_reason" | "stop_reason"
-                ) && contains_identity(
-                    value,
-                    identity,
-                    payload
-                        || matches!(
-                            field.as_str(),
-                            "content"
-                                | "text"
-                                | "refusal"
-                                | "reasoning_content"
-                                | "reasoning"
-                                | "reasoning_details"
-                                | "thinking"
-                                | "signature"
-                                | "data"
-                        ),
-                )
+                match field.as_str() {
+                    // Finish labels are excluded only when they are recognized.
+                    "type" | "role" => false,
+                    "finish_reason" | "stop_reason" => value.as_str().is_some_and(|reason| {
+                        !is_known_finish_reason(reason) && reason.contains(identity)
+                    }),
+                    _ => contains_identity(
+                        value,
+                        identity,
+                        payload
+                            || matches!(
+                                field.as_str(),
+                                "content"
+                                    | "text"
+                                    | "refusal"
+                                    | "reasoning_content"
+                                    | "reasoning"
+                                    | "reasoning_details"
+                                    | "thinking"
+                                    | "signature"
+                                    | "data"
+                            ),
+                    ),
+                }
             }),
             _ => false,
         }
@@ -4896,13 +4907,8 @@ fn provider_usage_identity(
                         .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
                     // Borrow provider-visible request text; do not copy or retain it in usage.
                     && !request_contains_identity(text)
-                    // Screen payloads in every choice/block, independently of HTTP observations.
-                    && !["choices", "content"].iter().any(|field| {
-                        raw.get(field)
-                            .is_some_and(|value| {
-                                contains_identity(value, text, *field == "content")
-                            })
-                    })
+                    // Include top-level stop reasons as well as every choice/block.
+                    && !contains_identity(raw, text, false)
             });
             invalid |= token.is_none();
             token.map(str::to_owned)
@@ -6875,6 +6881,35 @@ mod egress_http_tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn regression_identity_screen_preserves_known_finish_labels() {
+        for label in [
+            "stop",
+            "end_turn",
+            "stop_sequence",
+            "length",
+            "max_tokens",
+            "model_context_window_exceeded",
+            "other",
+        ] {
+            let raw = serde_json::json!({"id":label,"model":label,
+                "choices":[{"message":{"content":"OK"},"finish_reason":label}],
+                "content":[{"type":"text","text":"OK"}],"stop_reason":label
+            });
+            let mut trace = success_trace(
+                &StaticChatProvider::new("OK").descriptor,
+                None,
+                None,
+                String::new(),
+                Some("OK"),
+            );
+            provider_usage_identity(&mut trace, &raw, |_| false);
+            assert_eq!(trace.usage.response_id.as_deref(), Some(label));
+            assert_eq!(trace.usage.served_model.as_deref(), Some(label));
+            assert!(trace.metadata.get(RUNTIME_DIAGNOSTICS).is_none());
+        }
     }
 
     #[test]

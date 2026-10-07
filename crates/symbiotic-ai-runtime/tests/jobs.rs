@@ -31,6 +31,7 @@ struct Provider {
     panic: bool,
     usage: UsageTrace,
     answer_marker: Option<&'static str>,
+    finish_reason: Option<String>,
 }
 impl Provider {
     fn new() -> Self {
@@ -53,6 +54,7 @@ impl Provider {
                 ..Default::default()
             },
             answer_marker: None,
+            finish_reason: Some("stop".into()),
         }
     }
 }
@@ -87,7 +89,7 @@ impl ChatProvider for Provider {
         }
         let mut response = ChatResponse {
             text: "paid answer".into(),
-            finish_reason: Some("stop".into()),
+            finish_reason: self.finish_reason.clone(),
             raw_provider_response: None,
             trace: ModelInvocationTrace {
                 trace_id: TraceId::new(),
@@ -250,19 +252,33 @@ fn finish_reason_binding<P>(provider: P) -> ModelBinding<P> {
         .with_answer_recovery(AnswerRecovery::Retain)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishReasonFixture {
+    OpenAi,
+    Anthropic,
+    Host,
+}
+
 async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
-    make_provider: impl Fn(String) -> P,
-    anthropic: bool,
+    make_provider: impl Fn(String, Option<&str>) -> P,
+    fixture: FinishReasonFixture,
     reasons: &[Option<&str>],
+    echo_identity: bool,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let started = std::time::Instant::now();
     for &reason in reasons {
         for path in ["execute", "job", "queued", "transport"] {
+            if fixture == FinishReasonFixture::Host && path == "transport" {
+                continue; // Raw host calls are outside the runtime boundary.
+            }
             tokio::time::timeout(Duration::from_secs(5), async {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let endpoint = format!("http://{}", listener.local_addr().unwrap());
-                let body = if anthropic {
+                let listener = if fixture == FinishReasonFixture::Host { None } else {
+                    Some(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+                };
+                let endpoint = listener.as_ref().map(|listener|
+                    format!("http://{}", listener.local_addr().unwrap())).unwrap_or_default();
+                let mut body = if fixture == FinishReasonFixture::Anthropic {
                     serde_json::json!({"id":"fixture-id","model":"served-model",
                         "content":[{"type":"text","text":"OK"},
                             {"type":"thinking","thinking":"PRIVATE_REASONING","signature":"sig"}],
@@ -272,7 +288,18 @@ async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
                         "choices":[{"message":{"content":"OK","reasoning_content":"PRIVATE_REASONING"},
                             "finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})
                 };
+                if echo_identity {
+                    // The private marker appears only in the finish label and identities.
+                    body["id"] = serde_json::json!(reason);
+                    body["model"] = serde_json::json!(reason);
+                    if fixture == FinishReasonFixture::Anthropic {
+                        body["content"] = serde_json::json!([{"type":"text","text":"OK"}]);
+                    } else {
+                        body["choices"][0]["message"] = serde_json::json!({"content":"OK"});
+                    }
+                }
                 let server = tokio::spawn(async move {
+                    let Some(listener) = listener else { return; };
                     tokio::time::timeout(Duration::from_secs(2), async {
                         let (stream, _) = listener.accept().await.unwrap();
                         let mut stream = BufReader::new(stream);
@@ -295,7 +322,7 @@ async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
                         ).as_bytes()).await.unwrap();
                     }).await.expect("finish-reason HTTP fixture must finish promptly");
                 });
-                let p = make_provider(endpoint);
+                let p = make_provider(endpoint, reason);
                 let configured = finish_reason_binding(p.clone());
                 let dir = tempfile::tempdir().unwrap();
                 let r = runtime(dir.path());
@@ -334,13 +361,23 @@ async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
                 let invalid = reason == Some("PRIVATE_REASONING");
                 let expected = if invalid { Some("other") } else { reason };
                 let check = |output: &serde_json::Value| {
-                    assert_eq!(output["text"], "OK", "{path}");
+                    let text = if fixture == FinishReasonFixture::Host { "paid answer" } else { "OK" };
+                    assert_eq!(output["text"], text, "{path}");
                     assert_eq!(output["finish_reason"], serde_json::json!(expected), "{path}");
                     assert!(!output.to_string().contains("PRIVATE_REASONING"), "{path}");
                     let diagnostics = &output["trace"]["metadata"][model::RUNTIME_DIAGNOSTICS];
                     if invalid {
-                        assert_eq!(diagnostics[0]["kind"], "invalid_finish_reason", "{path}");
-                        assert_eq!(diagnostics[0]["error"], "invalid_response", "{path}");
+                        let diagnostics = diagnostics.as_array().unwrap();
+                        assert!(diagnostics.iter().any(|d| d["kind"] == "invalid_finish_reason"
+                            && d["error"] == "invalid_response"), "{path}: {diagnostics:?}");
+                        if echo_identity {
+                            assert!(output["trace"]["usage"]["response_id"].is_null(), "{path}");
+                            assert!(output["trace"]["usage"]["served_model"].is_null(), "{path}");
+                            assert!(output["trace"]["metadata"]["provider"]["response_id"].is_null(), "{path}");
+                            assert!(output["trace"]["metadata"]["provider"]["served_model"].is_null(), "{path}");
+                            assert!(diagnostics.iter().any(|d| d["kind"] == "invalid_usage_identity"
+                                && d["error"] == "invalid_response"), "{path}: {diagnostics:?}");
+                        }
                     } else {
                         assert!(diagnostics.is_null(), "{path}: {diagnostics}");
                     }
@@ -372,13 +409,13 @@ async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
         }
     }
     eprintln!(
-        "finish-reason paths: anthropic={anthropic}, reasons={}, paths=4, elapsed={:?}",
+        "finish-reason paths: fixture={fixture:?}, echo_identity={echo_identity}, reasons={}, elapsed={:?}",
         reasons.len(),
         started.elapsed()
     );
 }
 
-fn finish_reason_openai(url: String) -> model::OpenAiCompatibleChatProvider {
+fn finish_reason_openai(url: String, _: Option<&str>) -> model::OpenAiCompatibleChatProvider {
     model::OpenAiCompatibleChatProvider::new("fixture", "fixture-model", url, "synthetic-key")
         .with_timeout(1)
         .unwrap()
@@ -386,7 +423,7 @@ fn finish_reason_openai(url: String) -> model::OpenAiCompatibleChatProvider {
         .with_response_limit(65536)
 }
 
-fn finish_reason_anthropic(url: String) -> model::AnthropicChatProvider {
+fn finish_reason_anthropic(url: String, _: Option<&str>) -> model::AnthropicChatProvider {
     model::AnthropicChatProvider::new("fixture", "fixture-model", url, "synthetic-key")
         .with_timeout(1)
         .unwrap()
@@ -396,19 +433,31 @@ fn finish_reason_anthropic(url: String) -> model::AnthropicChatProvider {
 
 #[tokio::test]
 async fn regression_finish_reason_openai_reasoning_stays_out_of_restart_recovery() {
-    assert_finish_reason_paths(finish_reason_openai, false, &[Some("PRIVATE_REASONING")]).await;
+    assert_finish_reason_paths(
+        finish_reason_openai,
+        FinishReasonFixture::OpenAi,
+        &[Some("PRIVATE_REASONING")],
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn regression_finish_reason_anthropic_reasoning_stays_out_of_restart_recovery() {
-    assert_finish_reason_paths(finish_reason_anthropic, true, &[Some("PRIVATE_REASONING")]).await;
+    assert_finish_reason_paths(
+        finish_reason_anthropic,
+        FinishReasonFixture::Anthropic,
+        &[Some("PRIVATE_REASONING")],
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn regression_finish_reason_openai_known_labels_and_absence_are_unchanged() {
     assert_finish_reason_paths(
         finish_reason_openai,
-        false,
+        FinishReasonFixture::OpenAi,
         &[
             Some("stop"),
             Some("length"),
@@ -419,6 +468,7 @@ async fn regression_finish_reason_openai_known_labels_and_absence_are_unchanged(
             Some("other"),
             None,
         ],
+        false,
     )
     .await;
 }
@@ -427,13 +477,51 @@ async fn regression_finish_reason_openai_known_labels_and_absence_are_unchanged(
 async fn regression_finish_reason_anthropic_known_labels_are_unchanged() {
     assert_finish_reason_paths(
         finish_reason_anthropic,
-        true,
+        FinishReasonFixture::Anthropic,
         &[
             Some("end_turn"),
             Some("stop_sequence"),
             Some("max_tokens"),
             Some("model_context_window_exceeded"),
         ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_openai_identity_echoes_stay_out_of_restart_recovery() {
+    assert_finish_reason_paths(
+        finish_reason_openai,
+        FinishReasonFixture::OpenAi,
+        &[Some("PRIVATE_REASONING")],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_anthropic_identity_echoes_stay_out_of_restart_recovery() {
+    assert_finish_reason_paths(
+        finish_reason_anthropic,
+        FinishReasonFixture::Anthropic,
+        &[Some("PRIVATE_REASONING")],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn regression_finish_reason_host_text_stays_out_of_restart_recovery() {
+    assert_finish_reason_paths(
+        |_, reason| {
+            let mut p = Provider::new();
+            p.finish_reason = reason.map(str::to_owned);
+            p
+        },
+        FinishReasonFixture::Host,
+        &[Some("PRIVATE_REASONING"), Some("stop"), None],
+        false,
     )
     .await;
 }
