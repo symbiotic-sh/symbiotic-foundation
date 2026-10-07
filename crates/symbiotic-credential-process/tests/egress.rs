@@ -4677,6 +4677,24 @@ async fn jobs_owner_purge_refuses_unsigned_and_wrong_scope_before_mutation() {
                 .result,
             Err(EgressError::InvalidRequest)
         ));
+        let mut mismatched = key
+            .sign_jobs(JobsRequest {
+                scope: jobs_scope(),
+                command,
+            })
+            .unwrap();
+        mismatched.authentication.clear();
+        assert!(matches!(
+            client
+                .exchange(Request {
+                    version: PROTOCOL_VERSION,
+                    operation: Operation::CancelJobs(Box::new(mismatched))
+                })
+                .await
+                .unwrap()
+                .result,
+            Err(EgressError::InvalidRequest)
+        ));
         assert_eq!(
             conn.query_row("SELECT result FROM egress_permits", [], |r| r
                 .get::<_, String>(0))
