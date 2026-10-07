@@ -2,7 +2,7 @@
 //!
 //! IDs and all operations are scoped to a tenant, restore incarnation and queue.
 //! Enqueue/claim order is `(created_at, id)`; final deliveries use `(finished_at,
-//! id)`. Diagnostic cursors use ascending IDs.
+//! id)`. Diagnostic and admission-notice cursors use ascending IDs.
 //! SQLite owns atomicity: an error must roll back every write in an operation.
 
 use chrono::{DateTime, Utc};
@@ -388,6 +388,8 @@ pub enum JobRequest {
     },
     /// Bounded, content-free notices; these are never confirmable completions.
     AdmissionNotices {
+        /// Exclusive notice ID cursor; None starts at the first notice.
+        after: Option<String>,
         /// Maximum number of waiting job notices.
         limit: usize,
     },

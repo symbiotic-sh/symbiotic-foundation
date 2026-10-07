@@ -97,14 +97,27 @@ zero-charge evidence: its accounting and job remain uncertain.
 Cancel before claim finalizes waiting work; cancel after claim arrives with the
 lease heartbeat. Sent version-1 calls finish under their configured timeout.
 
-`Completions { limit, max_bytes, wait_seconds }` long-polls up to
+`Completions { after, limit, max_bytes, wait_seconds }` long-polls up to
 `io_timeout_seconds`; socket clients must configure a longer exchange timeout.
 The byte bound covers the complete `JobsCompletions` body and must fit within
 `max_frame_bytes` after subtracting the response envelope derived from the shared
 wire serializer. Final deliveries
 precede admission notices. A notice contains an ID/state/code and no delivery
-fence; acknowledging an unfinished job returns `NotFinal`. An individually
-oversized completion returns `CompletionTooLarge` before taking a delivery lease.
+fence; acknowledging an unfinished job returns `NotFinal`. The optional `after`
+notice cursor is an exclusive ID bound in ascending ID order. Supply `after: ""`
+to start pagination. When the request supplies a cursor, the response returns
+`after` for the last notice actually included within the count and byte bounds,
+or preserves the request cursor when no notice is included. Omitting `after`
+polls the first notice page with the previous response encoding and byte accounting:
+the response omits `after` and charges no cursor bytes. An empty page ends the
+current paginated scan; restart with `after: ""` to discover jobs that entered
+`AwaitingAdmission` at earlier IDs.
+Memory's job adapter must pass the returned cursor at its next Foundation update.
+Bare SQLite scans scoped unfinished rows through `jobs_claim`, filters by state
+and `id > after`, then sorts by ID for the bounded page. The wire layer adds
+opt-in cursor encoding and one empty-body serialization per paginated candidate
+to keep exact byte counts; no stored cursor, new index or schema is needed.
+An individually oversized completion returns `CompletionTooLarge` before taking a delivery lease.
 `JobStatus` reads one job's metadata without loading input, admission or output.
 Group summaries and diagnostics are outside this seven-operation subset.
 
@@ -354,7 +367,9 @@ state independently of the recovery deadline.
 Expired result rows are cleared incrementally at startup, before operations, and every
 second during socket serving, even when idle or connection slots are occupied. Each call
 clears at most 64 results selected by the partial deadline index, regardless of the
-expired backlog. Status lookup enforces the deadline even before physical cleanup.
+expired backlog. The hard-coded 64-result batch and one-second cadence are current
+provisional values, pending replacement by versioned maintenance settings.
+Status lookup enforces the deadline even before physical cleanup.
 Embedded users must periodically call `CredentialProcess::purge_expired_results()` while idle. Cleanup failure
 returns `StateUnavailable`; the daemon fails visibly. SQLite secure-delete is enabled;
 this is logical retention, not a forensic erasure guarantee for WAL files, backups, or
@@ -661,6 +676,30 @@ consumption. Resolver failures become `CredentialUnavailable`; their text is dis
 Resolver configs cannot be serialized. `ProcessConfig::validate_child_process()`
 refuses them with `ResolverRequiresThreadMode`; no callback crosses into a child.
 In thread mode, the credential boundary protects against accidents, not same-process code.
+
+The app's resolver must return promptly with a value or error and support concurrent
+calls. Startup resolves the admission key synchronously, including when reopening
+for recovery. Direct dispatch awaits provider resolution in `spawn_blocking` after
+permit consumption and before request-budget admission or provider execution.
+Provider `timeout_seconds` and `max_in_flight` therefore exclude that resolution;
+distinct accepted dispatches can invoke the resolver concurrently even when
+`max_in_flight` is one. Queued jobs acquire their account slot before resolving,
+but their provider timeout still does not bound the callback. Foundation imposes
+no resolver deadline. The app owns any lookup deadline and concurrency control
+its resolver needs.
+
+A slow resolver delays startup or dispatch and can delay shutdown. Dropping or
+cancelling the awaiting future cannot stop an already running callback. Tokio
+runtime drop waits for outstanding blocking callbacks to return; a runtime
+shutdown timeout only stops waiting and does not terminate them. After a crash,
+same-attempt recovery preserves an accepted unfinished direct dispatch as uncertain
+and does not rerun its provider lookup or resend it. Reopening still resolves the
+admission key. For example, with a one-second provider timeout, a provider resolver
+that waits for app release keeps direct dispatch pending without sending HTTP
+beyond that second; after release, provider execution starts with its own timeout.
+`regression_slow_resolver_delays_dispatch_beyond_provider_timeout` in
+`crates/symbiotic-credential-process/tests/egress.rs` pins this behavior with a
+test-controlled release and a callback hang guard.
 
 Run `symbiotic-credential-process /absolute/path/config.json`. The JSON configuration
 must be an owner-only regular file. Before reading configuration or secrets, the executable
