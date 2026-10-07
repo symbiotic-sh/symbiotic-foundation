@@ -104,16 +104,19 @@ The byte bound covers the complete `JobsCompletions` body and must fit within
 wire serializer. Final deliveries
 precede admission notices. A notice contains an ID/state/code and no delivery
 fence; acknowledging an unfinished job returns `NotFinal`. The optional `after`
-notice cursor is an exclusive ID bound in ascending ID order. The response returns
+notice cursor is an exclusive ID bound in ascending ID order. Supply `after: ""`
+to start pagination. When the request supplies a cursor, the response returns
 `after` for the last notice actually included within the count and byte bounds,
 or preserves the request cursor when no notice is included. Omitting `after`
-starts at the first notice, as before. An empty page ends the current scan; restart
-with no cursor to discover jobs that entered `AwaitingAdmission` at earlier IDs.
+polls the first notice page with the previous response encoding and byte accounting:
+the response omits `after` and charges no cursor bytes. An empty page ends the
+current paginated scan; restart with `after: ""` to discover jobs that entered
+`AwaitingAdmission` at earlier IDs.
 Memory's job adapter must pass the returned cursor at its next Foundation update.
 Bare SQLite scans scoped unfinished rows through `jobs_claim`, filters by state
 and `id > after`, then sorts by ID for the bounded page. The wire layer adds
-cursor encoding and one empty-body serialization per candidate to keep exact
-byte counts; no stored cursor, new index or schema is needed.
+opt-in cursor encoding and one empty-body serialization per paginated candidate
+to keep exact byte counts; no stored cursor, new index or schema is needed.
 An individually oversized completion returns `CompletionTooLarge` before taking a delivery lease.
 `JobStatus` reads one job's metadata without loading input, admission or output.
 Group summaries and diagnostics are outside this seven-operation subset.

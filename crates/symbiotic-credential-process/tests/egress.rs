@@ -4867,6 +4867,63 @@ async fn jobs_seven_operations_round_trip_on_both_transports_and_join_by_key() {
 }
 
 #[tokio::test]
+async fn jobs_notice_polls_without_cursor_preserve_wire_and_byte_budget() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
+        let process = fixture.process().await;
+        let client = InProcessEgressClient::new(process);
+        let mut input = queued(&fixture, "notice-without-cursor");
+        input.admission.attempt.expires_at = unix_seconds();
+        input.admission = AdmissionKey::new(KEY.to_vec())
+            .unwrap()
+            .sign_attempt(input.admission.attempt)
+            .unwrap();
+        let id = enqueue_id(&client, input).await;
+        wait_job(&client, &id, JobState::AwaitingAdmission).await;
+        let poll = |max_bytes| {
+            job_call(
+                &client,
+                serde_json::from_value(serde_json::json!({
+                    "operation": "completions",
+                    "body": { "limit": 1, "max_bytes": max_bytes, "wait_seconds": 0 }
+                }))
+                .unwrap(),
+            )
+        };
+        let JobsReply::Completions(page) = poll(65536).await.unwrap() else {
+            panic!("notice page")
+        };
+        assert_eq!(page.notices.len(), 1);
+        assert_eq!(page.notices[0].id, id);
+        let old_body = serde_json::json!({ "items": page.items, "notices": page.notices });
+        let max_bytes = serde_json::to_vec(&old_body).unwrap().len();
+        let JobsReply::Completions(exact) = poll(max_bytes).await.unwrap() else {
+            panic!("exact notice page")
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PreviousCompletions {
+            items: Vec<JobDelivery>,
+            notices: Vec<symbiotic_queue::jobs::JobDiagnostic>,
+        }
+        let bytes = serde_json::to_vec(&exact).unwrap();
+        assert_eq!(bytes.len(), max_bytes);
+        let previous: PreviousCompletions = serde_json::from_slice(&bytes).unwrap();
+        assert!(previous.items.is_empty());
+        assert_eq!(previous.notices[0].id, id);
+        assert!(exact.after.is_none());
+        assert!(matches!(
+            poll(max_bytes - 1).await,
+            Err(JobsClientError::Job(JobError::CompletionTooLarge { job, bytes }))
+                if job == id && bytes == max_bytes
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    })
+    .await
+    .expect("bounded no-cursor completion compatibility");
+}
+
+#[tokio::test]
 async fn jobs_notice_cursor_reaches_unresolved_notices_within_page_bounds() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
@@ -4906,7 +4963,7 @@ async fn jobs_notice_cursor_reaches_unresolved_notices_within_page_bounds() {
                 (page, next)
             }
         };
-        let (first, next) = poll(None, 2, 65536).await;
+        let (first, next) = poll(Some(String::new()), 2, 65536).await;
         assert_eq!(
             first
                 .notices
@@ -4916,8 +4973,9 @@ async fn jobs_notice_cursor_reaches_unresolved_notices_within_page_bounds() {
             expected[..2]
         );
         assert_eq!(next.as_deref(), Some(expected[1].id.as_str()));
-        let (repeated, _) = poll(None, 2, 65536).await;
+        let (repeated, repeated_next) = poll(None, 2, 65536).await;
         assert_eq!(repeated.notices[0].id, expected[0]);
+        assert!(repeated_next.is_none());
         let mut seen = first
             .notices
             .iter()
@@ -4938,16 +4996,16 @@ async fn jobs_notice_cursor_reaches_unresolved_notices_within_page_bounds() {
         }
         assert_eq!(seen, expected);
         // Use an exact one-notice byte budget while the count allows two.
-        let (one, _) = poll(None, 1, 65536).await;
+        let (one, _) = poll(Some(String::new()), 1, 65536).await;
         let max_bytes = serde_json::to_vec(&one).unwrap().len();
         assert!(matches!(
             job_call(&client, JobsCommand::Completions {
-                after: None, limit: 2, max_bytes: max_bytes - 1, wait_seconds: 0,
+                after: Some(String::new()), limit: 2, max_bytes: max_bytes - 1, wait_seconds: 0,
             }).await,
             Err(JobsClientError::Job(JobError::CompletionTooLarge { job, bytes }))
                 if job == expected[0] && bytes == max_bytes
         ));
-        let mut after = None;
+        let mut after = Some(String::new());
         let mut seen = Vec::new();
         for id in &expected {
             let (page, next) = poll(after, 2, max_bytes).await;

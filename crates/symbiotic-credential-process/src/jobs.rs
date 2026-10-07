@@ -678,14 +678,18 @@ impl CredentialProcess {
                         else {
                             return Err(JobError::Storage);
                         };
-                        // Count the cursor through the shared serializer, as part of the body.
+                        // Count opt-in cursors through the shared serializer, as part of the body.
                         let mut header = empty.clone();
                         let mut header_bytes = body_bytes;
                         for notice in notices.items {
                             let size =
                                 encoded_bytes(&notice)? + usize::from(!page.notices.is_empty());
-                            header.after = Some(notice.id.id.clone());
-                            let next_header_bytes = encoded_bytes(&header)?;
+                            let next_header_bytes = if after.is_some() {
+                                header.after = Some(notice.id.id.clone());
+                                encoded_bytes(&header)?
+                            } else {
+                                header_bytes
+                            };
                             let required = used - header_bytes + next_header_bytes + size;
                             if required > max_bytes {
                                 if page.items.is_empty() && page.notices.is_empty() {

@@ -38,7 +38,8 @@ pub enum JobsCommand {
     },
     /// Final deliveries first, then non-confirmable admission notices, within both bounds.
     Completions {
-        /// Exclusive notice ID cursor; omitted requests start at the first notice.
+        /// Exclusive notice ID cursor; an empty string starts a paginated scan.
+        /// Omit to poll the first notice page without a response cursor or its byte cost.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
         /// Maximum number of final deliveries and notices combined.
@@ -131,6 +132,7 @@ pub struct JobsCompletions {
     /// Waiting jobs that need successor authority.
     pub notices: Vec<JobDiagnostic>,
     /// Last returned notice ID, or the request cursor when no notice fits.
+    /// Omitted when the request does not opt into notice pagination with `after`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
 }
@@ -198,7 +200,8 @@ impl<C: EgressClient> JobsClient<C> {
         }
     }
     /// Fetch bounded final deliveries and admission notices, optionally long-polling.
-    /// Pass the response `after` to continue notices; None restarts the notice scan.
+    /// Pass `Some(String::new())` to start pagination, then each response `after` to continue.
+    /// None polls the first notice page without a response cursor or its byte cost.
     /// Final deliveries are polled independently of the notice cursor.
     pub async fn completions(
         &self,
