@@ -242,6 +242,40 @@ fn cleanup_failure_exits_even_with_a_broken_stderr_pipe() {
 }
 
 #[test]
+fn cleanup_failure_writes_its_diagnostic_before_exit() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let dir = tempfile::tempdir().unwrap();
+    let stderr = dir.path().join("watcher.stderr");
+    let (reader, writer) = std::io::pipe().unwrap();
+    let read_fd = reader.as_raw_fd();
+    let mut command = fixture("full-stderr", dir.path());
+    command
+        .env("SYMBIOTIC_PARENT_FD", read_fd.to_string())
+        .stderr(fs::File::create(&stderr).unwrap());
+    // The pipe is close-on-exec, so unrelated fixtures cannot retain its writer.
+    // SAFETY: pre_exec explicitly inherits only this child's parent reader.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(read_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = Reap(command.spawn().unwrap());
+    drop(reader);
+    until_termination(|| dir.path().join("full-stderr.ready").exists());
+    drop(writer);
+    until_termination(|| child.0.try_wait().unwrap().is_some());
+    assert_eq!(child.0.wait().unwrap().code(), Some(1));
+    let written = fs::read_to_string(&stderr).unwrap();
+    assert!(
+        written.contains("parent-death cleanup failed"),
+        "writable stderr must receive the diagnostic, got {written:?}"
+    );
+}
+
+#[test]
 fn full_stderr_does_not_block_parent_death_exit() {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let dir = tempfile::tempdir().unwrap();

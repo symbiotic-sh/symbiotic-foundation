@@ -15,42 +15,69 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Queued diagnostics beyond this are dropped while stderr does not drain.
+const DIAGNOSTIC_QUEUE: usize = 16;
+// The parent-death watcher waits at most this long for its diagnostic before exit.
+const EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_secs(1);
+
+type Diagnostic = (Vec<u8>, Option<mpsc::SyncSender<()>>);
+static DIAGNOSTICS: OnceLock<Option<mpsc::SyncSender<Diagnostic>>> = OnceLock::new();
+
+/// Drop and termination diagnostics are best effort and never make the caller
+/// wait on stderr. One writer thread performs ordinary blocking writes, so fd 2's
+/// file status flags, which the app and every process that inherited its stderr
+/// share, are never changed. A message is dropped only when the queue is full.
 pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    // Drop/termination diagnostics are best effort. Do not take stderr's Rust
-    // lock, wait for an undrained pipe, or change fd 2's file status flags: they
-    // are shared with the app and every process that inherited its stderr.
-    // Each write follows a zero-timeout poll and is at most PIPE_BUF bytes, so a
-    // pipe that poll reports writable accepts it without waiting. A writer that
-    // fills the pipe between poll and write can still delay this write.
-    let bytes = format!("{message}\n");
-    write_diagnostic(bytes.as_bytes(), |remaining| {
-        let mut ready = libc::pollfd {
-            fd: libc::STDERR_FILENO,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: poll reads one live pollfd; write borrows the live message buffer.
-        unsafe {
-            match libc::poll(&mut ready, 1, 0) {
-                -1 => return Err(io::Error::last_os_error()),
-                // In particular, never wait or retry when output would block.
-                _ if ready.revents & libc::POLLOUT == 0 => {
-                    return Err(io::ErrorKind::WouldBlock.into());
+    queue_diagnostic(message, None);
+}
+
+/// Like `diagnostic`, but waits up to `EXIT_DIAGNOSTIC_WAIT` for the write
+/// because the process exits next and the writer thread ends with it.
+fn diagnostic_before_exit(message: std::fmt::Arguments<'_>) {
+    let (written, done) = mpsc::sync_channel(1);
+    if queue_diagnostic(message, Some(written)) {
+        let _ = done.recv_timeout(EXIT_DIAGNOSTIC_WAIT);
+    }
+}
+
+fn queue_diagnostic(
+    message: std::fmt::Arguments<'_>,
+    written: Option<mpsc::SyncSender<()>>,
+) -> bool {
+    let Some(diagnostics) = DIAGNOSTICS.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<Diagnostic>(DIAGNOSTIC_QUEUE);
+        std::thread::Builder::new()
+            .name("foundation-diagnostics".into())
+            .spawn(move || {
+                for (bytes, written) in rx {
+                    write_diagnostic(&bytes, |remaining| {
+                        // SAFETY: write borrows the live message buffer.
+                        let count = unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                remaining.as_ptr().cast(),
+                                remaining.len(),
+                            )
+                        };
+                        if count == -1 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(count as usize)
+                        }
+                    });
+                    if let Some(written) = written {
+                        let _ = written.send(());
+                    }
                 }
-                _ => {}
-            }
-            let written = libc::write(
-                libc::STDERR_FILENO,
-                remaining.as_ptr().cast(),
-                remaining.len().min(libc::PIPE_BUF),
-            );
-            if written == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(written as usize)
-            }
-        }
-    });
+            })
+            .ok()
+            .map(|_| tx)
+    }) else {
+        return false;
+    };
+    diagnostics
+        .try_send((format!("{message}\n").into_bytes(), written))
+        .is_ok()
 }
 
 fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
@@ -59,7 +86,8 @@ fn write_diagnostic(mut bytes: &[u8], mut write: impl FnMut(&[u8]) -> io::Result
             Ok(0) => break,
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            // In particular, never wait or retry when output would block.
+            // Any other error ends this message, including WouldBlock when the
+            // app itself made stderr nonblocking.
             Err(_) => break,
         }
     }
@@ -317,7 +345,7 @@ pub fn watch_parent(
                 }
             };
             if let Err(error) = cleanup() {
-                diagnostic(format_args!("parent-death cleanup failed: {error}"));
+                diagnostic_before_exit(format_args!("parent-death cleanup failed: {error}"));
                 std::process::exit(1);
             }
             std::process::exit(code);
